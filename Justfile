@@ -30,6 +30,10 @@ retrain: extract train
 evaluate:
     cd ml && uv run python -m weatherstat.evaluate
 
+# Visualize extracted data
+visualize *ARGS:
+    cd ml && uv run python -m weatherstat.visualize {{ARGS}}
+
 # Run inference pipeline
 infer:
     cd ml && uv run python -m weatherstat.inference
