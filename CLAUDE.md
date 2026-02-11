@@ -28,14 +28,22 @@ See `docs/PLAN.md` for the full roadmap.
 
 ```bash
 just                  # List available tasks
-just collect          # Run HA state collector (5-min snapshots)
+just collect          # Run HA state collector (5-min loop)
+just collect-once     # Collect a single snapshot
+just collect-durable  # Auto-restart collector + health monitoring
+just health           # Check if collector data is fresh
 just extract          # Extract historical data from HA
 just train            # Train both baseline and full models
 just train-baseline   # Train hourly temp-only model (5+ months)
-just train-full       # Train 5-min full-feature model (~10 days)
+just train-full       # Train 5-min full-feature model (historical + collector)
 just evaluate         # Compare baseline vs full model
 just retrain          # Re-extract + retrain everything
-just infer            # Run inference pipeline
+just predict          # Fetch live state, predict with both models
+just counterfactual   # Predict under HVAC on/off scenarios
+just control          # Single control cycle (dry-run)
+just control-loop     # 15-min control loop (dry-run)
+just control-live     # Single control cycle with live execution
+just execute          # Apply latest command JSON to HA
 just lint             # Lint both packages
 just test             # Test both packages
 just typecheck        # TypeScript type-check
