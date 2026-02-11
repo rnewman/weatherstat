@@ -50,7 +50,7 @@ from weatherstat.types import (
 # ── Constants ──────────────────────────────────────────────────────────────
 
 # Setpoint sweep range (°F)
-SETPOINT_MIN = 68
+SETPOINT_MIN = 67
 SETPOINT_MAX = 76
 SETPOINT_STEP = 1
 
@@ -111,7 +111,7 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
                 ComfortScheduleEntry(
                     18,
                     8,
-                    RoomComfort("office", 66.0, 76.0, cold_penalty=1.0, hot_penalty=0.5),
+                    RoomComfort("office", 67.0, 76.0, cold_penalty=1.0, hot_penalty=0.5),
                 ),
             ),
         ),
@@ -128,13 +128,13 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
                 ComfortScheduleEntry(
                     9,
                     21,
-                    RoomComfort("bedroom", 68.0, 74.0, cold_penalty=1.0, hot_penalty=1.5),
+                    RoomComfort("bedroom", 68.0, 72.0, cold_penalty=1.0, hot_penalty=1.5),
                 ),
                 # Night: cool for sleep
                 ComfortScheduleEntry(
                     21,
                     6,
-                    RoomComfort("bedroom", 64.0, 68.0, cold_penalty=1.0, hot_penalty=3.0),
+                    RoomComfort("bedroom", 66.0, 69.0, cold_penalty=1.0, hot_penalty=3.0),
                 ),
             ),
         ),

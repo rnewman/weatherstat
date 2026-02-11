@@ -56,17 +56,21 @@ if [[ -z "${HA_URL:-}" ]] || [[ -z "${HA_TOKEN:-}" ]]; then
 fi
 
 # Start health monitor in background
+# Initial grace period: wait 2x the collection interval before the first check,
+# so the collector has time to connect to HA and write its first snapshot.
+HEALTH_GRACE=600  # 10 minutes
 health_monitor() {
+    sleep "$HEALTH_GRACE"
     while true; do
-        sleep "$HEALTH_INTERVAL"
         bash "$HEALTH_CHECK" 2>&1 | while IFS= read -r line; do
             echo "[health] $line"
         done
+        sleep "$HEALTH_INTERVAL"
     done
 }
 health_monitor &
 HEALTH_PID=$!
-echo "[run-collector] Health monitor started (PID: $HEALTH_PID, interval: ${HEALTH_INTERVAL}s)"
+echo "[run-collector] Health monitor started (PID: $HEALTH_PID, grace: ${HEALTH_GRACE}s, interval: ${HEALTH_INTERVAL}s)"
 
 # Restart loop with exponential backoff
 backoff=$BACKOFF_INITIAL

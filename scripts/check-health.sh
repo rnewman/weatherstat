@@ -16,19 +16,22 @@ if [[ ! -f "$DB_PATH" ]]; then
     exit 1
 fi
 
-# Get the latest timestamp from SQLite
-latest_ts=$(sqlite3 "$DB_PATH" "SELECT MAX(timestamp) FROM snapshots;" 2>/dev/null)
+# Get the latest timestamp from SQLite (-noheader -list bypasses any .sqliterc formatting)
+latest_ts=$(sqlite3 -noheader -list "$DB_PATH" "SELECT MAX(timestamp) FROM snapshots;" 2>/dev/null)
 
 if [[ -z "$latest_ts" ]]; then
     echo "ERROR: No snapshots in database"
     exit 1
 fi
 
-# Convert to epoch seconds
-latest_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${latest_ts%%.*}" "+%s" 2>/dev/null || \
+# Convert to epoch seconds (timestamps are UTC — strip the Z suffix and parse in UTC)
+ts_no_frac="${latest_ts%%.*}"  # remove fractional seconds and Z
+export TZ=UTC
+latest_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$ts_no_frac" "+%s" 2>/dev/null || \
     date -d "${latest_ts}" "+%s" 2>/dev/null || echo "0")
+unset TZ
 
-now_epoch=$(date "+%s")
+now_epoch=$(date -u "+%s")
 age_seconds=$((now_epoch - latest_epoch))
 age_minutes=$((age_seconds / 60))
 
