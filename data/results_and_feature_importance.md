@@ -1,0 +1,46 @@
+Metrics Summary
+
+Baseline model (5,039 hourly rows, 92 features, 5+ months of temperature data):
+┌────────────┬─────────┬────────┬────────┐
+│    Zone    │ Horizon │  RMSE  │  MAE   │
+├────────────┼─────────┼────────┼────────┤
+│ Upstairs   │ 1h      │ 0.44°F │ 0.33°F │
+├────────────┼─────────┼────────┼────────┤
+│ Upstairs   │ 2h      │ 0.63°F │ 0.50°F │
+├────────────┼─────────┼────────┼────────┤
+│ Upstairs   │ 4h      │ 1.03°F │ 0.84°F │
+├────────────┼─────────┼────────┼────────┤
+│ Downstairs │ 1h      │ 0.29°F │ 0.21°F │
+├────────────┼─────────┼────────┼────────┤
+│ Downstairs │ 2h      │ 0.46°F │ 0.36°F │
+├────────────┼─────────┼────────┼────────┤
+│ Downstairs │ 4h      │ 0.79°F │ 0.63°F │
+└────────────┴─────────┴────────┴────────┘
+Full model (2,881 rows at 5-min, 115 features, 10 days):
+┌────────────┬─────────┬────────┬────────┐
+│    Zone    │ Horizon │  RMSE  │  MAE   │
+├────────────┼─────────┼────────┼────────┤
+│ Upstairs   │ 1h      │ 0.59°F │ 0.48°F │
+├────────────┼─────────┼────────┼────────┤
+│ Upstairs   │ 2h      │ 0.88°F │ 0.71°F │
+├────────────┼─────────┼────────┼────────┤
+│ Upstairs   │ 4h      │ 1.00°F │ 0.82°F │
+├────────────┼─────────┼────────┼────────┤
+│ Downstairs │ 1h      │ 0.39°F │ 0.32°F │
+├────────────┼─────────┼────────┼────────┤
+│ Downstairs │ 2h      │ 0.54°F │ 0.42°F │
+├────────────┼─────────┼────────┼────────┤
+│ Downstairs │ 4h      │ 0.61°F │ 0.50°F │
+└────────────┴─────────┴────────┴────────┘
+Feature Importance Highlights
+
+At short horizons (1h): current thermostat temp dominates massively — it's the best predictor of near-future temp. This is expected
+physics (thermal inertia).
+
+At longer horizons (4h), the interesting features emerge:
+- Solar elevation becomes the #1 or #2 feature in the full model at 4h — confirming the solar gain hypothesis
+- Rolling averages (12h, 24h) gain importance — capturing thermal trends
+- mini_split_living_room_mode_enc appears in downstairs 4h importance — the LR split runs ~67% of the time and affects nearby downstairs
+temps
+- thermostat_upstairs_target shows up in downstairs predictions — cross-zone interaction (heat rises)
+- Wind speed and outdoor humidity matter at longer horizons — weather affects heat loss rate
