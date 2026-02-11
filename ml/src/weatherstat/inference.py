@@ -219,11 +219,28 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
 
 
 def _resample_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
-    """Resample 5-min snapshot data to hourly means for baseline model."""
+    """Resample 5-min snapshot data to hourly for baseline model.
+
+    Numeric columns use mean; categorical columns use last value per hour.
+    This preserves HVAC features (setpoints, actions, modes) for baseline
+    models that include them.
+    """
     df = df.copy()
     df["_ts"] = pd.to_datetime(df["timestamp"])
+
     numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    hourly = df[["_ts"] + numeric_cols].set_index("_ts").resample("1h").mean()
+    cat_cols = df.select_dtypes(exclude=["number"]).columns.difference(
+        ["timestamp", "_ts"]
+    ).tolist()
+
+    grouped = df.set_index("_ts")
+    parts: list[pd.DataFrame] = []
+    if numeric_cols:
+        parts.append(grouped[numeric_cols].resample("1h").mean())
+    if cat_cols:
+        parts.append(grouped[cat_cols].resample("1h").last())
+
+    hourly = pd.concat(parts, axis=1) if parts else pd.DataFrame()
     hourly = hourly.reset_index().rename(columns={"_ts": "timestamp"})
     hourly["timestamp"] = hourly["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     return hourly
@@ -338,6 +355,11 @@ def predict_live() -> None:
     output_path = PREDICTIONS_DIR / f"prediction_{date_str}.json"
     output_path.write_text(json.dumps(output, indent=2))
     print(f"\nSaved to {output_path}")
+
+    # Save raw input for reproducible test cases
+    input_path = PREDICTIONS_DIR / f"prediction_{date_str}_input.parquet"
+    df_raw.to_parquet(input_path, index=False)
+    print(f"Input saved to {input_path}")
 
 
 def _fmt_temp(val: object) -> str:

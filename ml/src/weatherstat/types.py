@@ -195,8 +195,7 @@ class ControlDecision:
     total_cost: float
     comfort_cost: float
     energy_cost: float
-    upstairs_predictions: dict[str, float] = field(default_factory=dict)  # horizon -> temp
-    downstairs_predictions: dict[str, float] = field(default_factory=dict)
+    room_predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # room -> {horizon -> temp}
     dry_run: bool = True
 
 

@@ -1,10 +1,13 @@
 """LightGBM training pipeline with multi-horizon temperature prediction.
 
 Two training modes:
-- baseline: Train on hourly temp-only data (5+ months of statistics)
+- baseline: Train on hourly data (7+ months of statistics + HVAC features)
 - full: Train on 5-min full-feature data (~10 days of raw history)
 
-Predicts future temperature at T+1h, T+2h, T+4h per zone.
+Both modes use HVAC features (setpoints, actions, modes) when available.
+The baseline merges HVAC data from collector/extraction into the hourly
+statistics. LightGBM handles NaN natively, so pre-collector rows (where
+HVAC features are missing) still contribute temperature learning.
 
 Run:
   uv run python -m weatherstat.train --mode baseline
@@ -49,14 +52,104 @@ EXCLUDE_COLUMNS_BASE = {
 }
 
 
+# HVAC columns to merge from full-feature sources into baseline hourly data.
+# Temperature columns are NOT included — those come from hourly statistics
+# (actual hourly means computed by HA, more accurate than resampled snapshots).
+HVAC_MERGE_COLUMNS = [
+    "thermostat_upstairs_target",
+    "thermostat_downstairs_target",
+    "thermostat_upstairs_action",
+    "thermostat_downstairs_action",
+    "mini_split_bedroom_temp",
+    "mini_split_bedroom_target",
+    "mini_split_bedroom_mode",
+    "mini_split_living_room_temp",
+    "mini_split_living_room_target",
+    "mini_split_living_room_mode",
+    "blower_family_room_mode",
+    "blower_office_mode",
+    "navien_heating_mode",
+    "navien_heat_capacity",
+    "weather_condition",
+    "wind_speed",
+    "outdoor_humidity",
+    "any_window_open",
+]
+
+
+def _resample_to_hourly(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Resample 5-min data to hourly, keeping only specified columns.
+
+    Numeric columns use mean; categorical/bool use last value per hour.
+    """
+    available = [c for c in columns if c in df.columns]
+    if not available:
+        return pd.DataFrame()
+
+    subset = df[["timestamp"] + available].copy()
+    subset["_ts"] = pd.to_datetime(subset["timestamp"], format="ISO8601", utc=True)
+
+    numeric = subset[available].select_dtypes(include=["number"]).columns.tolist()
+    other = [c for c in available if c not in numeric]
+
+    grouped = subset.set_index("_ts")
+    parts: list[pd.DataFrame] = []
+    if numeric:
+        parts.append(grouped[numeric].resample("1h").mean())
+    if other:
+        parts.append(grouped[other].resample("1h").last())
+
+    if not parts:
+        return pd.DataFrame()
+
+    result = pd.concat(parts, axis=1).reset_index()
+    result = result.rename(columns={"_ts": "timestamp"})
+    result["timestamp"] = result["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    return result
+
+
 def load_baseline_data() -> pd.DataFrame:
-    """Load hourly statistics data for baseline training."""
+    """Load hourly statistics + HVAC features for baseline training.
+
+    Temperatures come from HA long-term statistics (7+ months of hourly means).
+    HVAC features (setpoints, actions, modes) come from full-feature sources
+    (historical extraction + collector), resampled to hourly and merged.
+    Pre-collector rows have NaN for HVAC features — LightGBM handles this.
+    """
     path = SNAPSHOTS_DIR / "historical_hourly.parquet"
     if not path.exists():
         print(f"Error: {path} not found. Run `just extract` first.", file=sys.stderr)
         sys.exit(1)
     df = pd.read_parquet(path)
     print(f"Loaded {len(df)} hourly rows from {path}")
+
+    # Merge HVAC features from full-feature sources
+    hvac_frames: list[pd.DataFrame] = []
+
+    parquet_path = SNAPSHOTS_DIR / "historical_full.parquet"
+    if parquet_path.exists():
+        full = pd.read_parquet(parquet_path)
+        print(f"  HVAC source: {len(full)} rows from {parquet_path.name}")
+        hvac_frames.append(full)
+
+    if SNAPSHOTS_DB.exists():
+        collector = load_collector_snapshots(SNAPSHOTS_DB)
+        print(f"  HVAC source: {len(collector)} rows from {SNAPSHOTS_DB.name}")
+        hvac_frames.append(collector)
+
+    if hvac_frames:
+        hvac_all = pd.concat(hvac_frames, ignore_index=True)
+        hvac_all = hvac_all.drop_duplicates(subset="timestamp", keep="last")
+        hvac_hourly = _resample_to_hourly(hvac_all, HVAC_MERGE_COLUMNS)
+
+        if not hvac_hourly.empty:
+            df = df.merge(hvac_hourly, on="timestamp", how="left")
+            hvac_cols = [c for c in hvac_hourly.columns if c != "timestamp"]
+            n_with_hvac = df[hvac_cols].notna().any(axis=1).sum()
+            print(f"  Merged HVAC features: {n_with_hvac}/{len(df)} rows have data")
+    else:
+        print("  No HVAC sources available (run `just extract` or `just collect`)")
+
     return df
 
 
@@ -174,21 +267,24 @@ def train_mode(mode: str) -> None:
     # Build exclude set: base excludes + all possible target columns
     exclude = EXCLUDE_COLUMNS_BASE | set(all_target_cols)
 
-    # Drop rows with NaN in trainable targets and features
+    # Determine feature columns
+    feature_cols = [c for c in df.columns if c not in exclude]
+    numeric_df = df[feature_cols].select_dtypes(include=["number"])
+    feature_cols = list(numeric_df.columns)
+
+    # Only drop rows where TARGET is NaN (from future shift at end of series).
+    # Feature NaN is fine — LightGBM handles missing values natively.
+    # This is important: HVAC features are only available for recent data, so
+    # most baseline rows have NaN for setpoints/actions. LightGBM learns the
+    # HVAC relationship from the rows that have data and uses temperature-only
+    # splits for the rest.
     pre_drop = len(df)
     df = df.dropna(subset=target_cols)
-    df = df.dropna()
-    print(f"Dropped {pre_drop - len(df)} rows with NaN, {len(df)} remaining")
+    print(f"Dropped {pre_drop - len(df)} rows with NaN targets, {len(df)} remaining")
 
     if len(df) < 50:
         print("Error: too few rows after dropping NaN.", file=sys.stderr)
         sys.exit(1)
-
-    feature_cols = [c for c in df.columns if c not in exclude]
-
-    # Filter to only numeric columns
-    numeric_df = df[feature_cols].select_dtypes(include=["number"])
-    feature_cols = list(numeric_df.columns)
 
     X = df[feature_cols]
     print(f"Features: {len(feature_cols)} columns")

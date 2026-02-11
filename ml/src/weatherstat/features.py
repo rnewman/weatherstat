@@ -338,15 +338,15 @@ def build_features(
         df = add_rolling_features(df, temp_cols, ROLLING_WINDOWS_5MIN)
 
     elif mode == "baseline":
+        # HVAC encoding (when HVAC columns are present from merged data)
+        df = encode_hvac_features(df)
+
+        # Delta features (target-current, indoor-outdoor, room-zone)
+        df = add_delta_features(df)
+
         # Temperature lags and rolling at hourly intervals
         temp_cols = [c for c in TEMP_COLUMNS_HOURLY if c in df.columns]
         df = add_lag_features(df, temp_cols, LAG_PERIODS_HOURLY)
         df = add_rolling_features(df, temp_cols, ROLLING_WINDOWS_HOURLY)
-
-        # Indoor-outdoor delta if outdoor_temp available
-        if "outdoor_temp" in df.columns:
-            for room, col in ROOM_TEMP_COLUMNS.items():
-                if col in df.columns:
-                    df[f"{room}_outdoor_delta"] = df[col] - df["outdoor_temp"]
 
     return df

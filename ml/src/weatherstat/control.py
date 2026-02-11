@@ -29,6 +29,7 @@ import pandas as pd
 from weatherstat.config import (
     CONTROL_STATE_FILE,
     HORIZONS_5MIN,
+    PREDICTION_ROOMS,
     PREDICTIONS_DIR,
 )
 from weatherstat.inference import (
@@ -93,7 +94,12 @@ HORIZON_LABELS: dict[int, str] = {12: "1h", 24: "2h", 48: "4h", 72: "6h", 144: "
 
 
 def default_comfort_schedules() -> list[ComfortSchedule]:
-    """Initial comfort profiles from user preferences."""
+    """Initial comfort profiles from user preferences.
+
+    All 8 rooms have schedules so the optimizer considers whole-house comfort.
+    Rooms without direct HVAC control (kitchen, piano, bathroom) use lighter
+    penalties — there's only so much the thermostats can do for them.
+    """
     return [
         ComfortSchedule(
             room="upstairs",
@@ -141,13 +147,44 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
                 ),
             ),
         ),
+        ComfortSchedule(
+            room="family_room",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("family_room", 70.0, 74.0)),),
+        ),
+        ComfortSchedule(
+            room="kitchen",
+            entries=(
+                ComfortScheduleEntry(
+                    0, 24,
+                    RoomComfort("kitchen", 69.0, 75.0, cold_penalty=1.0, hot_penalty=0.5),
+                ),
+            ),
+        ),
+        ComfortSchedule(
+            room="piano",
+            entries=(
+                ComfortScheduleEntry(
+                    0, 24,
+                    RoomComfort("piano", 69.0, 75.0, cold_penalty=1.0, hot_penalty=0.5),
+                ),
+            ),
+        ),
+        ComfortSchedule(
+            room="bathroom",
+            entries=(
+                # Bathroom has a window often open — relaxed bounds, low penalty
+                ComfortScheduleEntry(
+                    0, 24,
+                    RoomComfort("bathroom", 67.0, 76.0, cold_penalty=0.5, hot_penalty=0.3),
+                ),
+            ),
+        ),
     ]
 
 
 # ── Zone mapping ──────────────────────────────────────────────────────────
-# Maps room names to prediction zones. Currently the model only predicts
-# upstairs_temp and downstairs_temp. Rooms are mapped to the zone whose
-# thermostat controls their heat.
+# Maps rooms to HVAC zones. Used as fallback in compute_comfort_cost when
+# a room-specific model prediction is unavailable.
 
 ROOM_TO_ZONE: dict[str, str] = {
     "upstairs": "upstairs",
@@ -277,14 +314,16 @@ def sweep_setpoints(
 
             if total < best_cost:
                 best_cost = total
-                up_preds = {
-                    HORIZON_LABELS[h]: round(predictions.get(f"upstairs_temp_t+{h}", float("nan")), 2)
-                    for h in CONTROL_HORIZONS
-                }
-                dn_preds = {
-                    HORIZON_LABELS[h]: round(predictions.get(f"downstairs_temp_t+{h}", float("nan")), 2)
-                    for h in CONTROL_HORIZONS
-                }
+                room_preds: dict[str, dict[str, float]] = {}
+                for room in PREDICTION_ROOMS:
+                    rpred: dict[str, float] = {}
+                    for h in CONTROL_HORIZONS:
+                        key = f"{room}_temp_t+{h}"
+                        val = predictions.get(key)
+                        if val is not None:
+                            rpred[HORIZON_LABELS[h]] = round(val, 2)
+                    if rpred:
+                        room_preds[room] = rpred
                 best_decision = ControlDecision(
                     timestamp=datetime.now(UTC).isoformat(),
                     upstairs_setpoint=float(up_sp),
@@ -292,8 +331,7 @@ def sweep_setpoints(
                     total_cost=round(total, 4),
                     comfort_cost=round(comfort, 4),
                     energy_cost=round(energy, 4),
-                    upstairs_predictions=up_preds,
-                    downstairs_predictions=dn_preds,
+                    room_predictions=room_preds,
                 )
 
     if best_decision is None:
@@ -364,27 +402,21 @@ def check_data_freshness(df: pd.DataFrame) -> bool:
 
 def check_prediction_sanity(
     decision: ControlDecision,
-    up_current: float,
-    dn_current: float,
+    current_temps: dict[str, float],
 ) -> bool:
-    """Return True if 1h predictions look reasonable."""
+    """Return True if 1h predictions look reasonable for all rooms."""
     safe = True
-    up_1h = decision.upstairs_predictions.get("1h")
-    dn_1h = decision.downstairs_predictions.get("1h")
-
-    if up_1h is not None and abs(up_1h - up_current) > MAX_1H_CHANGE:
-        print(
-            f"  WARNING: Upstairs 1h prediction {up_1h:.1f}°F is"
-            f" >{MAX_1H_CHANGE}°F from current {up_current:.1f}°F"
-        )
-        safe = False
-    if dn_1h is not None and abs(dn_1h - dn_current) > MAX_1H_CHANGE:
-        print(
-            f"  WARNING: Downstairs 1h prediction {dn_1h:.1f}°F is"
-            f" >{MAX_1H_CHANGE}°F from current {dn_current:.1f}°F"
-        )
-        safe = False
-
+    for room, preds in decision.room_predictions.items():
+        pred_1h = preds.get("1h")
+        current = current_temps.get(room)
+        if pred_1h is None or current is None:
+            continue
+        if abs(pred_1h - current) > MAX_1H_CHANGE:
+            print(
+                f"  WARNING: {room} 1h prediction {pred_1h:.1f}°F is"
+                f" >{MAX_1H_CHANGE}°F from current {current:.1f}°F"
+            )
+            safe = False
     return safe
 
 
@@ -464,6 +496,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         return None
 
     # Current state
+    from weatherstat.features import ROOM_TEMP_COLUMNS
+
     latest = df_raw.iloc[-1]
     up_current = float(latest.get("thermostat_upstairs_temp", 70))
     dn_current = float(latest.get("thermostat_downstairs_temp", 70))
@@ -472,11 +506,23 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     out_temp = latest.get("outdoor_temp")
     now_str = df_raw["timestamp"].iloc[-1]
 
+    # Build current temperature dict for all rooms (for sanity checks and display)
+    current_temps: dict[str, float] = {}
+    for room, col in ROOM_TEMP_COLUMNS.items():
+        val = latest.get(col)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            current_temps[room] = float(val)
+
     print(f"\n[control] Current state ({now_str}):")
     print(f"  Upstairs:    {up_current:.1f}°F (setpoint: {up_target}°F)")
     print(f"  Downstairs:  {dn_current:.1f}°F (setpoint: {dn_target}°F)")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         print(f"  Outdoor:     {float(out_temp):.1f}°F")
+    other_rooms = [r for r in PREDICTION_ROOMS if r not in ("upstairs", "downstairs")]
+    for room in other_rooms:
+        t = current_temps.get(room)
+        if t is not None:
+            print(f"  {room:<14} {t:.1f}°F")
 
     # Load models
     feature_columns = load_feature_columns("full")
@@ -516,11 +562,19 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         f"  Total cost: {decision.total_cost:.4f}"
         f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
     )
-    print(f"  Upstairs predictions:  {decision.upstairs_predictions}")
-    print(f"  Downstairs predictions: {decision.downstairs_predictions}")
+
+    # Per-room prediction table
+    horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
+    header = f"  {'Room':<14}" + "".join(f"{h:>8}" for h in horizons)
+    print("\n  Predicted temperatures:")
+    print(header)
+    print(f"  {'-' * (14 + 8 * len(horizons))}")
+    for room, preds in decision.room_predictions.items():
+        vals = "".join(f"{preds.get(h, float('nan')):>7.1f}°" for h in horizons)
+        print(f"  {room:<14}{vals}")
 
     # Safety checks
-    sane = check_prediction_sanity(decision, up_current, dn_current)
+    sane = check_prediction_sanity(decision, current_temps)
     if not sane:
         print("  Prediction sanity check FAILED — skipping execution")
         if not live:
@@ -539,8 +593,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             total_cost=decision.total_cost,
             comfort_cost=decision.comfort_cost,
             energy_cost=decision.energy_cost,
-            upstairs_predictions=decision.upstairs_predictions,
-            downstairs_predictions=decision.downstairs_predictions,
+            room_predictions=decision.room_predictions,
             dry_run=not live,
         )
 

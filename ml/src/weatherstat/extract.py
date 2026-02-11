@@ -229,7 +229,7 @@ def extract_statistics(months_back: int = 7) -> pd.DataFrame:
             continue
 
         df = pd.DataFrame(records)
-        df["timestamp"] = pd.to_datetime(df["start"], utc=True)
+        df["timestamp"] = pd.to_datetime(df["start"], unit="ms", utc=True)
         df = df.rename(columns={"mean": col_name})
         df = df[["timestamp", col_name]]
         frames.append(df)
