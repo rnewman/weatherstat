@@ -1,0 +1,38 @@
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+export interface Config {
+  haUrl: string;
+  haToken: string;
+  snapshotIntervalMs: number;
+  dataDir: string;
+  snapshotsDir: string;
+  predictionsDir: string;
+}
+
+export function loadConfig(): Config {
+  const dataDir = resolve(
+    __dirname,
+    process.env["DATA_DIR"] ?? "../../data",
+  );
+
+  return {
+    haUrl: requireEnv("HA_URL"),
+    haToken: requireEnv("HA_TOKEN"),
+    snapshotIntervalMs:
+      (parseInt(process.env["SNAPSHOT_INTERVAL"] ?? "300", 10)) * 1000,
+    dataDir,
+    snapshotsDir: resolve(dataDir, "snapshots"),
+    predictionsDir: resolve(dataDir, "predictions"),
+  };
+}

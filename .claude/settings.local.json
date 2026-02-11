@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv --version:*)",
+      "Bash(pnpm --version:*)",
+      "Bash(node:*)",
+      "Bash(/opt/homebrew/bin/uv:*)",
+      "Bash(/opt/homebrew/bin/pnpm:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.astral.sh)",
+      "Bash(pnpm install:*)",
+      "Bash(uv sync:*)",
+      "Bash(pnpm exec tsc:*)",
+      "Bash(uv run ruff check:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(just)",
+      "Bash(/opt/homebrew/bin/just:*)",
+      "Bash(git -C /Users/rnewman/repos/weatherstat status)"
+    ]
+  }
+}

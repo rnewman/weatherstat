@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+*.egg
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Data artifacts
+data/snapshots/*.parquet
+data/predictions/*.json
+data/models/*.txt
+data/models/*.pkl
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
