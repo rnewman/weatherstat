@@ -186,17 +186,46 @@ class ComfortSchedule:
 
 
 @dataclass(frozen=True)
+class BlowerDecision:
+    """Control decision for a single blower fan."""
+
+    name: str  # "family_room", "office"
+    mode: str  # "off", "low", "high"
+
+
+@dataclass(frozen=True)
+class MiniSplitDecision:
+    """Control decision for a single mini-split heat pump."""
+
+    name: str  # "bedroom", "living_room"
+    mode: str  # "off", "heat", "cool"
+    target: float  # command target (derived from comfort schedule after sweep)
+
+
+@dataclass(frozen=True)
+class HVACScenario:
+    """One combination of all HVAC device states to evaluate during sweep."""
+
+    upstairs_heating: bool
+    downstairs_heating: bool
+    blowers: tuple[BlowerDecision, ...]
+    mini_splits: tuple[MiniSplitDecision, ...]
+
+
+@dataclass(frozen=True)
 class ControlDecision:
-    """A single control decision: heating on/off and derived cautious setpoints."""
+    """A single control decision: all HVAC devices and derived setpoints."""
 
     timestamp: str
     upstairs_heating: bool
     downstairs_heating: bool
     upstairs_setpoint: float  # derived: current ± CAUTIOUS_OFFSET
     downstairs_setpoint: float
-    total_cost: float
-    comfort_cost: float
-    energy_cost: float
+    blowers: tuple[BlowerDecision, ...] = ()
+    mini_splits: tuple[MiniSplitDecision, ...] = ()
+    total_cost: float = 0.0
+    comfort_cost: float = 0.0
+    energy_cost: float = 0.0
     room_predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # room -> {horizon -> temp}
     dry_run: bool = True
 
@@ -208,3 +237,6 @@ class ControlState:
     last_decision_time: str  # ISO 8601
     upstairs_setpoint: float
     downstairs_setpoint: float
+    blower_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
+    mini_split_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
+    mini_split_targets: dict[str, float] = field(default_factory=dict)  # name -> target

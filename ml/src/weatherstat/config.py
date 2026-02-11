@@ -1,6 +1,7 @@
 """Paths and constants for the weatherstat ML pipeline."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 # Project root is three levels up from this file (ml/src/weatherstat/config.py)
@@ -44,6 +45,86 @@ PREDICTION_ROOMS = [
 
 # Backward-compatible alias
 PREDICTION_ZONES = PREDICTION_ROOMS
+
+# ── HVAC device configuration ─────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class BlowerConfig:
+    """Configuration for a single blower fan device."""
+
+    name: str  # e.g. "family_room"
+    feature_col: str  # e.g. "blower_family_room_mode_enc"
+    command_key: str  # e.g. "blowerFamilyRoomMode" (camelCase for executor JSON)
+    zone: str = "downstairs"  # thermostat zone — blower only active when zone is heating
+    levels: tuple[str, ...] = ("off", "low", "high")  # shorten to ("off", "high") to reduce sweep
+
+
+@dataclass(frozen=True)
+class MiniSplitConfig:
+    """Configuration for a single mini-split heat pump device."""
+
+    name: str  # e.g. "bedroom"
+    mode_feature_col: str  # e.g. "mini_split_bedroom_mode_enc"
+    target_feature_col: str  # e.g. "mini_split_bedroom_target"
+    delta_feature_col: str  # e.g. "bedroom_target_delta"
+    temp_col: str  # e.g. "mini_split_bedroom_temp"
+    command_mode_key: str  # e.g. "miniSplitBedroomMode"
+    command_target_key: str  # e.g. "miniSplitBedroomTarget"
+
+
+BLOWERS: tuple[BlowerConfig, ...] = (
+    BlowerConfig(
+        name="family_room",
+        feature_col="blower_family_room_mode_enc",
+        command_key="blowerFamilyRoomMode",
+    ),
+    BlowerConfig(
+        name="office",
+        feature_col="blower_office_mode_enc",
+        command_key="blowerOfficeMode",
+    ),
+)
+
+MINI_SPLITS: tuple[MiniSplitConfig, ...] = (
+    MiniSplitConfig(
+        name="bedroom",
+        mode_feature_col="mini_split_bedroom_mode_enc",
+        target_feature_col="mini_split_bedroom_target",
+        delta_feature_col="bedroom_target_delta",
+        temp_col="mini_split_bedroom_temp",
+        command_mode_key="miniSplitBedroomMode",
+        command_target_key="miniSplitBedroomTarget",
+    ),
+    MiniSplitConfig(
+        name="living_room",
+        mode_feature_col="mini_split_living_room_mode_enc",
+        target_feature_col="mini_split_living_room_target",
+        delta_feature_col="living_room_target_delta",
+        temp_col="mini_split_living_room_temp",
+        command_mode_key="miniSplitLivingRoomMode",
+        command_target_key="miniSplitLivingRoomTarget",
+    ),
+)
+
+# Mini-split modes swept during control (skip auto/fan_only/dry — not temperature control)
+MINI_SPLIT_SWEEP_MODES: tuple[str, ...] = ("off", "heat", "cool")
+
+# Representative target for model override during sweep.
+# The actual command target is derived post-sweep from the comfort schedule midpoint.
+MINI_SPLIT_SWEEP_TARGET = 72.0
+
+# Mini-split mode encoding (matches features.py split_mode_map)
+MINI_SPLIT_MODE_ENC: dict[str, float] = {"off": 0.0, "heat": 1.0, "cool": -1.0}
+
+# Blower mode encoding (matches features.py blower_map)
+BLOWER_MODE_ENC: dict[str, float] = {"off": 0.0, "low": 1.0, "high": 2.0}
+
+# Energy cost per device-state (tiebreaker when comfort is equal)
+ENERGY_COST_GAS_ZONE = 0.010  # Navien via thermostat — highest
+ENERGY_COST_MINI_SPLIT = 0.005  # Heat pump — efficient but uses electricity
+ENERGY_COST_BLOWER: dict[str, float] = {"off": 0.0, "low": 0.001, "high": 0.002}
+
 
 # LightGBM training parameters — conservative for small datasets
 LGBM_PARAMS: dict[str, object] = {

@@ -1,12 +1,11 @@
-"""Control policy — comfort-optimizing setpoint selection.
+"""Control policy — comfort-optimizing HVAC selection.
 
-Receding-horizon controller: "what setpoints maximize comfort over the next 6 hours?"
+Receding-horizon controller: "what HVAC settings maximize comfort over the next 6 hours?"
 Re-evaluated every 15 minutes.
 
-Two thermostats (upstairs, downstairs) are the only control variables.
-The cost function evaluates comfort across all rooms even though it can only
-steer two setpoints — e.g. "setting downstairs to 72 keeps the office comfortable
-but makes the bedroom too warm" is a tradeoff the optimizer reasons about.
+Control variables: 2 thermostats (binary on/off), 2 blowers (off/low/high),
+2 mini-splits (off/heat/cool). 324-combo sweep (~4s). Config-driven device lists
+make adding blowers a single-line change.
 
 Run:
   uv run python -m weatherstat.control            # single cycle, dry-run
@@ -27,24 +26,34 @@ import numpy as np
 import pandas as pd
 
 from weatherstat.config import (
+    BLOWERS,
     CONTROL_STATE_FILE,
+    ENERGY_COST_BLOWER,
+    ENERGY_COST_GAS_ZONE,
+    ENERGY_COST_MINI_SPLIT,
     HORIZONS_5MIN,
+    MINI_SPLIT_SWEEP_MODES,
+    MINI_SPLIT_SWEEP_TARGET,
+    MINI_SPLITS,
     PREDICTION_ROOMS,
     PREDICTIONS_DIR,
 )
 from weatherstat.inference import (
-    _build_heating_overrides,
     _prepare_feature_row,
     build_features,
+    build_hvac_overrides,
     fetch_recent_history,
     load_feature_columns,
     load_models,
 )
 from weatherstat.types import (
+    BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
     ControlState,
+    HVACScenario,
+    MiniSplitDecision,
     RoomComfort,
 )
 
@@ -67,9 +76,6 @@ MAX_STALE_SECONDS = 15 * 60  # 15 minutes
 
 # Maximum predicted 1h temperature change before logging warning
 MAX_1H_CHANGE = 5.0  # °F
-
-# Energy penalty coefficient
-ENERGY_PENALTY = 0.01
 
 # Horizon weights: nearer predictions matter more, model is more accurate
 HORIZON_WEIGHTS: dict[int, float] = {
@@ -252,13 +258,24 @@ def compute_comfort_cost(
     return cost
 
 
-def compute_energy_cost(up_heating: bool, dn_heating: bool) -> float:
-    """Small energy penalty to prefer heating off when comfort is equal."""
+def compute_energy_cost(scenario: HVACScenario) -> float:
+    """Tiered energy penalty: gas zones > mini-splits > blower fans.
+
+    Used as tiebreaker when comfort cost is equal — prefer less energy usage.
+    """
     cost = 0.0
-    if up_heating:
-        cost += ENERGY_PENALTY
-    if dn_heating:
-        cost += ENERGY_PENALTY
+    # Gas zones (Navien boiler via thermostat)
+    if scenario.upstairs_heating:
+        cost += ENERGY_COST_GAS_ZONE
+    if scenario.downstairs_heating:
+        cost += ENERGY_COST_GAS_ZONE
+    # Mini-splits (heat pump — efficient but uses electricity)
+    for sd in scenario.mini_splits:
+        if sd.mode != "off":
+            cost += ENERGY_COST_MINI_SPLIT
+    # Blower fans (negligible)
+    for bd in scenario.blowers:
+        cost += ENERGY_COST_BLOWER.get(bd.mode, 0.0)
     return cost
 
 
@@ -272,69 +289,132 @@ def _cautious_setpoint(current_temp: float, heating: bool) -> float:
     return max(ABSOLUTE_MIN, min(ABSOLUTE_MAX, sp))
 
 
-# ── Heating sweep ────────────────────────────────────────────────────────
+# ── Scenario generation & sweep ──────────────────────────────────────────
 
 
-def sweep_heating(
+def generate_scenarios() -> list[HVACScenario]:
+    """Generate all HVAC combinations from config-driven device lists.
+
+    Cartesian product: thermostats (4) × blowers (levels^n) × mini-splits (modes^n),
+    pruned by physical constraints (blowers only useful when their zone is heating).
+    """
+    from itertools import product
+
+    # Mini-split combinations (independent of thermostats)
+    split_mode_lists = [MINI_SPLIT_SWEEP_MODES for _ in MINI_SPLITS]
+    split_combos: list[tuple[MiniSplitDecision, ...]] = []
+    for modes in product(*split_mode_lists):
+        split_combos.append(
+            tuple(
+                MiniSplitDecision(s.name, mode, MINI_SPLIT_SWEEP_TARGET)
+                for s, mode in zip(MINI_SPLITS, modes, strict=True)
+            )
+        )
+
+    # Full cartesian product with blower constraint:
+    # Blowers only redistribute heat from the hydronic slab — useless when zone isn't heating.
+    scenarios: list[HVACScenario] = []
+    for up_on in [True, False]:
+        for dn_on in [True, False]:
+            heating = {"upstairs": up_on, "downstairs": dn_on}
+
+            # Build blower levels per device: full range if zone heating, force off otherwise
+            per_blower_levels = []
+            for b in BLOWERS:
+                if heating.get(b.zone, False):
+                    per_blower_levels.append(b.levels)
+                else:
+                    per_blower_levels.append(("off",))
+
+            for levels in product(*per_blower_levels):
+                blowers = tuple(
+                    BlowerDecision(b.name, lvl) for b, lvl in zip(BLOWERS, levels, strict=True)
+                )
+                for splits in split_combos:
+                    scenarios.append(HVACScenario(up_on, dn_on, blowers, splits))
+
+    return scenarios
+
+
+def sweep_scenarios(
     base_row: pd.DataFrame,
     feature_columns: list[str],
     models: dict[str, object],
     up_current: float,
     dn_current: float,
+    current_split_temps: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
 ) -> ControlDecision:
-    """Sweep all 4 binary heating combinations and return the best decision.
+    """Sweep all HVAC combinations and return the best decision.
 
-    Thermostats are bang-bang controllers. The only real decision is
-    {upstairs on/off} × {downstairs on/off} = 4 combinations.
+    Unified sweep over thermostats × blowers × mini-splits.
     """
+    scenarios = generate_scenarios()
     best_cost = float("inf")
     best_decision: ControlDecision | None = None
 
-    for up_on in [True, False]:
-        for dn_on in [True, False]:
-            overrides = _build_heating_overrides(up_on, dn_on)
-            X = base_row.copy()
-            for col, val in overrides.items():
-                if col in X.columns:
-                    X[col] = val
+    for scenario in scenarios:
+        overrides = build_hvac_overrides(scenario, current_split_temps)
+        X = base_row.copy()
+        for col, val in overrides.items():
+            if col in X.columns:
+                X[col] = val
 
-            # Predict at all horizons
-            predictions: dict[str, float] = {}
-            for target, model in models.items():
-                predictions[target] = float(model.predict(X)[0])  # type: ignore[union-attr]
+        # Predict at all control horizons
+        predictions: dict[str, float] = {}
+        for target, model in models.items():
+            predictions[target] = float(model.predict(X)[0])  # type: ignore[union-attr]
 
-            comfort = compute_comfort_cost(predictions, schedules, base_hour)
-            energy = compute_energy_cost(up_on, dn_on)
-            total = comfort + energy
+        comfort = compute_comfort_cost(predictions, schedules, base_hour)
+        energy = compute_energy_cost(scenario)
+        total = comfort + energy
 
-            if total < best_cost:
-                best_cost = total
-                room_preds: dict[str, dict[str, float]] = {}
-                for room in PREDICTION_ROOMS:
-                    rpred: dict[str, float] = {}
-                    for h in CONTROL_HORIZONS:
-                        key = f"{room}_temp_t+{h}"
-                        val = predictions.get(key)
-                        if val is not None:
-                            rpred[HORIZON_LABELS[h]] = round(val, 2)
-                    if rpred:
-                        room_preds[room] = rpred
-                best_decision = ControlDecision(
-                    timestamp=datetime.now(UTC).isoformat(),
-                    upstairs_heating=up_on,
-                    downstairs_heating=dn_on,
-                    upstairs_setpoint=_cautious_setpoint(up_current, up_on),
-                    downstairs_setpoint=_cautious_setpoint(dn_current, dn_on),
-                    total_cost=round(total, 4),
-                    comfort_cost=round(comfort, 4),
-                    energy_cost=round(energy, 4),
-                    room_predictions=room_preds,
-                )
+        if total < best_cost:
+            best_cost = total
+            room_preds: dict[str, dict[str, float]] = {}
+            for room in PREDICTION_ROOMS:
+                rpred: dict[str, float] = {}
+                for h in CONTROL_HORIZONS:
+                    key = f"{room}_temp_t+{h}"
+                    val = predictions.get(key)
+                    if val is not None:
+                        rpred[HORIZON_LABELS[h]] = round(val, 2)
+                if rpred:
+                    room_preds[room] = rpred
+
+            # Compute mini-split command targets from comfort schedule midpoints
+            final_splits: list[MiniSplitDecision] = []
+            for sd in scenario.mini_splits:
+                if sd.mode == "off":
+                    final_splits.append(sd)
+                else:
+                    # Derive command target from room's comfort schedule midpoint
+                    target_temp = MINI_SPLIT_SWEEP_TARGET  # fallback
+                    for sched in schedules:
+                        if sched.room == sd.name:
+                            comfort_entry = sched.comfort_at(base_hour)
+                            if comfort_entry is not None:
+                                target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
+                            break
+                    final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
+
+            best_decision = ControlDecision(
+                timestamp=datetime.now(UTC).isoformat(),
+                upstairs_heating=scenario.upstairs_heating,
+                downstairs_heating=scenario.downstairs_heating,
+                upstairs_setpoint=_cautious_setpoint(up_current, scenario.upstairs_heating),
+                downstairs_setpoint=_cautious_setpoint(dn_current, scenario.downstairs_heating),
+                blowers=scenario.blowers,
+                mini_splits=tuple(final_splits),
+                total_cost=round(total, 4),
+                comfort_cost=round(comfort, 4),
+                energy_cost=round(energy, 4),
+                room_predictions=room_preds,
+            )
 
     if best_decision is None:
-        raise RuntimeError("No heating combinations evaluated")
+        raise RuntimeError("No HVAC scenarios evaluated")
 
     return best_decision
 
@@ -343,7 +423,10 @@ def sweep_heating(
 
 
 def load_control_state() -> ControlState | None:
-    """Load persisted control state, or None if not found."""
+    """Load persisted control state, or None if not found.
+
+    Backward-compatible: old state files without blower/mini-split fields load cleanly.
+    """
     if not CONTROL_STATE_FILE.exists():
         return None
     try:
@@ -352,6 +435,9 @@ def load_control_state() -> ControlState | None:
             last_decision_time=data["last_decision_time"],
             upstairs_setpoint=data["upstairs_setpoint"],
             downstairs_setpoint=data["downstairs_setpoint"],
+            blower_modes=data.get("blower_modes", {}),
+            mini_split_modes=data.get("mini_split_modes", {}),
+            mini_split_targets=data.get("mini_split_targets", {}),
         )
     except (json.JSONDecodeError, KeyError):
         return None
@@ -359,10 +445,13 @@ def load_control_state() -> ControlState | None:
 
 def save_control_state(decision: ControlDecision) -> None:
     """Persist control state to prevent rapid cycling."""
-    state = {
+    state: dict[str, object] = {
         "last_decision_time": decision.timestamp,
         "upstairs_setpoint": decision.upstairs_setpoint,
         "downstairs_setpoint": decision.downstairs_setpoint,
+        "blower_modes": {bd.name: bd.mode for bd in decision.blowers},
+        "mini_split_modes": {sd.name: sd.mode for sd in decision.mini_splits},
+        "mini_split_targets": {sd.name: sd.target for sd in decision.mini_splits},
     }
     CONTROL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONTROL_STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -421,29 +510,29 @@ def check_prediction_sanity(
 # ── Command JSON output ───────────────────────────────────────────────────
 
 
-def write_command_json(
-    decision: ControlDecision,
-    current_state: dict[str, object],
-) -> Path:
+def write_command_json(decision: ControlDecision) -> Path:
     """Write executor-compatible command JSON.
 
     Uses camelCase keys matching the TS Prediction interface.
-    Mini split and blower values are passed through from current state.
+    All device values come from the decision (no pass-through from current state).
     """
-    command = {
+    command: dict[str, object] = {
         "timestamp": decision.timestamp,
         "thermostatUpstairsTarget": decision.upstairs_setpoint,
         "thermostatDownstairsTarget": decision.downstairs_setpoint,
-        # Pass through current mini split state (not controlled yet)
-        "miniSplitBedroomTarget": current_state.get("mini_split_bedroom_target", 72),
-        "miniSplitBedroomMode": current_state.get("mini_split_bedroom_mode", "off"),
-        "miniSplitLivingRoomTarget": current_state.get("mini_split_living_room_target", 72),
-        "miniSplitLivingRoomMode": current_state.get("mini_split_living_room_mode", "off"),
-        # Pass through current blower state
-        "blowerFamilyRoomMode": current_state.get("blower_family_room_mode", "off"),
-        "blowerOfficeMode": current_state.get("blower_office_mode", "off"),
         "confidence": 1.0 - min(decision.total_cost / 10.0, 0.9),
     }
+
+    # Blowers
+    for bd in decision.blowers:
+        cfg = next(b for b in BLOWERS if b.name == bd.name)
+        command[cfg.command_key] = bd.mode
+
+    # Mini-splits
+    for sd in decision.mini_splits:
+        cfg = next(s for s in MINI_SPLITS if s.name == sd.name)
+        command[cfg.command_mode_key] = sd.mode
+        command[cfg.command_target_key] = sd.target
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -511,6 +600,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if val is not None and not (isinstance(val, float) and np.isnan(val)):
             current_temps[room] = float(val)
 
+    # Current mini-split temps for delta computation during sweep
+    current_split_temps: dict[str, float] = {}
+    for cfg in MINI_SPLITS:
+        val = latest.get(cfg.temp_col)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            current_split_temps[cfg.name] = float(val)
+
     print(f"\n[control] Current state ({now_str}):")
     print(f"  Upstairs:    {up_current:.1f}°F (setpoint: {up_target}°F)")
     print(f"  Downstairs:  {dn_current:.1f}°F (setpoint: {dn_target}°F)")
@@ -521,6 +617,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         t = current_temps.get(room)
         if t is not None:
             print(f"  {room:<14} {t:.1f}°F")
+    # Show current blower/mini-split state
+    for cfg in BLOWERS:
+        mode = str(latest.get(f"blower_{cfg.name}_mode", "?"))
+        print(f"  blower_{cfg.name:<10} {mode}")
+    for cfg in MINI_SPLITS:
+        mode = str(latest.get(f"mini_split_{cfg.name}_mode", "?"))
+        target = latest.get(f"mini_split_{cfg.name}_target", "?")
+        print(f"  split_{cfg.name:<12} {mode} @ {target}°F")
 
     # Load models
     feature_columns = load_feature_columns("full")
@@ -536,29 +640,38 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Current hour for comfort schedule lookup
     base_hour = datetime.now(UTC).hour
 
-    # Sweep binary heating combinations (4 combos)
+    # Sweep all HVAC combinations
     schedules = default_comfort_schedules()
-    print("\n[control] Sweeping heating on/off...")
+    n_scenarios = len(generate_scenarios())
+    print(f"\n[control] Sweeping {n_scenarios} HVAC combinations...")
     t0 = time.monotonic()
-    decision = sweep_heating(
+    decision = sweep_scenarios(
         base_row,
         feature_columns,
         models,
         up_current,
         dn_current,
+        current_split_temps,
         schedules,
         base_hour,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
-    print(f"  Sweep completed in {elapsed_ms:.1f}ms")
+    print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
 
     up_label = "ON" if decision.upstairs_heating else "OFF"
     dn_label = "ON" if decision.downstairs_heating else "OFF"
 
     # Print decision
     print("\n[control] Decision:")
-    print(f"  Upstairs heating:  {up_label} → setpoint {decision.upstairs_setpoint:.0f}°F")
+    print(f"  Upstairs heating:   {up_label} → setpoint {decision.upstairs_setpoint:.0f}°F")
     print(f"  Downstairs heating: {dn_label} → setpoint {decision.downstairs_setpoint:.0f}°F")
+    for bd in decision.blowers:
+        print(f"  Blower {bd.name:<14} {bd.mode}")
+    for sd in decision.mini_splits:
+        if sd.mode == "off":
+            print(f"  Split {sd.name:<15} off")
+        else:
+            print(f"  Split {sd.name:<15} {sd.mode} @ {sd.target:.0f}°F")
     print(
         f"  Total cost: {decision.total_cost:.4f}"
         f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
@@ -577,18 +690,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Safety checks
     sane = check_prediction_sanity(decision, current_temps)
 
-    # Extract current pass-through state for command JSON
-    current_state: dict[str, object] = {
-        "mini_split_bedroom_target": latest.get("mini_split_bedroom_target", 72),
-        "mini_split_bedroom_mode": str(latest.get("mini_split_bedroom_mode", "off")),
-        "mini_split_living_room_target": latest.get("mini_split_living_room_target", 72),
-        "mini_split_living_room_mode": str(latest.get("mini_split_living_room_mode", "off")),
-        "blower_family_room_mode": str(latest.get("blower_family_room_mode", "off")),
-        "blower_office_mode": str(latest.get("blower_office_mode", "off")),
-    }
-
     # Write command JSON
-    cmd_path = write_command_json(decision, current_state)
+    cmd_path = write_command_json(decision)
     print(f"\n  Command JSON: {cmd_path}")
 
     if live:

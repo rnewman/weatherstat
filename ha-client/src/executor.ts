@@ -62,13 +62,16 @@ async function setMiniSplit(
     target: { entity_id: entityId },
     serviceData: { hvac_mode: mode },
   });
-  await client.callService({
-    domain: "climate",
-    service: "set_temperature",
-    target: { entity_id: entityId },
-    serviceData: { temperature: targetTemp },
-  });
-  console.log(`[executor] Set ${entityId} to ${mode} @ ${targetTemp}`);
+  // Only set temperature when actively heating/cooling — "off" doesn't need one
+  if (mode !== "off") {
+    await client.callService({
+      domain: "climate",
+      service: "set_temperature",
+      target: { entity_id: entityId },
+      serviceData: { temperature: targetTemp },
+    });
+  }
+  console.log(`[executor] Set ${entityId} to ${mode}${mode !== "off" ? ` @ ${targetTemp}` : ""}`);
 }
 
 async function setBlower(

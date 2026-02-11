@@ -20,14 +20,20 @@ import numpy as np
 import pandas as pd
 
 from weatherstat.config import (
+    BLOWER_MODE_ENC,
+    BLOWERS,
     HORIZONS_5MIN,
     HORIZONS_HOURLY,
+    MINI_SPLIT_MODE_ENC,
+    MINI_SPLIT_SWEEP_TARGET,
+    MINI_SPLITS,
     MODELS_DIR,
     PREDICTION_ROOMS,
     PREDICTIONS_DIR,
     SNAPSHOTS_DB,
 )
 from weatherstat.features import ROOM_TEMP_COLUMNS, build_features
+from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision
 
 
 def _target_columns(horizons: list[int]) -> list[str]:
@@ -375,35 +381,85 @@ def _round_or_none(val: object) -> float | None:
     return round(float(val), 2)
 
 
-# ── Heating overrides ──────────────────────────────────────────────────────
+# ── HVAC overrides ─────────────────────────────────────────────────────────
 
 
-def _build_heating_overrides(up_heating: bool, dn_heating: bool) -> dict[str, float]:
-    """Build feature overrides for a binary heating scenario.
+def build_hvac_overrides(
+    scenario: HVACScenario,
+    current_split_temps: dict[str, float],
+) -> dict[str, float]:
+    """Build feature overrides for a full HVAC scenario.
 
-    Thermostats are bang-bang controllers: the only real input is on/off.
-    The setpoint number just achieves on/off and is not a model feature.
+    Args:
+        scenario: The HVAC device states to evaluate.
+        current_split_temps: Current sensor temps for mini-splits, keyed by config name
+            (e.g. {"bedroom": 68.5, "living_room": 70.2}). Used to compute target deltas.
+
+    Returns:
+        Dict of feature column → override value.
     """
     overrides: dict[str, float] = {
-        "thermostat_upstairs_action_enc": 1.0 if up_heating else 0.0,
-        "thermostat_downstairs_action_enc": 1.0 if dn_heating else 0.0,
-        "navien_heating_mode_enc": 1.0 if (up_heating or dn_heating) else 0.0,
+        # Thermostats (bang-bang: on/off is the real input)
+        "thermostat_upstairs_action_enc": 1.0 if scenario.upstairs_heating else 0.0,
+        "thermostat_downstairs_action_enc": 1.0 if scenario.downstairs_heating else 0.0,
+        # Navien fires when either thermostat is on
+        "navien_heating_mode_enc": 1.0 if (scenario.upstairs_heating or scenario.downstairs_heating) else 0.0,
     }
-    # Blowers follow downstairs thermostat
-    blower = 1.0 if dn_heating else 0.0
-    overrides["blower_family_room_mode_enc"] = blower
-    overrides["blower_office_mode_enc"] = blower
+
+    # Blowers — independent of thermostats now
+    for bd in scenario.blowers:
+        cfg = next(b for b in BLOWERS if b.name == bd.name)
+        overrides[cfg.feature_col] = BLOWER_MODE_ENC.get(bd.mode, 0.0)
+
+    # Mini-splits
+    for sd in scenario.mini_splits:
+        cfg = next(s for s in MINI_SPLITS if s.name == sd.name)
+        overrides[cfg.mode_feature_col] = MINI_SPLIT_MODE_ENC.get(sd.mode, 0.0)
+        if sd.mode == "off":
+            # When off, leave target and delta unchanged (model sees current state)
+            pass
+        else:
+            # Override target to fixed sweep value and compute delta
+            overrides[cfg.target_feature_col] = MINI_SPLIT_SWEEP_TARGET
+            current_temp = current_split_temps.get(cfg.name)
+            if current_temp is not None:
+                overrides[cfg.delta_feature_col] = MINI_SPLIT_SWEEP_TARGET - current_temp
+
     return overrides
 
 
 # ── Counterfactual predictions ──────────────────────────────────────────────
 
 
-def predict_counterfactual() -> None:
-    """Predict temperatures under all 4 binary heating scenarios.
+def _make_counterfactual_scenarios(
+    current_split_temps: dict[str, float],
+) -> dict[str, HVACScenario]:
+    """Build named counterfactual scenarios for comparison.
 
-    Sweeps {up_on/off} × {dn_on/off} = 4 combos. Thermostats are bang-bang
-    controllers, so the meaningful question is "heat on or off?" not "what setpoint?"
+    Returns a small set of meaningful "what-if" scenarios rather than the full
+    cartesian product (which is reserved for the control sweep).
+    """
+    all_blowers_off = tuple(BlowerDecision(b.name, "off") for b in BLOWERS)
+    all_blowers_high = tuple(BlowerDecision(b.name, "high") for b in BLOWERS)
+    all_splits_off = tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS)
+    all_splits_heat = tuple(
+        MiniSplitDecision(s.name, "heat", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS
+    )
+
+    return {
+        "all_off": HVACScenario(False, False, all_blowers_off, all_splits_off),
+        "thermo_only": HVACScenario(True, True, all_blowers_off, all_splits_off),
+        "thermo+blowers": HVACScenario(True, True, all_blowers_high, all_splits_off),
+        "thermo+splits@72": HVACScenario(True, True, all_blowers_off, all_splits_heat),
+        "everything_on": HVACScenario(True, True, all_blowers_high, all_splits_heat),
+    }
+
+
+def predict_counterfactual() -> None:
+    """Predict temperatures under named HVAC scenarios.
+
+    Evaluates a small set of meaningful "what-if" combinations covering the
+    range from everything off to everything on.
     """
     from weatherstat.extract import _check_config
 
@@ -432,6 +488,13 @@ def predict_counterfactual() -> None:
     print(f"  Downstairs:  {_fmt_temp(dn_now)}  ({dn_action})")
     print(f"  Outdoor:     {_fmt_temp(out_now)}")
 
+    # Current mini-split temps for delta computation
+    current_split_temps: dict[str, float] = {}
+    for cfg in MINI_SPLITS:
+        val = latest_row.get(cfg.temp_col)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            current_split_temps[cfg.name] = float(val)
+
     # Build features once
     feature_columns = load_feature_columns("full")
     models = load_models("full", HORIZONS_5MIN)
@@ -442,17 +505,13 @@ def predict_counterfactual() -> None:
     df_feat = build_features(df_raw.copy(), mode="full")
     base_row = _prepare_feature_row(df_feat, feature_columns)
 
-    # 4 binary scenarios
-    scenarios = [
-        ("both_on", True, True),
-        ("up_only", True, False),
-        ("dn_only", False, True),
-        ("both_off", False, False),
-    ]
+    # Named scenarios
+    scenarios = _make_counterfactual_scenarios(current_split_temps)
+    scenario_labels = list(scenarios.keys())
 
     results: dict[str, dict[str, float]] = {}
-    for label, up_on, dn_on in scenarios:
-        overrides = _build_heating_overrides(up_on, dn_on)
+    for label, scenario in scenarios.items():
+        overrides = build_hvac_overrides(scenario, current_split_temps)
         X = base_row.copy()
         for col, val in overrides.items():
             if col in X.columns:
@@ -463,14 +522,13 @@ def predict_counterfactual() -> None:
         results[label] = preds
 
     # Print comparison table
-    col_w = 10
+    col_w = 12
     horizon_labels = {12: "1h", 24: "2h", 48: "4h", 72: "6h", 144: "12h"}
-    scenario_labels = ["both_on", "up_only", "dn_only", "both_off"]
 
-    print(f"\n{'=' * 72}")
-    print("HEATING COUNTERFACTUALS (full model)")
-    print(f"{'=' * 72}")
-    print('  "What temperatures if we turn heating on/off?"')
+    print(f"\n{'=' * (18 + col_w * len(scenario_labels))}")
+    print("HVAC COUNTERFACTUALS (full model)")
+    print(f"{'=' * (18 + col_w * len(scenario_labels))}")
+    print('  "What temperatures under different HVAC configs?"')
     print(f"  Current: up={up_now:.1f}°F, dn={dn_now:.1f}°F, out={_fmt_temp(out_now)}\n")
 
     header = f"  {'Room':<14} {'':>4}" + "".join(f"{lbl:>{col_w}}" for lbl in scenario_labels)
@@ -492,8 +550,8 @@ def predict_counterfactual() -> None:
         if has_any:
             print()
 
-    # Delta table: difference from both_off
-    print("  Delta vs both_off:")
+    # Delta table: difference from all_off
+    print("  Delta vs all_off:")
     print(header)
     print(f"  {'-' * (18 + col_w * len(scenario_labels))}")
 
@@ -501,7 +559,7 @@ def predict_counterfactual() -> None:
         has_any = False
         for h in HORIZONS_5MIN:
             target = f"{room}_temp_t+{h}"
-            base_val = results["both_off"].get(target, float("nan"))
+            base_val = results["all_off"].get(target, float("nan"))
             if np.isnan(base_val):
                 continue
             has_any = True
@@ -509,7 +567,7 @@ def predict_counterfactual() -> None:
             for s in scenario_labels:
                 v = results[s].get(target, float("nan"))
                 delta = v - base_val
-                if s == "both_off":
+                if s == "all_off":
                     row += f"{'---':>{col_w}}"
                 else:
                     row += f"{delta:>+{col_w}.2f}"
