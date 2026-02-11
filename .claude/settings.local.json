@@ -15,7 +15,19 @@
       "Bash(uv run pytest:*)",
       "Bash(just)",
       "Bash(/opt/homebrew/bin/just:*)",
-      "Bash(git -C /Users/rnewman/repos/weatherstat status)"
+      "Bash(git -C /Users/rnewman/repos/weatherstat status)",
+      "mcp__Home_Assistant__ha_get_overview",
+      "mcp__Home_Assistant__ha_search_entities",
+      "mcp__Home_Assistant__ha_get_state",
+      "mcp__Home_Assistant__ha_get_statistics",
+      "mcp__Home_Assistant__ha_get_history",
+      "Bash(source:*)",
+      "Bash(uv run python:*)",
+      "Bash(ls:*)",
+      "Bash(pnpm approve-builds:*)",
+      "Bash(uv run ruff format:*)",
+      "Bash(sqlite3:*)",
+      "Bash(just train-full:*)"
     ]
   }
 }
