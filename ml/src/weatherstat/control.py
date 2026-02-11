@@ -85,6 +85,9 @@ LOOP_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 # Horizons used for control (subset of HORIZONS_5MIN, skip 12h for control)
 CONTROL_HORIZONS = [12, 24, 48, 72]
 
+# Human-readable labels for horizon steps (5-min intervals)
+HORIZON_LABELS: dict[int, str] = {12: "1h", 24: "2h", 48: "4h", 72: "6h", 144: "12h"}
+
 
 # ── Default comfort profiles ──────────────────────────────────────────────
 
@@ -173,7 +176,7 @@ def compute_comfort_cost(
         Total weighted comfort cost.
     """
     cost = 0.0
-    horizon_labels = {12: 1, 24: 2, 48: 4, 72: 6}
+    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
 
     for schedule in schedules:
         zone = ROOM_TO_ZONE.get(schedule.room)
@@ -182,7 +185,7 @@ def compute_comfort_cost(
 
         for h in CONTROL_HORIZONS:
             weight = HORIZON_WEIGHTS.get(h, 0.5)
-            hours_ahead = horizon_labels.get(h, h // 12)
+            hours_ahead = horizon_hours.get(h, h // 12)
             future_hour = (base_hour + hours_ahead) % 24
 
             comfort = schedule.comfort_at(future_hour)
@@ -266,11 +269,11 @@ def sweep_setpoints(
             if total < best_cost:
                 best_cost = total
                 up_preds = {
-                    f"t+{h}": round(predictions.get(f"upstairs_temp_t+{h}", float("nan")), 2)
+                    HORIZON_LABELS[h]: round(predictions.get(f"upstairs_temp_t+{h}", float("nan")), 2)
                     for h in CONTROL_HORIZONS
                 }
                 dn_preds = {
-                    f"t+{h}": round(predictions.get(f"downstairs_temp_t+{h}", float("nan")), 2)
+                    HORIZON_LABELS[h]: round(predictions.get(f"downstairs_temp_t+{h}", float("nan")), 2)
                     for h in CONTROL_HORIZONS
                 }
                 best_decision = ControlDecision(
@@ -357,8 +360,8 @@ def check_prediction_sanity(
 ) -> bool:
     """Return True if 1h predictions look reasonable."""
     safe = True
-    up_1h = decision.upstairs_predictions.get("t+12")
-    dn_1h = decision.downstairs_predictions.get("t+12")
+    up_1h = decision.upstairs_predictions.get("1h")
+    dn_1h = decision.downstairs_predictions.get("1h")
 
     if up_1h is not None and abs(up_1h - up_current) > MAX_1H_CHANGE:
         print(
