@@ -8,7 +8,7 @@
 
 import { loadConfig } from "./config.ts";
 import { WebSocketHAClient } from "./connection.ts";
-import { collectLoop, collectOnce } from "./collector.ts";
+import { collectLoop, collectOnce, closeDb } from "./collector.ts";
 import { executePrediction } from "./executor.ts";
 
 const COMMANDS = ["collect", "execute", "once"] as const;
@@ -37,6 +37,7 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = async () => {
     console.log("\nShutting down...");
+    closeDb();
     await client.disconnect();
     process.exit(0);
   };

@@ -18,6 +18,7 @@ export interface Config {
   dataDir: string;
   snapshotsDir: string;
   predictionsDir: string;
+  dbPath: string;
 }
 
 export function loadConfig(): Config {
@@ -26,13 +27,16 @@ export function loadConfig(): Config {
     process.env["DATA_DIR"] ?? "../../data",
   );
 
+  const snapshotsDir = resolve(dataDir, "snapshots");
+
   return {
     haUrl: requireEnv("HA_URL"),
     haToken: requireEnv("HA_TOKEN"),
     snapshotIntervalMs:
       (parseInt(process.env["SNAPSHOT_INTERVAL"] ?? "300", 10)) * 1000,
     dataDir,
-    snapshotsDir: resolve(dataDir, "snapshots"),
+    snapshotsDir,
     predictionsDir: resolve(dataDir, "predictions"),
+    dbPath: resolve(snapshotsDir, "snapshots.db"),
   };
 }
