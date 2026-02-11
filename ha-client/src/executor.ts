@@ -14,11 +14,10 @@ import type { Config } from "./config.ts";
 import {
   THERMOSTAT_UPSTAIRS,
   THERMOSTAT_DOWNSTAIRS,
-  MINI_SPLIT_1,
-  MINI_SPLIT_2,
-  FLOOR_HEAT,
-  BLOWER_1,
-  BLOWER_2,
+  MINI_SPLIT_BEDROOM,
+  MINI_SPLIT_LIVING_ROOM,
+  BLOWER_FAMILY_ROOM,
+  BLOWER_OFFICE,
 } from "./entities.ts";
 
 async function loadLatestPrediction(predictionsDir: string): Promise<Prediction | null> {
@@ -72,17 +71,31 @@ async function setMiniSplit(
   console.log(`[executor] Set ${entityId} to ${mode} @ ${targetTemp}`);
 }
 
-async function setSwitch(
+async function setBlower(
   client: HAClient,
   entityId: string,
-  on: boolean,
+  mode: string,
 ): Promise<void> {
-  await client.callService({
-    domain: "switch",
-    service: on ? "turn_on" : "turn_off",
-    target: { entity_id: entityId },
-  });
-  console.log(`[executor] Set ${entityId} to ${on ? "on" : "off"}`);
+  if (mode === "off") {
+    await client.callService({
+      domain: "fan",
+      service: "turn_off",
+      target: { entity_id: entityId },
+    });
+  } else {
+    await client.callService({
+      domain: "fan",
+      service: "turn_on",
+      target: { entity_id: entityId },
+    });
+    await client.callService({
+      domain: "fan",
+      service: "set_preset_mode",
+      target: { entity_id: entityId },
+      serviceData: { preset_mode: mode },
+    });
+  }
+  console.log(`[executor] Set ${entityId} to ${mode}`);
 }
 
 export async function executePrediction(client: HAClient, config: Config): Promise<void> {
@@ -99,13 +112,12 @@ export async function executePrediction(client: HAClient, config: Config): Promi
   await setThermostat(client, THERMOSTAT_DOWNSTAIRS, prediction.thermostatDownstairsTarget);
 
   // Apply mini split settings
-  await setMiniSplit(client, MINI_SPLIT_1, prediction.miniSplit1Target, prediction.miniSplit1Mode);
-  await setMiniSplit(client, MINI_SPLIT_2, prediction.miniSplit2Target, prediction.miniSplit2Mode);
+  await setMiniSplit(client, MINI_SPLIT_BEDROOM, prediction.miniSplitBedroomTarget, prediction.miniSplitBedroomMode);
+  await setMiniSplit(client, MINI_SPLIT_LIVING_ROOM, prediction.miniSplitLivingRoomTarget, prediction.miniSplitLivingRoomMode);
 
-  // Apply floor heat and blowers
-  await setSwitch(client, FLOOR_HEAT, prediction.floorHeatOn);
-  await setSwitch(client, BLOWER_1, prediction.blower1On);
-  await setSwitch(client, BLOWER_2, prediction.blower2On);
+  // Apply blower modes
+  await setBlower(client, BLOWER_FAMILY_ROOM, prediction.blowerFamilyRoomMode);
+  await setBlower(client, BLOWER_OFFICE, prediction.blowerOfficeMode);
 
   console.log("[executor] All commands executed");
 }
