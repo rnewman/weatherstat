@@ -10,6 +10,8 @@ class HVACMode(StrEnum):
     COOL = "cool"
     HEAT_COOL = "heat_cool"
     AUTO = "auto"
+    FAN_ONLY = "fan_only"
+    DRY = "dry"
 
 
 class HVACAction(StrEnum):
@@ -17,17 +19,39 @@ class HVACAction(StrEnum):
     COOLING = "cooling"
     IDLE = "idle"
     OFF = "off"
+    DRYING = "drying"
+    FAN = "fan"
+
+
+class BlowerMode(StrEnum):
+    OFF = "off"
+    LOW = "low"
+    HIGH = "high"
+
+
+class NavienHeatingMode(StrEnum):
+    SPACE_HEATING = "Space Heating"
+    IDLE = "Idle"
 
 
 class WeatherCondition(StrEnum):
-    SUNNY = "sunny"
+    """All met.no weather conditions that HA can report."""
+
+    CLEAR_NIGHT = "clear-night"
     CLOUDY = "cloudy"
+    EXCEPTIONAL = "exceptional"
+    FOG = "fog"
+    HAIL = "hail"
+    LIGHTNING = "lightning"
+    LIGHTNING_RAINY = "lightning-rainy"
     PARTLY_CLOUDY = "partlycloudy"
+    POURING = "pouring"
     RAINY = "rainy"
     SNOWY = "snowy"
+    SNOWY_RAINY = "snowy-rainy"
+    SUNNY = "sunny"
     WINDY = "windy"
-    FOG = "fog"
-    CLEAR_NIGHT = "clear-night"
+    WINDY_VARIANT = "windy-variant"
     UNKNOWN = "unknown"
 
 
@@ -63,28 +87,41 @@ class SnapshotRow:
     """Matches the Parquet schema written by the HA client."""
 
     timestamp: str
+    # Thermostat zones
     thermostat_upstairs_temp: float
     thermostat_upstairs_target: float
     thermostat_upstairs_action: str
     thermostat_downstairs_temp: float
     thermostat_downstairs_target: float
     thermostat_downstairs_action: str
-    mini_split_1_temp: float
-    mini_split_1_target: float
-    mini_split_1_mode: str
-    mini_split_2_temp: float
-    mini_split_2_target: float
-    mini_split_2_mode: str
-    floor_heat_on: bool
-    blower_1_on: bool
-    blower_2_on: bool
+    # Mini splits (named by location)
+    mini_split_bedroom_temp: float
+    mini_split_bedroom_target: float
+    mini_split_bedroom_mode: str
+    mini_split_living_room_temp: float
+    mini_split_living_room_target: float
+    mini_split_living_room_mode: str
+    # Blowers (mode captures speed level)
+    blower_family_room_mode: str
+    blower_office_mode: str
+    # Navien
+    navien_heating_mode: str
+    navien_heat_capacity: float
+    # Environment
     outdoor_temp: float
     outdoor_humidity: float
     wind_speed: float
     weather_condition: str
-    navien_heater_active: bool
+    indoor_humidity: float
     any_window_open: bool
-    indoor_temps_json: str
+    # Per-room temperatures
+    upstairs_aggregate_temp: float
+    downstairs_aggregate_temp: float
+    family_room_temp: float
+    office_temp: float
+    bedroom_temp: float
+    kitchen_temp: float
+    living_room_temp: float
 
 
 @dataclass(frozen=True)
@@ -94,11 +131,10 @@ class Prediction:
     timestamp: str
     thermostat_upstairs_target: float
     thermostat_downstairs_target: float
-    mini_split_1_target: float
-    mini_split_1_mode: HVACMode
-    mini_split_2_target: float
-    mini_split_2_mode: HVACMode
-    floor_heat_on: bool
-    blower_1_on: bool
-    blower_2_on: bool
+    mini_split_bedroom_target: float
+    mini_split_bedroom_mode: HVACMode
+    mini_split_living_room_target: float
+    mini_split_living_room_mode: HVACMode
+    blower_family_room_mode: BlowerMode
+    blower_office_mode: BlowerMode
     confidence: float
