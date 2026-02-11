@@ -23,10 +23,10 @@ ELEVATION = 30.0  # meters
 HA_URL = os.environ.get("HA_URL", "")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 
-# Prediction horizons (in steps). At 5-min intervals: 12=1h, 24=2h, 48=4h.
-# At hourly intervals: 1=1h, 2=2h, 4=4h.
-HORIZONS_5MIN = [12, 24, 48]  # 1h, 2h, 4h
-HORIZONS_HOURLY = [1, 2, 4]  # 1h, 2h, 4h
+# Prediction horizons (in steps). At 5-min intervals: 12=1h, 24=2h, 48=4h, etc.
+# At hourly intervals: 1=1h, 2=2h, 4=4h, etc.
+HORIZONS_5MIN = [12, 24, 48, 72, 144]  # 1h, 2h, 4h, 6h, 12h
+HORIZONS_HOURLY = [1, 2, 4, 6, 12]  # 1h, 2h, 4h, 6h, 12h
 
 # Zones to predict temperatures for
 PREDICTION_ZONES = ["upstairs", "downstairs"]

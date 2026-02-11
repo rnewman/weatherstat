@@ -4,9 +4,11 @@ Renders time-series plots of temperatures, weather, solar, and HVAC state
 from the extracted historical data.
 
 Run: uv run python -m weatherstat.visualize
+      uv run python -m weatherstat.visualize --importance
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -15,7 +17,7 @@ import pandas as pd
 from astral import LocationInfo
 from astral.sun import elevation as sun_elevation
 
-from weatherstat.config import DATA_DIR, LATITUDE, LONGITUDE, SNAPSHOTS_DIR
+from weatherstat.config import DATA_DIR, LATITUDE, LONGITUDE, MODELS_DIR, SNAPSHOTS_DIR
 
 _LOCATION = LocationInfo(
     name="Home", region="US", timezone="America/Los_Angeles",
@@ -137,6 +139,99 @@ def plot_floor(
     ax_solar.grid(True, alpha=0.3)
 
 
+def _prettify_feature(name: str) -> str:
+    """Shorten feature names for display."""
+    return (
+        name.replace("thermostat_upstairs_", "tstat_up_")
+        .replace("thermostat_downstairs_", "tstat_dn_")
+        .replace("upstairs_aggregate_", "up_agg_")
+        .replace("downstairs_aggregate_", "dn_agg_")
+        .replace("family_room_", "fam_rm_")
+        .replace("living_room_", "liv_rm_")
+        .replace("mini_split_living_room_", "split_lr_")
+        .replace("mini_split_bedroom_", "split_br_")
+        .replace("outdoor_", "out_")
+        .replace("indoor_", "in_")
+        .replace("_rolling_", "_r")
+        .replace("_lag_", "_L")
+        .replace("_temp", "")
+    )
+
+
+def _prettify_target(name: str) -> str:
+    """Make target names readable."""
+    return (
+        name.replace("upstairs_temp_t+", "Up T+")
+        .replace("downstairs_temp_t+", "Dn T+")
+    )
+
+
+def render_feature_importance(output_path: Path, top_n: int = 25) -> None:
+    """Render stacked horizontal bar chart of feature importance from evaluation report."""
+    report_path = MODELS_DIR / "evaluation_report.json"
+    if not report_path.exists():
+        print(f"Error: {report_path} not found. Run `just evaluate` first.")
+        return
+
+    with open(report_path) as f:
+        report = json.load(f)
+
+    fig, axes = plt.subplots(1, 2, figsize=(22, 12))
+    fig.suptitle("LightGBM Feature Importance (gain)", fontsize=15, fontweight="bold", y=0.98)
+
+    # Color palette for targets — warm for upstairs, cool for downstairs
+    target_colors_baseline = {
+        "upstairs_temp_t+1": "#e74c3c", "upstairs_temp_t+2": "#e67e22", "upstairs_temp_t+4": "#f1c40f",
+        "downstairs_temp_t+1": "#3498db", "downstairs_temp_t+2": "#2ecc71", "downstairs_temp_t+4": "#9b59b6",
+    }
+    target_colors_full = {
+        "upstairs_temp_t+12": "#e74c3c", "upstairs_temp_t+24": "#e67e22", "upstairs_temp_t+48": "#f1c40f",
+        "downstairs_temp_t+12": "#3498db", "downstairs_temp_t+24": "#2ecc71", "downstairs_temp_t+48": "#9b59b6",
+    }
+
+    for ax, (model_key, model_label, color_map) in zip(
+        axes,
+        [
+            ("baseline", "Baseline (hourly, 5+ months)", target_colors_baseline),
+            ("full", "Full (5-min, 10 days)", target_colors_full),
+        ],
+    ):
+        fi = report[model_key]["feature_importance"]
+        targets = list(fi.keys())
+
+        # Gather all features and their total importance
+        totals: dict[str, float] = {}
+        for target_data in fi.values():
+            for feat, gain in target_data.items():
+                totals[feat] = totals.get(feat, 0.0) + gain
+
+        # Top N features by total
+        top_features = sorted(totals, key=totals.get, reverse=True)[:top_n]
+        top_features.reverse()  # bottom-to-top for horizontal bar
+
+        # Build stacked bar data
+        y_pos = np.arange(len(top_features))
+        left = np.zeros(len(top_features))
+
+        for target in targets:
+            values = [fi[target].get(feat, 0.0) for feat in top_features]
+            ax.barh(y_pos, values, left=left, height=0.7, label=_prettify_target(target), color=color_map[target])
+            left += values
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([_prettify_feature(f) for f in top_features], fontsize=8)
+        ax.set_xlabel("Importance (gain)", fontsize=10)
+        ax.set_title(f"{model_label}\n({report[model_key]['features']} features, "
+                     f"{report[model_key]['training_rows']} train rows)", fontsize=11)
+        ax.legend(loc="lower right", fontsize=8, title="Target", title_fontsize=9)
+        ax.grid(True, axis="x", alpha=0.3)
+
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved feature importance chart to {output_path}")
+
+
 def render(df: pd.DataFrame, output_path: Path, title: str = "Weatherstat Data") -> None:
     """Render the full visualization to a PNG file."""
     ts = pd.DatetimeIndex(pd.to_datetime(df["timestamp"]))
@@ -168,7 +263,14 @@ def main() -> None:
     )
     parser.add_argument("--output", type=str, default=None, help="Output PNG path")
     parser.add_argument("--last-days", type=int, default=None, help="Only show the last N days")
+    parser.add_argument("--importance", action="store_true", help="Render feature importance stacked bar chart")
+    parser.add_argument("--top-n", type=int, default=25, help="Number of top features to show (default: 25)")
     args = parser.parse_args()
+
+    if args.importance:
+        output_path = Path(args.output) if args.output else DATA_DIR / "feature_importance.png"
+        render_feature_importance(output_path, top_n=args.top_n)
+        return
 
     if args.source == "full":
         path = SNAPSHOTS_DIR / "historical_full.parquet"

@@ -34,9 +34,17 @@ evaluate:
 visualize *ARGS:
     cd ml && uv run python -m weatherstat.visualize {{ARGS}}
 
-# Run inference pipeline
-infer:
+# Predict: fetch live state from HA, predict with both models
+predict:
     cd ml && uv run python -m weatherstat.inference
+
+# Predict from collector snapshot files
+predict-snapshot:
+    cd ml && uv run python -m weatherstat.inference --snapshot
+
+# Counterfactual: predict under HVAC on/off scenarios
+counterfactual:
+    cd ml && uv run python -m weatherstat.inference --counterfactual
 
 # Lint both packages
 lint: lint-ts lint-py
