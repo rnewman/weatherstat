@@ -27,7 +27,8 @@
       "Bash(pnpm approve-builds:*)",
       "Bash(uv run ruff format:*)",
       "Bash(sqlite3:*)",
-      "Bash(just train-full:*)"
+      "Bash(just train-full:*)",
+      "mcp__Home_Assistant__ha_get_entity"
     ]
   }
 }
