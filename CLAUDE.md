@@ -8,22 +8,21 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 ## Architecture
 
 - HA interface is abstracted behind `HAClient` (types.ts). WebSocket is one implementation; add-on/integration would use HA internal API.
-- Communication between TS and Python is file-based: Parquet snapshots in `data/snapshots/`, JSON predictions in `data/predictions/`.
+- Collector writes 5-min snapshots to SQLite (`data/snapshots/snapshots.db`). Training merges this with historical Parquet extractions. Control/prediction output goes to JSON in `data/predictions/`.
 - Weather data comes from HA's `weather.forecast_home` entity (met.no) — same source for training and inference (no feature skew).
 - Feature engineering lives in `ml/src/weatherstat/features.py` and is shared by both training and inference.
 - Entity IDs are real and live in `ha-client/src/entities.ts`. Full reference in `docs/entities.md`.
+- Collector SQLite schema matches the Parquet snapshot schema (same columns, snake_case). Only difference: `any_window_open` is INTEGER in SQLite vs bool in Parquet (normalized at load time).
 
 ## Development Stages
 
-This project develops iteratively. Each stage builds on the previous:
+1. **Pipeline & data** (done) — Collector running, historical extraction, LightGBM training (baseline + full), evaluation framework.
+2. **Control loop** (done) — Setpoint sweep, comfort schedules, safety rails, dry-run + live execution.
+3. **Data accumulation** (in progress) — Collector running since Feb 2026. Retrain weekly. All data is winter so far.
+4. **Per-room models & blower control** (next) — Extend to office/bedroom predictions, add blower fan speed to control sweep.
+5. **Hybrid physics + ML** (future) — Blend ML with exponential-decay model for long-horizon accuracy.
 
-1. **Data collection** (Stage 1A) — Get the collector running ASAP. Every day of missed data is unrecoverable. Extract historical data from HA.
-2. **Basic modeling** (Stage 1B-C) — Train baseline thermal-dynamics model on 5+ months of hourly temp data, and a proof-of-concept HVAC-aware model on ~10 days of full-feature data.
-3. **Multi-horizon prediction** (Stage 1D) — Predict temperature at T+1h, T+2h, T+4h per zone. Compare baseline vs HVAC-augmented model.
-4. **Evaluation** — Assess predictions against physical expectations. Does the model capture thermal dynamics? Do HVAC features add signal?
-5. **Iterate** — Retrain weekly as data accumulates. Revisit feature engineering and model architecture after 4-8 weeks. Seasonal coverage grows over months.
-
-Current stage: **Stage 1 complete (pipeline built)**. Next: extract real data, train, evaluate, start collector for ongoing collection.
+See `docs/PLAN.md` for the full roadmap.
 
 ## Commands
 
