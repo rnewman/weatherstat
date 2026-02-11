@@ -14,44 +14,64 @@ import type { Config } from "./config.ts";
 import {
   THERMOSTAT_UPSTAIRS,
   THERMOSTAT_DOWNSTAIRS,
-  MINI_SPLIT_1,
-  MINI_SPLIT_2,
-  FLOOR_HEAT,
-  BLOWER_1,
-  BLOWER_2,
+  MINI_SPLIT_BEDROOM,
+  MINI_SPLIT_LIVING_ROOM,
+  BLOWER_FAMILY_ROOM,
+  BLOWER_OFFICE,
   TEMP_SENSORS,
+  OUTDOOR_TEMP,
+  INDOOR_HUMIDITY,
   WINDOW_SENSORS,
   WEATHER_ENTITY,
-  NAVIEN_HEATER,
+  NAVIEN_HEATING_MODE,
+  NAVIEN_HEAT_CAPACITY,
   ALL_MONITORED_ENTITIES,
 } from "./entities.ts";
 
 const SNAPSHOT_SCHEMA = new ParquetSchema({
   timestamp: { type: "UTF8" },
+  // Thermostat zones
   thermostatUpstairsTemp: { type: "DOUBLE" },
   thermostatUpstairsTarget: { type: "DOUBLE" },
   thermostatUpstairsAction: { type: "UTF8" },
   thermostatDownstairsTemp: { type: "DOUBLE" },
   thermostatDownstairsTarget: { type: "DOUBLE" },
   thermostatDownstairsAction: { type: "UTF8" },
-  miniSplit1Temp: { type: "DOUBLE" },
-  miniSplit1Target: { type: "DOUBLE" },
-  miniSplit1Mode: { type: "UTF8" },
-  miniSplit2Temp: { type: "DOUBLE" },
-  miniSplit2Target: { type: "DOUBLE" },
-  miniSplit2Mode: { type: "UTF8" },
-  floorHeatOn: { type: "BOOLEAN" },
-  blower1On: { type: "BOOLEAN" },
-  blower2On: { type: "BOOLEAN" },
+  // Mini splits
+  miniSplitBedroomTemp: { type: "DOUBLE" },
+  miniSplitBedroomTarget: { type: "DOUBLE" },
+  miniSplitBedroomMode: { type: "UTF8" },
+  miniSplitLivingRoomTemp: { type: "DOUBLE" },
+  miniSplitLivingRoomTarget: { type: "DOUBLE" },
+  miniSplitLivingRoomMode: { type: "UTF8" },
+  // Blowers
+  blowerFamilyRoomMode: { type: "UTF8" },
+  blowerOfficeMode: { type: "UTF8" },
+  // Navien
+  navienHeatingMode: { type: "UTF8" },
+  navienHeatCapacity: { type: "DOUBLE" },
+  // Environment
   outdoorTemp: { type: "DOUBLE" },
   outdoorHumidity: { type: "DOUBLE" },
   windSpeed: { type: "DOUBLE" },
   weatherCondition: { type: "UTF8" },
-  navienHeaterActive: { type: "BOOLEAN" },
+  indoorHumidity: { type: "DOUBLE" },
   anyWindowOpen: { type: "BOOLEAN" },
-  // indoorTemps stored as JSON string for flexibility
-  indoorTempsJson: { type: "UTF8" },
+  // Per-room temperatures
+  upstairsAggregateTemp: { type: "DOUBLE" },
+  downstairsAggregateTemp: { type: "DOUBLE" },
+  familyRoomTemp: { type: "DOUBLE" },
+  officeTemp: { type: "DOUBLE" },
+  bedroomTemp: { type: "DOUBLE" },
+  kitchenTemp: { type: "DOUBLE" },
+  livingRoomTemp: { type: "DOUBLE" },
 });
+
+function getBlowerMode(state: string | undefined, presetMode: unknown): string {
+  if (state === "off" || !state) return "off";
+  if (typeof presetMode === "string") return presetMode;
+  return "low"; // fan is on but no preset — default to low
+}
 
 async function buildSnapshot(client: HAClient): Promise<SnapshotRow> {
   const states = await client.getStates(ALL_MONITORED_ENTITIES);
@@ -69,46 +89,59 @@ async function buildSnapshot(client: HAClient): Promise<SnapshotRow> {
     return typeof val === "string" ? val : fallback;
   };
 
-  const isOn = (entityId: string): boolean => {
-    return stateMap.get(entityId)?.state === "on";
+  const getSensorNum = (entityId: string, fallback: number): number => {
+    const s = stateMap.get(entityId);
+    if (!s) return fallback;
+    const val = parseFloat(s.state);
+    return Number.isFinite(val) ? val : fallback;
   };
 
-  const anyWindowOpen = WINDOW_SENSORS.some((id) => isOn(id));
-
-  const indoorTemps: Record<string, number> = {};
-  for (const [location, entityId] of Object.entries(TEMP_SENSORS)) {
-    const s = stateMap.get(entityId);
-    if (s) {
-      indoorTemps[location] = parseFloat(s.state) || 0;
-    }
-  }
+  const anyWindowOpen = WINDOW_SENSORS.some(
+    (id) => stateMap.get(id)?.state === "on",
+  );
 
   const weather = stateMap.get(WEATHER_ENTITY);
 
+  const blowerFR = stateMap.get(BLOWER_FAMILY_ROOM);
+  const blowerOff = stateMap.get(BLOWER_OFFICE);
+
   return {
     timestamp: new Date().toISOString(),
+    // Thermostat zones
     thermostatUpstairsTemp: getAttrNum(THERMOSTAT_UPSTAIRS, "current_temperature", 0),
     thermostatUpstairsTarget: getAttrNum(THERMOSTAT_UPSTAIRS, "temperature", 0),
     thermostatUpstairsAction: getAttrStr(THERMOSTAT_UPSTAIRS, "hvac_action", "idle"),
     thermostatDownstairsTemp: getAttrNum(THERMOSTAT_DOWNSTAIRS, "current_temperature", 0),
     thermostatDownstairsTarget: getAttrNum(THERMOSTAT_DOWNSTAIRS, "temperature", 0),
     thermostatDownstairsAction: getAttrStr(THERMOSTAT_DOWNSTAIRS, "hvac_action", "idle"),
-    miniSplit1Temp: getAttrNum(MINI_SPLIT_1, "current_temperature", 0),
-    miniSplit1Target: getAttrNum(MINI_SPLIT_1, "temperature", 0),
-    miniSplit1Mode: stateMap.get(MINI_SPLIT_1)?.state ?? "off",
-    miniSplit2Temp: getAttrNum(MINI_SPLIT_2, "current_temperature", 0),
-    miniSplit2Target: getAttrNum(MINI_SPLIT_2, "temperature", 0),
-    miniSplit2Mode: stateMap.get(MINI_SPLIT_2)?.state ?? "off",
-    floorHeatOn: isOn(FLOOR_HEAT),
-    blower1On: isOn(BLOWER_1),
-    blower2On: isOn(BLOWER_2),
-    outdoorTemp: weather ? (weather.attributes["temperature"] as number ?? 0) : 0,
+    // Mini splits
+    miniSplitBedroomTemp: getAttrNum(MINI_SPLIT_BEDROOM, "current_temperature", 0),
+    miniSplitBedroomTarget: getAttrNum(MINI_SPLIT_BEDROOM, "temperature", 0),
+    miniSplitBedroomMode: stateMap.get(MINI_SPLIT_BEDROOM)?.state ?? "off",
+    miniSplitLivingRoomTemp: getAttrNum(MINI_SPLIT_LIVING_ROOM, "current_temperature", 0),
+    miniSplitLivingRoomTarget: getAttrNum(MINI_SPLIT_LIVING_ROOM, "temperature", 0),
+    miniSplitLivingRoomMode: stateMap.get(MINI_SPLIT_LIVING_ROOM)?.state ?? "off",
+    // Blowers
+    blowerFamilyRoomMode: getBlowerMode(blowerFR?.state, blowerFR?.attributes["preset_mode"]),
+    blowerOfficeMode: getBlowerMode(blowerOff?.state, blowerOff?.attributes["preset_mode"]),
+    // Navien
+    navienHeatingMode: stateMap.get(NAVIEN_HEATING_MODE)?.state ?? "Idle",
+    navienHeatCapacity: getSensorNum(NAVIEN_HEAT_CAPACITY, 0),
+    // Environment
+    outdoorTemp: getSensorNum(OUTDOOR_TEMP, 0),
     outdoorHumidity: weather ? (weather.attributes["humidity"] as number ?? 0) : 0,
     windSpeed: weather ? (weather.attributes["wind_speed"] as number ?? 0) : 0,
     weatherCondition: weather?.state ?? "unknown",
-    navienHeaterActive: isOn(NAVIEN_HEATER),
+    indoorHumidity: getSensorNum(INDOOR_HUMIDITY, 0),
     anyWindowOpen,
-    indoorTemps,
+    // Per-room temperatures
+    upstairsAggregateTemp: getSensorNum(TEMP_SENSORS.upstairs_aggregate, 0),
+    downstairsAggregateTemp: getSensorNum(TEMP_SENSORS.downstairs_aggregate, 0),
+    familyRoomTemp: getSensorNum(TEMP_SENSORS.family_room, 0),
+    officeTemp: getSensorNum(TEMP_SENSORS.office, 0),
+    bedroomTemp: getSensorNum(TEMP_SENSORS.bedroom, 0),
+    kitchenTemp: getSensorNum(TEMP_SENSORS.kitchen, 0),
+    livingRoomTemp: getSensorNum(TEMP_SENSORS.living_room, 0),
   };
 }
 
@@ -120,12 +153,7 @@ async function writeSnapshot(snapshot: SnapshotRow, snapshotsDir: string): Promi
   const filepath = resolve(snapshotsDir, filename);
 
   const writer = await ParquetWriter.openFile(SNAPSHOT_SCHEMA, filepath);
-
-  await writer.appendRow({
-    ...snapshot,
-    indoorTempsJson: JSON.stringify(snapshot.indoorTemps),
-  });
-
+  await writer.appendRow(snapshot);
   await writer.close();
   return filepath;
 }

@@ -60,10 +60,11 @@ export interface MiniSplitState {
   fanMode: FanMode;
 }
 
+export type BlowerMode = "off" | "low" | "high";
+
 export interface BlowerState {
   entityId: string;
-  isOn: boolean;
-  speed: number | null; // null if not controllable
+  mode: BlowerMode;
 }
 
 export interface WindowSensorState {
@@ -101,36 +102,41 @@ export interface WeatherForecastEntry {
 
 export interface SnapshotRow {
   timestamp: string; // ISO 8601
-  // Thermostats
+  // Thermostat zones
   thermostatUpstairsTemp: number;
   thermostatUpstairsTarget: number;
-  thermostatUpstairsAction: string;
+  thermostatUpstairsAction: string; // "heating" | "idle"
   thermostatDownstairsTemp: number;
   thermostatDownstairsTarget: number;
   thermostatDownstairsAction: string;
-  // Mini splits
-  miniSplit1Temp: number;
-  miniSplit1Target: number;
-  miniSplit1Mode: string;
-  miniSplit2Temp: number;
-  miniSplit2Target: number;
-  miniSplit2Mode: string;
-  // Floor heat
-  floorHeatOn: boolean;
-  // Blowers (controllable ones)
-  blower1On: boolean;
-  blower2On: boolean;
+  // Mini splits (named by location)
+  miniSplitBedroomTemp: number;
+  miniSplitBedroomTarget: number;
+  miniSplitBedroomMode: string; // "off" | "heat" | "cool" | ...
+  miniSplitLivingRoomTemp: number;
+  miniSplitLivingRoomTarget: number;
+  miniSplitLivingRoomMode: string;
+  // Blowers (mode captures speed level)
+  blowerFamilyRoomMode: string; // "off" | "low" | "high"
+  blowerOfficeMode: string;
+  // Navien
+  navienHeatingMode: string; // "Space Heating" | "Idle"
+  navienHeatCapacity: number; // 0-100%
   // Environment
   outdoorTemp: number;
   outdoorHumidity: number;
   windSpeed: number;
   weatherCondition: string;
-  // Navien heater
-  navienHeaterActive: boolean;
-  // Window sensors (any open?)
+  indoorHumidity: number;
   anyWindowOpen: boolean;
-  // Indoor temps (various sensors)
-  indoorTemps: Record<string, number>;
+  // Per-room temperatures
+  upstairsAggregateTemp: number;
+  downstairsAggregateTemp: number;
+  familyRoomTemp: number;
+  officeTemp: number;
+  bedroomTemp: number;
+  kitchenTemp: number;
+  livingRoomTemp: number;
 }
 
 // ---- Prediction (read from JSON) ----
@@ -139,12 +145,11 @@ export interface Prediction {
   timestamp: string;
   thermostatUpstairsTarget: number;
   thermostatDownstairsTarget: number;
-  miniSplit1Target: number;
-  miniSplit1Mode: HVACMode;
-  miniSplit2Target: number;
-  miniSplit2Mode: HVACMode;
-  floorHeatOn: boolean;
-  blower1On: boolean;
-  blower2On: boolean;
+  miniSplitBedroomTarget: number;
+  miniSplitBedroomMode: HVACMode;
+  miniSplitLivingRoomTarget: number;
+  miniSplitLivingRoomMode: HVACMode;
+  blowerFamilyRoomMode: string;
+  blowerOfficeMode: string;
   confidence: number;
 }
