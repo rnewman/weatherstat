@@ -13,6 +13,8 @@ dependencies = [
     "pyarrow>=18.0",
     "astral>=3.2",
     "numpy>=2.0",
+    "requests>=2.32",
+    "websockets>=14.0",
 ]
 
 [project.optional-dependencies]
