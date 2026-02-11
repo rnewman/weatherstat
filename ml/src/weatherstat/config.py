@@ -8,8 +8,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 DATA_DIR = PROJECT_ROOT / "data"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
+SNAPSHOTS_DB = SNAPSHOTS_DIR / "snapshots.db"
 PREDICTIONS_DIR = DATA_DIR / "predictions"
 MODELS_DIR = DATA_DIR / "models"
+CONTROL_STATE_FILE = DATA_DIR / "control_state.json"
 
 # Snapshot collection interval (should match HA client config)
 SNAPSHOT_INTERVAL_SECONDS = 300

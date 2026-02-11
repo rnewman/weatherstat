@@ -11,6 +11,7 @@ Run:
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import UTC, datetime
 
@@ -24,17 +25,13 @@ from weatherstat.config import (
     MODELS_DIR,
     PREDICTION_ZONES,
     PREDICTIONS_DIR,
-    SNAPSHOTS_DIR,
+    SNAPSHOTS_DB,
 )
 from weatherstat.features import build_features
 
 
 def _target_columns(horizons: list[int]) -> list[str]:
-    return [
-        f"{zone}_temp_t+{h}"
-        for zone in PREDICTION_ZONES
-        for h in horizons
-    ]
+    return [f"{zone}_temp_t+{h}" for zone in PREDICTION_ZONES for h in horizons]
 
 
 def load_models(prefix: str, horizons: list[int]) -> dict[str, lgb.Booster]:
@@ -103,11 +100,7 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
     sensor_history = fetch_history(sensor_ids, start, end)
 
     # Fetch climate + fan + weather entities (with attributes)
-    attr_ids = (
-        list(CLIMATE_ENTITIES.values())
-        + list(FAN_ENTITIES.values())
-        + [WEATHER_ENTITY]
-    )
+    attr_ids = list(CLIMATE_ENTITIES.values()) + list(FAN_ENTITIES.values()) + [WEATHER_ENTITY]
     attr_history = fetch_history_with_attributes(attr_ids, start, end)
 
     # Fetch window sensors
@@ -138,14 +131,15 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
             continue
         series_dict = _climate_to_series(records)
         if name.startswith("thermostat_"):
-            for suffix, series in [("target", series_dict["target"]),
-                                   ("action", series_dict["action"])]:
+            for suffix, series in [("target", series_dict["target"]), ("action", series_dict["action"])]:
                 s = series[~series.index.duplicated(keep="last")]
                 result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
         else:
-            for suffix, series in [("temp", series_dict["temp"]),
-                                   ("target", series_dict["target"]),
-                                   ("mode", series_dict["mode"])]:
+            for suffix, series in [
+                ("temp", series_dict["temp"]),
+                ("target", series_dict["target"]),
+                ("mode", series_dict["mode"]),
+            ]:
                 s = series[~series.index.duplicated(keep="last")]
                 result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
 
@@ -188,15 +182,26 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
 
     # Ensure numeric columns
     numeric_cols = [
-        "thermostat_upstairs_temp", "thermostat_downstairs_temp",
-        "upstairs_aggregate_temp", "downstairs_aggregate_temp",
-        "family_room_temp", "office_temp", "kitchen_temp",
-        "bedroom_temp", "living_room_temp", "outdoor_temp",
-        "indoor_humidity", "navien_heat_capacity",
-        "outdoor_humidity", "outdoor_wind_speed",
-        "thermostat_upstairs_target", "thermostat_downstairs_target",
-        "mini_split_bedroom_temp", "mini_split_bedroom_target",
-        "mini_split_living_room_temp", "mini_split_living_room_target",
+        "thermostat_upstairs_temp",
+        "thermostat_downstairs_temp",
+        "upstairs_aggregate_temp",
+        "downstairs_aggregate_temp",
+        "family_room_temp",
+        "office_temp",
+        "kitchen_temp",
+        "bedroom_temp",
+        "living_room_temp",
+        "outdoor_temp",
+        "indoor_humidity",
+        "navien_heat_capacity",
+        "outdoor_humidity",
+        "outdoor_wind_speed",
+        "thermostat_upstairs_target",
+        "thermostat_downstairs_target",
+        "mini_split_bedroom_temp",
+        "mini_split_bedroom_target",
+        "mini_split_living_room_temp",
+        "mini_split_living_room_target",
     ]
     for col in numeric_cols:
         if col in result.columns:
@@ -452,7 +457,7 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
     print(f"\n{'=' * 72}")
     print("SETPOINT COUNTERFACTUALS (full model)")
     print(f"{'=' * 72}")
-    print("  \"What temperature will we reach if both thermostats are set to X?\"")
+    print('  "What temperature will we reach if both thermostats are set to X?"')
     print(f"  Current temps: up={up_now:.1f}\u00b0F, dn={dn_now:.1f}\u00b0F, out={_fmt_temp(out_now)}\n")
 
     sp_labels = [f"{sp}\u00b0F" for sp in setpoints]
@@ -501,10 +506,7 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
             "upstairs_target": _round_or_none(up_target),
             "downstairs_target": _round_or_none(dn_target),
         },
-        "setpoints": {
-            str(sp): {t: round(v, 2) for t, v in preds.items()}
-            for sp, preds in results.items()
-        },
+        "setpoints": {str(sp): {t: round(v, 2) for t, v in preds.items()} for sp, preds in results.items()},
     }
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -518,18 +520,28 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
 
 
 def load_latest_snapshots(n_rows: int = 48) -> pd.DataFrame:
-    """Load the most recent snapshot rows (enough for lag/rolling features)."""
-    parquet_files = sorted(SNAPSHOTS_DIR.glob("snapshot_*.parquet"))
-    if not parquet_files:
-        print(f"No snapshot files found in {SNAPSHOTS_DIR}", file=sys.stderr)
+    """Load the most recent snapshot rows from SQLite (enough for lag/rolling features)."""
+    if not SNAPSHOTS_DB.exists():
+        print(f"No snapshot database found at {SNAPSHOTS_DB}", file=sys.stderr)
         sys.exit(1)
 
-    df = pd.read_parquet(parquet_files[-1])
-    if len(parquet_files) > 1 and len(df) < n_rows:
-        prev_df = pd.read_parquet(parquet_files[-2])
-        df = pd.concat([prev_df, df], ignore_index=True)
+    conn = sqlite3.connect(str(SNAPSHOTS_DB))
+    query = f"SELECT * FROM snapshots ORDER BY timestamp DESC LIMIT {n_rows}"
+    df = pd.read_sql(query, conn)
+    conn.close()
 
-    return df.tail(n_rows).reset_index(drop=True)
+    if df.empty:
+        print("No snapshots in database", file=sys.stderr)
+        sys.exit(1)
+
+    # Reverse to chronological order
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    # Convert any_window_open from INTEGER back to bool
+    if "any_window_open" in df.columns:
+        df["any_window_open"] = df["any_window_open"].astype(bool)
+
+    return df
 
 
 def infer_snapshot() -> None:
@@ -577,7 +589,8 @@ def main() -> None:
         help="Use collector snapshot files instead of fetching from HA",
     )
     group.add_argument(
-        "--counterfactual", "--cf",
+        "--counterfactual",
+        "--cf",
         action="store_true",
         help="Predict under different thermostat setpoint scenarios",
     )

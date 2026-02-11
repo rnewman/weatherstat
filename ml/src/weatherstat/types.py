@@ -1,6 +1,6 @@
 """Domain types mirroring the TypeScript side, using frozen dataclasses and StrEnum."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 
@@ -138,3 +138,70 @@ class Prediction:
     blower_family_room_mode: BlowerMode
     blower_office_mode: BlowerMode
     confidence: float
+
+
+# ── Control types ──────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RoomComfort:
+    """Comfort bounds and penalty weights for a single room."""
+
+    room: str  # "bedroom", "office", "upstairs", "downstairs"
+    min_temp: float  # lower comfort bound (°F)
+    max_temp: float  # upper comfort bound (°F)
+    cold_penalty: float = 2.0  # weight for being below min
+    hot_penalty: float = 1.0  # weight for being above max
+
+
+@dataclass(frozen=True)
+class ComfortScheduleEntry:
+    """A time-of-day range with its comfort profile."""
+
+    start_hour: int  # 0-23 inclusive
+    end_hour: int  # 0-23 inclusive (wraps at midnight if start > end)
+    comfort: RoomComfort
+
+
+@dataclass(frozen=True)
+class ComfortSchedule:
+    """Time-of-day comfort profile for a room."""
+
+    room: str
+    entries: tuple[ComfortScheduleEntry, ...] = field(default_factory=tuple)
+
+    def comfort_at(self, hour: int) -> RoomComfort | None:
+        """Return the active RoomComfort for a given hour, or None if no entry matches."""
+        for entry in self.entries:
+            if entry.start_hour <= entry.end_hour:
+                if entry.start_hour <= hour < entry.end_hour:
+                    return entry.comfort
+            else:
+                # Wraps midnight (e.g. 22-6)
+                if hour >= entry.start_hour or hour < entry.end_hour:
+                    return entry.comfort
+        return None
+
+
+@dataclass(frozen=True)
+class ControlDecision:
+    """A single control decision: chosen setpoints and associated costs."""
+
+    timestamp: str
+    upstairs_setpoint: float
+    downstairs_setpoint: float
+    total_cost: float
+    comfort_cost: float
+    energy_cost: float
+    upstairs_predictions: dict[str, float] = field(default_factory=dict)  # horizon -> temp
+    downstairs_predictions: dict[str, float] = field(default_factory=dict)
+    dry_run: bool = True
+
+
+@dataclass(frozen=True)
+class ControlState:
+    """Persisted state to prevent rapid cycling."""
+
+    last_decision_time: str  # ISO 8601
+    upstairs_setpoint: float
+    downstairs_setpoint: float

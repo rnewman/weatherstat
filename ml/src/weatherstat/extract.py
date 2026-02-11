@@ -12,15 +12,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 import websockets.client
 
-from weatherstat.config import HA_TOKEN, HA_URL, SNAPSHOTS_DIR
+from weatherstat.config import HA_TOKEN, HA_URL, SNAPSHOTS_DB, SNAPSHOTS_DIR
 
 # ── Entity definitions ──────────────────────────────────────────────────────
 
@@ -80,6 +82,7 @@ ALL_HISTORY_ENTITIES: list[str] = [
 
 
 # ── HA API helpers ───────────────────────────────────────────────────────────
+
 
 def _check_config() -> None:
     if not HA_URL or not HA_TOKEN:
@@ -175,15 +178,19 @@ async def fetch_statistics(
             raise RuntimeError(f"Auth failed: {msg}")
 
         # Request statistics
-        await ws.send(json.dumps({
-            "id": 1,
-            "type": "recorder/statistics_during_period",
-            "start_time": start.isoformat(),
-            "end_time": end.isoformat(),
-            "statistic_ids": entity_ids,
-            "period": period,
-            "types": ["mean", "min", "max"],
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "type": "recorder/statistics_during_period",
+                    "start_time": start.isoformat(),
+                    "end_time": end.isoformat(),
+                    "statistic_ids": entity_ids,
+                    "period": period,
+                    "types": ["mean", "min", "max"],
+                }
+            )
+        )
 
         msg = json.loads(await ws.recv())
         if not msg.get("success"):
@@ -193,6 +200,7 @@ async def fetch_statistics(
 
 
 # ── Statistics extraction (long-term hourly) ─────────────────────────────────
+
 
 def extract_statistics(months_back: int = 7) -> pd.DataFrame:
     """Extract hourly temperature statistics for 5+ months.
@@ -250,6 +258,7 @@ def extract_statistics(months_back: int = 7) -> pd.DataFrame:
 
 # ── History extraction (short-term full features) ────────────────────────────
 
+
 def _history_to_series(
     records: list[dict[str, str]],
     value_fn: object = None,
@@ -260,6 +269,7 @@ def _history_to_series(
               Defaults to float conversion (NaN on failure).
     """
     if value_fn is None:
+
         def value_fn(s: str) -> float | None:
             try:
                 return float(s)
@@ -415,11 +425,7 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
     sensor_history = fetch_history(sensor_ids, start, end)
 
     # 2. Fetch climate + fan + weather entities (with attributes)
-    attr_ids = (
-        list(CLIMATE_ENTITIES.values())
-        + list(FAN_ENTITIES.values())
-        + [WEATHER_ENTITY]
-    )
+    attr_ids = list(CLIMATE_ENTITIES.values()) + list(FAN_ENTITIES.values()) + [WEATHER_ENTITY]
     print(f"  Fetching {len(attr_ids)} attribute entities...")
     attr_history = fetch_history_with_attributes(attr_ids, start, end)
 
@@ -465,15 +471,16 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
 
         if name.startswith("thermostat_"):
             # Thermostats: temp comes from the separate sensor, so just target + action
-            for suffix, series in [("target", series_dict["target"]),
-                                   ("action", series_dict["action"])]:
+            for suffix, series in [("target", series_dict["target"]), ("action", series_dict["action"])]:
                 s = series[~series.index.duplicated(keep="last")]
                 result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
         else:
             # Mini splits: state=mode, plus temp, target
-            for suffix, series in [("temp", series_dict["temp"]),
-                                   ("target", series_dict["target"]),
-                                   ("mode", series_dict["mode"])]:
+            for suffix, series in [
+                ("temp", series_dict["temp"]),
+                ("target", series_dict["target"]),
+                ("mode", series_dict["mode"]),
+            ]:
                 s = series[~series.index.duplicated(keep="last")]
                 result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
 
@@ -519,15 +526,26 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
 
     # Ensure numeric columns are float
     numeric_cols = [
-        "thermostat_upstairs_temp", "thermostat_downstairs_temp",
-        "upstairs_aggregate_temp", "downstairs_aggregate_temp",
-        "family_room_temp", "office_temp", "kitchen_temp",
-        "bedroom_temp", "living_room_temp", "outdoor_temp",
-        "indoor_humidity", "navien_heat_capacity",
-        "outdoor_humidity", "outdoor_wind_speed",
-        "thermostat_upstairs_target", "thermostat_downstairs_target",
-        "mini_split_bedroom_temp", "mini_split_bedroom_target",
-        "mini_split_living_room_temp", "mini_split_living_room_target",
+        "thermostat_upstairs_temp",
+        "thermostat_downstairs_temp",
+        "upstairs_aggregate_temp",
+        "downstairs_aggregate_temp",
+        "family_room_temp",
+        "office_temp",
+        "kitchen_temp",
+        "bedroom_temp",
+        "living_room_temp",
+        "outdoor_temp",
+        "indoor_humidity",
+        "navien_heat_capacity",
+        "outdoor_humidity",
+        "outdoor_wind_speed",
+        "thermostat_upstairs_target",
+        "thermostat_downstairs_target",
+        "mini_split_bedroom_temp",
+        "mini_split_bedroom_target",
+        "mini_split_living_room_temp",
+        "mini_split_living_room_target",
     ]
     for col in numeric_cols:
         if col in result.columns:
@@ -546,12 +564,38 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
     return result
 
 
+# ── Collector SQLite reader ───────────────────────────────────────────────
+
+
+def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
+    """Load all collector snapshots from the SQLite database.
+
+    Args:
+        db_path: Path to snapshots.db. Defaults to SNAPSHOTS_DB.
+
+    Returns:
+        DataFrame with all snapshots in chronological order.
+    """
+    path = db_path or SNAPSHOTS_DB
+    if not path.exists():
+        print(f"No snapshot database found at {path}", file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect(str(path))
+    df = pd.read_sql("SELECT * FROM snapshots ORDER BY timestamp", conn)
+    conn.close()
+
+    if "any_window_open" in df.columns:
+        df["any_window_open"] = df["any_window_open"].astype(bool)
+
+    return df
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Extract historical data from Home Assistant"
-    )
+    parser = argparse.ArgumentParser(description="Extract historical data from Home Assistant")
     parser.add_argument(
         "--mode",
         choices=["all", "statistics", "history"],
