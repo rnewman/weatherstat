@@ -32,3 +32,6 @@ data/models/*.pkl
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude
+.claude
