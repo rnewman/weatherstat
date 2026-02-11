@@ -20,7 +20,7 @@ import pandas as pd
 import requests
 import websockets.client
 
-from weatherstat.config import DATA_DIR, HA_TOKEN, HA_URL, SNAPSHOTS_DIR
+from weatherstat.config import HA_TOKEN, HA_URL, SNAPSHOTS_DIR
 
 # ── Entity definitions ──────────────────────────────────────────────────────
 
@@ -130,12 +130,11 @@ def fetch_history_with_attributes(
     start: datetime,
     end: datetime,
 ) -> dict[str, list[dict[str, object]]]:
-    """Fetch raw state history WITH attributes for climate/fan entities."""
+    """Fetch raw state history WITH attributes for climate/fan/weather entities."""
     url = f"{HA_URL}/api/history/period/{start.isoformat()}"
     params = {
         "end_time": end.isoformat(),
         "filter_entity_id": ",".join(entity_ids),
-        "minimal_response": "",
     }
 
     resp = requests.get(url, headers=_rest_headers(), params=params, timeout=120)
@@ -163,7 +162,7 @@ async def fetch_statistics(
     """
     ws_url = HA_URL.replace("http", "ws", 1) + "/api/websocket"
 
-    async with websockets.client.connect(ws_url) as ws:
+    async with websockets.client.connect(ws_url, max_size=2**24) as ws:
         # Wait for auth_required
         msg = json.loads(await ws.recv())
         if msg.get("type") != "auth_required":

@@ -9,12 +9,14 @@ description = "LightGBM training/inference pipeline for smart thermostat control
 requires-python = ">=3.12"
 dependencies = [
     "lightgbm>=4.5",
+    "scikit-learn>=1.5",
     "pandas>=2.2",
     "pyarrow>=18.0",
     "astral>=3.2",
     "numpy>=2.0",
     "requests>=2.32",
     "websockets>=14.0",
+    "matplotlib>=3.9",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,7 @@ packages = ["src/weatherstat"]
 [tool.ruff]
 target-version = "py312"
 src = ["src", "tests"]
+line-length = 110
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

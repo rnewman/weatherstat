@@ -6,7 +6,6 @@ Reports per-zone per-horizon RMSE, MAE, and feature importance.
 Run: uv run python -m weatherstat.evaluate
 """
 
-import sys
 
 import lightgbm as lgb
 import pandas as pd
