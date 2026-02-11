@@ -13,6 +13,7 @@ SNAPSHOTS_DB = SNAPSHOTS_DIR / "snapshots.db"
 PREDICTIONS_DIR = DATA_DIR / "predictions"
 MODELS_DIR = DATA_DIR / "models"
 CONTROL_STATE_FILE = DATA_DIR / "control_state.json"
+ADVISORY_STATE_FILE = DATA_DIR / "advisory_state.json"
 
 
 def experiment_models_dir(name: str) -> Path:

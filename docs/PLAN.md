@@ -40,6 +40,13 @@
 - Monitoring control loop decisions before going live
 - Verifying recommendations match physical intuition (e.g. blower artifact caught and constrained)
 
+### Human Advisory Notifications
+- Window advisories: "open windows for free cooling" and "close windows — heating is active"
+- Evaluates after each control cycle using current sensor state
+- Sends HA persistent notifications (replaces stale notifications via notification_id)
+- Cooldown timers prevent notification fatigue (4h free cooling, 1h close windows)
+- Future: comfort breach warnings, solar gain/blinds, room migration suggestions
+
 ## Near-Term
 
 ### Experiment Infrastructure
@@ -47,18 +54,6 @@
 - Experiment-namespaced model directories (`data/models/{experiment}/`)
 - Eval harness comparing experiment models against production baseline
 - Enables physics features and MPC work in parallel without risk
-
-### Human Advisory Mode
-- Notify when predicted conditions suggest human action the system can't take:
-  - "Open windows — outdoor temp is below indoor, free cooling available"
-  - "Close south blinds — afternoon solar will overshoot bedroom by 3°F"
-  - "Move to family room — office will be cold for the next 2 hours"
-- Triggers: predicted comfort breach that HVAC can't fix (or can only fix at high cost),
-  outdoor temp favorable for ventilation, solar angle + window orientation
-- Delivery: HA `persistent_notification` or mobile push via `notify` service
-  (both are `callService` calls the executor already supports)
-- Key design: notification fatigue avoidance — cooldown timers, severity thresholds,
-  "already acted" acknowledgment
 
 ### Physics-Informed Features
 - Heating/cooling rate (dT/dt), thermal deficit, estimated time-to-setpoint

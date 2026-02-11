@@ -704,6 +704,21 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     else:
         print("  Mode: DRY-RUN — command written but not executed")
 
+    # ── Advisories ──
+    from weatherstat.advisory import process_advisories
+
+    any_window = bool(latest.get("any_window_open", False))
+    heating_active = decision.upstairs_heating or decision.downstairs_heating
+    process_advisories(
+        outdoor_temp=float(out_temp)
+        if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
+        else None,
+        indoor_temps=current_temps,
+        any_window_open=any_window,
+        heating_active=heating_active,
+        live=live,
+    )
+
     return decision
 
 
