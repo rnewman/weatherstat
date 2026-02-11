@@ -21,6 +21,50 @@ _LOCATION = LocationInfo(
     longitude=LONGITUDE,
 )
 
+# ── Column groupings ────────────────────────────────────────────────────────
+
+# All temperature columns available in the full snapshot schema
+TEMP_COLUMNS_FULL = [
+    "thermostat_upstairs_temp",
+    "thermostat_downstairs_temp",
+    "upstairs_aggregate_temp",
+    "downstairs_aggregate_temp",
+    "family_room_temp",
+    "office_temp",
+    "kitchen_temp",
+    "bedroom_temp",
+    "living_room_temp",
+    "outdoor_temp",
+]
+
+# Temperature columns available in hourly statistics (subset of full)
+TEMP_COLUMNS_HOURLY = [
+    "thermostat_upstairs_temp",
+    "thermostat_downstairs_temp",
+    "upstairs_aggregate_temp",
+    "downstairs_aggregate_temp",
+    "family_room_temp",
+    "office_temp",
+    "kitchen_temp",
+    "bedroom_temp",
+    "living_room_temp",
+    "outdoor_temp",
+]
+
+# Zone temperature columns used as prediction targets
+ZONE_TEMP_COLUMNS = {
+    "upstairs": "thermostat_upstairs_temp",
+    "downstairs": "thermostat_downstairs_temp",
+}
+
+# Lag and rolling parameters — adjusted per data frequency
+LAG_PERIODS_5MIN = [1, 3, 6, 12]  # 5min, 15min, 30min, 1hr
+LAG_PERIODS_HOURLY = [1, 2, 4, 6]  # 1hr, 2hr, 4hr, 6hr
+ROLLING_WINDOWS_5MIN = [6, 12, 24]  # 30min, 1hr, 2hr
+ROLLING_WINDOWS_HOURLY = [3, 6, 12]  # 3hr, 6hr, 12hr
+
+
+# ── Time and solar features ─────────────────────────────────────────────────
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add time-based features from the timestamp column.
@@ -62,7 +106,6 @@ def add_solar_features(df: pd.DataFrame) -> pd.DataFrame:
             elev = elevation(_LOCATION.observer, dt)
             azi = azimuth(_LOCATION.observer, dt)
         except ValueError:
-            # Sun below horizon or calculation error
             elev = 0.0
             azi = 0.0
         elevations.append(elev)
@@ -73,6 +116,87 @@ def add_solar_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
+# ── HVAC encoding ────────────────────────────────────────────────────────────
+
+def encode_hvac_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Encode HVAC categorical features as numeric values.
+
+    - Thermostat actions: heating=1, idle=0
+    - Mini split modes: off=0, heat=1, cool=-1, fan_only=0.5, dry=0.25, auto=0.5
+    - Blower modes: off=0, low=1, high=2
+    - Navien heating mode: Space Heating=1, Idle=0
+    """
+    df = df.copy()
+
+    # Thermostat actions
+    action_map = {"heating": 1, "idle": 0, "off": 0}
+    for col in ["thermostat_upstairs_action", "thermostat_downstairs_action"]:
+        if col in df.columns:
+            df[f"{col}_enc"] = df[col].map(action_map).fillna(0).astype(float)
+
+    # Mini split modes
+    split_mode_map = {
+        "off": 0, "heat": 1, "cool": -1, "fan_only": 0.5,
+        "dry": 0.25, "auto": 0.5, "heat_cool": 0.5,
+    }
+    for col in ["mini_split_bedroom_mode", "mini_split_living_room_mode"]:
+        if col in df.columns:
+            df[f"{col}_enc"] = df[col].map(split_mode_map).fillna(0).astype(float)
+
+    # Blower modes
+    blower_map = {"off": 0, "low": 1, "high": 2}
+    for col in ["blower_family_room_mode", "blower_office_mode"]:
+        if col in df.columns:
+            df[f"{col}_enc"] = df[col].map(blower_map).fillna(0).astype(float)
+
+    # Navien heating mode
+    if "navien_heating_mode" in df.columns:
+        df["navien_heating_mode_enc"] = (
+            df["navien_heating_mode"]
+            .map({"Space Heating": 1, "Idle": 0})
+            .fillna(0)
+            .astype(float)
+        )
+
+    return df
+
+
+# ── Delta features ───────────────────────────────────────────────────────────
+
+def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add temperature delta features: (indoor - outdoor) and (target - current).
+
+    Indoor-outdoor delta captures heat loss driving force.
+    Target-current delta captures the gap the HVAC system is closing.
+    """
+    df = df.copy()
+
+    # Indoor-outdoor deltas (heat loss driving force)
+    indoor_cols = {
+        "upstairs": "thermostat_upstairs_temp",
+        "downstairs": "thermostat_downstairs_temp",
+    }
+    if "outdoor_temp" in df.columns:
+        for zone, col in indoor_cols.items():
+            if col in df.columns:
+                df[f"{zone}_outdoor_delta"] = df[col] - df["outdoor_temp"]
+
+    # Target-current deltas (gap being closed)
+    target_pairs = [
+        ("thermostat_upstairs_target", "thermostat_upstairs_temp", "upstairs_target_delta"),
+        ("thermostat_downstairs_target", "thermostat_downstairs_temp", "downstairs_target_delta"),
+        ("mini_split_bedroom_target", "mini_split_bedroom_temp", "bedroom_target_delta"),
+        ("mini_split_living_room_target", "mini_split_living_room_temp", "living_room_target_delta"),
+    ]
+    for target_col, temp_col, delta_name in target_pairs:
+        if target_col in df.columns and temp_col in df.columns:
+            df[delta_name] = df[target_col] - df[temp_col]
+
+    return df
+
+
+# ── Lag and rolling features ────────────────────────────────────────────────
 
 def add_lag_features(
     df: pd.DataFrame, columns: list[str], lags: list[int]
@@ -86,6 +210,8 @@ def add_lag_features(
     """
     df = df.copy()
     for col in columns:
+        if col not in df.columns:
+            continue
         for lag in lags:
             df[f"{col}_lag_{lag}"] = df[col].shift(lag)
     return df
@@ -103,37 +229,90 @@ def add_rolling_features(
     """
     df = df.copy()
     for col in columns:
+        if col not in df.columns:
+            continue
         for window in windows:
             rolling = df[col].rolling(window, min_periods=1)
             df[f"{col}_rolling_{window}"] = rolling.mean()
     return df
 
 
-# Columns to compute lags and rolling means for
-TEMP_COLUMNS = [
-    "thermostat_upstairs_temp",
-    "thermostat_downstairs_temp",
-    "mini_split_1_temp",
-    "mini_split_2_temp",
-    "outdoor_temp",
-]
+# ── Future temperature targets ───────────────────────────────────────────────
 
-LAG_PERIODS = [1, 3, 6, 12]  # 5min, 15min, 30min, 1hr at 5-min intervals
-ROLLING_WINDOWS = [6, 12, 24]  # 30min, 1hr, 2hr
+def add_future_targets(
+    df: pd.DataFrame,
+    zone_columns: dict[str, str],
+    horizons: list[int],
+) -> pd.DataFrame:
+    """Create future temperature columns for multi-horizon prediction.
+
+    Shifts temperature columns BACKWARD (negative shift) to align future values
+    with current rows. Rows at the end where future is unknown become NaN.
+
+    Args:
+        df: DataFrame sorted by timestamp.
+        zone_columns: {zone_name: temp_column_name} mapping.
+        horizons: List of forward steps to create targets for.
+
+    Returns:
+        DataFrame with additional columns: {zone}_temp_t+{horizon}
+    """
+    df = df.copy()
+    for zone, col in zone_columns.items():
+        if col not in df.columns:
+            continue
+        for h in horizons:
+            df[f"{zone}_temp_t+{h}"] = df[col].shift(-h)
+    return df
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+# ── Main pipeline ────────────────────────────────────────────────────────────
+
+def build_features(
+    df: pd.DataFrame,
+    mode: str = "full",
+) -> pd.DataFrame:
     """Full feature engineering pipeline.
 
     Takes a raw snapshot DataFrame and returns a feature-enriched DataFrame.
     Used by both training and inference to ensure consistency.
+
+    Args:
+        df: Raw snapshot or statistics DataFrame.
+        mode: "full" for 5-min full-feature data, "baseline" for hourly temp-only.
     """
     df = df.sort_values("timestamp").reset_index(drop=True)
 
+    # Time and solar features (always)
     df = add_time_features(df)
     df = add_solar_features(df)
-    df = add_weather_features(df)
-    df = add_lag_features(df, TEMP_COLUMNS, LAG_PERIODS)
-    df = add_rolling_features(df, TEMP_COLUMNS, ROLLING_WINDOWS)
+
+    # Weather features (if weather columns present)
+    if "weather_condition" in df.columns:
+        df = add_weather_features(df)
+
+    if mode == "full":
+        # HVAC encoding (only in full mode)
+        df = encode_hvac_features(df)
+
+        # Delta features (only in full mode)
+        df = add_delta_features(df)
+
+        # Temperature lags and rolling at 5-min intervals
+        temp_cols = [c for c in TEMP_COLUMNS_FULL if c in df.columns]
+        df = add_lag_features(df, temp_cols, LAG_PERIODS_5MIN)
+        df = add_rolling_features(df, temp_cols, ROLLING_WINDOWS_5MIN)
+
+    elif mode == "baseline":
+        # Temperature lags and rolling at hourly intervals
+        temp_cols = [c for c in TEMP_COLUMNS_HOURLY if c in df.columns]
+        df = add_lag_features(df, temp_cols, LAG_PERIODS_HOURLY)
+        df = add_rolling_features(df, temp_cols, ROLLING_WINDOWS_HOURLY)
+
+        # Indoor-outdoor delta if outdoor_temp available
+        if "outdoor_temp" in df.columns:
+            for zone, col in ZONE_TEMP_COLUMNS.items():
+                if col in df.columns:
+                    df[f"{zone}_outdoor_delta"] = df[col] - df["outdoor_temp"]
 
     return df
