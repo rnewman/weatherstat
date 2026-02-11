@@ -8,9 +8,27 @@ default:
 collect:
     cd ha-client && npx tsx src/index.ts collect
 
-# Train LightGBM model
-train:
-    cd ml && uv run python -m weatherstat.train
+# Extract historical data from HA
+extract *ARGS:
+    cd ml && uv run python -m weatherstat.extract {{ARGS}}
+
+# Train LightGBM baseline model (hourly temp-only, 5+ months)
+train-baseline:
+    cd ml && uv run python -m weatherstat.train --mode baseline
+
+# Train LightGBM full model (5-min all features, ~10 days)
+train-full:
+    cd ml && uv run python -m weatherstat.train --mode full
+
+# Train both models
+train: train-baseline train-full
+
+# Retrain: re-extract data then train both models
+retrain: extract train
+
+# Evaluate and compare models
+evaluate:
+    cd ml && uv run python -m weatherstat.evaluate
 
 # Run inference pipeline
 infer:
