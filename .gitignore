@@ -14,9 +14,17 @@ node_modules/
 
 # Data artifacts
 data/snapshots/*.parquet
+data/snapshots/*.db
+data/snapshots/*.db-wal
+data/snapshots/*.db-shm
 data/predictions/*.json
 data/models/*.txt
 data/models/*.pkl
+data/control_state.json
+
+# Logs
+logs/
+!logs/.gitkeep
 
 # Environment
 .env

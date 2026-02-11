@@ -28,7 +28,7 @@ async function loadLatestPrediction(predictionsDir: string): Promise<Prediction 
     return null;
   }
 
-  const jsonFiles = files.filter((f) => f.endsWith(".json")).sort();
+  const jsonFiles = files.filter((f) => f.startsWith("command_") && f.endsWith(".json")).sort();
   const latest = jsonFiles[jsonFiles.length - 1];
   if (!latest) return null;
 

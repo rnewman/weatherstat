@@ -4,9 +4,21 @@
 default:
     @just --list
 
-# Run HA state collector
+# Run HA state collector (5-min loop)
 collect:
     cd ha-client && npx tsx src/index.ts collect
+
+# Collect a single snapshot
+collect-once:
+    cd ha-client && npx tsx src/index.ts once
+
+# Run collector with auto-restart + health monitoring
+collect-durable:
+    bash scripts/run-collector.sh
+
+# Check collector health (is data fresh?)
+health:
+    bash scripts/check-health.sh
 
 # Extract historical data from HA
 extract *ARGS:
@@ -75,6 +87,22 @@ test-py:
 # TypeScript type-check
 typecheck:
     cd ha-client && pnpm exec tsc --noEmit
+
+# Single control cycle (dry-run)
+control:
+    cd ml && uv run python -m weatherstat.control
+
+# Run control loop (dry-run, 15-min interval)
+control-loop:
+    cd ml && uv run python -m weatherstat.control --loop
+
+# Single control cycle with live execution
+control-live:
+    cd ml && uv run python -m weatherstat.control --live
+
+# Execute latest command JSON via HA
+execute:
+    cd ha-client && npx tsx src/index.ts execute
 
 # Install all dependencies
 install:
