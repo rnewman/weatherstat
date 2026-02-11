@@ -24,8 +24,10 @@ from weatherstat.config import (
     LGBM_PARAMS_SMALL,
     MODELS_DIR,
     PREDICTION_ZONES,
+    SNAPSHOTS_DB,
     SNAPSHOTS_DIR,
 )
+from weatherstat.extract import load_collector_snapshots
 from weatherstat.features import (
     ZONE_TEMP_COLUMNS,
     add_future_targets,
@@ -59,13 +61,55 @@ def load_baseline_data() -> pd.DataFrame:
 
 
 def load_full_data() -> pd.DataFrame:
-    """Load 5-min full-feature data for full training."""
-    path = SNAPSHOTS_DIR / "historical_full.parquet"
-    if not path.exists():
-        print(f"Error: {path} not found. Run `just extract` first.", file=sys.stderr)
+    """Load 5-min full-feature data for full training.
+
+    Merges two optional sources:
+    - historical_full.parquet (bootstrap extraction from HA)
+    - snapshots.db (ongoing collector data)
+
+    At least one source must exist. On timestamp collision the collector
+    row wins (it's the live truth).
+    """
+    frames: list[pd.DataFrame] = []
+
+    # Source 1: historical extraction (optional)
+    parquet_path = SNAPSHOTS_DIR / "historical_full.parquet"
+    if parquet_path.exists():
+        hist = pd.read_parquet(parquet_path)
+        print(f"Loaded {len(hist)} rows from {parquet_path.name}")
+        frames.append(hist)
+
+    # Source 2: collector SQLite (optional)
+    if SNAPSHOTS_DB.exists():
+        collector = load_collector_snapshots(SNAPSHOTS_DB)
+        print(f"Loaded {len(collector)} rows from {SNAPSHOTS_DB.name}")
+        frames.append(collector)
+
+    if not frames:
+        print(
+            "Error: no training data found. Need historical_full.parquet or snapshots.db.\n"
+            "Run `just extract` or `just collect` first.",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    df = pd.read_parquet(path)
-    print(f"Loaded {len(df)} rows from {path}")
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Dedup on timestamp — keep last (collector appended second, so it wins)
+    pre_dedup = len(df)
+    df = df.drop_duplicates(subset="timestamp", keep="last")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    if pre_dedup > len(df):
+        print(f"Deduped: {pre_dedup} → {len(df)} rows ({pre_dedup - len(df)} overlapping timestamps removed)")
+
+    # Normalize timestamp format (SQLite has .000Z milliseconds, Parquet doesn't)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    # Normalize any_window_open to bool (INTEGER in SQLite, bool in Parquet)
+    if "any_window_open" in df.columns:
+        df["any_window_open"] = df["any_window_open"].astype(bool)
+
+    print(f"Full dataset: {len(df)} rows")
     return df
 
 
@@ -84,7 +128,13 @@ def train_mode(mode: str) -> None:
     elif mode == "full":
         df = load_full_data()
         horizons = HORIZONS_5MIN
-        params = LGBM_PARAMS_SMALL
+        # Auto-select params: ~17 days of 5-min data ≈ 5000 rows
+        if len(df) >= 5000:
+            params = LGBM_PARAMS
+            print(f"Using full LGBM params ({len(df)} rows >= 5000)")
+        else:
+            params = LGBM_PARAMS_SMALL
+            print(f"Using small LGBM params ({len(df)} rows < 5000)")
         model_prefix = "full"
     else:
         print(f"Unknown mode: {mode}", file=sys.stderr)
