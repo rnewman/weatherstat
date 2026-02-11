@@ -375,68 +375,39 @@ def _round_or_none(val: object) -> float | None:
     return round(float(val), 2)
 
 
-# ── Counterfactual predictions ──────────────────────────────────────────────
-
-# Default setpoint range to sweep (°F)
-DEFAULT_SETPOINTS = [68, 70, 72, 74, 76]
+# ── Heating overrides ──────────────────────────────────────────────────────
 
 
-def _build_setpoint_overrides(
-    up_temp: float,
-    dn_temp: float,
-    up_setpoint: float,
-    dn_setpoint: float,
-) -> dict[str, float]:
-    """Build feature overrides for a setpoint scenario.
+def _build_heating_overrides(up_heating: bool, dn_heating: bool) -> dict[str, float]:
+    """Build feature overrides for a binary heating scenario.
 
-    The setpoint is the real control variable. Everything else follows:
-    - If setpoint > current temp → thermostat heats, Navien fires, blowers run
-    - If setpoint ≤ current temp → thermostat idles
-    - target_delta = setpoint - current_temp (the gap the HVAC is closing)
+    Thermostats are bang-bang controllers: the only real input is on/off.
+    The setpoint number just achieves on/off and is not a model feature.
     """
-    overrides: dict[str, float] = {}
-
-    up_heating = up_setpoint > up_temp
-    dn_heating = dn_setpoint > dn_temp
-
-    # Upstairs
-    overrides["thermostat_upstairs_target"] = up_setpoint
-    overrides["upstairs_target_delta"] = up_setpoint - up_temp
-    overrides["thermostat_upstairs_action_enc"] = 1.0 if up_heating else 0.0
-
-    # Downstairs
-    overrides["thermostat_downstairs_target"] = dn_setpoint
-    overrides["downstairs_target_delta"] = dn_setpoint - dn_temp
-    overrides["thermostat_downstairs_action_enc"] = 1.0 if dn_heating else 0.0
-
-    # Navien fires when either zone is heating
-    overrides["navien_heating_mode_enc"] = 1.0 if (up_heating or dn_heating) else 0.0
-
+    overrides: dict[str, float] = {
+        "thermostat_upstairs_action_enc": 1.0 if up_heating else 0.0,
+        "thermostat_downstairs_action_enc": 1.0 if dn_heating else 0.0,
+        "navien_heating_mode_enc": 1.0 if (up_heating or dn_heating) else 0.0,
+    }
     # Blowers follow downstairs thermostat
     blower = 1.0 if dn_heating else 0.0
     overrides["blower_family_room_mode_enc"] = blower
     overrides["blower_office_mode_enc"] = blower
-
     return overrides
 
 
-def predict_counterfactual(setpoints: list[int] | None = None) -> None:
-    """Predict temperatures under different thermostat setpoint scenarios.
+# ── Counterfactual predictions ──────────────────────────────────────────────
 
-    The setpoint is the actual control input — "what if I set both thermostats
-    to X°F?" The model sees the target, the target-current delta, and the
-    resulting HVAC action. No faked time series, no autoregressive propagation.
 
-    Args:
-        setpoints: List of setpoint temperatures to try (°F). Both zones set
-                   to the same value for each scenario. Defaults to [68..76].
+def predict_counterfactual() -> None:
+    """Predict temperatures under all 4 binary heating scenarios.
+
+    Sweeps {up_on/off} × {dn_on/off} = 4 combos. Thermostats are bang-bang
+    controllers, so the meaningful question is "heat on or off?" not "what setpoint?"
     """
     from weatherstat.extract import _check_config
 
     _check_config()
-
-    if setpoints is None:
-        setpoints = DEFAULT_SETPOINTS
 
     print("Fetching recent history from Home Assistant...")
     df_raw = fetch_recent_history(hours_back=14)
@@ -453,12 +424,12 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
     up_now = float(latest_row.get("thermostat_upstairs_temp", 0))
     dn_now = float(latest_row.get("thermostat_downstairs_temp", 0))
     out_now = latest_row.get("outdoor_temp")
-    up_target = latest_row.get("thermostat_upstairs_target", "?")
-    dn_target = latest_row.get("thermostat_downstairs_target", "?")
+    up_action = latest_row.get("thermostat_upstairs_action", "?")
+    dn_action = latest_row.get("thermostat_downstairs_action", "?")
 
     print(f"\nCurrent state ({now_str}):")
-    print(f"  Upstairs:    {_fmt_temp(up_now)}  (setpoint: {_fmt_temp(up_target)})")
-    print(f"  Downstairs:  {_fmt_temp(dn_now)}  (setpoint: {_fmt_temp(dn_target)})")
+    print(f"  Upstairs:    {_fmt_temp(up_now)}  ({up_action})")
+    print(f"  Downstairs:  {_fmt_temp(dn_now)}  ({dn_action})")
     print(f"  Outdoor:     {_fmt_temp(out_now)}")
 
     # Build features once
@@ -471,12 +442,17 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
     df_feat = build_features(df_raw.copy(), mode="full")
     base_row = _prepare_feature_row(df_feat, feature_columns)
 
-    # Run each setpoint scenario (both zones set to same value)
-    # results[setpoint][target_name] = predicted_temp
-    results: dict[int, dict[str, float]] = {}
+    # 4 binary scenarios
+    scenarios = [
+        ("both_on", True, True),
+        ("up_only", True, False),
+        ("dn_only", False, True),
+        ("both_off", False, False),
+    ]
 
-    for sp in setpoints:
-        overrides = _build_setpoint_overrides(up_now, dn_now, float(sp), float(sp))
+    results: dict[str, dict[str, float]] = {}
+    for label, up_on, dn_on in scenarios:
+        overrides = _build_heating_overrides(up_on, dn_on)
         X = base_row.copy()
         for col, val in overrides.items():
             if col in X.columns:
@@ -484,57 +460,56 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
         preds: dict[str, float] = {}
         for target, model in models.items():
             preds[target] = float(model.predict(X)[0])
-        results[sp] = preds
+        results[label] = preds
 
     # Print comparison table
     col_w = 10
     horizon_labels = {12: "1h", 24: "2h", 48: "4h", 72: "6h", 144: "12h"}
+    scenario_labels = ["both_on", "up_only", "dn_only", "both_off"]
 
     print(f"\n{'=' * 72}")
-    print("SETPOINT COUNTERFACTUALS (full model)")
+    print("HEATING COUNTERFACTUALS (full model)")
     print(f"{'=' * 72}")
-    print('  "What temperature will we reach if both thermostats are set to X?"')
-    print(f"  Current temps: up={up_now:.1f}\u00b0F, dn={dn_now:.1f}\u00b0F, out={_fmt_temp(out_now)}\n")
+    print('  "What temperatures if we turn heating on/off?"')
+    print(f"  Current: up={up_now:.1f}°F, dn={dn_now:.1f}°F, out={_fmt_temp(out_now)}\n")
 
-    sp_labels = [f"{sp}\u00b0F" for sp in setpoints]
-    header = f"  {'Zone':<14} {'':>4}" + "".join(f"{lbl:>{col_w}}" for lbl in sp_labels)
+    header = f"  {'Room':<14} {'':>4}" + "".join(f"{lbl:>{col_w}}" for lbl in scenario_labels)
     print(header)
-    print(f"  {'-' * (18 + col_w * len(setpoints))}")
+    print(f"  {'-' * (18 + col_w * len(scenario_labels))}")
 
     for room in PREDICTION_ROOMS:
         has_any = False
         for h in HORIZONS_5MIN:
             target = f"{room}_temp_t+{h}"
-            if not any(target in results[sp] for sp in setpoints):
+            if not any(target in results[s] for s in scenario_labels):
                 continue
             has_any = True
             row = f"  {room:<14} {horizon_labels[h]:>4}"
-            for sp in setpoints:
-                v = results[sp].get(target, float("nan"))
+            for s in scenario_labels:
+                v = results[s].get(target, float("nan"))
                 row += f"{_fmt_temp(v):>{col_w}}"
             print(row)
         if has_any:
             print()
 
-    # Delta table: difference from lowest setpoint
-    lo = setpoints[0]
-    print(f"  Delta vs setpoint={lo}\u00b0F:")
+    # Delta table: difference from both_off
+    print("  Delta vs both_off:")
     print(header)
-    print(f"  {'-' * (18 + col_w * len(setpoints))}")
+    print(f"  {'-' * (18 + col_w * len(scenario_labels))}")
 
     for room in PREDICTION_ROOMS:
         has_any = False
         for h in HORIZONS_5MIN:
             target = f"{room}_temp_t+{h}"
-            base_val = results[lo].get(target, float("nan"))
+            base_val = results["both_off"].get(target, float("nan"))
             if np.isnan(base_val):
                 continue
             has_any = True
             row = f"  {room:<14} {horizon_labels[h]:>4}"
-            for sp in setpoints:
-                v = results[sp].get(target, float("nan"))
+            for s in scenario_labels:
+                v = results[s].get(target, float("nan"))
                 delta = v - base_val
-                if sp == lo:
+                if s == "both_off":
                     row += f"{'---':>{col_w}}"
                 else:
                     row += f"{delta:>+{col_w}.2f}"
@@ -549,10 +524,10 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
             "upstairs_temp": up_now,
             "downstairs_temp": dn_now,
             "outdoor_temp": _round_or_none(out_now),
-            "upstairs_target": _round_or_none(up_target),
-            "downstairs_target": _round_or_none(dn_target),
+            "upstairs_action": str(up_action),
+            "downstairs_action": str(dn_action),
         },
-        "setpoints": {str(sp): {t: round(v, 2) for t, v in preds.items()} for sp, preds in results.items()},
+        "scenarios": {s: {t: round(v, 2) for t, v in p.items()} for s, p in results.items()},
     }
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -638,21 +613,14 @@ def main() -> None:
         "--counterfactual",
         "--cf",
         action="store_true",
-        help="Predict under different thermostat setpoint scenarios",
-    )
-    parser.add_argument(
-        "--setpoints",
-        type=str,
-        default=None,
-        help="Comma-separated setpoints to test, e.g. '68,70,72,74,76'",
+        help="Predict under all 4 binary heating on/off scenarios",
     )
     args = parser.parse_args()
 
     if args.snapshot:
         infer_snapshot()
     elif args.counterfactual:
-        sp = [int(s) for s in args.setpoints.split(",")] if args.setpoints else None
-        predict_counterfactual(setpoints=sp)
+        predict_counterfactual()
     else:
         predict_live()
 

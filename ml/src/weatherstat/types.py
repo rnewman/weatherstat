@@ -187,10 +187,12 @@ class ComfortSchedule:
 
 @dataclass(frozen=True)
 class ControlDecision:
-    """A single control decision: chosen setpoints and associated costs."""
+    """A single control decision: heating on/off and derived cautious setpoints."""
 
     timestamp: str
-    upstairs_setpoint: float
+    upstairs_heating: bool
+    downstairs_heating: bool
+    upstairs_setpoint: float  # derived: current ± CAUTIOUS_OFFSET
     downstairs_setpoint: float
     total_cost: float
     comfort_cost: float

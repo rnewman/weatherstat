@@ -28,7 +28,12 @@
       "Bash(uv run ruff format:*)",
       "Bash(sqlite3:*)",
       "Bash(just train-full:*)",
-      "mcp__Home_Assistant__ha_get_entity"
+      "mcp__Home_Assistant__ha_get_entity",
+      "Bash(just lint:*)",
+      "Bash(just extract:*)",
+      "Bash(just train-baseline:*)",
+      "Bash(just predict:*)",
+      "Bash(just typecheck:*)"
     ]
   }
 }

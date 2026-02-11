@@ -33,7 +33,7 @@ from weatherstat.config import (
     PREDICTIONS_DIR,
 )
 from weatherstat.inference import (
-    _build_setpoint_overrides,
+    _build_heating_overrides,
     _prepare_feature_row,
     build_features,
     fetch_recent_history,
@@ -50,13 +50,13 @@ from weatherstat.types import (
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-# Setpoint sweep range (°F)
-SETPOINT_MIN = 67
-SETPOINT_MAX = 76
-SETPOINT_STEP = 1
+# Cautious setpoint offset: when the control loop decides "heat on", we set the
+# thermostat to current_temp + CAUTIOUS_OFFSET. If the loop is interrupted, the
+# house drifts gently instead of running away to extreme temperatures.
+CAUTIOUS_OFFSET = 2  # °F above/below current temp
 
-# Absolute safety bounds
-ABSOLUTE_MIN = 65
+# Absolute safety bounds (in case of stale current_temp or other weirdness)
+ABSOLUTE_MIN = 62
 ABSOLUTE_MAX = 78
 
 # Minimum hold time before changing setpoints (seconds)
@@ -252,22 +252,30 @@ def compute_comfort_cost(
     return cost
 
 
-def compute_energy_cost(
-    up_setpoint: float,
-    dn_setpoint: float,
-    up_current: float,
-    dn_current: float,
-) -> float:
-    """Small energy penalty to prefer lower setpoints when comfort is equal."""
-    cost = ENERGY_PENALTY * max(0.0, up_setpoint - up_current)
-    cost += ENERGY_PENALTY * max(0.0, dn_setpoint - dn_current)
+def compute_energy_cost(up_heating: bool, dn_heating: bool) -> float:
+    """Small energy penalty to prefer heating off when comfort is equal."""
+    cost = 0.0
+    if up_heating:
+        cost += ENERGY_PENALTY
+    if dn_heating:
+        cost += ENERGY_PENALTY
     return cost
 
 
-# ── Setpoint search ───────────────────────────────────────────────────────
+def _cautious_setpoint(current_temp: float, heating: bool) -> float:
+    """Compute a cautious setpoint that achieves on/off without runaway risk.
+
+    If the control loop is interrupted, the thermostat will gently coast
+    instead of driving to an extreme temperature.
+    """
+    sp = current_temp + CAUTIOUS_OFFSET if heating else current_temp - CAUTIOUS_OFFSET
+    return max(ABSOLUTE_MIN, min(ABSOLUTE_MAX, sp))
 
 
-def sweep_setpoints(
+# ── Heating sweep ────────────────────────────────────────────────────────
+
+
+def sweep_heating(
     base_row: pd.DataFrame,
     feature_columns: list[str],
     models: dict[str, object],
@@ -276,28 +284,17 @@ def sweep_setpoints(
     schedules: list[ComfortSchedule],
     base_hour: int,
 ) -> ControlDecision:
-    """Sweep all setpoint pairs and return the best decision.
+    """Sweep all 4 binary heating combinations and return the best decision.
 
-    Args:
-        base_row: Single-row DataFrame of current features.
-        feature_columns: Feature column names expected by models.
-        models: Loaded LightGBM models keyed by target name.
-        up_current: Current upstairs temperature.
-        dn_current: Current downstairs temperature.
-        schedules: Comfort schedules.
-        base_hour: Current hour of day.
-
-    Returns:
-        ControlDecision with the best setpoint pair.
+    Thermostats are bang-bang controllers. The only real decision is
+    {upstairs on/off} × {downstairs on/off} = 4 combinations.
     """
     best_cost = float("inf")
     best_decision: ControlDecision | None = None
 
-    setpoints = list(range(SETPOINT_MIN, SETPOINT_MAX + 1, SETPOINT_STEP))
-
-    for up_sp in setpoints:
-        for dn_sp in setpoints:
-            overrides = _build_setpoint_overrides(up_current, dn_current, float(up_sp), float(dn_sp))
+    for up_on in [True, False]:
+        for dn_on in [True, False]:
+            overrides = _build_heating_overrides(up_on, dn_on)
             X = base_row.copy()
             for col, val in overrides.items():
                 if col in X.columns:
@@ -309,7 +306,7 @@ def sweep_setpoints(
                 predictions[target] = float(model.predict(X)[0])  # type: ignore[union-attr]
 
             comfort = compute_comfort_cost(predictions, schedules, base_hour)
-            energy = compute_energy_cost(float(up_sp), float(dn_sp), up_current, dn_current)
+            energy = compute_energy_cost(up_on, dn_on)
             total = comfort + energy
 
             if total < best_cost:
@@ -326,8 +323,10 @@ def sweep_setpoints(
                         room_preds[room] = rpred
                 best_decision = ControlDecision(
                     timestamp=datetime.now(UTC).isoformat(),
-                    upstairs_setpoint=float(up_sp),
-                    downstairs_setpoint=float(dn_sp),
+                    upstairs_heating=up_on,
+                    downstairs_heating=dn_on,
+                    upstairs_setpoint=_cautious_setpoint(up_current, up_on),
+                    downstairs_setpoint=_cautious_setpoint(dn_current, dn_on),
                     total_cost=round(total, 4),
                     comfort_cost=round(comfort, 4),
                     energy_cost=round(energy, 4),
@@ -335,8 +334,7 @@ def sweep_setpoints(
                 )
 
     if best_decision is None:
-        # Should not happen — setpoints list is non-empty
-        raise RuntimeError("No setpoint pairs evaluated")
+        raise RuntimeError("No heating combinations evaluated")
 
     return best_decision
 
@@ -538,11 +536,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Current hour for comfort schedule lookup
     base_hour = datetime.now(UTC).hour
 
-    # Sweep setpoints
+    # Sweep binary heating combinations (4 combos)
     schedules = default_comfort_schedules()
-    print("\n[control] Sweeping setpoints...")
+    print("\n[control] Sweeping heating on/off...")
     t0 = time.monotonic()
-    decision = sweep_setpoints(
+    decision = sweep_heating(
         base_row,
         feature_columns,
         models,
@@ -554,10 +552,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.1f}ms")
 
+    up_label = "ON" if decision.upstairs_heating else "OFF"
+    dn_label = "ON" if decision.downstairs_heating else "OFF"
+
     # Print decision
     print("\n[control] Decision:")
-    print(f"  Upstairs setpoint:  {decision.upstairs_setpoint:.0f}°F")
-    print(f"  Downstairs setpoint: {decision.downstairs_setpoint:.0f}°F")
+    print(f"  Upstairs heating:  {up_label} → setpoint {decision.upstairs_setpoint:.0f}°F")
+    print(f"  Downstairs heating: {dn_label} → setpoint {decision.downstairs_setpoint:.0f}°F")
     print(
         f"  Total cost: {decision.total_cost:.4f}"
         f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
@@ -575,27 +576,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Safety checks
     sane = check_prediction_sanity(decision, current_temps)
-    if not sane:
-        print("  Prediction sanity check FAILED — skipping execution")
-        if not live:
-            print("  (would skip in live mode; writing command anyway for inspection)")
-
-    # Clamp to absolute bounds
-    up_sp = max(ABSOLUTE_MIN, min(ABSOLUTE_MAX, decision.upstairs_setpoint))
-    dn_sp = max(ABSOLUTE_MIN, min(ABSOLUTE_MAX, decision.downstairs_setpoint))
-    if up_sp != decision.upstairs_setpoint or dn_sp != decision.downstairs_setpoint:
-        print(f"  Clamped setpoints: up={up_sp}°F, dn={dn_sp}°F")
-        # Rebuild with clamped values
-        decision = ControlDecision(
-            timestamp=decision.timestamp,
-            upstairs_setpoint=up_sp,
-            downstairs_setpoint=dn_sp,
-            total_cost=decision.total_cost,
-            comfort_cost=decision.comfort_cost,
-            energy_cost=decision.energy_cost,
-            room_predictions=decision.room_predictions,
-            dry_run=not live,
-        )
 
     # Extract current pass-through state for command JSON
     current_state: dict[str, object] = {

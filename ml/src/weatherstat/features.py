@@ -178,11 +178,13 @@ def encode_hvac_features(df: pd.DataFrame) -> pd.DataFrame:
 # ── Delta features ───────────────────────────────────────────────────────────
 
 def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add temperature delta features: (indoor - outdoor) and (target - current).
+    """Add temperature delta features.
 
     Indoor-outdoor delta captures heat loss driving force.
-    Target-current delta captures the gap the HVAC system is closing.
-    Room-zone-target delta captures how far each room is from its zone setpoint.
+    Mini split target-current delta captures the proportional control gap.
+
+    Thermostat target deltas are NOT included — thermostats are binary (on/off)
+    controllers, so the setpoint number is not a meaningful model input.
     """
     df = df.copy()
 
@@ -202,30 +204,14 @@ def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
             if col in df.columns:
                 df[f"{room}_outdoor_delta"] = df[col] - df["outdoor_temp"]
 
-    # HVAC target-current deltas (gap being closed by direct control)
-    target_pairs = [
-        ("thermostat_upstairs_target", "thermostat_upstairs_temp", "upstairs_target_delta"),
-        ("thermostat_downstairs_target", "thermostat_downstairs_temp", "downstairs_target_delta"),
+    # Mini split target-current deltas (proportional controllers — setpoint matters)
+    mini_split_pairs = [
         ("mini_split_bedroom_target", "mini_split_bedroom_temp", "bedroom_target_delta"),
         ("mini_split_living_room_target", "mini_split_living_room_temp", "living_room_target_delta"),
     ]
-    for target_col, temp_col, delta_name in target_pairs:
+    for target_col, temp_col, delta_name in mini_split_pairs:
         if target_col in df.columns and temp_col in df.columns:
             df[delta_name] = df[target_col] - df[temp_col]
-
-    # Room-to-zone thermostat target deltas (how far each room is from its zone setpoint)
-    room_zone_target = {
-        "bedroom": "thermostat_upstairs_target",
-        "kitchen": "thermostat_upstairs_target",
-        "piano": "thermostat_upstairs_target",
-        "bathroom": "thermostat_upstairs_target",
-        "family_room": "thermostat_downstairs_target",
-        "office": "thermostat_downstairs_target",
-    }
-    for room, target_col in room_zone_target.items():
-        temp_col = room_outdoor_cols[room]
-        if target_col in df.columns and temp_col in df.columns:
-            df[f"{room}_zone_target_delta"] = df[target_col] - df[temp_col]
 
     return df
 

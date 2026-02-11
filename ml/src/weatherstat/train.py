@@ -40,6 +40,11 @@ from weatherstat.features import (
 # Columns to exclude from features (identifiers, raw categoricals, targets)
 EXCLUDE_COLUMNS_BASE = {
     "timestamp",
+    # Thermostat setpoint numbers — thermostats are binary (on/off) controllers,
+    # the setpoint number is just the mechanism to achieve on/off.
+    # The actual control signal is thermostat_*_action_enc.
+    "thermostat_upstairs_target",
+    "thermostat_downstairs_target",
     # Raw categorical strings (encoded versions are used instead)
     "thermostat_upstairs_action",
     "thermostat_downstairs_action",
@@ -56,8 +61,6 @@ EXCLUDE_COLUMNS_BASE = {
 # Temperature columns are NOT included — those come from hourly statistics
 # (actual hourly means computed by HA, more accurate than resampled snapshots).
 HVAC_MERGE_COLUMNS = [
-    "thermostat_upstairs_target",
-    "thermostat_downstairs_target",
     "thermostat_upstairs_action",
     "thermostat_downstairs_action",
     "mini_split_bedroom_temp",
