@@ -104,6 +104,31 @@ control-live:
 execute:
     cd ha-client && npx tsx src/index.ts execute
 
+# ── Experiments ──────────────────────────────────────────────────────────
+
+# Create a git worktree for an experiment branch (shares data/)
+worktree NAME *PATH:
+    bash scripts/worktree.sh {{NAME}} {{PATH}}
+
+# Train both models into an experiment directory
+train-experiment NAME:
+    cd ml && uv run python -m weatherstat.train --mode baseline --experiment {{NAME}}
+    cd ml && uv run python -m weatherstat.train --mode full --experiment {{NAME}}
+
+# Train just the full model into an experiment directory
+train-experiment-full NAME:
+    cd ml && uv run python -m weatherstat.train --mode full --experiment {{NAME}}
+
+# Compare an experiment's models against production
+experiment-compare NAME:
+    cd ml && uv run python -m weatherstat.experiment compare {{NAME}}
+
+# List all experiments
+experiments:
+    cd ml && uv run python -m weatherstat.experiment list
+
+# ── Setup ────────────────────────────────────────────────────────────────
+
 # Install all dependencies
 install:
     cd ha-client && pnpm install

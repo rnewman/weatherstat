@@ -12,11 +12,21 @@
 - Evaluation framework comparing baseline vs full model
 
 ### Stage 2: Control Loop
-- Setpoint sweep over 81 upstairs/downstairs pairs
+- Setpoint sweep over thermostat pairs
 - Comfort schedules (per-room, time-of-day, asymmetric penalties)
 - Safety rails: setpoint clamps, hold time, staleness check, sanity limits
 - Dry-run mode (default) + live execution via HA services
 - Counterfactual analysis ("what if setpoints were X?")
+
+### Stage 3: Per-Room Models & Full HVAC Control
+- 8-room prediction: upstairs, downstairs, bedroom, kitchen, piano, bathroom, family_room, office
+- 5 horizons each (1h, 2h, 4h, 6h, 12h) → 40 models per training mode
+- Unified HVAC sweep: thermostats (4) × blowers (3^2) × mini-splits (3^2) = 180 combos (~2.4s)
+  - Physical constraint: blowers forced off when their zone's thermostat is off
+  - Mini-split sweep over off/heat/cool with fixed representative target; command target derived from comfort schedule midpoint post-sweep
+- Config-driven device lists (`BlowerConfig`, `MiniSplitConfig`) — adding a blower is a one-line change
+- Tiered energy cost: gas > heat pump > fan (tiebreaker when comfort is equal)
+- Executor handles all device types: thermostats, mini-splits (mode + target), blowers (off/low/high)
 
 ## In Progress
 
@@ -28,28 +38,34 @@
 
 ### Dry-Run Control Validation
 - Monitoring control loop decisions before going live
-- Verifying setpoint recommendations match physical intuition
+- Verifying recommendations match physical intuition (e.g. blower artifact caught and constrained)
 
 ## Near-Term
 
-### Per-Room Prediction
-- Extend models to predict office and bedroom temps (currently upstairs/downstairs only)
-- Requires enough blower/mini-split operational data to learn their effects
+### Experiment Infrastructure
+- Git worktrees sharing `data/` so experiments don't disrupt the running collector/control loop
+- Experiment-namespaced model directories (`data/models/{experiment}/`)
+- Eval harness comparing experiment models against production baseline
+- Enables physics features and MPC work in parallel without risk
 
-### Blower Control
-- Add blower fan speed to the control sweep (currently thermostats only)
-- Blower family room has ~6 weeks of data; blower office only ~2 weeks
-- Need per-room models before blowers can be usefully optimized
+### Human Advisory Mode
+- Notify when predicted conditions suggest human action the system can't take:
+  - "Open windows — outdoor temp is below indoor, free cooling available"
+  - "Close south blinds — afternoon solar will overshoot bedroom by 3°F"
+  - "Move to family room — office will be cold for the next 2 hours"
+- Triggers: predicted comfort breach that HVAC can't fix (or can only fix at high cost),
+  outdoor temp favorable for ventilation, solar angle + window orientation
+- Delivery: HA `persistent_notification` or mobile push via `notify` service
+  (both are `callService` calls the executor already supports)
+- Key design: notification fatigue avoidance — cooldown timers, severity thresholds,
+  "already acted" acknowledgment
 
 ### Physics-Informed Features
 - Heating/cooling rate (dT/dt), thermal deficit, estimated time-to-setpoint
 - Helps the model learn control-relevant dynamics without a physics simulation
+- Implement as an experiment branch first, promote if metrics improve
 
 ## Medium-Term
-
-### Mini Split Control
-- Include mini split modes/targets in the control sweep
-- Needs more varied mini split operational data (current data is mostly static settings)
 
 ### Hybrid Physics + ML
 - Blend ML predictions (good at short horizons) with exponential-decay physics model (long horizons)
@@ -60,17 +76,19 @@
 - Cron job or launchd plist to retrain weekly
 - Track model metrics over time to detect drift
 
-## Long-Term
-
-### Advisory Mode
-- Surface control recommendations in HA (notifications, dashboard cards)
-- "The model suggests lowering the thermostat — afternoon sun will overshoot"
-
 ### Full MPC
 - Model Predictive Control: optimize over multi-step HVAC trajectories
 - Exploration vs exploitation strategy for broadening training distribution
 - Multi-zone coordination (upstairs heat is ceiling heat for downstairs)
 
-### HA Integration
-- Package as a Home Assistant add-on or custom integration
-- Replace WebSocket/file-based communication with HA internal API
+## Long-Term
+
+### HA Packaging
+Three integration levels under consideration:
+- **Add-on** (Docker, easiest): package as-is, supervisor manages lifecycle, file-based IPC stays.
+  Lowest effort but clunky.
+- **Integration** (Python HA component): collector becomes `DataUpdateCoordinator`, predictions
+  stored as HA entities, control decisions as automations. Native but significant rewrite.
+- **Hybrid** (likely best): training stays external (too heavy for HA), inference + control
+  become a lightweight HA integration reading models from a shared volume.
+  Collector and executor merge into the integration, eliminating file-based IPC.

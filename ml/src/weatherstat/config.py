@@ -14,6 +14,15 @@ PREDICTIONS_DIR = DATA_DIR / "predictions"
 MODELS_DIR = DATA_DIR / "models"
 CONTROL_STATE_FILE = DATA_DIR / "control_state.json"
 
+
+def experiment_models_dir(name: str) -> Path:
+    """Return the models directory for a named experiment.
+
+    Production models live in data/models/. Experiments live in data/models/{name}/.
+    The control loop always reads from MODELS_DIR (production).
+    """
+    return MODELS_DIR / name
+
 # Snapshot collection interval (should match HA client config)
 SNAPSHOT_INTERVAL_SECONDS = 300
 

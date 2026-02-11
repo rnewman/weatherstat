@@ -47,6 +47,13 @@ just execute          # Apply latest command JSON to HA
 just lint             # Lint both packages
 just test             # Test both packages
 just typecheck        # TypeScript type-check
+
+# Experiments
+just worktree NAME    # Create git worktree for experiment branch
+just train-experiment NAME      # Train both models to data/models/{NAME}/
+just train-experiment-full NAME # Train full model to data/models/{NAME}/
+just experiment-compare NAME    # Compare experiment vs production
+just experiments      # List all experiments
 ```
 
 ## Key Documentation

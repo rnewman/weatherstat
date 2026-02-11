@@ -16,6 +16,7 @@ Run:
 
 import argparse
 import sys
+from pathlib import Path
 
 import lightgbm as lgb
 import pandas as pd
@@ -29,6 +30,7 @@ from weatherstat.config import (
     PREDICTION_ROOMS,
     SNAPSHOTS_DB,
     SNAPSHOTS_DIR,
+    experiment_models_dir,
 )
 from weatherstat.extract import load_collector_snapshots
 from weatherstat.features import (
@@ -214,8 +216,15 @@ def get_target_columns(zones: list[str], horizons: list[int]) -> list[str]:
     return [f"{zone}_temp_t+{h}" for zone in zones for h in horizons]
 
 
-def train_mode(mode: str) -> None:
-    """Run training for the specified mode."""
+def train_mode(mode: str, output_dir: Path | None = None) -> None:
+    """Run training for the specified mode.
+
+    Args:
+        mode: "baseline" or "full".
+        output_dir: Override model output directory (default: MODELS_DIR).
+            Used for experiment workflows to write to data/models/{experiment}/.
+    """
+    models_dir = output_dir or MODELS_DIR
     if mode == "baseline":
         df = load_baseline_data()
         horizons = HORIZONS_HOURLY
@@ -300,7 +309,9 @@ def train_mode(mode: str) -> None:
 
     print(f"Train: {len(X_train)} rows, Val: {len(X_val)} rows")
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    if models_dir != MODELS_DIR:
+        print(f"Experiment output: {models_dir}")
 
     results: list[dict[str, object]] = []
 
@@ -334,7 +345,7 @@ def train_mode(mode: str) -> None:
         })
 
         # Save model
-        model_path = MODELS_DIR / f"{model_prefix}_{target}_lgbm.txt"
+        model_path = models_dir / f"{model_prefix}_{target}_lgbm.txt"
         model.booster_.save_model(str(model_path))
         print(f"  Saved: {model_path.name}")
 
@@ -347,7 +358,7 @@ def train_mode(mode: str) -> None:
             print(f"    {feat}: {imp}")
 
     # Save feature columns for inference
-    feature_path = MODELS_DIR / f"{model_prefix}_feature_columns.txt"
+    feature_path = models_dir / f"{model_prefix}_feature_columns.txt"
     feature_path.write_text("\n".join(feature_cols))
 
     # Print summary
@@ -368,8 +379,15 @@ def main() -> None:
         required=True,
         help="Training mode: baseline (hourly temp-only) or full (5-min all features)",
     )
+    parser.add_argument(
+        "--experiment",
+        type=str,
+        default=None,
+        help="Write models to data/models/{name}/ instead of production",
+    )
     args = parser.parse_args()
-    train_mode(args.mode)
+    output_dir = experiment_models_dir(args.experiment) if args.experiment else None
+    train_mode(args.mode, output_dir=output_dir)
 
 
 if __name__ == "__main__":
