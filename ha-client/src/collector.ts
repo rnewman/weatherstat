@@ -153,7 +153,7 @@ async function writeSnapshot(snapshot: SnapshotRow, snapshotsDir: string): Promi
   const filepath = resolve(snapshotsDir, filename);
 
   const writer = await ParquetWriter.openFile(SNAPSHOT_SCHEMA, filepath);
-  await writer.appendRow(snapshot);
+  await writer.appendRow({ ...snapshot } as Record<string, unknown>);
   await writer.close();
   return filepath;
 }
