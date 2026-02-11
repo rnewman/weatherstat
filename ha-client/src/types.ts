@@ -136,6 +136,8 @@ export interface SnapshotRow {
   officeTemp: number;
   bedroomTemp: number;
   kitchenTemp: number;
+  pianoTemp: number;
+  bathroomTemp: number;
   livingRoomTemp: number;
 }
 

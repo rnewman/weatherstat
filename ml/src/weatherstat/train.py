@@ -23,13 +23,13 @@ from weatherstat.config import (
     LGBM_PARAMS,
     LGBM_PARAMS_SMALL,
     MODELS_DIR,
-    PREDICTION_ZONES,
+    PREDICTION_ROOMS,
     SNAPSHOTS_DB,
     SNAPSHOTS_DIR,
 )
 from weatherstat.extract import load_collector_snapshots
 from weatherstat.features import (
-    ZONE_TEMP_COLUMNS,
+    ROOM_TEMP_COLUMNS,
     add_future_targets,
     build_features,
 )
@@ -145,14 +145,36 @@ def train_mode(mode: str) -> None:
     df = build_features(df, mode=mode)
 
     # Add future temperature targets
-    df = add_future_targets(df, ZONE_TEMP_COLUMNS, horizons)
+    df = add_future_targets(df, ROOM_TEMP_COLUMNS, horizons)
 
-    target_cols = get_target_columns(PREDICTION_ZONES, horizons)
+    all_target_cols = get_target_columns(PREDICTION_ROOMS, horizons)
 
-    # Build exclude set: base excludes + all target columns
-    exclude = EXCLUDE_COLUMNS_BASE | set(target_cols)
+    # Filter to rooms with sufficient data (>50% non-NaN target values)
+    target_cols: list[str] = []
+    skipped_rooms: set[str] = set()
+    for col in all_target_cols:
+        if col not in df.columns:
+            room = col.rsplit("_temp_t+", 1)[0]
+            skipped_rooms.add(room)
+            continue
+        non_null_frac = df[col].notna().mean()
+        if non_null_frac < 0.5:
+            room = col.rsplit("_temp_t+", 1)[0]
+            skipped_rooms.add(room)
+        else:
+            target_cols.append(col)
 
-    # Drop rows with NaN (from lag/rolling/future shift)
+    if skipped_rooms:
+        print(f"Skipping rooms with insufficient data: {sorted(skipped_rooms)}")
+
+    if not target_cols:
+        print("Error: no rooms have sufficient data for training.", file=sys.stderr)
+        sys.exit(1)
+
+    # Build exclude set: base excludes + all possible target columns
+    exclude = EXCLUDE_COLUMNS_BASE | set(all_target_cols)
+
+    # Drop rows with NaN in trainable targets and features
     pre_drop = len(df)
     df = df.dropna(subset=target_cols)
     df = df.dropna()
@@ -170,7 +192,8 @@ def train_mode(mode: str) -> None:
 
     X = df[feature_cols]
     print(f"Features: {len(feature_cols)} columns")
-    print(f"Targets: {target_cols}")
+    n_rooms = len(target_cols) // len(horizons)
+    print(f"Targets: {len(target_cols)} ({n_rooms} rooms x {len(horizons)} horizons)")
 
     # Time-based train/test split (no shuffle — preserves temporal order)
     split_idx = int(len(X) * 0.8)

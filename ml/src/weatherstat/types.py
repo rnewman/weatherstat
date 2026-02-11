@@ -121,6 +121,8 @@ class SnapshotRow:
     office_temp: float
     bedroom_temp: float
     kitchen_temp: float
+    piano_temp: float
+    bathroom_temp: float
     living_room_temp: float
 
 

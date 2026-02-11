@@ -152,7 +152,11 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
 ROOM_TO_ZONE: dict[str, str] = {
     "upstairs": "upstairs",
     "bedroom": "upstairs",
+    "kitchen": "upstairs",
+    "piano": "upstairs",
+    "bathroom": "upstairs",
     "downstairs": "downstairs",
+    "family_room": "downstairs",
     "office": "downstairs",
 }
 
@@ -192,8 +196,13 @@ def compute_comfort_cost(
             if comfort is None:
                 continue
 
-            pred_key = f"{zone}_temp_t+{h}"
+            # Prefer room's own model prediction; fall back to zone thermostat prediction
+            room = schedule.room
+            pred_key = f"{room}_temp_t+{h}"
             pred_temp = predictions.get(pred_key)
+            if pred_temp is None:
+                pred_key = f"{zone}_temp_t+{h}"
+                pred_temp = predictions.get(pred_key)
             if pred_temp is None:
                 continue
 

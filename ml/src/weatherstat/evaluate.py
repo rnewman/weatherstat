@@ -14,11 +14,11 @@ from weatherstat.config import (
     HORIZONS_5MIN,
     HORIZONS_HOURLY,
     MODELS_DIR,
-    PREDICTION_ZONES,
+    PREDICTION_ROOMS,
     SNAPSHOTS_DIR,
 )
 from weatherstat.features import (
-    ZONE_TEMP_COLUMNS,
+    ROOM_TEMP_COLUMNS,
     add_future_targets,
     build_features,
 )
@@ -49,13 +49,24 @@ def evaluate_model(
         return None
 
     feature_cols = feature_path.read_text().strip().split("\n")
-    target_cols = _target_cols(PREDICTION_ZONES, horizons)
+    all_target_cols = _target_cols(PREDICTION_ROOMS, horizons)
 
     # Build features and targets
     df = build_features(df, mode=mode)
-    df = add_future_targets(df, ZONE_TEMP_COLUMNS, horizons)
+    df = add_future_targets(df, ROOM_TEMP_COLUMNS, horizons)
 
-    # Drop NaN
+    # Filter to targets that exist and have models
+    target_cols = [
+        t for t in all_target_cols
+        if t in df.columns
+        and (MODELS_DIR / f"{model_prefix}_{t}_lgbm.txt").exists()
+        and df[t].notna().mean() >= 0.5
+    ]
+    if not target_cols:
+        print("  No targets with sufficient data and trained models")
+        return None
+
+    # Drop NaN for available targets only
     df = df.dropna(subset=target_cols)
     df = df.dropna()
 
@@ -90,13 +101,13 @@ def evaluate_model(
         rmse = ((y_val - y_pred) ** 2).mean() ** 0.5
         mae = (y_val - y_pred).abs().mean()
 
-        # Parse zone and horizon from target name
+        # Parse room and horizon from target name
         parts = target.rsplit("_t+", 1)
-        zone = parts[0].replace("_temp", "")
+        room = parts[0].replace("_temp", "")
         horizon = parts[1] if len(parts) > 1 else "?"
 
         results.append({
-            "zone": zone,
+            "room": room,
             "horizon": horizon,
             "rmse": round(float(rmse), 4),
             "mae": round(float(mae), 4),
@@ -189,16 +200,16 @@ def main() -> None:
         fu_1h = full_results[full_results["horizon"] == "12"]
 
         if not bl_1h.empty and not fu_1h.empty:
-            for zone in PREDICTION_ZONES:
-                bl_row = bl_1h[bl_1h["zone"] == zone]
-                fu_row = fu_1h[fu_1h["zone"] == zone]
+            for room in PREDICTION_ROOMS:
+                bl_row = bl_1h[bl_1h["room"] == room]
+                fu_row = fu_1h[fu_1h["room"] == room]
                 if bl_row.empty or fu_row.empty:
                     continue
                 bl_rmse = float(bl_row["rmse"].iloc[0])
                 fu_rmse = float(fu_row["rmse"].iloc[0])
                 diff = fu_rmse - bl_rmse
                 better = "BETTER" if diff < 0 else "WORSE" if diff > 0 else "SAME"
-                print(f"  {zone} (1h): baseline={bl_rmse:.3f}, full={fu_rmse:.3f}, "
+                print(f"  {room} (1h): baseline={bl_rmse:.3f}, full={fu_rmse:.3f}, "
                       f"delta={diff:+.3f} ({better})")
         else:
             print("  Cannot compare — different horizon formats or missing data")

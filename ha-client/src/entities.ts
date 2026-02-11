@@ -24,6 +24,8 @@ export const TEMP_SENSORS = {
   office: "sensor.climate_office_air_temperature",
   kitchen: "sensor.kitchen_air_temperature",
   bedroom: "sensor.climate_bedroom_air_temperature",
+  piano: "sensor.climate_piano_air_temperature",
+  bathroom: "sensor.climate_bathroom_air_temperature",
   bedroom_aggregate: "sensor.bedroom_aggregate_temperature",
   living_room: "sensor.living_room_aggregate_temperature",
 } as const;

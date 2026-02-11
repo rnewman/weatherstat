@@ -23,25 +23,28 @@ from weatherstat.config import (
     HORIZONS_5MIN,
     HORIZONS_HOURLY,
     MODELS_DIR,
-    PREDICTION_ZONES,
+    PREDICTION_ROOMS,
     PREDICTIONS_DIR,
     SNAPSHOTS_DB,
 )
-from weatherstat.features import build_features
+from weatherstat.features import ROOM_TEMP_COLUMNS, build_features
 
 
 def _target_columns(horizons: list[int]) -> list[str]:
-    return [f"{zone}_temp_t+{h}" for zone in PREDICTION_ZONES for h in horizons]
+    return [f"{room}_temp_t+{h}" for room in PREDICTION_ROOMS for h in horizons]
 
 
 def load_models(prefix: str, horizons: list[int]) -> dict[str, lgb.Booster]:
-    """Load trained LightGBM models for all targets."""
+    """Load trained LightGBM models for all available targets.
+
+    Loads whatever models exist — rooms without trained models are skipped.
+    Returns empty dict only if no models exist at all.
+    """
     models: dict[str, lgb.Booster] = {}
     for target in _target_columns(horizons):
         model_path = MODELS_DIR / f"{prefix}_{target}_lgbm.txt"
-        if not model_path.exists():
-            return {}  # model set not available
-        models[target] = lgb.Booster(model_file=str(model_path))
+        if model_path.exists():
+            models[target] = lgb.Booster(model_file=str(model_path))
     return models
 
 
@@ -190,6 +193,8 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
         "office_temp",
         "kitchen_temp",
         "bedroom_temp",
+        "piano_temp",
+        "bathroom_temp",
         "living_room_temp",
         "outdoor_temp",
         "indoor_humidity",
@@ -290,31 +295,40 @@ def predict_live() -> None:
     print(f"\n{'=' * 58}")
     print("TEMPERATURE PREDICTIONS")
     print(f"{'=' * 58}")
-    print(f"  {'Zone':<14} {'Horizon':<10} {'Baseline':>10} {'Full':>10}")
+    print(f"  {'Room':<14} {'Horizon':<10} {'Baseline':>10} {'Full':>10}")
     print(f"  {'-' * 50}")
 
     horizon_labels = {1: "1h", 2: "2h", 4: "4h", 6: "6h", 12: "12h"}
 
-    for zone in PREDICTION_ZONES:
+    for room in PREDICTION_ROOMS:
+        has_any = False
         for bh, fh in zip(HORIZONS_HOURLY, HORIZONS_5MIN, strict=True):
-            b_key = f"{zone}_temp_t+{bh}"
-            f_key = f"{zone}_temp_t+{fh}"
+            b_key = f"{room}_temp_t+{bh}"
+            f_key = f"{room}_temp_t+{fh}"
             b_val = baseline_preds.get(b_key, float("nan")) if baseline_preds else float("nan")
             f_val = full_preds.get(f_key, float("nan")) if full_preds else float("nan")
+            if np.isnan(b_val) and np.isnan(f_val):
+                continue
+            has_any = True
             label = horizon_labels[bh]
-            print(f"  {zone:<14} {label:<10} {_fmt_temp(b_val):>10} {_fmt_temp(f_val):>10}")
+            print(f"  {room:<14} {label:<10} {_fmt_temp(b_val):>10} {_fmt_temp(f_val):>10}")
+        if has_any:
+            print()  # blank line between rooms
 
-    # Save prediction output
+    # Save prediction output — include per-room current temperatures
+    current: dict[str, object] = {
+        "outdoor_temp": _round_or_none(out_now),
+        "upstairs_action": str(up_action),
+        "downstairs_action": str(dn_action),
+        "weather": str(weather),
+    }
+    for room, col in ROOM_TEMP_COLUMNS.items():
+        val = latest_row.get(col)
+        current[f"{room}_temp"] = _round_or_none(val)
+
     output: dict[str, object] = {
         "timestamp": now_str,
-        "current": {
-            "upstairs_temp": _round_or_none(up_now),
-            "downstairs_temp": _round_or_none(dn_now),
-            "outdoor_temp": _round_or_none(out_now),
-            "upstairs_action": str(up_action),
-            "downstairs_action": str(dn_action),
-            "weather": str(weather),
-        },
+        "current": current,
         "baseline": {k: round(v, 2) for k, v in baseline_preds.items()} if baseline_preds else {},
         "full": {k: round(v, 2) for k, v in full_preds.items()} if full_preds else {},
     }
@@ -465,15 +479,20 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
     print(header)
     print(f"  {'-' * (18 + col_w * len(setpoints))}")
 
-    for zone in PREDICTION_ZONES:
+    for room in PREDICTION_ROOMS:
+        has_any = False
         for h in HORIZONS_5MIN:
-            target = f"{zone}_temp_t+{h}"
-            row = f"  {zone:<14} {horizon_labels[h]:>4}"
+            target = f"{room}_temp_t+{h}"
+            if not any(target in results[sp] for sp in setpoints):
+                continue
+            has_any = True
+            row = f"  {room:<14} {horizon_labels[h]:>4}"
             for sp in setpoints:
                 v = results[sp].get(target, float("nan"))
                 row += f"{_fmt_temp(v):>{col_w}}"
             print(row)
-        print()
+        if has_any:
+            print()
 
     # Delta table: difference from lowest setpoint
     lo = setpoints[0]
@@ -481,11 +500,15 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
     print(header)
     print(f"  {'-' * (18 + col_w * len(setpoints))}")
 
-    for zone in PREDICTION_ZONES:
+    for room in PREDICTION_ROOMS:
+        has_any = False
         for h in HORIZONS_5MIN:
-            target = f"{zone}_temp_t+{h}"
+            target = f"{room}_temp_t+{h}"
             base_val = results[lo].get(target, float("nan"))
-            row = f"  {zone:<14} {horizon_labels[h]:>4}"
+            if np.isnan(base_val):
+                continue
+            has_any = True
+            row = f"  {room:<14} {horizon_labels[h]:>4}"
             for sp in setpoints:
                 v = results[sp].get(target, float("nan"))
                 delta = v - base_val
@@ -494,7 +517,8 @@ def predict_counterfactual(setpoints: list[int] | None = None) -> None:
                 else:
                     row += f"{delta:>+{col_w}.2f}"
             print(row)
-        print()
+        if has_any:
+            print()
 
     # Save
     output: dict[str, object] = {

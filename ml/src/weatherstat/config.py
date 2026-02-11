@@ -30,8 +30,20 @@ HA_TOKEN = os.environ.get("HA_TOKEN", "")
 HORIZONS_5MIN = [12, 24, 48, 72, 144]  # 1h, 2h, 4h, 6h, 12h
 HORIZONS_HOURLY = [1, 2, 4, 6, 12]  # 1h, 2h, 4h, 6h, 12h
 
-# Zones to predict temperatures for
-PREDICTION_ZONES = ["upstairs", "downstairs"]
+# Rooms to predict temperatures for
+PREDICTION_ROOMS = [
+    "upstairs",
+    "downstairs",
+    "bedroom",
+    "kitchen",
+    "piano",
+    "bathroom",
+    "family_room",
+    "office",
+]
+
+# Backward-compatible alias
+PREDICTION_ZONES = PREDICTION_ROOMS
 
 # LightGBM training parameters — conservative for small datasets
 LGBM_PARAMS: dict[str, object] = {

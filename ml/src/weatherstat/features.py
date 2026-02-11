@@ -33,6 +33,8 @@ TEMP_COLUMNS_FULL = [
     "office_temp",
     "kitchen_temp",
     "bedroom_temp",
+    "piano_temp",
+    "bathroom_temp",
     "living_room_temp",
     "outdoor_temp",
 ]
@@ -47,15 +49,26 @@ TEMP_COLUMNS_HOURLY = [
     "office_temp",
     "kitchen_temp",
     "bedroom_temp",
+    "piano_temp",
+    "bathroom_temp",
     "living_room_temp",
     "outdoor_temp",
 ]
 
-# Zone temperature columns used as prediction targets
-ZONE_TEMP_COLUMNS = {
+# Room temperature columns used as prediction targets
+ROOM_TEMP_COLUMNS = {
     "upstairs": "thermostat_upstairs_temp",
     "downstairs": "thermostat_downstairs_temp",
+    "bedroom": "bedroom_temp",
+    "kitchen": "kitchen_temp",
+    "piano": "piano_temp",
+    "bathroom": "bathroom_temp",
+    "family_room": "family_room_temp",
+    "office": "office_temp",
 }
+
+# Backward-compatible alias
+ZONE_TEMP_COLUMNS = ROOM_TEMP_COLUMNS
 
 # Lag and rolling parameters — adjusted per data frequency
 LAG_PERIODS_5MIN = [1, 3, 6, 12]  # 5min, 15min, 30min, 1hr
@@ -169,20 +182,27 @@ def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
 
     Indoor-outdoor delta captures heat loss driving force.
     Target-current delta captures the gap the HVAC system is closing.
+    Room-zone-target delta captures how far each room is from its zone setpoint.
     """
     df = df.copy()
 
-    # Indoor-outdoor deltas (heat loss driving force)
-    indoor_cols = {
+    # Indoor-outdoor deltas for all rooms (heat loss driving force)
+    room_outdoor_cols = {
         "upstairs": "thermostat_upstairs_temp",
         "downstairs": "thermostat_downstairs_temp",
+        "bedroom": "bedroom_temp",
+        "kitchen": "kitchen_temp",
+        "piano": "piano_temp",
+        "bathroom": "bathroom_temp",
+        "family_room": "family_room_temp",
+        "office": "office_temp",
     }
     if "outdoor_temp" in df.columns:
-        for zone, col in indoor_cols.items():
+        for room, col in room_outdoor_cols.items():
             if col in df.columns:
-                df[f"{zone}_outdoor_delta"] = df[col] - df["outdoor_temp"]
+                df[f"{room}_outdoor_delta"] = df[col] - df["outdoor_temp"]
 
-    # Target-current deltas (gap being closed)
+    # HVAC target-current deltas (gap being closed by direct control)
     target_pairs = [
         ("thermostat_upstairs_target", "thermostat_upstairs_temp", "upstairs_target_delta"),
         ("thermostat_downstairs_target", "thermostat_downstairs_temp", "downstairs_target_delta"),
@@ -192,6 +212,20 @@ def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
     for target_col, temp_col, delta_name in target_pairs:
         if target_col in df.columns and temp_col in df.columns:
             df[delta_name] = df[target_col] - df[temp_col]
+
+    # Room-to-zone thermostat target deltas (how far each room is from its zone setpoint)
+    room_zone_target = {
+        "bedroom": "thermostat_upstairs_target",
+        "kitchen": "thermostat_upstairs_target",
+        "piano": "thermostat_upstairs_target",
+        "bathroom": "thermostat_upstairs_target",
+        "family_room": "thermostat_downstairs_target",
+        "office": "thermostat_downstairs_target",
+    }
+    for room, target_col in room_zone_target.items():
+        temp_col = room_outdoor_cols[room]
+        if target_col in df.columns and temp_col in df.columns:
+            df[f"{room}_zone_target_delta"] = df[target_col] - df[temp_col]
 
     return df
 
@@ -311,8 +345,8 @@ def build_features(
 
         # Indoor-outdoor delta if outdoor_temp available
         if "outdoor_temp" in df.columns:
-            for zone, col in ZONE_TEMP_COLUMNS.items():
+            for room, col in ROOM_TEMP_COLUMNS.items():
                 if col in df.columns:
-                    df[f"{zone}_outdoor_delta"] = df[col] - df["outdoor_temp"]
+                    df[f"{room}_outdoor_delta"] = df[col] - df["outdoor_temp"]
 
     return df

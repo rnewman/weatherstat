@@ -59,6 +59,8 @@ const SNAPSHOT_COLUMNS = [
   "office_temp",
   "bedroom_temp",
   "kitchen_temp",
+  "piano_temp",
+  "bathroom_temp",
   "living_room_temp",
 ] as const;
 
@@ -92,6 +94,8 @@ const CAMEL_TO_SNAKE: Record<string, string> = {
   officeTemp: "office_temp",
   bedroomTemp: "bedroom_temp",
   kitchenTemp: "kitchen_temp",
+  pianoTemp: "piano_temp",
+  bathroomTemp: "bathroom_temp",
   livingRoomTemp: "living_room_temp",
 };
 
@@ -126,6 +130,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
   office_temp REAL,
   bedroom_temp REAL,
   kitchen_temp REAL,
+  piano_temp REAL,
+  bathroom_temp REAL,
   living_room_temp REAL
 )`;
 
@@ -144,6 +150,16 @@ function getDb(dbPath: string): DatabaseType {
   _db = new Database(dbPath);
   _db.pragma("journal_mode = WAL");
   _db.exec(CREATE_TABLE_SQL);
+
+  // Migrate existing databases: add new columns if missing
+  for (const col of ["piano_temp", "bathroom_temp"]) {
+    try {
+      _db.exec(`ALTER TABLE snapshots ADD COLUMN ${col} REAL`);
+    } catch {
+      // Column already exists — ignore
+    }
+  }
+
   return _db;
 }
 
@@ -230,6 +246,8 @@ async function buildSnapshot(client: HAClient): Promise<SnapshotRow> {
     officeTemp: getSensorNum(TEMP_SENSORS.office, 0),
     bedroomTemp: getSensorNum(TEMP_SENSORS.bedroom, 0),
     kitchenTemp: getSensorNum(TEMP_SENSORS.kitchen, 0),
+    pianoTemp: getSensorNum(TEMP_SENSORS.piano, 0),
+    bathroomTemp: getSensorNum(TEMP_SENSORS.bathroom, 0),
     livingRoomTemp: getSensorNum(TEMP_SENSORS.living_room, 0),
   };
 }
