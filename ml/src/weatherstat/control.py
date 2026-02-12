@@ -86,6 +86,12 @@ HORIZON_WEIGHTS: dict[int, float] = {
     144: 0.3,  # 12h (low weight — far out, less reliable)
 }
 
+# Minimum cost improvement over all-off required to justify active HVAC.
+# Prevents noise-driven decisions when model predictions barely differ between
+# scenarios. Equivalent to requiring ~1°F of genuine comfort improvement at
+# one horizon before turning on heating.
+MIN_IMPROVEMENT = 1.0
+
 # Control loop interval
 LOOP_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 
@@ -279,6 +285,26 @@ def compute_energy_cost(scenario: HVACScenario) -> float:
     return cost
 
 
+def _zone_comfort_max(zone: str, schedules: list[ComfortSchedule], hour: int) -> float:
+    """Get the comfort max for a zone's primary thermostat at the given hour."""
+    for s in schedules:
+        if s.room == zone:
+            c = s.comfort_at(hour)
+            if c is not None:
+                return c.max_temp
+    return ABSOLUTE_MAX
+
+
+def _zone_comfort_min(zone: str, schedules: list[ComfortSchedule], hour: int) -> float:
+    """Get the comfort min for a zone's primary thermostat at the given hour."""
+    for s in schedules:
+        if s.room == zone:
+            c = s.comfort_at(hour)
+            if c is not None:
+                return c.min_temp
+    return ABSOLUTE_MIN
+
+
 def _cautious_setpoint(current_temp: float, heating: bool) -> float:
     """Compute a cautious setpoint that achieves on/off without runaway risk.
 
@@ -343,16 +369,75 @@ def sweep_scenarios(
     up_current: float,
     dn_current: float,
     current_split_temps: dict[str, float],
+    current_temps: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
 ) -> ControlDecision:
     """Sweep all HVAC combinations and return the best decision.
 
     Unified sweep over thermostats × blowers × mini-splits.
+    Physical constraints prune the search space before the sweep.
     """
     scenarios = generate_scenarios()
+    pre_count = len(scenarios)
+    blocked_reasons: list[str] = []
+
+    # ── Physical constraint 1: zone thermostat at/above comfort max ────
+    # Heating a zone when the thermostat already exceeds comfort is wasteful.
+    up_max = _zone_comfort_max("upstairs", schedules, base_hour)
+    dn_max = _zone_comfort_max("downstairs", schedules, base_hour)
+    up_allow = up_current < up_max
+    dn_allow = dn_current < dn_max
+    if not up_allow or not dn_allow:
+        scenarios = [
+            s for s in scenarios
+            if (up_allow or not s.upstairs_heating) and (dn_allow or not s.downstairs_heating)
+        ]
+        if not up_allow:
+            blocked_reasons.append(f"upstairs at/above max ({up_current:.1f}°F >= {up_max:.0f}°F)")
+        if not dn_allow:
+            blocked_reasons.append(f"downstairs at/above max ({dn_current:.1f}°F >= {dn_max:.0f}°F)")
+
+    # ── Physical constraint 2: thermal direction ────
+    # If no room is currently below its comfort min (looking at all future
+    # horizons' schedules), heating serves no purpose. The 15-min control
+    # loop will re-evaluate if temps drop.
+    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
+    any_room_cold = False
+    for schedule in schedules:
+        room = schedule.room
+        temp = current_temps.get(room)
+        if temp is None:
+            continue
+        for h in CONTROL_HORIZONS:
+            hours_ahead = horizon_hours.get(h, h // 12)
+            future_hour = (base_hour + hours_ahead) % 24
+            comfort = schedule.comfort_at(future_hour)
+            if comfort is not None and temp < comfort.min_temp:
+                any_room_cold = True
+                break
+        if any_room_cold:
+            break
+
+    if not any_room_cold and (up_allow or dn_allow):
+        scenarios = [s for s in scenarios if not s.upstairs_heating and not s.downstairs_heating]
+        blocked_reasons.append("no room below comfort min")
+
+    if blocked_reasons:
+        print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
+        print(f"  Reduced scenarios: {pre_count} → {len(scenarios)}")
+
     best_cost = float("inf")
     best_decision: ControlDecision | None = None
+    off_decision: ControlDecision | None = None  # Track all-off for comparison
+
+    def _is_all_off(s: HVACScenario) -> bool:
+        return (
+            not s.upstairs_heating
+            and not s.downstairs_heating
+            and all(b.mode == "off" for b in s.blowers)
+            and all(sp.mode == "off" for sp in s.mini_splits)
+        )
 
     for scenario in scenarios:
         overrides = build_hvac_overrides(scenario, current_split_temps)
@@ -370,51 +455,67 @@ def sweep_scenarios(
         energy = compute_energy_cost(scenario)
         total = comfort + energy
 
+        room_preds: dict[str, dict[str, float]] = {}
+        for room in PREDICTION_ROOMS:
+            rpred: dict[str, float] = {}
+            for h in CONTROL_HORIZONS:
+                key = f"{room}_temp_t+{h}"
+                val = predictions.get(key)
+                if val is not None:
+                    rpred[HORIZON_LABELS[h]] = round(val, 2)
+            if rpred:
+                room_preds[room] = rpred
+
+        # Compute mini-split command targets from comfort schedule midpoints
+        final_splits: list[MiniSplitDecision] = []
+        for sd in scenario.mini_splits:
+            if sd.mode == "off":
+                final_splits.append(sd)
+            else:
+                target_temp = MINI_SPLIT_SWEEP_TARGET  # fallback
+                for sched in schedules:
+                    if sched.room == sd.name:
+                        comfort_entry = sched.comfort_at(base_hour)
+                        if comfort_entry is not None:
+                            target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
+                        break
+                final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
+
+        decision = ControlDecision(
+            timestamp=datetime.now(UTC).isoformat(),
+            upstairs_heating=scenario.upstairs_heating,
+            downstairs_heating=scenario.downstairs_heating,
+            upstairs_setpoint=_cautious_setpoint(up_current, scenario.upstairs_heating),
+            downstairs_setpoint=_cautious_setpoint(dn_current, scenario.downstairs_heating),
+            blowers=scenario.blowers,
+            mini_splits=tuple(final_splits),
+            total_cost=round(total, 4),
+            comfort_cost=round(comfort, 4),
+            energy_cost=round(energy, 4),
+            room_predictions=room_preds,
+        )
+
+        if _is_all_off(scenario):
+            off_decision = decision
+
         if total < best_cost:
             best_cost = total
-            room_preds: dict[str, dict[str, float]] = {}
-            for room in PREDICTION_ROOMS:
-                rpred: dict[str, float] = {}
-                for h in CONTROL_HORIZONS:
-                    key = f"{room}_temp_t+{h}"
-                    val = predictions.get(key)
-                    if val is not None:
-                        rpred[HORIZON_LABELS[h]] = round(val, 2)
-                if rpred:
-                    room_preds[room] = rpred
-
-            # Compute mini-split command targets from comfort schedule midpoints
-            final_splits: list[MiniSplitDecision] = []
-            for sd in scenario.mini_splits:
-                if sd.mode == "off":
-                    final_splits.append(sd)
-                else:
-                    # Derive command target from room's comfort schedule midpoint
-                    target_temp = MINI_SPLIT_SWEEP_TARGET  # fallback
-                    for sched in schedules:
-                        if sched.room == sd.name:
-                            comfort_entry = sched.comfort_at(base_hour)
-                            if comfort_entry is not None:
-                                target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
-                            break
-                    final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
-
-            best_decision = ControlDecision(
-                timestamp=datetime.now(UTC).isoformat(),
-                upstairs_heating=scenario.upstairs_heating,
-                downstairs_heating=scenario.downstairs_heating,
-                upstairs_setpoint=_cautious_setpoint(up_current, scenario.upstairs_heating),
-                downstairs_setpoint=_cautious_setpoint(dn_current, scenario.downstairs_heating),
-                blowers=scenario.blowers,
-                mini_splits=tuple(final_splits),
-                total_cost=round(total, 4),
-                comfort_cost=round(comfort, 4),
-                energy_cost=round(energy, 4),
-                room_predictions=room_preds,
-            )
+            best_decision = decision
 
     if best_decision is None:
         raise RuntimeError("No HVAC scenarios evaluated")
+
+    # Minimum improvement safeguard: only choose an active HVAC scenario if it
+    # improves total cost over all-off by at least MIN_IMPROVEMENT. Prevents
+    # noise-driven decisions when the model barely differentiates scenarios.
+    if off_decision is not None and best_decision is not off_decision:
+        improvement = off_decision.total_cost - best_decision.total_cost
+        if improvement < MIN_IMPROVEMENT:
+            print(
+                f"  Reverting to all-off: improvement {improvement:.3f}"
+                f" < threshold {MIN_IMPROVEMENT:.1f}"
+            )
+            best_decision = off_decision
 
     return best_decision
 
@@ -669,6 +770,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         up_current,
         dn_current,
         current_split_temps,
+        current_temps,
         schedules,
         base_hour,
     )
@@ -694,15 +796,50 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
     )
 
-    # Per-room prediction table
+    # Per-room prediction table (decision vs all-off baseline)
     horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
-    header = f"  {'Room':<14}" + "".join(f"{h:>8}" for h in horizons)
-    print("\n  Predicted temperatures:")
+
+    # Compute all-off baseline prediction for comparison
+    all_off = HVACScenario(
+        False, False,
+        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+        tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
+    )
+    off_overrides = build_hvac_overrides(all_off, current_split_temps)
+    X_off = base_row.copy()
+    for col, val in off_overrides.items():
+        if col in X_off.columns:
+            X_off[col] = val
+    off_preds: dict[str, float] = {}
+    for target, model in models.items():
+        off_preds[target] = float(model.predict(X_off)[0])  # type: ignore[union-attr]
+    off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
+
+    print(f"\n  All-off baseline: comfort={off_comfort:.4f}")
+
+    header = f"  {'Room':<14}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
+    print("\n  Predicted temperatures (decision vs all-off):")
     print(header)
-    print(f"  {'-' * (14 + 8 * len(horizons))}")
-    for room, preds in decision.room_predictions.items():
-        vals = "".join(f"{preds.get(h, float('nan')):>7.1f}°" for h in horizons)
-        print(f"  {room:<14}{vals}")
+    print(f"  {'-' * (14 + 18 * len(horizons))}")
+    for room in PREDICTION_ROOMS:
+        dec_vals = decision.room_predictions.get(room, {})
+        row = f"  {room:<14}"
+        has_any = False
+        for h_step, h_label in zip(CONTROL_HORIZONS, horizons, strict=True):
+            dec_t = dec_vals.get(h_label)
+            off_key = f"{room}_temp_t+{h_step}"
+            off_t = off_preds.get(off_key)
+            if dec_t is not None:
+                has_any = True
+                row += f"{dec_t:>8.1f}°"
+            else:
+                row += f"{'--':>9}"
+            if off_t is not None:
+                row += f"{off_t:>8.1f}°"
+            else:
+                row += f"{'--':>9}"
+        if has_any:
+            print(row)
 
     # Safety checks
     sane = check_prediction_sanity(decision, current_temps)
