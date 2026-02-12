@@ -14,6 +14,7 @@ SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 SNAPSHOTS_DB = SNAPSHOTS_DIR / "snapshots.db"
 PREDICTIONS_DIR = DATA_DIR / "predictions"
 MODELS_DIR = DATA_DIR / "models"
+METRICS_DIR = DATA_DIR / "metrics"
 CONTROL_STATE_FILE = DATA_DIR / "control_state.json"
 ADVISORY_STATE_FILE = DATA_DIR / "advisory_state.json"
 

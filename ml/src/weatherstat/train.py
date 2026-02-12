@@ -15,7 +15,10 @@ Run:
 """
 
 import argparse
+import json
+import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import lightgbm as lgb
@@ -26,6 +29,7 @@ from weatherstat.config import (
     HORIZONS_HOURLY,
     LGBM_PARAMS,
     LGBM_PARAMS_SMALL,
+    METRICS_DIR,
     MODELS_DIR,
     PREDICTION_ROOMS,
     SNAPSHOTS_DB,
@@ -186,6 +190,52 @@ def get_target_columns(zones: list[str], horizons: list[int]) -> list[str]:
     return [f"{zone}_temp_t+{h}" for zone in zones for h in horizons]
 
 
+def _git_short_hash() -> str | None:
+    """Return the short git commit hash, or None if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+def _save_metrics(
+    mode: str,
+    experiment: str | None,
+    results: list[dict[str, object]],
+    n_features: int,
+    n_rows_raw: int,
+    data_start: str,
+    data_end: str,
+) -> None:
+    """Write a timestamped metrics JSON to data/metrics/."""
+    now = datetime.now(UTC)
+    ts_label = now.strftime("%Y-%m-%dT%H%M%S")
+
+    metrics = {
+        "timestamp": now.isoformat(),
+        "mode": mode,
+        "experiment": experiment,
+        "git_hash": _git_short_hash(),
+        "data": {
+            "rows_raw": n_rows_raw,
+            "rows_train": results[0]["n_train"] if results else 0,
+            "rows_val": results[0]["n_val"] if results else 0,
+            "n_features": n_features,
+            "date_range": [data_start, data_end],
+        },
+        "targets": results,
+    }
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    path = METRICS_DIR / f"{mode}_{ts_label}.json"
+    path.write_text(json.dumps(metrics, indent=2))
+    print(f"Metrics saved to {path}")
+
+
 def train_mode(mode: str, output_dir: Path | None = None) -> None:
     """Run training for the specified mode.
 
@@ -214,6 +264,11 @@ def train_mode(mode: str, output_dir: Path | None = None) -> None:
     else:
         print(f"Unknown mode: {mode}", file=sys.stderr)
         sys.exit(1)
+
+    # Capture data date range before any row drops
+    data_start = str(df["timestamp"].min())
+    data_end = str(df["timestamp"].max())
+    n_rows_raw = len(df)
 
     # Feature engineering
     print(f"\nBuilding features (mode={mode})...")
@@ -306,12 +361,19 @@ def train_mode(mode: str, output_dir: Path | None = None) -> None:
         print(f"  RMSE: {rmse:.3f} F")
         print(f"  MAE:  {mae:.3f} F")
 
+        # Feature importance (top 10)
+        importance = pd.Series(
+            model.feature_importances_, index=feature_cols
+        ).sort_values(ascending=False)
+        top_features = {str(feat): int(imp) for feat, imp in importance.head(10).items()}
+
         results.append({
             "target": target,
             "rmse": round(rmse, 4),
             "mae": round(mae, 4),
             "n_train": len(X_train),
             "n_val": len(X_val),
+            "top_features": top_features,
         })
 
         # Save model
@@ -319,12 +381,8 @@ def train_mode(mode: str, output_dir: Path | None = None) -> None:
         model.booster_.save_model(str(model_path))
         print(f"  Saved: {model_path.name}")
 
-        # Feature importance (top 10)
-        importance = pd.Series(
-            model.feature_importances_, index=feature_cols
-        ).sort_values(ascending=False)
         print("  Top 10 features:")
-        for feat, imp in importance.head(10).items():
+        for feat, imp in top_features.items():
             print(f"    {feat}: {imp}")
 
     # Save feature columns for inference
@@ -336,8 +394,20 @@ def train_mode(mode: str, output_dir: Path | None = None) -> None:
     print(f"TRAINING SUMMARY ({mode} mode)")
     print(f"{'=' * 60}")
     results_df = pd.DataFrame(results)
-    print(results_df.to_string(index=False))
+    print(results_df[["target", "rmse", "mae", "n_train", "n_val"]].to_string(index=False))
     print(f"\nFeature columns saved to {feature_path}")
+
+    # ── Save metrics JSON ──
+    _save_metrics(
+        mode=mode,
+        experiment=output_dir.name if output_dir and output_dir != MODELS_DIR else None,
+        results=results,
+        n_features=len(feature_cols),
+        n_rows_raw=n_rows_raw,
+        data_start=data_start,
+        data_end=data_end,
+    )
+
     print("Training complete!")
 
 

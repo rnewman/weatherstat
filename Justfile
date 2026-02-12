@@ -42,6 +42,10 @@ retrain: extract train
 evaluate:
     cd ml && uv run python -m weatherstat.evaluate
 
+# View training metrics (latest summary, history, or compare two runs)
+metrics *ARGS:
+    cd ml && uv run python -m weatherstat.metrics {{ARGS}}
+
 # Visualize extracted data
 visualize *ARGS:
     cd ml && uv run python -m weatherstat.visualize {{ARGS}}
@@ -126,6 +130,25 @@ experiment-compare NAME:
 # List all experiments
 experiments:
     cd ml && uv run python -m weatherstat.experiment list
+
+# ── Retraining ─────────────────────────────────────────────────────────
+
+# Run manual retrain (extract + train, with logging)
+retrain-manual:
+    bash scripts/run-retrain.sh
+
+# Install weekly retrain launchd agent (Sunday 3 AM)
+retrain-install:
+    mkdir -p ~/Library/LaunchAgents
+    cp com.twinql.weatherstat.retrain.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.twinql.weatherstat.retrain.plist
+    @echo "Retrain agent installed (Sunday 3:00 AM)"
+
+# Uninstall weekly retrain launchd agent
+retrain-uninstall:
+    -launchctl unload ~/Library/LaunchAgents/com.twinql.weatherstat.retrain.plist
+    rm -f ~/Library/LaunchAgents/com.twinql.weatherstat.retrain.plist
+    @echo "Retrain agent uninstalled"
 
 # ── Setup ────────────────────────────────────────────────────────────────
 

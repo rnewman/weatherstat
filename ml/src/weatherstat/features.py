@@ -168,6 +168,57 @@ def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── Physics-informed features ──────────────────────────────────────────────
+
+
+def add_physics_features(df: pd.DataFrame, mode: str = "full") -> pd.DataFrame:
+    """Add physics-informed features capturing thermal dynamics.
+
+    - dT/dt: temperature rate of change (°F/hr) at multiple windows
+    - d²T/dt²: thermal acceleration (rate of rate change)
+    - Heating power interaction: action × outdoor_delta
+
+    These help the model learn control-relevant dynamics — "the room is warming
+    at 1°F/hr" predicts future temps better than just the current reading.
+    """
+    df = df.copy()
+
+    # Time step in hours (for normalizing rates to °F/hr)
+    if mode == "full":
+        dt_hours = 5.0 / 60.0  # 5 minutes
+        rate_periods = [1, 3, 6, 12]  # 5min, 15min, 30min, 1hr
+    else:
+        dt_hours = 1.0  # 1 hour
+        rate_periods = [1, 2, 3, 6]  # 1hr, 2hr, 3hr, 6hr
+
+    temp_cols = [c for c in _CFG.room_temp_columns.values() if c in df.columns]
+    if "outdoor_temp" in df.columns:
+        temp_cols.append("outdoor_temp")
+
+    # dT/dt at multiple windows (°F/hr)
+    for col in temp_cols:
+        for period in rate_periods:
+            window_hours = period * dt_hours
+            rate = df[col].diff(period) / window_hours
+            df[f"{col}_rate_{period}"] = rate
+
+    # d²T/dt² — thermal acceleration (only for the shortest window to avoid noise)
+    for col in temp_cols:
+        rate_col = f"{col}_rate_{rate_periods[0]}"
+        if rate_col in df.columns:
+            df[f"{col}_accel"] = df[rate_col].diff(1)
+
+    # Heating power interaction: action × outdoor_delta
+    # Captures "how hard is the heating system working against the cold?"
+    for name in _CFG.thermostats:
+        action_col = f"thermostat_{name}_action_enc"
+        delta_col = f"{name}_outdoor_delta"
+        if action_col in df.columns and delta_col in df.columns:
+            df[f"{name}_heating_power"] = df[action_col] * df[delta_col]
+
+    return df
+
+
 # ── Lag and rolling features ────────────────────────────────────────────────
 
 def add_lag_features(
@@ -270,6 +321,9 @@ def build_features(
         # Delta features (only in full mode)
         df = add_delta_features(df)
 
+        # Physics-informed features (dT/dt, acceleration, heating power)
+        df = add_physics_features(df, mode="full")
+
         # Temperature lags and rolling at 5-min intervals
         temp_cols = [c for c in TEMP_COLUMNS_FULL if c in df.columns]
         df = add_lag_features(df, temp_cols, LAG_PERIODS_5MIN)
@@ -281,6 +335,9 @@ def build_features(
 
         # Delta features (target-current, indoor-outdoor, room-zone)
         df = add_delta_features(df)
+
+        # Physics-informed features (dT/dt, acceleration, heating power)
+        df = add_physics_features(df, mode="baseline")
 
         # Temperature lags and rolling at hourly intervals
         temp_cols = [c for c in TEMP_COLUMNS_HOURLY if c in df.columns]
