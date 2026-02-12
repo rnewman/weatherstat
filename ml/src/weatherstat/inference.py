@@ -34,6 +34,9 @@ from weatherstat.config import (
 )
 from weatherstat.features import ROOM_TEMP_COLUMNS, build_features
 from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision
+from weatherstat.yaml_config import load_config
+
+_CFG = load_config()
 
 
 def _target_columns(horizons: list[int]) -> list[str]:
@@ -172,14 +175,7 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
             result[col] = s.reindex(time_index, method="ffill")
 
     # Process window sensors → per-window columns + any_window_open
-    window_column_map = {
-        "binary_sensor.window_basement_intrusion": "window_basement_open",
-        "binary_sensor.window_family_room_intrusion": "window_family_room_open",
-        "binary_sensor.window_balcony_intrusion": "window_balcony_open",
-        "binary_sensor.window_bedroom_intrusion": "window_bedroom_open",
-        "binary_sensor.window_office_window_door_is_open": "window_office_open",
-        "binary_sensor.kitchen_window_sensor_intrusion": "window_kitchen_open",
-    }
+    window_column_map = _CFG.window_column_map
     window_cols_present: list[str] = []
     for entity_id, col_name in window_column_map.items():
         records = window_history.get(entity_id, [])
@@ -200,31 +196,8 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
     result = result.reset_index()
     result["timestamp"] = result["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
-    # Ensure numeric columns
-    numeric_cols = [
-        "thermostat_upstairs_temp",
-        "thermostat_downstairs_temp",
-        "upstairs_aggregate_temp",
-        "downstairs_aggregate_temp",
-        "family_room_temp",
-        "office_temp",
-        "kitchen_temp",
-        "bedroom_temp",
-        "piano_temp",
-        "bathroom_temp",
-        "living_room_temp",
-        "outdoor_temp",
-        "indoor_humidity",
-        "navien_heat_capacity",
-        "outdoor_humidity",
-        "outdoor_wind_speed",
-        "thermostat_upstairs_target",
-        "thermostat_downstairs_target",
-        "mini_split_bedroom_temp",
-        "mini_split_bedroom_target",
-        "mini_split_living_room_temp",
-        "mini_split_living_room_target",
-    ]
+    # Ensure numeric columns (from YAML config)
+    numeric_cols = _CFG.numeric_extract_columns
     for col in numeric_cols:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce")
@@ -628,15 +601,7 @@ def load_latest_snapshots(n_rows: int = 48) -> pd.DataFrame:
     df = df.iloc[::-1].reset_index(drop=True)
 
     # Convert window columns from INTEGER back to bool
-    for col in [
-        "window_basement_open",
-        "window_family_room_open",
-        "window_balcony_open",
-        "window_bedroom_open",
-        "window_office_open",
-        "window_kitchen_open",
-        "any_window_open",
-    ]:
+    for col in _CFG.window_bool_columns:
         if col in df.columns:
             df[col] = df[col].astype(bool)
 

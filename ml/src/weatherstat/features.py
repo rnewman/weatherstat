@@ -9,63 +9,30 @@ import pandas as pd
 from astral import LocationInfo
 from astral.sun import azimuth, elevation
 
-from weatherstat.config import LATITUDE, LONGITUDE
 from weatherstat.weather import add_weather_features
+from weatherstat.yaml_config import load_config
 
-# Location for solar calculations
+_CFG = load_config()
+
+# Location for solar calculations (from YAML config)
 _LOCATION = LocationInfo(
     name="Home",
     region="US",
-    timezone="America/Los_Angeles",
-    latitude=LATITUDE,
-    longitude=LONGITUDE,
+    timezone=_CFG.location.timezone,
+    latitude=_CFG.location.latitude,
+    longitude=_CFG.location.longitude,
 )
 
-# ── Column groupings ────────────────────────────────────────────────────────
+# ── Column groupings (from YAML config) ──────────────────────────────────────
 
 # All temperature columns available in the full snapshot schema
-TEMP_COLUMNS_FULL = [
-    "thermostat_upstairs_temp",
-    "thermostat_downstairs_temp",
-    "upstairs_aggregate_temp",
-    "downstairs_aggregate_temp",
-    "family_room_temp",
-    "office_temp",
-    "kitchen_temp",
-    "bedroom_temp",
-    "piano_temp",
-    "bathroom_temp",
-    "living_room_temp",
-    "outdoor_temp",
-]
+TEMP_COLUMNS_FULL = _CFG.all_temp_columns
 
-# Temperature columns available in hourly statistics (subset of full)
-TEMP_COLUMNS_HOURLY = [
-    "thermostat_upstairs_temp",
-    "thermostat_downstairs_temp",
-    "upstairs_aggregate_temp",
-    "downstairs_aggregate_temp",
-    "family_room_temp",
-    "office_temp",
-    "kitchen_temp",
-    "bedroom_temp",
-    "piano_temp",
-    "bathroom_temp",
-    "living_room_temp",
-    "outdoor_temp",
-]
+# Temperature columns available in hourly statistics (same set — all have statistics)
+TEMP_COLUMNS_HOURLY = _CFG.all_temp_columns
 
 # Room temperature columns used as prediction targets
-ROOM_TEMP_COLUMNS = {
-    "upstairs": "thermostat_upstairs_temp",
-    "downstairs": "thermostat_downstairs_temp",
-    "bedroom": "bedroom_temp",
-    "kitchen": "kitchen_temp",
-    "piano": "piano_temp",
-    "bathroom": "bathroom_temp",
-    "family_room": "family_room_temp",
-    "office": "office_temp",
-}
+ROOM_TEMP_COLUMNS = _CFG.room_temp_columns
 
 # Backward-compatible alias
 ZONE_TEMP_COLUMNS = ROOM_TEMP_COLUMNS
@@ -139,35 +106,34 @@ def encode_hvac_features(df: pd.DataFrame) -> pd.DataFrame:
     - Mini split modes: off=0, heat=1, cool=-1, fan_only=0.5, dry=0.25, auto=0.5
     - Blower modes: off=0, low=1, high=2
     - Navien heating mode: Space Heating=1, Idle=0
+
+    Column lists and encoding maps are driven by YAML config.
     """
     df = df.copy()
 
     # Thermostat actions
     action_map = {"heating": 1, "idle": 0, "off": 0}
-    for col in ["thermostat_upstairs_action", "thermostat_downstairs_action"]:
+    for col in _CFG.thermostat_action_columns:
         if col in df.columns:
             df[f"{col}_enc"] = df[col].map(action_map).fillna(0).astype(float)
 
-    # Mini split modes
-    split_mode_map = {
-        "off": 0, "heat": 1, "cool": -1, "fan_only": 0.5,
-        "dry": 0.25, "auto": 0.5, "heat_cool": 0.5,
-    }
-    for col in ["mini_split_bedroom_mode", "mini_split_living_room_mode"]:
+    # Mini split modes (encoding from YAML)
+    split_mode_map = next(iter(_CFG.mini_splits.values())).mode_encoding
+    for col in _CFG.mini_split_mode_columns:
         if col in df.columns:
             df[f"{col}_enc"] = df[col].map(split_mode_map).fillna(0).astype(float)
 
-    # Blower modes
-    blower_map = {"off": 0, "low": 1, "high": 2}
-    for col in ["blower_family_room_mode", "blower_office_mode"]:
+    # Blower modes (encoding from YAML)
+    blower_map = next(iter(_CFG.blowers.values())).level_encoding
+    for col in _CFG.blower_mode_columns:
         if col in df.columns:
             df[f"{col}_enc"] = df[col].map(blower_map).fillna(0).astype(float)
 
-    # Navien heating mode
+    # Navien heating mode (encoding from YAML)
     if "navien_heating_mode" in df.columns:
         df["navien_heating_mode_enc"] = (
             df["navien_heating_mode"]
-            .map({"Space Heating": 1, "Idle": 0})
+            .map(_CFG.boiler.mode_encoding)
             .fillna(0)
             .astype(float)
         )
@@ -188,28 +154,14 @@ def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # Indoor-outdoor deltas for all rooms (heat loss driving force)
-    room_outdoor_cols = {
-        "upstairs": "thermostat_upstairs_temp",
-        "downstairs": "thermostat_downstairs_temp",
-        "bedroom": "bedroom_temp",
-        "kitchen": "kitchen_temp",
-        "piano": "piano_temp",
-        "bathroom": "bathroom_temp",
-        "family_room": "family_room_temp",
-        "office": "office_temp",
-    }
+    # Indoor-outdoor deltas for all rooms (heat loss driving force, from YAML config)
     if "outdoor_temp" in df.columns:
-        for room, col in room_outdoor_cols.items():
+        for room, col in _CFG.room_temp_columns.items():
             if col in df.columns:
                 df[f"{room}_outdoor_delta"] = df[col] - df["outdoor_temp"]
 
     # Mini split target-current deltas (proportional controllers — setpoint matters)
-    mini_split_pairs = [
-        ("mini_split_bedroom_target", "mini_split_bedroom_temp", "bedroom_target_delta"),
-        ("mini_split_living_room_target", "mini_split_living_room_temp", "living_room_target_delta"),
-    ]
-    for target_col, temp_col, delta_name in mini_split_pairs:
+    for target_col, temp_col, delta_name in _CFG.mini_split_delta_pairs:
         if target_col in df.columns and temp_col in df.columns:
             df[delta_name] = df[target_col] - df[temp_col]
 

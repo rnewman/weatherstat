@@ -144,21 +144,39 @@ def evaluate_close_windows(
 # ── HA notification dispatch ─────────────────────────────────────────────
 
 
-def send_ha_notification(advisory: Advisory) -> bool:
-    """Send a persistent notification to Home Assistant.
+def send_ha_notification(advisory: Advisory, target: str = "persistent_notification") -> bool:
+    """Send a notification to Home Assistant.
 
-    Uses notification_id so new notifications replace old ones (no stacking).
+    Dispatches to the appropriate HA service based on the target:
+    - "persistent_notification" → persistent_notification/create (sidebar)
+    - "notify.mobile_app_*" → notify/mobile_app_* (mobile push)
+    - "notify.*" → notify/* (notification group)
+
+    Uses notification_id/tag so new notifications replace old ones (no stacking).
     Returns True on success, False on failure (logged but not raised).
     """
-    url = f"{HA_URL}/api/services/persistent_notification/create"
+    tag = f"weatherstat_{advisory.advisory_type.value}"
+
+    if target == "persistent_notification":
+        service = "persistent_notification/create"
+        payload: dict[str, object] = {
+            "title": advisory.title,
+            "message": advisory.message,
+            "notification_id": tag,
+        }
+    else:
+        # notify.mobile_app_foo → notify/mobile_app_foo
+        service = target.replace(".", "/", 1)
+        payload = {
+            "title": advisory.title,
+            "message": advisory.message,
+            "data": {"tag": tag},
+        }
+
+    url = f"{HA_URL}/api/services/{service}"
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
         "Content-Type": "application/json",
-    }
-    payload = {
-        "title": advisory.title,
-        "message": advisory.message,
-        "notification_id": f"weatherstat_{advisory.advisory_type.value}",
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
@@ -178,6 +196,7 @@ def process_advisories(
     window_states: dict[str, bool],
     heating_active: bool,
     live: bool = False,
+    notification_target: str = "persistent_notification",
 ) -> list[Advisory]:
     """Evaluate all advisory rules, apply cooldowns, and dispatch notifications.
 
@@ -187,6 +206,7 @@ def process_advisories(
         window_states: Window name → open boolean for each window sensor.
         heating_active: Whether either thermostat zone is heating.
         live: If True, send HA notifications and persist cooldown state.
+        notification_target: HA service target (from YAML config).
 
     Returns:
         List of advisories that were triggered (regardless of cooldown/send status).
@@ -211,9 +231,9 @@ def process_advisories(
             continue
 
         print(f"  {advisory.advisory_type}: {advisory.message}")
-        if live and send_ha_notification(advisory):
+        if live and send_ha_notification(advisory, target=notification_target):
             state[advisory.advisory_type.value] = time.time()
-            print("  → Sent to HA")
+            print(f"  → Sent to HA ({notification_target})")
 
     if not triggered:
         print("  No advisories triggered")

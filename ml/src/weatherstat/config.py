@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from weatherstat.yaml_config import load_config as _load_config
+
 # Project root is three levels up from this file (ml/src/weatherstat/config.py)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -27,11 +29,15 @@ def experiment_models_dir(name: str) -> Path:
 # Snapshot collection interval (should match HA client config)
 SNAPSHOT_INTERVAL_SECONDS = 300
 
-# Location for solar position calculations (Seattle)
-LATITUDE = 47.66
-LONGITUDE = -122.40
-ELEVATION = 30.0  # meters
-TIMEZONE = "America/Los_Angeles"
+# ── Config-driven constants (from weatherstat.yaml) ───────────────────────
+
+_CFG = _load_config()
+
+# Location for solar position calculations
+LATITUDE = _CFG.location.latitude
+LONGITUDE = _CFG.location.longitude
+ELEVATION = _CFG.location.elevation
+TIMEZONE = _CFG.location.timezone
 
 # Home Assistant connection (shared .env with TS client)
 HA_URL = os.environ.get("HA_URL", "")
@@ -42,17 +48,8 @@ HA_TOKEN = os.environ.get("HA_TOKEN", "")
 HORIZONS_5MIN = [12, 24, 48, 72, 144]  # 1h, 2h, 4h, 6h, 12h
 HORIZONS_HOURLY = [1, 2, 4, 6, 12]  # 1h, 2h, 4h, 6h, 12h
 
-# Rooms to predict temperatures for
-PREDICTION_ROOMS = [
-    "upstairs",
-    "downstairs",
-    "bedroom",
-    "kitchen",
-    "piano",
-    "bathroom",
-    "family_room",
-    "office",
-]
+# Rooms to predict temperatures for (from YAML config)
+PREDICTION_ROOMS = _CFG.prediction_rooms
 
 # Backward-compatible alias
 PREDICTION_ZONES = PREDICTION_ROOMS
@@ -84,57 +81,58 @@ class MiniSplitConfig:
     command_target_key: str  # e.g. "miniSplitBedroomTarget"
 
 
-BLOWERS: tuple[BlowerConfig, ...] = (
+def _snake_to_camel(s: str) -> str:
+    """Convert snake_case to camelCase."""
+    parts = s.split("_")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+
+# Build BlowerConfig from YAML
+BLOWERS: tuple[BlowerConfig, ...] = tuple(
     BlowerConfig(
-        name="family_room",
-        feature_col="blower_family_room_mode_enc",
-        command_key="blowerFamilyRoomMode",
-    ),
-    BlowerConfig(
-        name="office",
-        feature_col="blower_office_mode_enc",
-        command_key="blowerOfficeMode",
-    ),
+        name=name,
+        feature_col=f"blower_{name}_mode_enc",
+        command_key=_snake_to_camel(f"blower_{name}_mode"),
+        zone=cfg.zone,
+        levels=cfg.levels,
+    )
+    for name, cfg in _CFG.blowers.items()
 )
 
-MINI_SPLITS: tuple[MiniSplitConfig, ...] = (
+# Build MiniSplitConfig from YAML
+MINI_SPLITS: tuple[MiniSplitConfig, ...] = tuple(
     MiniSplitConfig(
-        name="bedroom",
-        mode_feature_col="mini_split_bedroom_mode_enc",
-        target_feature_col="mini_split_bedroom_target",
-        delta_feature_col="bedroom_target_delta",
-        temp_col="mini_split_bedroom_temp",
-        command_mode_key="miniSplitBedroomMode",
-        command_target_key="miniSplitBedroomTarget",
-    ),
-    MiniSplitConfig(
-        name="living_room",
-        mode_feature_col="mini_split_living_room_mode_enc",
-        target_feature_col="mini_split_living_room_target",
-        delta_feature_col="living_room_target_delta",
-        temp_col="mini_split_living_room_temp",
-        command_mode_key="miniSplitLivingRoomMode",
-        command_target_key="miniSplitLivingRoomTarget",
-    ),
+        name=name,
+        mode_feature_col=f"mini_split_{name}_mode_enc",
+        target_feature_col=f"mini_split_{name}_target",
+        delta_feature_col=f"{name}_target_delta",
+        temp_col=f"mini_split_{name}_temp",
+        command_mode_key=_snake_to_camel(f"mini_split_{name}_mode"),
+        command_target_key=_snake_to_camel(f"mini_split_{name}_target"),
+    )
+    for name, cfg in _CFG.mini_splits.items()
 )
 
-# Mini-split modes swept during control (skip auto/fan_only/dry — not temperature control)
-MINI_SPLIT_SWEEP_MODES: tuple[str, ...] = ("off", "heat", "cool")
+# Mini-split modes swept during control (from YAML)
+MINI_SPLIT_SWEEP_MODES: tuple[str, ...] = next(iter(_CFG.mini_splits.values())).sweep_modes
 
 # Representative target for model override during sweep.
 # The actual command target is derived post-sweep from the comfort schedule midpoint.
 MINI_SPLIT_SWEEP_TARGET = 72.0
 
-# Mini-split mode encoding (matches features.py split_mode_map)
-MINI_SPLIT_MODE_ENC: dict[str, float] = {"off": 0.0, "heat": 1.0, "cool": -1.0}
+# Mini-split mode encoding (from YAML, filtered to sweep modes for control)
+MINI_SPLIT_MODE_ENC: dict[str, float] = {
+    mode: enc for mode, enc in next(iter(_CFG.mini_splits.values())).mode_encoding.items()
+    if mode in MINI_SPLIT_SWEEP_MODES
+}
 
-# Blower mode encoding (matches features.py blower_map)
-BLOWER_MODE_ENC: dict[str, float] = {"off": 0.0, "low": 1.0, "high": 2.0}
+# Blower mode encoding (from YAML)
+BLOWER_MODE_ENC: dict[str, float] = next(iter(_CFG.blowers.values())).level_encoding
 
-# Energy cost per device-state (tiebreaker when comfort is equal)
-ENERGY_COST_GAS_ZONE = 0.010  # Navien via thermostat — highest
-ENERGY_COST_MINI_SPLIT = 0.005  # Heat pump — efficient but uses electricity
-ENERGY_COST_BLOWER: dict[str, float] = {"off": 0.0, "low": 0.001, "high": 0.002}
+# Energy cost per device-state (from YAML, tiebreaker when comfort is equal)
+ENERGY_COST_GAS_ZONE = _CFG.energy_costs.gas_zone
+ENERGY_COST_MINI_SPLIT = _CFG.energy_costs.mini_split
+ENERGY_COST_BLOWER: dict[str, float] = _CFG.energy_costs.blower
 
 
 # LightGBM training parameters — conservative for small datasets

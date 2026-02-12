@@ -23,66 +23,20 @@ import requests
 import websockets.client
 
 from weatherstat.config import HA_TOKEN, HA_URL, SNAPSHOTS_DB, SNAPSHOTS_DIR
+from weatherstat.yaml_config import load_config
 
-# ── Entity definitions ──────────────────────────────────────────────────────
+_CFG = load_config()
 
-# Temperature sensors with long-term statistics (hourly)
-STATISTICS_ENTITIES: dict[str, str] = {
-    "thermostat_upstairs_temp": "sensor.upstairs_thermostat_air_temperature",
-    "thermostat_downstairs_temp": "sensor.downstairs_thermostat_air_temperature",
-    "upstairs_aggregate_temp": "sensor.upstairs_temperatures",
-    "downstairs_aggregate_temp": "sensor.downstairs_temperatures",
-    "family_room_temp": "sensor.climate_family_room_air_temperature",
-    "office_temp": "sensor.climate_office_air_temperature",
-    "kitchen_temp": "sensor.kitchen_air_temperature",
-    "bedroom_temp": "sensor.climate_bedroom_air_temperature",
-    "piano_temp": "sensor.climate_piano_air_temperature",
-    "bathroom_temp": "sensor.climate_bathroom_air_temperature",
-    "living_room_temp": "sensor.living_room_aggregate_temperature",
-    "outdoor_temp": "sensor.climate_side_air_temperature",
-    "indoor_humidity": "sensor.upstairs_thermostat_humidity",
-}
+# ── Entity definitions (from YAML config) ──────────────────────────────────
 
-# Climate entities (thermostats, mini splits) — raw history only
-CLIMATE_ENTITIES: dict[str, str] = {
-    "thermostat_upstairs": "climate.upstairs_thermostat",
-    "thermostat_downstairs": "climate.downstairs_thermostat",
-    "mini_split_bedroom": "climate.m5nanoc6_bed_split_bedroom_split",
-    "mini_split_living_room": "climate.m5nanoc6_lr_split_living_room_split",
-}
+STATISTICS_ENTITIES: dict[str, str] = _CFG.statistics_entities
+CLIMATE_ENTITIES: dict[str, str] = _CFG.climate_entities
+FAN_ENTITIES: dict[str, str] = _CFG.fan_entities
+SENSOR_ENTITIES: dict[str, str] = _CFG.sensor_entities
+WEATHER_ENTITY = _CFG.weather_entity
+WINDOW_SENSORS = _CFG.window_sensors
 
-# Fan entities (blowers)
-FAN_ENTITIES: dict[str, str] = {
-    "blower_family_room": "fan.blower_1",
-    "blower_office": "fan.blower_office",
-}
-
-# Sensor entities (Navien, weather)
-SENSOR_ENTITIES: dict[str, str] = {
-    "navien_heating_mode": "sensor.navien_navien_heating_mode",
-    "navien_heat_capacity": "sensor.navien_navien_heat_capacity",
-}
-
-WEATHER_ENTITY = "weather.forecast_home"
-
-WINDOW_SENSORS = [
-    "binary_sensor.window_basement_intrusion",
-    "binary_sensor.window_family_room_intrusion",
-    "binary_sensor.window_balcony_intrusion",
-    "binary_sensor.window_bedroom_intrusion",
-    "binary_sensor.window_office_window_door_is_open",
-    "binary_sensor.kitchen_window_sensor_intrusion",
-]
-
-# All entities for raw history extraction
-ALL_HISTORY_ENTITIES: list[str] = [
-    *STATISTICS_ENTITIES.values(),
-    *CLIMATE_ENTITIES.values(),
-    *FAN_ENTITIES.values(),
-    *SENSOR_ENTITIES.values(),
-    WEATHER_ENTITY,
-    *WINDOW_SENSORS,
-]
+ALL_HISTORY_ENTITIES: list[str] = _CFG.all_history_entities
 
 
 # ── HA API helpers ───────────────────────────────────────────────────────────
@@ -510,14 +464,7 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
             result[col] = s.reindex(time_index, method="ffill")
 
     # 8. Process window sensors → per-window columns + any_window_open
-    window_column_map = {
-        "binary_sensor.window_basement_intrusion": "window_basement_open",
-        "binary_sensor.window_family_room_intrusion": "window_family_room_open",
-        "binary_sensor.window_balcony_intrusion": "window_balcony_open",
-        "binary_sensor.window_bedroom_intrusion": "window_bedroom_open",
-        "binary_sensor.window_office_window_door_is_open": "window_office_open",
-        "binary_sensor.kitchen_window_sensor_intrusion": "window_kitchen_open",
-    }
+    window_column_map = _CFG.window_column_map
     window_cols_present: list[str] = []
     for entity_id, col_name in window_column_map.items():
         records = window_history.get(entity_id, [])
@@ -538,31 +485,8 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
     result = result.reset_index()
     result["timestamp"] = result["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
-    # Ensure numeric columns are float
-    numeric_cols = [
-        "thermostat_upstairs_temp",
-        "thermostat_downstairs_temp",
-        "upstairs_aggregate_temp",
-        "downstairs_aggregate_temp",
-        "family_room_temp",
-        "office_temp",
-        "kitchen_temp",
-        "bedroom_temp",
-        "piano_temp",
-        "bathroom_temp",
-        "living_room_temp",
-        "outdoor_temp",
-        "indoor_humidity",
-        "navien_heat_capacity",
-        "outdoor_humidity",
-        "outdoor_wind_speed",
-        "thermostat_upstairs_target",
-        "thermostat_downstairs_target",
-        "mini_split_bedroom_temp",
-        "mini_split_bedroom_target",
-        "mini_split_living_room_temp",
-        "mini_split_living_room_target",
-    ]
+    # Ensure numeric columns are float (from YAML config)
+    numeric_cols = _CFG.numeric_extract_columns
     for col in numeric_cols:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce")
@@ -601,15 +525,7 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
     df = pd.read_sql("SELECT * FROM snapshots ORDER BY timestamp", conn)
     conn.close()
 
-    for col in [
-        "window_basement_open",
-        "window_family_room_open",
-        "window_balcony_open",
-        "window_bedroom_open",
-        "window_office_open",
-        "window_kitchen_open",
-        "any_window_open",
-    ]:
+    for col in _CFG.window_bool_columns:
         if col in df.columns:
             df[col] = df[col].astype(bool)
 

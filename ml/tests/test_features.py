@@ -80,9 +80,9 @@ def test_add_delta_features() -> None:
     assert list(result["upstairs_outdoor_delta"]) == [32.0, 31.0, 33.0]
     assert list(result["downstairs_outdoor_delta"]) == [30.0, 29.0, 31.0]
 
-    # Target-current delta
-    assert list(result["upstairs_target_delta"]) == [1.0, 0.0, 2.0]
-    assert list(result["downstairs_target_delta"]) == [1.0, 0.0, 2.0]
+    # Thermostat target deltas are NOT computed (thermostats are binary on/off)
+    assert "upstairs_target_delta" not in result.columns
+    assert "downstairs_target_delta" not in result.columns
 
 
 def test_add_future_targets() -> None:
@@ -167,7 +167,8 @@ def test_build_features_full_mode() -> None:
 
     # Should have delta features
     assert "upstairs_outdoor_delta" in result.columns
-    assert "upstairs_target_delta" in result.columns
+    # Thermostat target deltas are NOT computed (only mini-split target deltas)
+    assert "upstairs_target_delta" not in result.columns
 
     # Should have weather features
     assert "weather_condition_code" in result.columns

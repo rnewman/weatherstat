@@ -38,54 +38,17 @@ from weatherstat.features import (
     add_future_targets,
     build_features,
 )
+from weatherstat.yaml_config import load_config
 
-# Columns to exclude from features (identifiers, raw categoricals, targets)
-EXCLUDE_COLUMNS_BASE = {
-    "timestamp",
-    # Thermostat setpoint numbers — thermostats are binary (on/off) controllers,
-    # the setpoint number is just the mechanism to achieve on/off.
-    # The actual control signal is thermostat_*_action_enc.
-    "thermostat_upstairs_target",
-    "thermostat_downstairs_target",
-    # Raw categorical strings (encoded versions are used instead)
-    "thermostat_upstairs_action",
-    "thermostat_downstairs_action",
-    "mini_split_bedroom_mode",
-    "mini_split_living_room_mode",
-    "blower_family_room_mode",
-    "blower_office_mode",
-    "navien_heating_mode",
-    "weather_condition",
-}
+_CFG = load_config()
 
+# Columns to exclude from features (from YAML config: identifiers, raw categoricals, targets)
+EXCLUDE_COLUMNS_BASE = _CFG.exclude_columns
 
-# HVAC columns to merge from full-feature sources into baseline hourly data.
+# HVAC columns to merge from full-feature sources into baseline hourly data (from YAML config).
 # Temperature columns are NOT included — those come from hourly statistics
 # (actual hourly means computed by HA, more accurate than resampled snapshots).
-HVAC_MERGE_COLUMNS = [
-    "thermostat_upstairs_action",
-    "thermostat_downstairs_action",
-    "mini_split_bedroom_temp",
-    "mini_split_bedroom_target",
-    "mini_split_bedroom_mode",
-    "mini_split_living_room_temp",
-    "mini_split_living_room_target",
-    "mini_split_living_room_mode",
-    "blower_family_room_mode",
-    "blower_office_mode",
-    "navien_heating_mode",
-    "navien_heat_capacity",
-    "weather_condition",
-    "wind_speed",
-    "outdoor_humidity",
-    "window_basement_open",
-    "window_family_room_open",
-    "window_balcony_open",
-    "window_bedroom_open",
-    "window_office_open",
-    "window_kitchen_open",
-    "any_window_open",
-]
+HVAC_MERGE_COLUMNS = _CFG.hvac_merge_columns
 
 
 def _resample_to_hourly(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -210,15 +173,7 @@ def load_full_data() -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
 
     # Normalize window columns to bool (INTEGER in SQLite, bool in Parquet)
-    for col in [
-        "window_basement_open",
-        "window_family_room_open",
-        "window_balcony_open",
-        "window_bedroom_open",
-        "window_office_open",
-        "window_kitchen_open",
-        "any_window_open",
-    ]:
+    for col in _CFG.window_bool_columns:
         if col in df.columns:
             df[col] = df[col].astype(bool)
 

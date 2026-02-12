@@ -56,6 +56,9 @@ from weatherstat.types import (
     MiniSplitDecision,
     RoomComfort,
 )
+from weatherstat.yaml_config import load_config
+
+_CFG = load_config()
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -106,108 +109,31 @@ HORIZON_LABELS: dict[int, str] = {12: "1h", 24: "2h", 48: "4h", 72: "6h", 144: "
 
 
 def default_comfort_schedules() -> list[ComfortSchedule]:
-    """Initial comfort profiles from user preferences.
+    """Comfort profiles from YAML config.
 
-    All 8 rooms have schedules so the optimizer considers whole-house comfort.
-    Rooms without direct HVAC control (kitchen, piano, bathroom) use lighter
-    penalties — there's only so much the thermostats can do for them.
+    All rooms with schedules are included so the optimizer considers whole-house comfort.
+    Rooms without direct HVAC control use lighter penalties — there's only so much
+    the thermostats can do for them.
     """
-    return [
-        ComfortSchedule(
-            room="upstairs",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 70.0, 74.0)),),
-        ),
-        ComfortSchedule(
-            room="downstairs",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("downstairs", 70.0, 74.0)),),
-        ),
-        ComfortSchedule(
-            room="office",
-            entries=(
-                ComfortScheduleEntry(
-                    8,
-                    18,
-                    RoomComfort("office", 70.0, 74.0, cold_penalty=2.0, hot_penalty=2.0),
-                ),
-                ComfortScheduleEntry(
-                    18,
-                    8,
-                    RoomComfort("office", 67.0, 76.0, cold_penalty=1.0, hot_penalty=0.5),
-                ),
-            ),
-        ),
-        ComfortSchedule(
-            room="bedroom",
-            entries=(
-                # Wake-up: target 72°F
-                ComfortScheduleEntry(
-                    6,
-                    9,
-                    RoomComfort("bedroom", 70.0, 73.0, cold_penalty=2.0, hot_penalty=2.0),
-                ),
-                # Daytime: relaxed
-                ComfortScheduleEntry(
-                    9,
-                    21,
-                    RoomComfort("bedroom", 68.0, 72.0, cold_penalty=1.0, hot_penalty=1.5),
-                ),
-                # Night: cool for sleep
-                ComfortScheduleEntry(
-                    21,
-                    6,
-                    RoomComfort("bedroom", 66.0, 69.0, cold_penalty=1.0, hot_penalty=3.0),
-                ),
-            ),
-        ),
-        ComfortSchedule(
-            room="family_room",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("family_room", 70.0, 74.0)),),
-        ),
-        ComfortSchedule(
-            room="kitchen",
-            entries=(
-                ComfortScheduleEntry(
-                    0, 24,
-                    RoomComfort("kitchen", 69.0, 75.0, cold_penalty=1.0, hot_penalty=0.5),
-                ),
-            ),
-        ),
-        ComfortSchedule(
-            room="piano",
-            entries=(
-                ComfortScheduleEntry(
-                    0, 24,
-                    RoomComfort("piano", 69.0, 75.0, cold_penalty=1.0, hot_penalty=0.5),
-                ),
-            ),
-        ),
-        ComfortSchedule(
-            room="bathroom",
-            entries=(
-                # Bathroom has a window often open — relaxed bounds, low penalty
-                ComfortScheduleEntry(
-                    0, 24,
-                    RoomComfort("bathroom", 67.0, 76.0, cold_penalty=0.5, hot_penalty=0.3),
-                ),
-            ),
-        ),
-    ]
+    schedules: list[ComfortSchedule] = []
+    for room, entries in _CFG.comfort.items():
+        schedule_entries = tuple(
+            ComfortScheduleEntry(
+                e.start_hour,
+                e.end_hour,
+                RoomComfort(room, e.min_temp, e.max_temp, e.cold_penalty, e.hot_penalty),
+            )
+            for e in entries
+        )
+        schedules.append(ComfortSchedule(room=room, entries=schedule_entries))
+    return schedules
 
 
 # ── Zone mapping ──────────────────────────────────────────────────────────
 # Maps rooms to HVAC zones. Used as fallback in compute_comfort_cost when
 # a room-specific model prediction is unavailable.
 
-ROOM_TO_ZONE: dict[str, str] = {
-    "upstairs": "upstairs",
-    "bedroom": "upstairs",
-    "kitchen": "upstairs",
-    "piano": "upstairs",
-    "bathroom": "upstairs",
-    "downstairs": "downstairs",
-    "family_room": "downstairs",
-    "office": "downstairs",
-}
+ROOM_TO_ZONE: dict[str, str] = _CFG.room_to_zone
 
 
 # ── Cost function ─────────────────────────────────────────────────────────
@@ -713,14 +639,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     print(f"  Downstairs:  {dn_current:.1f}°F (setpoint: {dn_target}°F)")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         print(f"  Outdoor:     {float(out_temp):.1f}°F")
-    window_cols = {
-        "window_basement_open": "basement",
-        "window_family_room_open": "family_room",
-        "window_balcony_open": "balcony",
-        "window_bedroom_open": "bedroom",
-        "window_office_open": "office",
-        "window_kitchen_open": "kitchen",
-    }
+    window_cols = _CFG.window_display_map
     open_windows = [label for col, label in window_cols.items() if bool(latest.get(col, False))]
     if open_windows:
         print(f"  Windows:     {', '.join(open_windows)} open")
@@ -874,6 +793,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         window_states=window_states,
         heating_active=heating_active,
         live=live,
+        notification_target=_CFG.notification_target,
     )
 
     return decision
