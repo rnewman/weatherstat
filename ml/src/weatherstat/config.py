@@ -31,6 +31,7 @@ SNAPSHOT_INTERVAL_SECONDS = 300
 LATITUDE = 47.66
 LONGITUDE = -122.40
 ELEVATION = 30.0  # meters
+TIMEZONE = "America/Los_Angeles"
 
 # Home Assistant connection (shared .env with TS client)
 HA_URL = os.environ.get("HA_URL", "")

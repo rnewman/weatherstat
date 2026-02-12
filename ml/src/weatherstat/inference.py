@@ -171,17 +171,28 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
             s = series[~series.index.duplicated(keep="last")]
             result[col] = s.reindex(time_index, method="ffill")
 
-    # Process window sensors
-    window_series_list: list[pd.Series] = []
-    for entity_id in WINDOW_SENSORS:
+    # Process window sensors → per-window columns + any_window_open
+    window_column_map = {
+        "binary_sensor.window_basement_intrusion": "window_basement_open",
+        "binary_sensor.window_family_room_intrusion": "window_family_room_open",
+        "binary_sensor.window_balcony_intrusion": "window_balcony_open",
+        "binary_sensor.window_bedroom_intrusion": "window_bedroom_open",
+        "binary_sensor.window_office_window_door_is_open": "window_office_open",
+        "binary_sensor.kitchen_window_sensor_intrusion": "window_kitchen_open",
+    }
+    window_cols_present: list[str] = []
+    for entity_id, col_name in window_column_map.items():
         records = window_history.get(entity_id, [])
         if records:
             s = _history_to_series(records, value_fn=lambda s: s == "on")
             s = s[~s.index.duplicated(keep="last")]
-            window_series_list.append(s.reindex(time_index, method="ffill"))
-    if window_series_list:
-        window_df = pd.concat(window_series_list, axis=1)
-        result["any_window_open"] = window_df.any(axis=1).astype(bool)
+            result[col_name] = s.reindex(time_index, method="ffill").astype(bool)
+            window_cols_present.append(col_name)
+        else:
+            result[col_name] = False
+
+    if window_cols_present:
+        result["any_window_open"] = result[window_cols_present].any(axis=1).astype(bool)
     else:
         result["any_window_open"] = False
 
@@ -616,9 +627,18 @@ def load_latest_snapshots(n_rows: int = 48) -> pd.DataFrame:
     # Reverse to chronological order
     df = df.iloc[::-1].reset_index(drop=True)
 
-    # Convert any_window_open from INTEGER back to bool
-    if "any_window_open" in df.columns:
-        df["any_window_open"] = df["any_window_open"].astype(bool)
+    # Convert window columns from INTEGER back to bool
+    for col in [
+        "window_basement_open",
+        "window_family_room_open",
+        "window_balcony_open",
+        "window_bedroom_open",
+        "window_office_open",
+        "window_kitchen_open",
+        "any_window_open",
+    ]:
+        if col in df.columns:
+            df[col] = df[col].astype(bool)
 
     return df
 

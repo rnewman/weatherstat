@@ -22,7 +22,6 @@ import {
   TEMP_SENSORS,
   OUTDOOR_TEMP,
   INDOOR_HUMIDITY,
-  WINDOW_SENSORS,
   WEATHER_ENTITY,
   NAVIEN_HEATING_MODE,
   NAVIEN_HEAT_CAPACITY,
@@ -52,6 +51,12 @@ const SNAPSHOT_COLUMNS = [
   "wind_speed",
   "weather_condition",
   "indoor_humidity",
+  "window_basement_open",
+  "window_family_room_open",
+  "window_balcony_open",
+  "window_bedroom_open",
+  "window_office_open",
+  "window_kitchen_open",
   "any_window_open",
   "upstairs_aggregate_temp",
   "downstairs_aggregate_temp",
@@ -87,6 +92,12 @@ const CAMEL_TO_SNAKE: Record<string, string> = {
   windSpeed: "wind_speed",
   weatherCondition: "weather_condition",
   indoorHumidity: "indoor_humidity",
+  windowBasementOpen: "window_basement_open",
+  windowFamilyRoomOpen: "window_family_room_open",
+  windowBalconyOpen: "window_balcony_open",
+  windowBedroomOpen: "window_bedroom_open",
+  windowOfficeOpen: "window_office_open",
+  windowKitchenOpen: "window_kitchen_open",
   anyWindowOpen: "any_window_open",
   upstairsAggregateTemp: "upstairs_aggregate_temp",
   downstairsAggregateTemp: "downstairs_aggregate_temp",
@@ -123,6 +134,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
   wind_speed REAL,
   weather_condition TEXT,
   indoor_humidity REAL,
+  window_basement_open INTEGER,
+  window_family_room_open INTEGER,
+  window_balcony_open INTEGER,
+  window_bedroom_open INTEGER,
+  window_office_open INTEGER,
+  window_kitchen_open INTEGER,
   any_window_open INTEGER,
   upstairs_aggregate_temp REAL,
   downstairs_aggregate_temp REAL,
@@ -155,6 +172,20 @@ function getDb(dbPath: string): DatabaseType {
   for (const col of ["piano_temp", "bathroom_temp"]) {
     try {
       _db.exec(`ALTER TABLE snapshots ADD COLUMN ${col} REAL`);
+    } catch {
+      // Column already exists — ignore
+    }
+  }
+  for (const col of [
+    "window_basement_open",
+    "window_family_room_open",
+    "window_balcony_open",
+    "window_bedroom_open",
+    "window_office_open",
+    "window_kitchen_open",
+  ]) {
+    try {
+      _db.exec(`ALTER TABLE snapshots ADD COLUMN ${col} INTEGER`);
     } catch {
       // Column already exists — ignore
     }
@@ -201,9 +232,19 @@ async function buildSnapshot(client: HAClient): Promise<SnapshotRow> {
     return Number.isFinite(val) ? val : fallback;
   };
 
-  const anyWindowOpen = WINDOW_SENSORS.some(
-    (id) => stateMap.get(id)?.state === "on",
-  );
+  const windowNameMap: Record<string, keyof SnapshotRow> = {
+    "binary_sensor.window_basement_intrusion": "windowBasementOpen",
+    "binary_sensor.window_family_room_intrusion": "windowFamilyRoomOpen",
+    "binary_sensor.window_balcony_intrusion": "windowBalconyOpen",
+    "binary_sensor.window_bedroom_intrusion": "windowBedroomOpen",
+    "binary_sensor.window_office_window_door_is_open": "windowOfficeOpen",
+    "binary_sensor.kitchen_window_sensor_intrusion": "windowKitchenOpen",
+  };
+  const windowStates: Record<string, boolean> = {};
+  for (const [entityId, propName] of Object.entries(windowNameMap)) {
+    windowStates[propName] = stateMap.get(entityId)?.state === "on";
+  }
+  const anyWindowOpen = Object.values(windowStates).some(Boolean);
 
   const weather = stateMap.get(WEATHER_ENTITY);
 
@@ -238,6 +279,12 @@ async function buildSnapshot(client: HAClient): Promise<SnapshotRow> {
     windSpeed: weather ? (weather.attributes["wind_speed"] as number ?? 0) : 0,
     weatherCondition: weather?.state ?? "unknown",
     indoorHumidity: getSensorNum(INDOOR_HUMIDITY, 0),
+    windowBasementOpen: windowStates["windowBasementOpen"] ?? false,
+    windowFamilyRoomOpen: windowStates["windowFamilyRoomOpen"] ?? false,
+    windowBalconyOpen: windowStates["windowBalconyOpen"] ?? false,
+    windowBedroomOpen: windowStates["windowBedroomOpen"] ?? false,
+    windowOfficeOpen: windowStates["windowOfficeOpen"] ?? false,
+    windowKitchenOpen: windowStates["windowKitchenOpen"] ?? false,
     anyWindowOpen,
     // Per-room temperatures
     upstairsAggregateTemp: getSensorNum(TEMP_SENSORS.upstairs_aggregate, 0),

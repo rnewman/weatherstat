@@ -78,6 +78,12 @@ HVAC_MERGE_COLUMNS = [
     "weather_condition",
     "wind_speed",
     "outdoor_humidity",
+    "window_basement_open",
+    "window_family_room_open",
+    "window_balcony_open",
+    "window_bedroom_open",
+    "window_office_open",
+    "window_kitchen_open",
     "any_window_open",
 ]
 
@@ -94,7 +100,7 @@ def _resample_to_hourly(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     subset = df[["timestamp"] + available].copy()
     subset["_ts"] = pd.to_datetime(subset["timestamp"], format="ISO8601", utc=True)
 
-    numeric = subset[available].select_dtypes(include=["number"]).columns.tolist()
+    numeric = subset[available].select_dtypes(include=["number", "bool"]).columns.tolist()
     other = [c for c in available if c not in numeric]
 
     grouped = subset.set_index("_ts")
@@ -203,9 +209,18 @@ def load_full_data() -> pd.DataFrame:
     # Normalize timestamp format (SQLite has .000Z milliseconds, Parquet doesn't)
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-    # Normalize any_window_open to bool (INTEGER in SQLite, bool in Parquet)
-    if "any_window_open" in df.columns:
-        df["any_window_open"] = df["any_window_open"].astype(bool)
+    # Normalize window columns to bool (INTEGER in SQLite, bool in Parquet)
+    for col in [
+        "window_basement_open",
+        "window_family_room_open",
+        "window_balcony_open",
+        "window_bedroom_open",
+        "window_office_open",
+        "window_kitchen_open",
+        "any_window_open",
+    ]:
+        if col in df.columns:
+            df[col] = df[col].astype(bool)
 
     print(f"Full dataset: {len(df)} rows")
     return df
@@ -281,7 +296,7 @@ def train_mode(mode: str, output_dir: Path | None = None) -> None:
 
     # Determine feature columns
     feature_cols = [c for c in df.columns if c not in exclude]
-    numeric_df = df[feature_cols].select_dtypes(include=["number"])
+    numeric_df = df[feature_cols].select_dtypes(include=["number", "bool"])
     feature_cols = list(numeric_df.columns)
 
     # Only drop rows where TARGET is NaN (from future shift at end of series).

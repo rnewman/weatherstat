@@ -75,14 +75,14 @@ def is_on_cooldown(state: dict[str, float], advisory_type: AdvisoryType) -> bool
 def evaluate_free_cooling(
     outdoor_temp: float | None,
     indoor_temps: dict[str, float],
-    any_window_open: bool,
+    window_states: dict[str, bool],
     heating_active: bool,
 ) -> Advisory | None:
     """Suggest opening windows when outdoor air is cooler than indoor.
 
     Triggers when:
-    - outdoor_temp is known and ≥ 50°F (not too cold)
-    - outdoor_temp is ≥ 3°F below median indoor temp
+    - outdoor_temp is known and >= 50°F (not too cold)
+    - outdoor_temp is >= 3°F below median indoor temp
     - no windows are already open
     - heating is off (no point opening windows while heating)
     """
@@ -90,7 +90,7 @@ def evaluate_free_cooling(
         return None
     if outdoor_temp < 50.0:
         return None
-    if any_window_open:
+    if any(window_states.values()):
         return None
     if heating_active:
         return None
@@ -111,7 +111,7 @@ def evaluate_free_cooling(
 
 
 def evaluate_close_windows(
-    any_window_open: bool,
+    window_states: dict[str, bool],
     heating_active: bool,
     outdoor_temp: float | None,
 ) -> Advisory | None:
@@ -120,17 +120,24 @@ def evaluate_close_windows(
     Triggers when:
     - any window is open
     - either thermostat zone is heating
+
+    Names the specific open windows in the message.
     """
-    if not any_window_open:
+    open_names = [name for name, is_open in window_states.items() if is_open]
+    if not open_names:
         return None
     if not heating_active:
         return None
 
+    window_list = " and ".join(", ".join(open_names).rsplit(", ", 1))
     temp_note = f" It's {outdoor_temp:.0f}°F outside." if outdoor_temp is not None else ""
     return Advisory(
         advisory_type=AdvisoryType.CLOSE_WINDOWS,
         title="Close windows",
-        message=f"Windows are open but heating is running.{temp_note} Close windows to avoid wasting energy.",
+        message=(
+            f"The {window_list} window{'s are' if len(open_names) > 1 else ' is'} open"
+            f" but heating is running.{temp_note} Close to avoid wasting energy."
+        ),
     )
 
 
@@ -168,7 +175,7 @@ def send_ha_notification(advisory: Advisory) -> bool:
 def process_advisories(
     outdoor_temp: float | None,
     indoor_temps: dict[str, float],
-    any_window_open: bool,
+    window_states: dict[str, bool],
     heating_active: bool,
     live: bool = False,
 ) -> list[Advisory]:
@@ -177,7 +184,7 @@ def process_advisories(
     Args:
         outdoor_temp: Current outdoor temperature (°F), or None if unavailable.
         indoor_temps: Room name → current temperature for all rooms.
-        any_window_open: Whether any window contact sensor reports open.
+        window_states: Window name → open boolean for each window sensor.
         heating_active: Whether either thermostat zone is heating.
         live: If True, send HA notifications and persist cooldown state.
 
@@ -189,8 +196,8 @@ def process_advisories(
 
     # Evaluate all rules
     candidates: list[Advisory | None] = [
-        evaluate_free_cooling(outdoor_temp, indoor_temps, any_window_open, heating_active),
-        evaluate_close_windows(any_window_open, heating_active, outdoor_temp),
+        evaluate_free_cooling(outdoor_temp, indoor_temps, window_states, heating_active),
+        evaluate_close_windows(window_states, heating_active, outdoor_temp),
     ]
 
     print("\n[advisory] Evaluating advisories...")

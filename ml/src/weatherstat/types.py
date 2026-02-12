@@ -113,6 +113,12 @@ class SnapshotRow:
     wind_speed: float
     weather_condition: str
     indoor_humidity: float
+    window_basement_open: bool
+    window_family_room_open: bool
+    window_balcony_open: bool
+    window_bedroom_open: bool
+    window_office_open: bool
+    window_kitchen_open: bool
     any_window_open: bool
     # Per-room temperatures
     upstairs_aggregate_temp: float

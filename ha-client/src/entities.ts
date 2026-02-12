@@ -42,6 +42,8 @@ export const WINDOW_SENSORS = [
   "binary_sensor.window_family_room_intrusion",
   "binary_sensor.window_balcony_intrusion",
   "binary_sensor.window_bedroom_intrusion",
+  "binary_sensor.window_office_window_door_is_open",
+  "binary_sensor.kitchen_window_sensor_intrusion",
 ];
 
 // Weather entity (met.no integration)

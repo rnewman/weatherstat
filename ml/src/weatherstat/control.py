@@ -612,6 +612,19 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     print(f"  Downstairs:  {dn_current:.1f}°F (setpoint: {dn_target}°F)")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         print(f"  Outdoor:     {float(out_temp):.1f}°F")
+    window_cols = {
+        "window_basement_open": "basement",
+        "window_family_room_open": "family_room",
+        "window_balcony_open": "balcony",
+        "window_bedroom_open": "bedroom",
+        "window_office_open": "office",
+        "window_kitchen_open": "kitchen",
+    }
+    open_windows = [label for col, label in window_cols.items() if bool(latest.get(col, False))]
+    if open_windows:
+        print(f"  Windows:     {', '.join(open_windows)} open")
+    else:
+        print("  Windows:     all closed")
     other_rooms = [r for r in PREDICTION_ROOMS if r not in ("upstairs", "downstairs")]
     for room in other_rooms:
         t = current_temps.get(room)
@@ -637,8 +650,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     df_feat = build_features(df_raw.copy(), mode="full")
     base_row = _prepare_feature_row(df_feat, feature_columns)
 
-    # Current hour for comfort schedule lookup
-    base_hour = datetime.now(UTC).hour
+    # Current local hour for comfort schedule lookup
+    from zoneinfo import ZoneInfo
+
+    from weatherstat.config import TIMEZONE
+
+    base_hour = datetime.now(ZoneInfo(TIMEZONE)).hour
 
     # Sweep all HVAC combinations
     schedules = default_comfort_schedules()
@@ -707,14 +724,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # ── Advisories ──
     from weatherstat.advisory import process_advisories
 
-    any_window = bool(latest.get("any_window_open", False))
+    window_states = {label: bool(latest.get(col, False)) for col, label in window_cols.items()}
     heating_active = decision.upstairs_heating or decision.downstairs_heating
     process_advisories(
         outdoor_temp=float(out_temp)
         if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
         else None,
         indoor_temps=current_temps,
-        any_window_open=any_window,
+        window_states=window_states,
         heating_active=heating_active,
         live=live,
     )

@@ -128,6 +128,12 @@ export interface SnapshotRow {
   windSpeed: number;
   weatherCondition: string;
   indoorHumidity: number;
+  windowBasementOpen: boolean;
+  windowFamilyRoomOpen: boolean;
+  windowBalconyOpen: boolean;
+  windowBedroomOpen: boolean;
+  windowOfficeOpen: boolean;
+  windowKitchenOpen: boolean;
   anyWindowOpen: boolean;
   // Per-room temperatures
   upstairsAggregateTemp: number;
