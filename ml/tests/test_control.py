@@ -276,18 +276,18 @@ class TestComfortCost:
         assert abs(cost - expected) < 0.001
 
     def test_comfort_cost_respects_schedule_hour(self) -> None:
-        """Bedroom at hour 22 (night: max 69F) vs hour 10 (day: max 72F) -> different costs."""
+        """Bedroom at hour 22 (night: max 72F) vs hour 10 (day: max 75F) -> different costs at 74F."""
         from weatherstat.control import default_comfort_schedules
 
         schedules = default_comfort_schedules()
         bedroom_schedules = [s for s in schedules if s.room == "bedroom"]
 
-        predictions = {"bedroom_temp_t+12": 71.0}
+        predictions = {"bedroom_temp_t+12": 74.0}
 
-        # Hour 22 (night schedule: max 69F) -> 71 > 69, penalized
+        # Hour 22 (night schedule: max 72F) -> 74 > 72, penalized
         cost_night = compute_comfort_cost(predictions, bedroom_schedules, base_hour=22)
 
-        # Hour 10 (day schedule: max 72F) -> 71 < 72, no penalty
+        # Hour 10 (day schedule: max 75F) -> 74 < 75, no penalty
         cost_day = compute_comfort_cost(predictions, bedroom_schedules, base_hour=10)
 
         assert cost_night > cost_day
