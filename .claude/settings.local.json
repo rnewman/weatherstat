@@ -47,7 +47,13 @@
       "Bash(npx tsx:*)",
       "Bash(python3:*)",
       "Bash(grep:*)",
-      "Bash(tokei:*)"
+      "Bash(tokei:*)",
+      "Bash(xargs cat:*)",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm run typecheck:*)",
+      "mcp__Home_Assistant__ha_list_services",
+      "Bash(just metrics:*)",
+      "Bash(just test-py:*)"
     ]
   }
 }
