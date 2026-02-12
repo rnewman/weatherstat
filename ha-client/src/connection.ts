@@ -48,9 +48,17 @@ export class WebSocketHAClient implements HAClient {
     const auth = createLongLivedTokenAuth(this.url, this.token);
     this.connection = await createConnection({ auth });
 
-    // Start global entity subscription to keep cache fresh
-    this.entityUnsubscribe = subscribeEntities(this.connection, (entities) => {
-      this.cachedEntities = entities;
+    // Start global entity subscription and wait for the first batch of entities.
+    // Without this wait, getStates() would see an empty cache on the first call.
+    await new Promise<void>((resolve) => {
+      let resolved = false;
+      this.entityUnsubscribe = subscribeEntities(this.connection!, (entities) => {
+        this.cachedEntities = entities;
+        if (!resolved) {
+          resolved = true;
+          resolve();
+        }
+      });
     });
 
     return this.connection;
