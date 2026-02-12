@@ -52,9 +52,11 @@ async function main(): Promise<void> {
       case "once":
         await collectOnce(client, config);
         break;
-      case "execute":
-        await executePrediction(client, config);
+      case "execute": {
+        const force = process.argv.includes("--force");
+        await executePrediction(client, config, force);
         break;
+      }
     }
   } finally {
     await client.disconnect();
