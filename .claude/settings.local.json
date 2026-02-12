@@ -33,7 +33,21 @@
       "Bash(just extract:*)",
       "Bash(just train-baseline:*)",
       "Bash(just predict:*)",
-      "Bash(just typecheck:*)"
+      "Bash(just typecheck:*)",
+      "Bash(just control:*)",
+      "Bash(git -C /Users/rnewman/repos/weatherstat log --oneline -5)",
+      "Bash(chmod:*)",
+      "Bash(just experiments:*)",
+      "Bash(just --list:*)",
+      "Bash(just train-experiment-full:*)",
+      "Bash(just experiment-compare:*)",
+      "Bash(bash scripts/worktree.sh:*)",
+      "Bash(just collect-once:*)",
+      "Bash(just train:*)",
+      "Bash(npx tsx:*)",
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(tokei:*)"
     ]
   }
 }

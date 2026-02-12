@@ -18,8 +18,10 @@ data/snapshots/*.db
 data/snapshots/*.db-wal
 data/snapshots/*.db-shm
 data/predictions/*.json
+data/predictions/*.parquet
 data/models/*.txt
 data/models/*.pkl
+data/models/*/
 data/control_state.json
 
 # Logs
