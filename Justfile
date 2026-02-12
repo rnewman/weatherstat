@@ -104,9 +104,28 @@ control-loop:
 control-live:
     cd ml && uv run python -m weatherstat.control --live
 
+# Live control loop (15-min interval, generates + executes via HA)
+control-loop-live:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "[control-loop-live] Starting (15-min interval, Ctrl+C to stop)"
+    while true; do
+        echo ""
+        echo "── Control cycle: $(date) ──"
+        cd ml && uv run python -m weatherstat.control --live; cd ..
+        echo "[control-loop-live] Executing command via HA..."
+        cd ha-client && npx tsx src/index.ts execute; cd ..
+        echo "[control-loop-live] Next cycle in 15 minutes..."
+        sleep 900
+    done
+
 # Execute latest command JSON via HA
 execute:
     cd ha-client && npx tsx src/index.ts execute
+
+# Execute latest command, ignoring manual overrides
+execute-force:
+    cd ha-client && npx tsx src/index.ts execute --force
 
 # ── Experiments ──────────────────────────────────────────────────────────
 
