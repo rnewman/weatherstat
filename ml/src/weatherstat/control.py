@@ -725,7 +725,10 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     from weatherstat.advisory import process_advisories
 
     window_states = {label: bool(latest.get(col, False)) for col, label in window_cols.items()}
-    heating_active = decision.upstairs_heating or decision.downstairs_heating
+    heating_active = (
+        str(latest.get("thermostat_upstairs_action")) == "heating"
+        or str(latest.get("thermostat_downstairs_action")) == "heating"
+    )
     process_advisories(
         outdoor_temp=float(out_temp)
         if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
