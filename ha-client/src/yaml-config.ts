@@ -3,7 +3,7 @@
  *
  * Reads weatherstat.yaml (shared with Python) and derives entity IDs,
  * snapshot column definitions, SQL schema, and monitored entity lists.
- * Adding a sensor: add to weatherstat.yaml + update SnapshotRow in types.ts.
+ * Adding a sensor: just add to weatherstat.yaml — SnapshotRow is dynamic.
  */
 
 import { readFileSync } from "node:fs";

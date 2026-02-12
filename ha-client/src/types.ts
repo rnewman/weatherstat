@@ -98,53 +98,18 @@ export interface WeatherForecastEntry {
   windSpeed: number | null;
 }
 
-// ---- Snapshot (written to Parquet) ----
+// ---- Snapshot (written to SQLite) ----
 
+/** Dynamic snapshot row — columns are driven entirely by weatherstat.yaml.
+ *
+ * The only guaranteed field is `timestamp`. All other columns (temperatures,
+ * HVAC states, window sensors, weather) are generated at runtime by the
+ * YAML config loader. Adding a sensor to the YAML is sufficient; no TS
+ * interface changes needed.
+ */
 export interface SnapshotRow {
   timestamp: string; // ISO 8601
-  // Thermostat zones
-  thermostatUpstairsTemp: number;
-  thermostatUpstairsTarget: number;
-  thermostatUpstairsAction: string; // "heating" | "idle"
-  thermostatDownstairsTemp: number;
-  thermostatDownstairsTarget: number;
-  thermostatDownstairsAction: string;
-  // Mini splits (named by location)
-  miniSplitBedroomTemp: number;
-  miniSplitBedroomTarget: number;
-  miniSplitBedroomMode: string; // "off" | "heat" | "cool" | ...
-  miniSplitLivingRoomTemp: number;
-  miniSplitLivingRoomTarget: number;
-  miniSplitLivingRoomMode: string;
-  // Blowers (mode captures speed level)
-  blowerFamilyRoomMode: string; // "off" | "low" | "high"
-  blowerOfficeMode: string;
-  // Navien
-  navienHeatingMode: string; // "Space Heating" | "Idle"
-  navienHeatCapacity: number; // 0-100%
-  // Environment
-  outdoorTemp: number;
-  outdoorHumidity: number;
-  windSpeed: number;
-  weatherCondition: string;
-  indoorHumidity: number;
-  windowBasementOpen: boolean;
-  windowFamilyRoomOpen: boolean;
-  windowBalconyOpen: boolean;
-  windowBedroomOpen: boolean;
-  windowOfficeOpen: boolean;
-  windowKitchenOpen: boolean;
-  anyWindowOpen: boolean;
-  // Per-room temperatures
-  upstairsAggregateTemp: number;
-  downstairsAggregateTemp: number;
-  familyRoomTemp: number;
-  officeTemp: number;
-  bedroomTemp: number;
-  kitchenTemp: number;
-  pianoTemp: number;
-  bathroomTemp: number;
-  livingRoomTemp: number;
+  [column: string]: string | number | boolean;
 }
 
 // ---- Prediction (read from JSON) ----

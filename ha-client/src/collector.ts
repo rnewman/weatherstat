@@ -66,7 +66,7 @@ async function buildSnapshot(client: HAClient): Promise<SnapshotRow> {
     row[col.camel] = col.extract(stateMap);
   }
 
-  return row as unknown as SnapshotRow;
+  return row as SnapshotRow;
 }
 
 function writeSnapshot(snapshot: SnapshotRow, dbPath: string): string {
@@ -76,7 +76,7 @@ function writeSnapshot(snapshot: SnapshotRow, dbPath: string): string {
   // Build snake_case params for the INSERT
   const params: Record<string, string | number> = { timestamp: roundedTs };
   for (const [camel, snake] of Object.entries(config.camelToSnake)) {
-    const val = snapshot[camel as keyof SnapshotRow];
+    const val = snapshot[camel];
     if (typeof val === "boolean") {
       params[snake] = val ? 1 : 0;
     } else {
