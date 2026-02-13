@@ -71,8 +71,9 @@ CAUTIOUS_OFFSET = 2  # °F above/below current temp
 ABSOLUTE_MIN = 62
 ABSOLUTE_MAX = 78
 
-# Minimum hold time before changing setpoints (seconds)
-MIN_HOLD_SECONDS = 30 * 60  # 30 minutes
+# Minimum hold time before changing setpoints (seconds).
+# Must be less than LOOP_INTERVAL_SECONDS so every cycle produces a fresh decision.
+MIN_HOLD_SECONDS = 10 * 60  # 10 minutes
 
 # Maximum data staleness before refusing to execute (seconds)
 MAX_STALE_SECONDS = 15 * 60  # 15 minutes

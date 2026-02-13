@@ -60,6 +60,16 @@
 - Helps the model learn control-relevant dynamics without a physics simulation
 - Implement as an experiment branch first, promote if metrics improve
 
+### Virtual Thermostats (Per-Room Climate Entities)
+- Expose per-room target high/low as HA climate entities
+- User adjusts comfort targets from the HA dashboard or phone (no YAML editing)
+- Control loop reads targets from HA each cycle instead of (or defaulting from) YAML
+- Solves the "adjust from bed at 2 AM" problem — change targets without restarting the loop
+- Complements device-level override detection (target overrides vs device overrides)
+- Climate entity shows: current room temp, target range, heating/cooling/idle action
+- YAML comfort schedule provides defaults; HA entities override when set
+- Could add "reset to schedule" automation that restores YAML defaults at a set time
+
 ## Medium-Term
 
 ### Hybrid Physics + ML
@@ -70,6 +80,37 @@
 ### Automated Retraining
 - Cron job or launchd plist to retrain weekly
 - Track model metrics over time to detect drift
+
+### Unified Action Framework
+Every controllable action is a feature perturbation — the model doesn't care whether
+a feature changed electronically or because someone opened a window. The optimization
+should be unified; only the execution method differs.
+
+**Action abstraction:**
+- Each action has: name, feature columns + state→value mapping, current state,
+  execution type (electronic or advisory), energy cost, effort cost
+- Electronic: thermostats on/off, blowers off/low/high, mini-splits off/heat/cool
+- Advisory: windows open/closed, blinds open/closed
+- Future: motorized blinds (electronic), ventilation fans, etc.
+
+**Unified sweep:**
+- Evaluate all actions together in one optimization pass
+- Output splits into electronic commands (executor) and advisory notifications
+- Effort cost penalizes bothering the human — only suggest physical actions when
+  the predicted improvement materially exceeds what electronic actions achieve alone
+- Naturally discovers cross-domain optimizations: "open the window instead of running
+  the mini split on cool", "close blinds to prevent afternoon overshoot"
+
+**Replaces rule-based advisories:**
+- Current `advisory.py` heuristics (free cooling, close windows) become emergent
+  properties of the optimizer rather than hand-coded rules
+- Advisory suggestions come with predicted temperature impact ("closing the bedroom
+  window would keep the room at 69°F instead of dropping to 66°F")
+
+**Prerequisites:**
+- Window→room mapping in YAML (needed for targeted suggestions)
+- Blind sensors in HA (cover entities or binary sensors)
+- Effort cost tuning (how much "cost" to assign to human interruption)
 
 ### Full MPC
 - Model Predictive Control: optimize over multi-step HVAC trajectories
