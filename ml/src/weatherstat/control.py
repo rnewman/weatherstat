@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from weatherstat.config import (
+    ADVISORY_EFFORT_COST,
     BLOWERS,
     CONTROL_STATE_FILE,
     ENERGY_COST_BLOWER,
@@ -47,11 +48,15 @@ from weatherstat.inference import (
     load_models,
 )
 from weatherstat.types import (
+    Action,
+    ActionOption,
+    ActionRecommendation,
     BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
     ControlState,
+    ExecutionType,
     HVACScenario,
     MiniSplitDecision,
     RoomComfort,
@@ -447,6 +452,222 @@ def sweep_scenarios(
     return best_decision
 
 
+# ── Advisory (window) sweep ────────────────────────────────────────────────
+
+
+def build_advisory_actions(window_states: dict[str, bool]) -> list[Action]:
+    """Build Action objects for each window from YAML config + current states.
+
+    Args:
+        window_states: window_name -> is_open for each window in the config.
+
+    Returns:
+        One Action per window, each with "open" and "closed" options.
+    """
+    actions: list[Action] = []
+    for name in _CFG.windows:
+        col = f"window_{name}_open"
+        open_opt = ActionOption(name="open", feature_overrides={col: 1.0})
+        closed_opt = ActionOption(name="closed", feature_overrides={col: 0.0})
+        current = "open" if window_states.get(name, False) else "closed"
+        actions.append(Action(
+            name=name,
+            options=(open_opt, closed_opt),
+            current=current,
+            execution=ExecutionType.ADVISORY,
+            effort_cost=ADVISORY_EFFORT_COST,
+        ))
+    return actions
+
+
+def _decision_to_overrides(
+    decision: ControlDecision,
+    current_split_temps: dict[str, float],
+) -> dict[str, float]:
+    """Reconstruct HVAC feature overrides from a ControlDecision.
+
+    Used to apply the electronic decision's HVAC state as the baseline for
+    the window sweep.
+    """
+    scenario = HVACScenario(
+        upstairs_heating=decision.upstairs_heating,
+        downstairs_heating=decision.downstairs_heating,
+        blowers=decision.blowers,
+        mini_splits=decision.mini_splits,
+    )
+    return build_hvac_overrides(scenario, current_split_temps)
+
+
+def _build_advisory_message(
+    changed_windows: list[str],
+    improvement: float,
+    adv_preds: dict[str, float],
+    baseline_preds: dict[str, float],
+    recommend_open: bool,
+) -> str:
+    """Build human-readable advisory message with per-room temperature effects.
+
+    Args:
+        changed_windows: Names of windows to change.
+        improvement: Total comfort cost improvement.
+        adv_preds: Predictions with the recommended window states.
+        baseline_preds: Predictions with current window states.
+        recommend_open: True if recommending opening, False if closing.
+    """
+    action_verb = "Open" if recommend_open else "Close"
+
+    # Build per-room temperature effects at 1h horizon (step 12)
+    room_effects: list[str] = []
+    for wname in changed_windows:
+        wcfg = _CFG.windows.get(wname)
+        if wcfg is None:
+            continue
+        for room in wcfg.rooms:
+            key = f"{room}_temp_t+12"
+            adv_t = adv_preds.get(key)
+            base_t = baseline_preds.get(key)
+            if adv_t is not None and base_t is not None:
+                delta = adv_t - base_t
+                sign = "+" if delta >= 0 else ""
+                room_effects.append(f"{sign}{delta:.1f}°F {room}")
+
+    # Format window list
+    if len(changed_windows) == 1:
+        window_desc = f"the {changed_windows[0]} window"
+    else:
+        window_desc = "the " + " and ".join(
+            ", ".join(changed_windows).rsplit(", ", 1)
+        ) + " windows"
+
+    parts = [f"{action_verb} {window_desc}"]
+    if room_effects:
+        parts.append(f"predicted {', '.join(room_effects)} at 1h")
+    parts.append(f"(improvement: {improvement:.1f})")
+    return " — ".join(parts)
+
+
+def evaluate_advisories(
+    base_row: pd.DataFrame,
+    feature_columns: list[str],
+    models: dict[str, object],
+    electronic_overrides: dict[str, float],
+    advisory_actions: list[Action],
+    schedules: list[ComfortSchedule],
+    base_hour: int,
+) -> list[ActionRecommendation]:
+    """Full 2^N window sweep to find the best combination of window changes.
+
+    Args:
+        base_row: Feature row (1-row DataFrame) from the current state.
+        feature_columns: Ordered feature column names.
+        models: Loaded LightGBM models keyed by target name.
+        electronic_overrides: HVAC feature overrides from the electronic decision.
+        advisory_actions: Action objects for each window.
+        schedules: Comfort schedules for all rooms.
+        base_hour: Current hour of day (0-23).
+
+    Returns:
+        Sorted list of ActionRecommendation for each window that should change.
+        Empty if no improvement exceeds the effort threshold.
+    """
+    from itertools import product
+
+    n = len(advisory_actions)
+    if n == 0:
+        return []
+
+    # Build X_base with electronic overrides applied
+    X_base = base_row.copy()
+    for col, val in electronic_overrides.items():
+        if col in X_base.columns:
+            X_base[col] = val
+
+    # Baseline: predict with current window states (already in X_base)
+    baseline_preds: dict[str, float] = {}
+    for target, model in models.items():
+        baseline_preds[target] = float(model.predict(X_base)[0])  # type: ignore[union-attr]
+    baseline_comfort = compute_comfort_cost(baseline_preds, schedules, base_hour)
+
+    # Build current state index (for skipping)
+    current_indices = tuple(
+        0 if a.current == a.options[0].name else 1
+        for a in advisory_actions
+    )
+
+    best_improvement = 0.0
+    best_combo: tuple[int, ...] | None = None
+    best_preds: dict[str, float] = {}
+
+    # Enumerate all 2^N combinations
+    for combo in product(range(2), repeat=n):
+        if combo == current_indices:
+            continue  # skip current state
+
+        X_test = X_base.copy()
+        for i, opt_idx in enumerate(combo):
+            option = advisory_actions[i].options[opt_idx]
+            for col, val in option.feature_overrides.items():
+                if col in X_test.columns:
+                    X_test[col] = val
+
+        # Set any_window_open correctly if it's in the model features (transition)
+        if "any_window_open" in X_test.columns:
+            any_open = any(
+                advisory_actions[i].options[combo[i]].name == "open"
+                for i in range(n)
+            )
+            X_test["any_window_open"] = float(any_open)
+
+        combo_preds: dict[str, float] = {}
+        for target, model in models.items():
+            combo_preds[target] = float(model.predict(X_test)[0])  # type: ignore[union-attr]
+        combo_comfort = compute_comfort_cost(combo_preds, schedules, base_hour)
+
+        improvement = baseline_comfort - combo_comfort
+        if improvement > best_improvement:
+            best_improvement = improvement
+            best_combo = combo
+            best_preds = combo_preds
+
+    if best_combo is None:
+        return []
+
+    # Determine which windows changed
+    changed: list[tuple[str, str, str]] = []  # (name, recommended, current)
+    for i, (new_idx, cur_idx) in enumerate(zip(best_combo, current_indices, strict=True)):
+        if new_idx != cur_idx:
+            action = advisory_actions[i]
+            changed.append((
+                action.name,
+                action.options[new_idx].name,
+                action.current,
+            ))
+
+    num_changes = len(changed)
+    effort_threshold = ADVISORY_EFFORT_COST * num_changes
+    if best_improvement <= effort_threshold:
+        return []
+
+    # Determine if this is an "open" or "close" recommendation
+    recommend_open = any(rec == "open" for _, rec, _ in changed)
+    changed_names = [name for name, _, _ in changed]
+    message = _build_advisory_message(
+        changed_names, best_improvement, best_preds, baseline_preds, recommend_open,
+    )
+
+    recommendations: list[ActionRecommendation] = []
+    for name, recommended, current in changed:
+        recommendations.append(ActionRecommendation(
+            action_name=name,
+            recommended_state=recommended,
+            current_state=current,
+            comfort_improvement=best_improvement,
+            message=message,
+        ))
+
+    return sorted(recommendations, key=lambda r: r.action_name)
+
+
 # ── State persistence ─────────────────────────────────────────────────────
 
 
@@ -778,24 +999,56 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     else:
         print("  Mode: DRY-RUN — command written but not executed")
 
-    # ── Advisories ──
-    from weatherstat.advisory import process_advisories
+    # ── Model-based advisory sweep ──
+    window_states_dict = {
+        name: bool(latest.get(f"window_{name}_open", False))
+        for name in _CFG.windows
+    }
+    advisory_actions = build_advisory_actions(window_states_dict)
+    electronic_overrides = _decision_to_overrides(decision, current_split_temps)
 
-    window_states = {label: bool(latest.get(col, False)) for col, label in window_cols.items()}
-    heating_active = (
-        str(latest.get("thermostat_upstairs_action")) == "heating"
-        or str(latest.get("thermostat_downstairs_action")) == "heating"
+    n_combos = 2 ** len(advisory_actions)
+    t1 = time.monotonic()
+    recommendations = evaluate_advisories(
+        base_row, feature_columns, models,
+        electronic_overrides, advisory_actions,
+        schedules, base_hour,
     )
-    process_advisories(
-        outdoor_temp=float(out_temp)
-        if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
-        else None,
-        indoor_temps=current_temps,
-        window_states=window_states,
-        heating_active=heating_active,
-        live=live,
-        notification_target=_CFG.notification_target,
-    )
+    adv_ms = (time.monotonic() - t1) * 1000
+
+    if recommendations:
+        # All recommendations share the same message (multi-window)
+        print(f"\n[advisory] Window sweep ({n_combos} combos, {adv_ms:.0f}ms):")
+        print(f"  {recommendations[0].message}")
+        # Dispatch notifications for live mode
+        if live:
+            from weatherstat.advisory import (
+                Advisory,
+                AdvisoryType,
+                is_on_cooldown,
+                load_advisory_state,
+                save_advisory_state,
+                send_ha_notification,
+            )
+
+            state = load_advisory_state()
+            # Map recommendation direction to advisory type
+            rec_open = any(r.recommended_state == "open" for r in recommendations)
+            adv_type = AdvisoryType.FREE_COOLING if rec_open else AdvisoryType.CLOSE_WINDOWS
+            if not is_on_cooldown(state, adv_type):
+                advisory = Advisory(
+                    advisory_type=adv_type,
+                    title="Window advisory",
+                    message=recommendations[0].message,
+                )
+                if send_ha_notification(advisory, target=_CFG.notification_target):
+                    state[adv_type.value] = time.time()
+                    save_advisory_state(state)
+                    print(f"  → Sent to HA ({_CFG.notification_target})")
+            else:
+                print("  (on cooldown, not sent)")
+    else:
+        print(f"\n[advisory] No window recommendations ({n_combos} combos, {adv_ms:.0f}ms)")
 
     return decision
 

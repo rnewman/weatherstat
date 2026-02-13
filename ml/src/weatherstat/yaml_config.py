@@ -73,6 +73,7 @@ class BoilerConfig:
 class WindowConfig:
     name: str  # "basement", "family_room", etc.
     entity_id: str
+    rooms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,12 @@ class ExtraTempSensorConfig:
 
 
 @dataclass(frozen=True)
+class AdvisoryConfig:
+    effort_cost: float
+    cooldowns: dict[str, int]
+
+
+@dataclass(frozen=True)
 class WeatherstatConfig:
     """Top-level config parsed from weatherstat.yaml."""
 
@@ -123,6 +130,7 @@ class WeatherstatConfig:
     notification_target: str
     energy_costs: EnergyCostConfig
     extra_temp_sensors: dict[str, ExtraTempSensorConfig] = field(default_factory=dict)
+    advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
 
     # ── Derived properties ────────────────────────────────────────────
 
@@ -229,6 +237,8 @@ class WeatherstatConfig:
         cols.add("navien_heating_mode")
         # Weather condition string
         cols.add("weather_condition")
+        # Redundant aggregate — per-window features are sufficient
+        cols.add("any_window_open")
         return cols
 
     @property
@@ -420,7 +430,11 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     # Windows
     windows: dict[str, WindowConfig] = {}
     for name, win in data["windows"].items():
-        windows[name] = WindowConfig(name=name, entity_id=win["entity_id"])
+        windows[name] = WindowConfig(
+            name=name,
+            entity_id=win["entity_id"],
+            rooms=tuple(win.get("rooms", [])),
+        )
 
     # Rooms
     rooms: dict[str, RoomConfig] = {}
@@ -455,6 +469,13 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     for name, sensor in data.get("extra_temp_sensors", {}).items():
         extra_temp_sensors[name] = ExtraTempSensorConfig(name=name, entity_id=sensor["entity_id"])
 
+    # Advisory config (optional, with defaults)
+    adv_data = data.get("advisory", {})
+    advisory_config = AdvisoryConfig(
+        effort_cost=float(adv_data.get("effort_cost", 0.5)),
+        cooldowns={str(k): int(v) for k, v in adv_data.get("cooldowns", {}).items()},
+    )
+
     return WeatherstatConfig(
         location=location,
         temp_sensors=temp_sensors,
@@ -470,6 +491,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         notification_target=data["notifications"]["target"],
         energy_costs=energy_costs,
         extra_temp_sensors=extra_temp_sensors,
+        advisory=advisory_config,
     )
 
 

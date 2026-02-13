@@ -135,6 +135,10 @@ ENERGY_COST_GAS_ZONE = _CFG.energy_costs.gas_zone
 ENERGY_COST_MINI_SPLIT = _CFG.energy_costs.mini_split
 ENERGY_COST_BLOWER: dict[str, float] = _CFG.energy_costs.blower
 
+# Advisory configuration (from YAML)
+ADVISORY_EFFORT_COST: float = _CFG.advisory.effort_cost
+ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
+
 
 # LightGBM training parameters — conservative for small datasets
 LGBM_PARAMS: dict[str, object] = {

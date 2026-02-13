@@ -119,6 +119,7 @@ class SnapshotRow:
     window_bedroom_open: bool
     window_office_open: bool
     window_kitchen_open: bool
+    window_piano_open: bool
     any_window_open: bool
     # Per-room temperatures
     upstairs_aggregate_temp: float
@@ -246,3 +247,42 @@ class ControlState:
     blower_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
     mini_split_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
     mini_split_targets: dict[str, float] = field(default_factory=dict)  # name -> target
+
+
+# ── Unified action types ─────────────────────────────────────────────────
+
+
+class ExecutionType(StrEnum):
+    ELECTRONIC = "electronic"
+    ADVISORY = "advisory"
+
+
+@dataclass(frozen=True)
+class ActionOption:
+    """One possible state of a controllable action."""
+
+    name: str  # "open", "closed", "on", "off", etc.
+    feature_overrides: dict[str, float]  # feature_col -> value
+    energy_cost: float = 0.0
+
+
+@dataclass(frozen=True)
+class Action:
+    """A controllable action — electronic or advisory."""
+
+    name: str  # "window_bedroom", "thermostat_upstairs"
+    options: tuple[ActionOption, ...]
+    current: str  # current option name
+    execution: ExecutionType
+    effort_cost: float = 0.0  # penalty for recommending change
+
+
+@dataclass(frozen=True)
+class ActionRecommendation:
+    """An advisory recommendation from the optimizer."""
+
+    action_name: str  # "window_bedroom"
+    recommended_state: str  # "open" or "closed"
+    current_state: str
+    comfort_improvement: float  # comfort_cost reduction
+    message: str  # human-readable
