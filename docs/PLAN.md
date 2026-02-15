@@ -25,6 +25,8 @@
   - Physical constraint: blowers forced off when their zone's thermostat is off
   - Mini-split sweep over off/heat/cool with fixed representative target; command target derived from comfort schedule midpoint post-sweep
 - Config-driven device lists (`BlowerConfig`, `MiniSplitConfig`) — adding a blower is a one-line change
+- Window-open comfort adjustment (soft penalty — widen comfort bounds when window open)
+- Advisory quiet hours (suppress push notifications during sleep, still log)
 - Tiered energy cost: gas > heat pump > fan (tiebreaker when comfort is equal)
 - Executor handles all device types: thermostats, mini-splits (mode + target), blowers (off/low/high)
 
@@ -46,6 +48,13 @@
 - Sends HA persistent notifications (replaces stale notifications via notification_id)
 - Cooldown timers prevent notification fatigue (4h free cooling, 1h close windows)
 - Future: comfort breach warnings, solar gain/blinds, room migration suggestions
+
+### Sweep Scalability
+- Current: 180 HVAC combos + 128 window combos, ~4.4s total
+- At 6 blowers + 10 windows: ~26K HVAC combos + 1,024 window combos — untenable
+- Batch prediction (10–50× speedup, no algorithmic change) is the first step
+- Window decomposition (O(N) vs O(2^N)) and greedy coordinate descent (O(Σ levels) vs O(∏ levels)) follow
+- See `docs/FUTURE.md` for the full scalability plan
 
 ## Near-Term
 
@@ -108,14 +117,16 @@ should be unified; only the execution method differs.
   window would keep the room at 69°F instead of dropping to 66°F")
 
 **Prerequisites:**
-- Window→room mapping in YAML (needed for targeted suggestions)
+- Window→room mapping in YAML (needed for targeted suggestions) ✓ done
 - Blind sensors in HA (cover entities or binary sensors)
 - Effort cost tuning (how much "cost" to assign to human interruption)
+- Sweep scalability — unified action space is the product of all actions; see `docs/FUTURE.md`
 
 ### Full MPC
 - Model Predictive Control: optimize over multi-step HVAC trajectories
 - Exploration vs exploitation strategy for broadening training distribution
 - Multi-zone coordination (upstairs heat is ceiling heat for downstairs)
+- Multi-step trajectories multiply the single-step search space — scalability work (`docs/FUTURE.md`) is prerequisite
 
 ## Long-Term
 
