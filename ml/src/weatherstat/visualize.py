@@ -195,6 +195,7 @@ def render_feature_importance(output_path: Path, top_n: int = 25) -> None:
             ("baseline", "Baseline (hourly, 5+ months)", target_colors_baseline),
             ("full", "Full (5-min, 10 days)", target_colors_full),
         ],
+        strict=True,
     ):
         fi = report[model_key]["feature_importance"]
         targets = list(fi.keys())
