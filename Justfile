@@ -107,14 +107,19 @@ control-live:
 # Live control loop (15-min interval, generates + executes via HA)
 control-loop-live:
     #!/usr/bin/env bash
-    set -euo pipefail
+    set -uo pipefail
     echo "[control-loop-live] Starting (15-min interval, Ctrl+C to stop)"
     while true; do
         echo ""
         echo "── Control cycle: $(date) ──"
-        cd ml && uv run python -m weatherstat.control --live; cd ..
-        echo "[control-loop-live] Executing command via HA..."
-        cd ha-client && npx tsx src/index.ts execute; cd ..
+        if cd ml && uv run python -m weatherstat.control --live; then
+            cd ..
+            echo "[control-loop-live] Executing command via HA..."
+            cd ha-client && npx tsx src/index.ts execute; cd ..
+        else
+            cd /Users/rnewman/repos/weatherstat
+            echo "[control-loop-live] Control cycle failed (HA down?), will retry next cycle"
+        fi
         echo "[control-loop-live] Next cycle in 15 minutes..."
         sleep 900
     done
@@ -126,6 +131,10 @@ execute:
 # Execute latest command, ignoring manual overrides
 execute-force:
     cd ha-client && npx tsx src/index.ts execute --force
+
+# Fit thermal time constants (τ) from overnight cooling fixture
+fit-tau:
+    cd ml && uv run python scripts/fit_tau.py
 
 # ── Experiments ──────────────────────────────────────────────────────────
 
@@ -141,6 +150,27 @@ train-experiment NAME:
 # Train just the full model into an experiment directory
 train-experiment-full NAME:
     cd ml && uv run python -m weatherstat.train --mode full --experiment {{NAME}}
+
+# Train Newton cooling experiment (both models)
+train-experiment-newton:
+    cd ml && uv run python -m weatherstat.train --mode baseline --experiment newton_cooling
+    cd ml && uv run python -m weatherstat.train --mode full --experiment newton_cooling
+
+# Train full model using only collector data (no historical parquet)
+train-experiment-collector NAME:
+    cd ml && uv run python -m weatherstat.train --mode full --collector-only --experiment {{NAME}}
+
+# Backtest against overnight cooling test case (production model)
+backtest:
+    cd ml && uv run python scripts/backtest_overnight.py
+
+# Backtest production + experiment against overnight cooling
+backtest-experiment NAME:
+    cd ml && uv run python scripts/backtest_overnight.py --experiment {{NAME}}
+
+# Backtest production + all experiments against overnight cooling
+backtest-all:
+    cd ml && uv run python scripts/backtest_overnight.py --all
 
 # Compare an experiment's models against production
 experiment-compare NAME:

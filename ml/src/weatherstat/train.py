@@ -131,7 +131,7 @@ def load_baseline_data() -> pd.DataFrame:
     return df
 
 
-def load_full_data() -> pd.DataFrame:
+def load_full_data(collector_only: bool = False) -> pd.DataFrame:
     """Load 5-min full-feature data for full training.
 
     Merges two optional sources:
@@ -140,12 +140,17 @@ def load_full_data() -> pd.DataFrame:
 
     At least one source must exist. On timestamp collision the collector
     row wins (it's the live truth).
+
+    If collector_only=True, skip historical_full.parquet entirely — train
+    only on collector data where every row has full HVAC features.
     """
     frames: list[pd.DataFrame] = []
 
-    # Source 1: historical extraction (optional)
+    # Source 1: historical extraction (optional, skipped in collector-only mode)
     parquet_path = SNAPSHOTS_DIR / "historical_full.parquet"
-    if parquet_path.exists():
+    if collector_only:
+        print("Collector-only mode: skipping historical_full.parquet")
+    elif parquet_path.exists():
         hist = pd.read_parquet(parquet_path)
         print(f"Loaded {len(hist)} rows from {parquet_path.name}")
         frames.append(hist)
@@ -236,13 +241,15 @@ def _save_metrics(
     print(f"Metrics saved to {path}")
 
 
-def train_mode(mode: str, output_dir: Path | None = None) -> None:
+def train_mode(mode: str, output_dir: Path | None = None, collector_only: bool = False) -> None:
     """Run training for the specified mode.
 
     Args:
         mode: "baseline" or "full".
         output_dir: Override model output directory (default: MODELS_DIR).
             Used for experiment workflows to write to data/models/{experiment}/.
+        collector_only: If True, skip historical_full.parquet and train only on
+            collector data. Only applies to full mode.
     """
     models_dir = output_dir or MODELS_DIR
     if mode == "baseline":
@@ -251,7 +258,7 @@ def train_mode(mode: str, output_dir: Path | None = None) -> None:
         params = LGBM_PARAMS
         model_prefix = "baseline"
     elif mode == "full":
-        df = load_full_data()
+        df = load_full_data(collector_only=collector_only)
         horizons = HORIZONS_5MIN
         # Auto-select params: ~17 days of 5-min data ≈ 5000 rows
         if len(df) >= 5000:
@@ -425,9 +432,14 @@ def main() -> None:
         default=None,
         help="Write models to data/models/{name}/ instead of production",
     )
+    parser.add_argument(
+        "--collector-only",
+        action="store_true",
+        help="Train only on collector data (skip historical_full.parquet). Only applies to --mode full.",
+    )
     args = parser.parse_args()
     output_dir = experiment_models_dir(args.experiment) if args.experiment else None
-    train_mode(args.mode, output_dir=output_dir)
+    train_mode(args.mode, output_dir=output_dir, collector_only=args.collector_only)
 
 
 if __name__ == "__main__":

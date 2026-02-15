@@ -138,6 +138,7 @@ ENERGY_COST_BLOWER: dict[str, float] = _CFG.energy_costs.blower
 # Advisory configuration (from YAML)
 ADVISORY_EFFORT_COST: float = _CFG.advisory.effort_cost
 ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
+ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
 
 
 # LightGBM training parameters — conservative for small datasets

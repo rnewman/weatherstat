@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +28,7 @@ import pandas as pd
 
 from weatherstat.config import (
     ADVISORY_EFFORT_COST,
+    ADVISORY_QUIET_HOURS,
     BLOWERS,
     CONTROL_STATE_FILE,
     ENERGY_COST_BLOWER,
@@ -133,6 +135,71 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
         )
         schedules.append(ComfortSchedule(room=room, entries=schedule_entries))
     return schedules
+
+
+def adjust_schedules_for_windows(
+    schedules: list[ComfortSchedule],
+    window_states: dict[str, bool],
+    window_config: dict[str, object],
+    min_offset: float,
+    max_offset: float,
+) -> list[ComfortSchedule]:
+    """Widen comfort bounds for rooms with open windows.
+
+    When a room's window is open, shift min_temp down and max_temp up.
+    This makes the optimizer less eager to heat/cool a room with an open window.
+
+    Args:
+        schedules: Comfort schedules for all rooms.
+        window_states: window_name -> is_open for each window.
+        window_config: window_name -> WindowConfig from YAML.
+        min_offset: Amount to add to min_temp (negative = lower).
+        max_offset: Amount to add to max_temp (positive = higher).
+
+    Returns:
+        New list of ComfortSchedule with adjusted bounds for affected rooms.
+    """
+    # Build set of rooms with open windows
+    rooms_with_open_windows: set[str] = set()
+    for wname, is_open in window_states.items():
+        if is_open:
+            wcfg = window_config.get(wname)
+            if wcfg is not None:
+                for room in wcfg.rooms:
+                    rooms_with_open_windows.add(room)
+
+    if not rooms_with_open_windows:
+        return schedules
+
+    adjusted: list[ComfortSchedule] = []
+    for schedule in schedules:
+        if schedule.room not in rooms_with_open_windows:
+            adjusted.append(schedule)
+            continue
+        new_entries = tuple(
+            ComfortScheduleEntry(
+                e.start_hour,
+                e.end_hour,
+                RoomComfort(
+                    e.comfort.room,
+                    e.comfort.min_temp + min_offset,
+                    e.comfort.max_temp + max_offset,
+                    e.comfort.cold_penalty,
+                    e.comfort.hot_penalty,
+                ),
+            )
+            for e in schedule.entries
+        )
+        adjusted.append(ComfortSchedule(room=schedule.room, entries=new_entries))
+    return adjusted
+
+
+def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
+    """Return True if the given hour falls within quiet hours (wraps midnight)."""
+    start, end = quiet
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end
 
 
 # ── Zone mapping ──────────────────────────────────────────────────────────
@@ -901,6 +968,20 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Sweep all HVAC combinations
     schedules = default_comfort_schedules()
+    window_states_dict = {
+        name: bool(latest.get(f"window_{name}_open", False))
+        for name in _CFG.windows
+    }
+    schedules = adjust_schedules_for_windows(
+        schedules, window_states_dict, _CFG.windows, *_CFG.window_open_offset,
+    )
+    rooms_with_open = set()
+    for wn, ws in window_states_dict.items():
+        if ws:
+            for r in _CFG.windows[wn].rooms:
+                rooms_with_open.add(r)
+    if rooms_with_open:
+        print(f"  Comfort adjusted for open windows: {', '.join(sorted(rooms_with_open))}")
     n_scenarios = len(generate_scenarios())
     print(f"\n[control] Sweeping {n_scenarios} HVAC combinations...")
     t0 = time.monotonic()
@@ -1000,10 +1081,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         print("  Mode: DRY-RUN — command written but not executed")
 
     # ── Model-based advisory sweep ──
-    window_states_dict = {
-        name: bool(latest.get(f"window_{name}_open", False))
-        for name in _CFG.windows
-    }
     advisory_actions = build_advisory_actions(window_states_dict)
     electronic_overrides = _decision_to_overrides(decision, current_split_temps)
 
@@ -1035,7 +1112,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             # Map recommendation direction to advisory type
             rec_open = any(r.recommended_state == "open" for r in recommendations)
             adv_type = AdvisoryType.FREE_COOLING if rec_open else AdvisoryType.CLOSE_WINDOWS
-            if not is_on_cooldown(state, adv_type):
+            if _in_quiet_hours(base_hour, ADVISORY_QUIET_HOURS):
+                print("  (quiet hours, not sent)")
+            elif not is_on_cooldown(state, adv_type):
                 advisory = Advisory(
                     advisory_type=adv_type,
                     title="Window advisory",
@@ -1064,6 +1143,7 @@ def run_control_loop(live: bool = False) -> None:
             run_control_cycle(live=live)
         except Exception as e:
             print(f"[control] Error in control cycle: {e}", file=sys.stderr)
+            traceback.print_exc()
         print(f"\n[control] Next cycle in {LOOP_INTERVAL_SECONDS // 60} minutes...\n")
         time.sleep(LOOP_INTERVAL_SECONDS)
 

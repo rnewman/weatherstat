@@ -6,6 +6,7 @@ import pandas as pd
 from weatherstat.features import (
     add_delta_features,
     add_future_targets,
+    add_newton_cooling_features,
     add_time_features,
     build_features,
     encode_hvac_features,
@@ -177,3 +178,104 @@ def test_build_features_full_mode() -> None:
     # Should have 5-min lag features
     assert "thermostat_upstairs_temp_lag_1" in result.columns
     assert "thermostat_upstairs_temp_lag_12" in result.columns
+
+
+# ── Newton cooling features ────────────────────────────────────────────────
+
+
+def test_newton_cooling_predictions_between_room_and_outdoor() -> None:
+    """Newton predictions should be between current room temp and outdoor temp."""
+    df = pd.DataFrame({
+        "thermostat_upstairs_temp": [72.0, 73.0, 71.0],
+        "thermostat_downstairs_temp": [70.0, 71.0, 69.0],
+        "outdoor_temp": [40.0, 42.0, 38.0],
+    })
+
+    result = add_newton_cooling_features(df)
+
+    for horizon in ["1h", "2h", "4h", "6h", "12h"]:
+        pred = result[f"upstairs_newton_{horizon}"]
+        # Newton prediction should be between outdoor and room temp
+        assert (pred >= df["outdoor_temp"]).all(), f"upstairs {horizon}: pred below outdoor"
+        assert (pred <= df["thermostat_upstairs_temp"]).all(), f"upstairs {horizon}: pred above room"
+
+
+def test_newton_cooling_monotonic_decay() -> None:
+    """Longer horizons should show more cooling (monotonic decay toward outdoor)."""
+    df = pd.DataFrame({
+        "thermostat_upstairs_temp": [72.0],
+        "thermostat_downstairs_temp": [70.0],
+        "outdoor_temp": [40.0],
+    })
+
+    result = add_newton_cooling_features(df)
+
+    horizons = ["1h", "2h", "4h", "6h", "12h"]
+    for room in ["upstairs", "downstairs"]:
+        preds = [result[f"{room}_newton_{h}"].iloc[0] for h in horizons]
+        # Each successive horizon should be cooler (closer to outdoor)
+        for i in range(len(preds) - 1):
+            assert preds[i] > preds[i + 1], (
+                f"{room}: {horizons[i]}={preds[i]:.2f} not > {horizons[i+1]}={preds[i+1]:.2f}"
+            )
+
+
+def test_newton_cooling_delta_negative_when_warmer() -> None:
+    """Delta should be negative when room is warmer than outdoor (cooling)."""
+    df = pd.DataFrame({
+        "thermostat_upstairs_temp": [72.0],
+        "thermostat_downstairs_temp": [70.0],
+        "outdoor_temp": [40.0],
+    })
+
+    result = add_newton_cooling_features(df)
+
+    for horizon in ["1h", "2h", "4h", "6h", "12h"]:
+        delta = result[f"upstairs_newton_delta_{horizon}"].iloc[0]
+        assert delta < 0, f"upstairs delta {horizon} should be negative, got {delta}"
+
+
+def test_newton_cooling_nan_outdoor() -> None:
+    """NaN outdoor temp should produce NaN Newton features."""
+    df = pd.DataFrame({
+        "thermostat_upstairs_temp": [72.0],
+        "thermostat_downstairs_temp": [70.0],
+        "outdoor_temp": [np.nan],
+    })
+
+    result = add_newton_cooling_features(df)
+
+    for horizon in ["1h", "4h", "12h"]:
+        assert pd.isna(result[f"upstairs_newton_{horizon}"].iloc[0])
+        assert pd.isna(result[f"upstairs_newton_delta_{horizon}"].iloc[0])
+
+
+def test_newton_cooling_in_build_features_both_modes() -> None:
+    """Newton cooling features should appear in both full and baseline build_features output."""
+    df_baseline = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-15 00:00", periods=10, freq="h").strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        ),
+        "thermostat_upstairs_temp": np.linspace(70, 74, 10),
+        "thermostat_downstairs_temp": np.linspace(68, 72, 10),
+        "outdoor_temp": np.linspace(35, 40, 10),
+    })
+
+    result_baseline = build_features(df_baseline, mode="baseline")
+    assert "upstairs_newton_1h" in result_baseline.columns
+    assert "upstairs_newton_delta_12h" in result_baseline.columns
+    assert "downstairs_newton_4h" in result_baseline.columns
+
+    df_full = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-15 00:00", periods=20, freq="5min").strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        ),
+        "thermostat_upstairs_temp": np.linspace(70, 74, 20),
+        "thermostat_downstairs_temp": np.linspace(68, 72, 20),
+        "outdoor_temp": np.linspace(35, 40, 20),
+    })
+
+    result_full = build_features(df_full, mode="full")
+    assert "upstairs_newton_1h" in result_full.columns
+    assert "upstairs_newton_delta_12h" in result_full.columns
+    assert "downstairs_newton_4h" in result_full.columns

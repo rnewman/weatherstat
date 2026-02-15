@@ -17,7 +17,9 @@ from weatherstat.control import (
     CONTROL_HORIZONS,
     HORIZON_WEIGHTS,
     _cautious_setpoint,
+    _in_quiet_hours,
     _zone_comfort_max,
+    adjust_schedules_for_windows,
     build_advisory_actions,
     compute_comfort_cost,
     compute_energy_cost,
@@ -579,3 +581,138 @@ def _cfg_windows() -> list[tuple[str, object]]:
 
     cfg = load_config()
     return list(cfg.windows.items())
+
+
+# ── Window comfort adjustment tests ─────────────────────────────────────
+
+
+class TestAdjustSchedulesForWindows:
+    """Test comfort schedule adjustment when windows are open."""
+
+    def test_no_open_windows_returns_unchanged(self) -> None:
+        """All windows closed -> schedules unchanged."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        schedules = make_schedules()
+        window_states = {name: False for name in cfg.windows}
+
+        adjusted = adjust_schedules_for_windows(
+            schedules, window_states, cfg.windows, -3.0, 2.0,
+        )
+        # Same number of schedules, same entries
+        assert len(adjusted) == len(schedules)
+        for orig, adj in zip(schedules, adjusted, strict=True):
+            assert orig is adj  # should be the exact same object
+
+    def test_open_window_widens_comfort_bounds(self) -> None:
+        """Bedroom window open -> bedroom schedule shifted by offset."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        schedules = make_schedules(
+            bedroom=[
+                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 74.0, 2.0, 1.0)),
+            ],
+        )
+        window_states = {name: False for name in cfg.windows}
+        window_states["bedroom"] = True
+
+        adjusted = adjust_schedules_for_windows(
+            schedules, window_states, cfg.windows, -3.0, 2.0,
+        )
+
+        bedroom_sched = next(s for s in adjusted if s.room == "bedroom")
+        entry = bedroom_sched.entries[0]
+        assert entry.comfort.min_temp == 67.0  # 70 + (-3)
+        assert entry.comfort.max_temp == 76.0  # 74 + 2
+
+    def test_unrelated_room_not_affected(self) -> None:
+        """Bedroom window open -> upstairs schedule untouched."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        schedules = make_schedules()
+        window_states = {name: False for name in cfg.windows}
+        window_states["bedroom"] = True
+
+        adjusted = adjust_schedules_for_windows(
+            schedules, window_states, cfg.windows, -3.0, 2.0,
+        )
+
+        upstairs_orig = next(s for s in schedules if s.room == "upstairs")
+        upstairs_adj = next(s for s in adjusted if s.room == "upstairs")
+        assert upstairs_orig is upstairs_adj  # unchanged
+
+    def test_penalties_preserved(self) -> None:
+        """Window adjustment preserves cold_penalty and hot_penalty."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        schedules = make_schedules(
+            bedroom=[
+                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 74.0, 3.0, 0.5)),
+            ],
+        )
+        window_states = {name: False for name in cfg.windows}
+        window_states["bedroom"] = True
+
+        adjusted = adjust_schedules_for_windows(
+            schedules, window_states, cfg.windows, -3.0, 2.0,
+        )
+
+        bedroom_sched = next(s for s in adjusted if s.room == "bedroom")
+        entry = bedroom_sched.entries[0]
+        assert entry.comfort.cold_penalty == 3.0
+        assert entry.comfort.hot_penalty == 0.5
+
+    def test_window_without_rooms_no_effect(self) -> None:
+        """Basement window (rooms=[]) open -> no schedules affected."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        schedules = make_schedules()
+        window_states = {name: False for name in cfg.windows}
+        window_states["basement"] = True  # basement has rooms=[]
+
+        adjusted = adjust_schedules_for_windows(
+            schedules, window_states, cfg.windows, -3.0, 2.0,
+        )
+
+        for orig, adj in zip(schedules, adjusted, strict=True):
+            assert orig is adj
+
+
+# ── Quiet hours tests ─────────────────────────────────────────────────────
+
+
+class TestQuietHours:
+    """Test quiet hours helper."""
+
+    def test_within_quiet_hours_wrapping(self) -> None:
+        """22:00-07:00 range wraps midnight. Hour 23, 0, 6 are quiet."""
+        assert _in_quiet_hours(23, (22, 7)) is True
+        assert _in_quiet_hours(0, (22, 7)) is True
+        assert _in_quiet_hours(6, (22, 7)) is True
+
+    def test_outside_quiet_hours_wrapping(self) -> None:
+        """22:00-07:00 range. Hour 7, 12, 21 are not quiet."""
+        assert _in_quiet_hours(7, (22, 7)) is False
+        assert _in_quiet_hours(12, (22, 7)) is False
+        assert _in_quiet_hours(21, (22, 7)) is False
+
+    def test_non_wrapping_range(self) -> None:
+        """8:00-18:00 non-wrapping range."""
+        assert _in_quiet_hours(8, (8, 18)) is True
+        assert _in_quiet_hours(12, (8, 18)) is True
+        assert _in_quiet_hours(17, (8, 18)) is True
+        assert _in_quiet_hours(18, (8, 18)) is False
+        assert _in_quiet_hours(7, (8, 18)) is False
+
+    def test_boundary_start(self) -> None:
+        """Start hour is inclusive."""
+        assert _in_quiet_hours(22, (22, 7)) is True
+
+    def test_boundary_end(self) -> None:
+        """End hour is exclusive."""
+        assert _in_quiet_hours(7, (22, 7)) is False

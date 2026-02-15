@@ -107,9 +107,16 @@ class ExtraTempSensorConfig:
 
 
 @dataclass(frozen=True)
+class ThermalConfig:
+    tau: dict[str, float]  # room_name -> time constant (hours)
+    default_tau: float = 45.0
+
+
+@dataclass(frozen=True)
 class AdvisoryConfig:
     effort_cost: float
     cooldowns: dict[str, int]
+    quiet_hours: tuple[int, int] = (22, 7)
 
 
 @dataclass(frozen=True)
@@ -130,7 +137,9 @@ class WeatherstatConfig:
     notification_target: str
     energy_costs: EnergyCostConfig
     extra_temp_sensors: dict[str, ExtraTempSensorConfig] = field(default_factory=dict)
+    thermal: ThermalConfig = field(default_factory=lambda: ThermalConfig(tau={}, default_tau=45.0))
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
+    window_open_offset: tuple[float, float] = (-3.0, 2.0)  # (min_offset, max_offset)
 
     # ── Derived properties ────────────────────────────────────────────
 
@@ -441,9 +450,16 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     for name, room in data["rooms"].items():
         rooms[name] = RoomConfig(name=name, temp_column=room["temp_column"], zone=room["zone"])
 
+    # Window-open comfort offset (optional, in comfort section)
+    comfort_data = data["comfort"]
+    wo_offset = comfort_data.get("window_open_offset", {"min": -3, "max": 2})
+    window_open_offset = (float(wo_offset["min"]), float(wo_offset["max"]))
+
     # Comfort schedules
     comfort: dict[str, list[ComfortEntry]] = {}
-    for room, entries in data["comfort"].items():
+    for room, entries in comfort_data.items():
+        if room == "window_open_offset":
+            continue
         comfort[room] = []
         for entry in entries:
             hours = entry["hours"]
@@ -469,11 +485,20 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     for name, sensor in data.get("extra_temp_sensors", {}).items():
         extra_temp_sensors[name] = ExtraTempSensorConfig(name=name, entity_id=sensor["entity_id"])
 
+    # Thermal config (optional, with defaults)
+    thermal_data = data.get("thermal", {})
+    thermal_config = ThermalConfig(
+        tau={str(k): float(v) for k, v in thermal_data.get("tau", {}).items()},
+        default_tau=float(thermal_data.get("default_tau", 45.0)),
+    )
+
     # Advisory config (optional, with defaults)
     adv_data = data.get("advisory", {})
+    adv_quiet = adv_data.get("quiet_hours", [22, 7])
     advisory_config = AdvisoryConfig(
         effort_cost=float(adv_data.get("effort_cost", 0.5)),
         cooldowns={str(k): int(v) for k, v in adv_data.get("cooldowns", {}).items()},
+        quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
     )
 
     return WeatherstatConfig(
@@ -491,7 +516,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         notification_target=data["notifications"]["target"],
         energy_costs=energy_costs,
         extra_temp_sensors=extra_temp_sensors,
+        thermal=thermal_config,
         advisory=advisory_config,
+        window_open_offset=window_open_offset,
     )
 
 

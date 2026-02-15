@@ -219,6 +219,46 @@ def add_physics_features(df: pd.DataFrame, mode: str = "full") -> pd.DataFrame:
     return df
 
 
+# ── Newton's law of cooling features ───────────────────────────────────────
+
+# Hours ahead for each horizon label
+HORIZON_HOURS = {"1h": 1.0, "2h": 2.0, "4h": 4.0, "6h": 6.0, "12h": 12.0}
+
+
+def add_newton_cooling_features(df: pd.DataFrame, mode: str = "full") -> pd.DataFrame:
+    """Add Newton's law of cooling predictions as features.
+
+    For each room and horizon, computes:
+      T_newton = T_outdoor + (T_room - T_outdoor) * exp(-hours / tau)
+      delta    = T_newton - T_room  (expected passive change, ≤ 0 when warmer)
+
+    LightGBM can't compute exp(-t/τ) from raw temperatures (trees do axis-aligned
+    splits). Pre-computing gives the model direct access to physics predictions.
+    During HVAC sweep, Newton features stay unchanged (passive prediction);
+    HVAC features capture the heating effect. LightGBM combines them.
+    """
+    df = df.copy()
+    thermal = _CFG.thermal
+
+    for room, temp_col in _CFG.room_temp_columns.items():
+        if temp_col not in df.columns or "outdoor_temp" not in df.columns:
+            continue
+
+        tau = thermal.tau.get(room, thermal.default_tau)
+        t_room = df[temp_col]
+        t_outdoor = df["outdoor_temp"]
+
+        for label, hours in HORIZON_HOURS.items():
+            decay = np.exp(-hours / tau)
+            newton_pred = t_outdoor + (t_room - t_outdoor) * decay
+            newton_delta = newton_pred - t_room
+
+            df[f"{room}_newton_{label}"] = newton_pred
+            df[f"{room}_newton_delta_{label}"] = newton_delta
+
+    return df
+
+
 # ── Lag and rolling features ────────────────────────────────────────────────
 
 def add_lag_features(
@@ -324,6 +364,9 @@ def build_features(
         # Physics-informed features (dT/dt, acceleration, heating power)
         df = add_physics_features(df, mode="full")
 
+        # Newton's law of cooling predictions (passive thermal decay)
+        df = add_newton_cooling_features(df, mode="full")
+
         # Temperature lags and rolling at 5-min intervals
         temp_cols = [c for c in TEMP_COLUMNS_FULL if c in df.columns]
         df = add_lag_features(df, temp_cols, LAG_PERIODS_5MIN)
@@ -338,6 +381,9 @@ def build_features(
 
         # Physics-informed features (dT/dt, acceleration, heating power)
         df = add_physics_features(df, mode="baseline")
+
+        # Newton's law of cooling predictions (passive thermal decay)
+        df = add_newton_cooling_features(df, mode="baseline")
 
         # Temperature lags and rolling at hourly intervals
         temp_cols = [c for c in TEMP_COLUMNS_HOURLY if c in df.columns]
