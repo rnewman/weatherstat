@@ -196,7 +196,18 @@ export async function executePrediction(
 
   // Load last-applied state (what the executor actually set last time)
   const lastState = await loadExecutorState(config);
-  const last = lastState?.devices ?? {};
+  const OVERRIDE_STALE_MS = 30 * 60 * 1000; // 30 minutes (2× loop interval)
+
+  let last = lastState?.devices ?? {};
+  if (lastState?.timestamp) {
+    const age = Date.now() - new Date(lastState.timestamp).getTime();
+    if (age > OVERRIDE_STALE_MS) {
+      console.log(
+        `[executor] Executor state is ${Math.round(age / 60000)}m old — clearing overrides`,
+      );
+      last = {};
+    }
+  }
 
   // Clone last-applied — updated per-device only when we actually apply
   const updated: Record<string, DeviceState> = { ...last };
