@@ -304,13 +304,17 @@ def _zone_comfort_min(zone: str, schedules: list[ComfortSchedule], hour: int) ->
     return ABSOLUTE_MIN
 
 
-def _cautious_setpoint(current_temp: float, heating: bool) -> float:
+def _cautious_setpoint(current_temp: float, heating: bool, comfort_min: float = ABSOLUTE_MIN) -> float:
     """Compute a cautious setpoint that achieves on/off without runaway risk.
 
-    If the control loop is interrupted, the thermostat will gently coast
-    instead of driving to an extreme temperature.
+    When heating ON: current_temp + offset (ensure thermostat fires).
+    When heating OFF: comfort_min - 1 (thermostat acts as safety net at comfort floor).
+
+    The OFF setpoint uses comfort_min — not current_temp - offset — so the
+    thermostat prevents the house from cooling below the comfort range even
+    if the control loop is interrupted.
     """
-    sp = current_temp + CAUTIOUS_OFFSET if heating else current_temp - CAUTIOUS_OFFSET
+    sp = max(current_temp + CAUTIOUS_OFFSET, comfort_min + CAUTIOUS_OFFSET) if heating else (comfort_min - 1)
     return max(ABSOLUTE_MIN, min(ABSOLUTE_MAX, sp))
 
 
@@ -359,6 +363,52 @@ def generate_scenarios() -> list[HVACScenario]:
                     scenarios.append(HVACScenario(up_on, dn_on, blowers, splits))
 
     return scenarios
+
+
+def _batch_predict(
+    base_row: pd.DataFrame,
+    overrides_list: list[dict[str, float]],
+    models: dict[str, object],
+) -> tuple[list[str], np.ndarray]:
+    """Predict all scenarios in batch — one model.predict() call per target.
+
+    Replaces N × M individual predict calls with M batch calls (one per model).
+    For the HVAC sweep: 7,200 calls → 40. For the window sweep: 5,120 → 40.
+
+    Args:
+        base_row: 1-row DataFrame of base features.
+        overrides_list: Per-scenario feature column overrides.
+        models: Target name → LightGBM Booster mapping.
+
+    Returns:
+        (target_names, predictions) where predictions shape is (n_scenarios, n_targets).
+    """
+    n = len(overrides_list)
+    target_names = list(models.keys())
+    if n == 0:
+        return target_names, np.empty((0, len(target_names)))
+
+    col_to_idx = {col: i for i, col in enumerate(base_row.columns)}
+
+    # Tile base feature row into (n_scenarios × n_features) numpy array
+    X = np.tile(base_row.values.astype(np.float64), (n, 1))
+
+    # Apply per-scenario overrides via direct array indexing
+    for i, overrides in enumerate(overrides_list):
+        for col, val in overrides.items():
+            idx = col_to_idx.get(col)
+            if idx is not None:
+                X[i, idx] = val
+
+    # Wrap in DataFrame for model compatibility (LightGBM + test mocks accept DataFrames)
+    X_df = pd.DataFrame(X, columns=base_row.columns)
+
+    # One batch predict call per target model
+    result = np.empty((n, len(target_names)))
+    for j, target in enumerate(target_names):
+        result[:, j] = models[target].predict(X_df)  # type: ignore[union-attr]
+
+    return target_names, result
 
 
 def sweep_scenarios(
@@ -426,10 +476,6 @@ def sweep_scenarios(
         print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
         print(f"  Reduced scenarios: {pre_count} → {len(scenarios)}")
 
-    best_cost = float("inf")
-    best_decision: ControlDecision | None = None
-    off_decision: ControlDecision | None = None  # Track all-off for comparison
-
     def _is_all_off(s: HVACScenario) -> bool:
         return (
             not s.upstairs_heating
@@ -438,83 +484,98 @@ def sweep_scenarios(
             and all(sp.mode == "off" for sp in s.mini_splits)
         )
 
-    for scenario in scenarios:
-        overrides = build_hvac_overrides(scenario, current_split_temps)
-        X = base_row.copy()
-        for col, val in overrides.items():
-            if col in X.columns:
-                X[col] = val
+    # ── Phase 1: batch predict all scenarios ──
+    overrides_list = [build_hvac_overrides(s, current_split_temps) for s in scenarios]
+    target_names, pred_matrix = _batch_predict(base_row, overrides_list, models)
+    target_idx = {t: j for j, t in enumerate(target_names)}
 
-        # Predict at all control horizons
-        predictions: dict[str, float] = {}
-        for target, model in models.items():
-            predictions[target] = float(model.predict(X)[0])  # type: ignore[union-attr]
+    # ── Phase 2: score each scenario ──
+    best_idx = -1
+    best_cost = float("inf")
+    off_idx = -1
+    off_cost = float("inf")
 
+    for i, scenario in enumerate(scenarios):
+        predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
         comfort = compute_comfort_cost(predictions, schedules, base_hour)
         energy = compute_energy_cost(scenario)
         total = comfort + energy
 
-        room_preds: dict[str, dict[str, float]] = {}
-        for room in PREDICTION_ROOMS:
-            rpred: dict[str, float] = {}
-            for h in CONTROL_HORIZONS:
-                key = f"{room}_temp_t+{h}"
-                val = predictions.get(key)
-                if val is not None:
-                    rpred[HORIZON_LABELS[h]] = round(val, 2)
-            if rpred:
-                room_preds[room] = rpred
-
-        # Compute mini-split command targets from comfort schedule midpoints
-        final_splits: list[MiniSplitDecision] = []
-        for sd in scenario.mini_splits:
-            if sd.mode == "off":
-                final_splits.append(sd)
-            else:
-                target_temp = MINI_SPLIT_SWEEP_TARGET  # fallback
-                for sched in schedules:
-                    if sched.room == sd.name:
-                        comfort_entry = sched.comfort_at(base_hour)
-                        if comfort_entry is not None:
-                            target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
-                        break
-                final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
-
-        decision = ControlDecision(
-            timestamp=datetime.now(UTC).isoformat(),
-            upstairs_heating=scenario.upstairs_heating,
-            downstairs_heating=scenario.downstairs_heating,
-            upstairs_setpoint=_cautious_setpoint(up_current, scenario.upstairs_heating),
-            downstairs_setpoint=_cautious_setpoint(dn_current, scenario.downstairs_heating),
-            blowers=scenario.blowers,
-            mini_splits=tuple(final_splits),
-            total_cost=round(total, 4),
-            comfort_cost=round(comfort, 4),
-            energy_cost=round(energy, 4),
-            room_predictions=room_preds,
-        )
-
         if _is_all_off(scenario):
-            off_decision = decision
+            off_idx = i
+            off_cost = total
 
         if total < best_cost:
             best_cost = total
-            best_decision = decision
+            best_idx = i
 
-    if best_decision is None:
+    if best_idx < 0:
         raise RuntimeError("No HVAC scenarios evaluated")
 
     # Minimum improvement safeguard: only choose an active HVAC scenario if it
     # improves total cost over all-off by at least MIN_IMPROVEMENT. Prevents
     # noise-driven decisions when the model barely differentiates scenarios.
-    if off_decision is not None and best_decision is not off_decision:
-        improvement = off_decision.total_cost - best_decision.total_cost
+    if off_idx >= 0 and best_idx != off_idx:
+        improvement = off_cost - best_cost
         if improvement < MIN_IMPROVEMENT:
             print(
                 f"  Reverting to all-off: improvement {improvement:.3f}"
                 f" < threshold {MIN_IMPROVEMENT:.1f}"
             )
-            best_decision = off_decision
+            best_idx = off_idx
+
+    # ── Phase 3: build ControlDecision for winner ──
+    scenario = scenarios[best_idx]
+    predictions = {t: float(pred_matrix[best_idx, j]) for t, j in target_idx.items()}
+    comfort = compute_comfort_cost(predictions, schedules, base_hour)
+    energy = compute_energy_cost(scenario)
+    total = comfort + energy
+
+    room_preds: dict[str, dict[str, float]] = {}
+    for room in PREDICTION_ROOMS:
+        rpred: dict[str, float] = {}
+        for h in CONTROL_HORIZONS:
+            key = f"{room}_temp_t+{h}"
+            val = predictions.get(key)
+            if val is not None:
+                rpred[HORIZON_LABELS[h]] = round(val, 2)
+        if rpred:
+            room_preds[room] = rpred
+
+    # Compute mini-split command targets from comfort schedule midpoints
+    final_splits: list[MiniSplitDecision] = []
+    for sd in scenario.mini_splits:
+        if sd.mode == "off":
+            final_splits.append(sd)
+        else:
+            target_temp = MINI_SPLIT_SWEEP_TARGET  # fallback
+            for sched in schedules:
+                if sched.room == sd.name:
+                    comfort_entry = sched.comfort_at(base_hour)
+                    if comfort_entry is not None:
+                        target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
+                    break
+            final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
+
+    best_decision = ControlDecision(
+        timestamp=datetime.now(UTC).isoformat(),
+        upstairs_heating=scenario.upstairs_heating,
+        downstairs_heating=scenario.downstairs_heating,
+        upstairs_setpoint=_cautious_setpoint(
+            up_current, scenario.upstairs_heating,
+            comfort_min=_zone_comfort_min("upstairs", schedules, base_hour),
+        ),
+        downstairs_setpoint=_cautious_setpoint(
+            dn_current, scenario.downstairs_heating,
+            comfort_min=_zone_comfort_min("downstairs", schedules, base_hour),
+        ),
+        blowers=scenario.blowers,
+        mini_splits=tuple(final_splits),
+        total_cost=round(total, 4),
+        comfort_cost=round(comfort, 4),
+        energy_cost=round(energy, 4),
+        room_predictions=room_preds,
+    )
 
     return best_decision
 
@@ -649,51 +710,58 @@ def evaluate_advisories(
         if col in X_base.columns:
             X_base[col] = val
 
-    # Baseline: predict with current window states (already in X_base)
-    baseline_preds: dict[str, float] = {}
-    for target, model in models.items():
-        baseline_preds[target] = float(model.predict(X_base)[0])  # type: ignore[union-attr]
-    baseline_comfort = compute_comfort_cost(baseline_preds, schedules, base_hour)
-
     # Build current state index (for skipping)
     current_indices = tuple(
         0 if a.current == a.options[0].name else 1
         for a in advisory_actions
     )
 
-    best_improvement = 0.0
-    best_combo: tuple[int, ...] | None = None
-    best_preds: dict[str, float] = {}
+    has_any_window = "any_window_open" in X_base.columns
 
-    # Enumerate all 2^N combinations
+    # Build all combo overrides (baseline = empty overrides as first entry)
+    combos: list[tuple[int, ...]] = [current_indices]  # index 0 = baseline
+    overrides_list: list[dict[str, float]] = [{}]  # baseline: no window changes
+
     for combo in product(range(2), repeat=n):
         if combo == current_indices:
-            continue  # skip current state
+            continue
 
-        X_test = X_base.copy()
+        window_overrides: dict[str, float] = {}
         for i, opt_idx in enumerate(combo):
             option = advisory_actions[i].options[opt_idx]
-            for col, val in option.feature_overrides.items():
-                if col in X_test.columns:
-                    X_test[col] = val
+            window_overrides.update(option.feature_overrides)
 
-        # Set any_window_open correctly if it's in the model features (transition)
-        if "any_window_open" in X_test.columns:
+        if has_any_window:
             any_open = any(
                 advisory_actions[i].options[combo[i]].name == "open"
                 for i in range(n)
             )
-            X_test["any_window_open"] = float(any_open)
+            window_overrides["any_window_open"] = float(any_open)
 
-        combo_preds: dict[str, float] = {}
-        for target, model in models.items():
-            combo_preds[target] = float(model.predict(X_test)[0])  # type: ignore[union-attr]
+        combos.append(combo)
+        overrides_list.append(window_overrides)
+
+    # Batch predict all combos (including baseline)
+    target_names, pred_matrix = _batch_predict(X_base, overrides_list, models)
+    target_idx = {t: j for j, t in enumerate(target_names)}
+
+    # Score baseline (index 0)
+    baseline_preds = {t: float(pred_matrix[0, j]) for t, j in target_idx.items()}
+    baseline_comfort = compute_comfort_cost(baseline_preds, schedules, base_hour)
+
+    # Score all non-baseline combos
+    best_improvement = 0.0
+    best_combo: tuple[int, ...] | None = None
+    best_preds: dict[str, float] = {}
+
+    for k in range(1, len(combos)):
+        combo_preds = {t: float(pred_matrix[k, j]) for t, j in target_idx.items()}
         combo_comfort = compute_comfort_cost(combo_preds, schedules, base_hour)
 
         improvement = baseline_comfort - combo_comfort
         if improvement > best_improvement:
             best_improvement = improvement
-            best_combo = combo
+            best_combo = combos[k]
             best_preds = combo_preds
 
     if best_combo is None:
@@ -873,16 +941,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     _check_config()
 
-    # Check hold time
-    prior_state = load_control_state()
-    if should_hold(prior_state) and prior_state is not None:
-        last = prior_state.last_decision_time
-        print(f"[control] Holding current setpoints (last decision: {last})")
-        up_sp = prior_state.upstairs_setpoint
-        dn_sp = prior_state.downstairs_setpoint
-        print(f"  Upstairs: {up_sp}°F, Downstairs: {dn_sp}°F")
-        return None
-
     # Fetch data
     print("[control] Fetching recent history from Home Assistant...")
     df_raw = fetch_recent_history(hours_back=14)
@@ -1028,13 +1086,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
     )
     off_overrides = build_hvac_overrides(all_off, current_split_temps)
-    X_off = base_row.copy()
-    for col, val in off_overrides.items():
-        if col in X_off.columns:
-            X_off[col] = val
-    off_preds: dict[str, float] = {}
-    for target, model in models.items():
-        off_preds[target] = float(model.predict(X_off)[0])  # type: ignore[union-attr]
+    off_targets, off_matrix = _batch_predict(base_row, [off_overrides], models)
+    off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
     off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
 
     print(f"\n  All-off baseline: comfort={off_comfort:.4f}")

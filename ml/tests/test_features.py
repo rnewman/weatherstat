@@ -184,7 +184,7 @@ def test_build_features_full_mode() -> None:
 
 
 def test_newton_cooling_predictions_between_room_and_outdoor() -> None:
-    """Newton predictions should be between current room temp and outdoor temp."""
+    """Newton predictions (both sealed and ventilated) should be between room and outdoor temp."""
     df = pd.DataFrame({
         "thermostat_upstairs_temp": [72.0, 73.0, 71.0],
         "thermostat_downstairs_temp": [70.0, 71.0, 69.0],
@@ -193,11 +193,11 @@ def test_newton_cooling_predictions_between_room_and_outdoor() -> None:
 
     result = add_newton_cooling_features(df)
 
-    for horizon in ["1h", "2h", "4h", "6h", "12h"]:
-        pred = result[f"upstairs_newton_{horizon}"]
-        # Newton prediction should be between outdoor and room temp
-        assert (pred >= df["outdoor_temp"]).all(), f"upstairs {horizon}: pred below outdoor"
-        assert (pred <= df["thermostat_upstairs_temp"]).all(), f"upstairs {horizon}: pred above room"
+    for variant in ["sealed", "vent"]:
+        for horizon in ["1h", "2h", "4h", "6h", "12h"]:
+            pred = result[f"upstairs_newton_{variant}_{horizon}"]
+            assert (pred >= df["outdoor_temp"]).all(), f"upstairs {variant} {horizon}: below outdoor"
+            assert (pred <= df["thermostat_upstairs_temp"]).all(), f"upstairs {variant} {horizon}: above room"
 
 
 def test_newton_cooling_monotonic_decay() -> None:
@@ -212,12 +212,28 @@ def test_newton_cooling_monotonic_decay() -> None:
 
     horizons = ["1h", "2h", "4h", "6h", "12h"]
     for room in ["upstairs", "downstairs"]:
-        preds = [result[f"{room}_newton_{h}"].iloc[0] for h in horizons]
-        # Each successive horizon should be cooler (closer to outdoor)
-        for i in range(len(preds) - 1):
-            assert preds[i] > preds[i + 1], (
-                f"{room}: {horizons[i]}={preds[i]:.2f} not > {horizons[i+1]}={preds[i+1]:.2f}"
-            )
+        for variant in ["sealed", "vent"]:
+            preds = [result[f"{room}_newton_{variant}_{h}"].iloc[0] for h in horizons]
+            for i in range(len(preds) - 1):
+                assert preds[i] > preds[i + 1], (
+                    f"{room} {variant}: {horizons[i]}={preds[i]:.2f} not > {horizons[i+1]}={preds[i+1]:.2f}"
+                )
+
+
+def test_newton_ventilated_cools_faster_than_sealed() -> None:
+    """Ventilated predictions should be cooler than sealed (lower τ = faster decay)."""
+    df = pd.DataFrame({
+        "thermostat_upstairs_temp": [72.0],
+        "thermostat_downstairs_temp": [70.0],
+        "outdoor_temp": [40.0],
+    })
+
+    result = add_newton_cooling_features(df)
+
+    for horizon in ["1h", "4h", "12h"]:
+        sealed = result[f"upstairs_newton_sealed_{horizon}"].iloc[0]
+        vent = result[f"upstairs_newton_vent_{horizon}"].iloc[0]
+        assert vent < sealed, f"upstairs {horizon}: vent {vent:.2f} should be < sealed {sealed:.2f}"
 
 
 def test_newton_cooling_delta_negative_when_warmer() -> None:
@@ -230,9 +246,10 @@ def test_newton_cooling_delta_negative_when_warmer() -> None:
 
     result = add_newton_cooling_features(df)
 
-    for horizon in ["1h", "2h", "4h", "6h", "12h"]:
-        delta = result[f"upstairs_newton_delta_{horizon}"].iloc[0]
-        assert delta < 0, f"upstairs delta {horizon} should be negative, got {delta}"
+    for variant in ["sealed", "vent"]:
+        for horizon in ["1h", "2h", "4h", "6h", "12h"]:
+            delta = result[f"upstairs_newton_{variant}_delta_{horizon}"].iloc[0]
+            assert delta < 0, f"upstairs {variant} delta {horizon} should be negative, got {delta}"
 
 
 def test_newton_cooling_nan_outdoor() -> None:
@@ -245,9 +262,10 @@ def test_newton_cooling_nan_outdoor() -> None:
 
     result = add_newton_cooling_features(df)
 
-    for horizon in ["1h", "4h", "12h"]:
-        assert pd.isna(result[f"upstairs_newton_{horizon}"].iloc[0])
-        assert pd.isna(result[f"upstairs_newton_delta_{horizon}"].iloc[0])
+    for variant in ["sealed", "vent"]:
+        for horizon in ["1h", "4h", "12h"]:
+            assert pd.isna(result[f"upstairs_newton_{variant}_{horizon}"].iloc[0])
+            assert pd.isna(result[f"upstairs_newton_{variant}_delta_{horizon}"].iloc[0])
 
 
 def test_newton_cooling_in_build_features_both_modes() -> None:
@@ -262,9 +280,10 @@ def test_newton_cooling_in_build_features_both_modes() -> None:
     })
 
     result_baseline = build_features(df_baseline, mode="baseline")
-    assert "upstairs_newton_1h" in result_baseline.columns
-    assert "upstairs_newton_delta_12h" in result_baseline.columns
-    assert "downstairs_newton_4h" in result_baseline.columns
+    assert "upstairs_newton_sealed_1h" in result_baseline.columns
+    assert "upstairs_newton_vent_1h" in result_baseline.columns
+    assert "upstairs_newton_sealed_delta_12h" in result_baseline.columns
+    assert "downstairs_newton_vent_4h" in result_baseline.columns
 
     df_full = pd.DataFrame({
         "timestamp": pd.date_range("2024-01-15 00:00", periods=20, freq="5min").strftime(
@@ -276,6 +295,7 @@ def test_newton_cooling_in_build_features_both_modes() -> None:
     })
 
     result_full = build_features(df_full, mode="full")
-    assert "upstairs_newton_1h" in result_full.columns
-    assert "upstairs_newton_delta_12h" in result_full.columns
-    assert "downstairs_newton_4h" in result_full.columns
+    assert "upstairs_newton_sealed_1h" in result_full.columns
+    assert "upstairs_newton_vent_1h" in result_full.columns
+    assert "upstairs_newton_sealed_delta_12h" in result_full.columns
+    assert "downstairs_newton_vent_4h" in result_full.columns

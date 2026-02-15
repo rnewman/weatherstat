@@ -228,35 +228,44 @@ HORIZON_HOURS = {"1h": 1.0, "2h": 2.0, "4h": 4.0, "6h": 6.0, "12h": 12.0}
 def add_newton_cooling_features(df: pd.DataFrame, mode: str = "full") -> pd.DataFrame:
     """Add Newton's law of cooling predictions as features.
 
-    For each room and horizon, computes:
+    For each room and horizon, computes sealed and ventilated variants:
       T_newton = T_outdoor + (T_room - T_outdoor) * exp(-hours / tau)
       delta    = T_newton - T_room  (expected passive change, ≤ 0 when warmer)
+
+    Two τ values per room (sealed = windows closed, ventilated = windows open)
+    let LightGBM split on window state to pick the right physics prediction.
 
     LightGBM can't compute exp(-t/τ) from raw temperatures (trees do axis-aligned
     splits). Pre-computing gives the model direct access to physics predictions.
     During HVAC sweep, Newton features stay unchanged (passive prediction);
     HVAC features capture the heating effect. LightGBM combines them.
     """
-    df = df.copy()
     thermal = _CFG.thermal
+    new_cols: dict[str, pd.Series] = {}
 
     for room, temp_col in _CFG.room_temp_columns.items():
         if temp_col not in df.columns or "outdoor_temp" not in df.columns:
             continue
 
-        tau = thermal.tau.get(room, thermal.default_tau)
+        tau_s = thermal.tau_sealed.get(room, thermal.default_tau_sealed)
+        tau_v = thermal.tau_ventilated.get(room, thermal.default_tau_ventilated)
         t_room = df[temp_col]
         t_outdoor = df["outdoor_temp"]
 
         for label, hours in HORIZON_HOURS.items():
-            decay = np.exp(-hours / tau)
-            newton_pred = t_outdoor + (t_room - t_outdoor) * decay
-            newton_delta = newton_pred - t_room
+            # Sealed (windows closed)
+            decay_s = np.exp(-hours / tau_s)
+            pred_s = t_outdoor + (t_room - t_outdoor) * decay_s
+            new_cols[f"{room}_newton_sealed_{label}"] = pred_s
+            new_cols[f"{room}_newton_sealed_delta_{label}"] = pred_s - t_room
 
-            df[f"{room}_newton_{label}"] = newton_pred
-            df[f"{room}_newton_delta_{label}"] = newton_delta
+            # Ventilated (windows open)
+            decay_v = np.exp(-hours / tau_v)
+            pred_v = t_outdoor + (t_room - t_outdoor) * decay_v
+            new_cols[f"{room}_newton_vent_{label}"] = pred_v
+            new_cols[f"{room}_newton_vent_delta_{label}"] = pred_v - t_room
 
-    return df
+    return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
 # ── Lag and rolling features ────────────────────────────────────────────────

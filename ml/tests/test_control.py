@@ -14,6 +14,7 @@ import pandas as pd
 from weatherstat.config import BLOWERS, MINI_SPLITS
 from weatherstat.control import (
     ABSOLUTE_MAX,
+    ABSOLUTE_MIN,
     CONTROL_HORIZONS,
     HORIZON_WEIGHTS,
     _cautious_setpoint,
@@ -56,13 +57,16 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
 def make_mock_models(predictions: dict[str, float]) -> dict[str, object]:
     """Return dict of mock models that always predict the given values.
 
+    Returns per-row arrays matching input batch size (works with both
+    single-row and batch prediction).
+
     Args:
         predictions: Target name -> predicted value.
     """
     models: dict[str, object] = {}
     for target, value in predictions.items():
         mock = MagicMock()
-        mock.predict.return_value = np.array([value])
+        mock.predict.side_effect = lambda X, v=value: np.full(len(X), v)
         models[target] = mock
     return models
 
@@ -241,9 +245,8 @@ class TestMinImprovement:
 
             def _make_predict(warm_val: float, cold_val: float):
                 def predict(X: pd.DataFrame) -> np.ndarray:
-                    if X["thermostat_upstairs_action_enc"].iloc[0] > 0.5:
-                        return np.array([warm_val])
-                    return np.array([cold_val])
+                    mask = X["thermostat_upstairs_action_enc"] > 0.5
+                    return np.where(mask, warm_val, cold_val)
                 return predict
 
             mock.predict = _make_predict(warm_preds[target], cold_preds[target])
@@ -361,10 +364,21 @@ class TestCautiousSetpoint:
         sp = _cautious_setpoint(70.0, heating=True)
         assert sp == 72.0
 
-    def test_cautious_setpoint_cooling(self) -> None:
-        """Cooling: current - offset, but not below min."""
+    def test_cautious_setpoint_off_uses_comfort_min(self) -> None:
+        """Heating off: setpoint = comfort_min (safety net at comfort floor)."""
+        sp = _cautious_setpoint(70.0, heating=False, comfort_min=70.0)
+        assert sp == 70.0
+
+    def test_cautious_setpoint_off_defaults_to_absolute_min(self) -> None:
+        """Heating off without comfort_min: defaults to ABSOLUTE_MIN."""
         sp = _cautious_setpoint(70.0, heating=False)
-        assert sp == 68.0
+        assert sp == ABSOLUTE_MIN
+
+    def test_cautious_setpoint_heating_respects_comfort_min(self) -> None:
+        """Heating on: setpoint = max(current + offset, comfort_min + offset)."""
+        # Current temp below comfort min — setpoint should use comfort_min + offset
+        sp = _cautious_setpoint(67.0, heating=True, comfort_min=70.0)
+        assert sp == 72.0
 
 
 # ── Scenario generation tests ────────────────────────────────────────────
@@ -423,9 +437,10 @@ class TestAdvisoryEvaluation:
         # Models sensitive to bedroom window: open -> 65°F (cold), closed -> 72°F (comfy)
         def _make_predict(target: str):
             def predict(X: pd.DataFrame) -> np.ndarray:
-                if "window_bedroom_open" in X.columns and X["window_bedroom_open"].iloc[0] > 0.5:
-                    return np.array([65.0])
-                return np.array([72.0])
+                temp = np.full(len(X), 72.0)
+                if "window_bedroom_open" in X.columns:
+                    temp = np.where(X["window_bedroom_open"] > 0.5, 65.0, temp)
+                return temp
             return predict
 
         preds = _all_room_predictions(72.0)
@@ -463,12 +478,12 @@ class TestAdvisoryEvaluation:
         # Models sensitive to bedroom AND kitchen windows
         def _make_predict(target: str):
             def predict(X: pd.DataFrame) -> np.ndarray:
-                temp = 72.0
-                if "window_bedroom_open" in X.columns and X["window_bedroom_open"].iloc[0] > 0.5:
-                    temp -= 4.0
-                if "window_kitchen_open" in X.columns and X["window_kitchen_open"].iloc[0] > 0.5:
-                    temp -= 3.0
-                return np.array([temp])
+                temp = np.full(len(X), 72.0)
+                if "window_bedroom_open" in X.columns:
+                    temp = np.where(X["window_bedroom_open"] > 0.5, temp - 4.0, temp)
+                if "window_kitchen_open" in X.columns:
+                    temp = np.where(X["window_kitchen_open"] > 0.5, temp - 3.0, temp)
+                return temp
             return predict
 
         preds = _all_room_predictions(72.0)
@@ -534,12 +549,12 @@ class TestAdvisoryEvaluation:
 
         def _make_predict(target: str):
             def predict(X: pd.DataFrame) -> np.ndarray:
-                temp = 72.0
-                if "window_bedroom_open" in X.columns and X["window_bedroom_open"].iloc[0] > 0.5:
-                    temp -= improvement_per_window * 0.3
-                if "window_kitchen_open" in X.columns and X["window_kitchen_open"].iloc[0] > 0.5:
-                    temp -= improvement_per_window * 0.3
-                return np.array([temp])
+                temp = np.full(len(X), 72.0)
+                if "window_bedroom_open" in X.columns:
+                    temp = np.where(X["window_bedroom_open"] > 0.5, temp - improvement_per_window * 0.3, temp)
+                if "window_kitchen_open" in X.columns:
+                    temp = np.where(X["window_kitchen_open"] > 0.5, temp - improvement_per_window * 0.3, temp)
+                return temp
             return predict
 
         preds = _all_room_predictions(72.0)

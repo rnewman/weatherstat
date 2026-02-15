@@ -108,8 +108,10 @@ class ExtraTempSensorConfig:
 
 @dataclass(frozen=True)
 class ThermalConfig:
-    tau: dict[str, float]  # room_name -> time constant (hours)
-    default_tau: float = 45.0
+    tau_sealed: dict[str, float]  # room_name -> sealed time constant (hours)
+    tau_ventilated: dict[str, float]  # room_name -> ventilated time constant (hours)
+    default_tau_sealed: float = 45.0
+    default_tau_ventilated: float = 20.0
 
 
 @dataclass(frozen=True)
@@ -488,8 +490,10 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     # Thermal config (optional, with defaults)
     thermal_data = data.get("thermal", {})
     thermal_config = ThermalConfig(
-        tau={str(k): float(v) for k, v in thermal_data.get("tau", {}).items()},
-        default_tau=float(thermal_data.get("default_tau", 45.0)),
+        tau_sealed={str(k): float(v) for k, v in thermal_data.get("tau_sealed", {}).items()},
+        tau_ventilated={str(k): float(v) for k, v in thermal_data.get("tau_ventilated", {}).items()},
+        default_tau_sealed=float(thermal_data.get("default_tau_sealed", 45.0)),
+        default_tau_ventilated=float(thermal_data.get("default_tau_ventilated", 20.0)),
     )
 
     # Advisory config (optional, with defaults)
