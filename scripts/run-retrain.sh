@@ -2,7 +2,7 @@
 # Weekly retraining wrapper.
 #
 # - Sources .env for HA_URL/HA_TOKEN
-# - Runs `just retrain` (extract + train both models)
+# - Runs `just retrain` (train full model from collector data)
 # - Logs to logs/retrain-YYYY-MM-DD.log
 # - Single run, exits (designed for launchd scheduling)
 
@@ -43,7 +43,7 @@ log "Project: $PROJECT_ROOT"
 
 cd "$PROJECT_ROOT"
 
-# Run the full retrain pipeline (extract + train both models)
+# Run the retrain pipeline (train full model from collector data)
 if just retrain 2>&1 | tee -a "$LOG_FILE"; then
     log "Retrain completed successfully"
 else

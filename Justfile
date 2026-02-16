@@ -24,19 +24,20 @@ health:
 extract *ARGS:
     cd ml && uv run python -m weatherstat.extract {{ARGS}}
 
-# Train LightGBM baseline model (hourly temp-only, 5+ months)
+# Train on collector data (full model, collector-only)
+train:
+    cd ml && uv run python -m weatherstat.train --mode full --collector-only
+
+# Retrain from collector data (no extraction needed)
+retrain: train
+
+# Train LightGBM baseline model (hourly stats, 7+ months — for experiments)
 train-baseline:
     cd ml && uv run python -m weatherstat.train --mode baseline
 
-# Train LightGBM full model (5-min all features, ~10 days)
+# Train LightGBM full model including historical parquet (for experiments)
 train-full:
     cd ml && uv run python -m weatherstat.train --mode full
-
-# Train both models
-train: train-baseline train-full
-
-# Retrain: re-extract data then train both models
-retrain: extract train
 
 # Evaluate and compare models
 evaluate:
