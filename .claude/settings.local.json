@@ -53,7 +53,13 @@
       "Bash(pnpm run typecheck:*)",
       "mcp__Home_Assistant__ha_list_services",
       "Bash(just metrics:*)",
-      "Bash(just test-py:*)"
+      "Bash(just test-py:*)",
+      "Bash(npx tsc:*)",
+      "Bash(just train-experiment-collector:*)",
+      "Bash(just lint-py:*)",
+      "Bash(just train-experiment-newton:*)",
+      "Bash(just backtest-experiment:*)",
+      "Bash(just fit-tau:*)"
     ]
   }
 }
