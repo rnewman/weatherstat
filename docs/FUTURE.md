@@ -1,121 +1,144 @@
-# Sweep Scalability
+# Future Work
 
-The control loop evaluates HVAC scenarios and window combinations by brute-force
-Cartesian product. This works at current scale but won't survive device expansion.
+## Architecture: What the ML Model Should Do
 
-## Current cost
+The future temperature of a room is determined by:
 
-| Component | Combos | Model calls | Wall time |
+```
+T_future = T_passive + ΔT_hvac + ΔT_solar + ΔT_interroom + ΔT_ventilation
+```
+
+**Newton's law** handles `T_passive` well — exponential decay toward outdoor temp
+with per-room τ. This is physics we can compute directly.
+
+**The ML model's job** is learning the *corrections* that physics can't easily compute:
+1. **HVAC transfer function**: boiler ON → °F/hour gained in each room, with what lag?
+   Hydronic slab thermal mass makes this a multi-hour delayed response.
+2. **Solar gain per room**: south-facing windows (piano) vs north (bathroom). Depends
+   on solar elevation × cloud cover × window area. The structure is physics but the
+   coefficients are house-specific.
+3. **Inter-room coupling**: warm rooms heat adjacent cool rooms via stairway, duct,
+   and convection paths.
+4. **Ventilation sensitivity**: wind speed × window state → additional heat loss.
+
+**The ML model should NOT try to learn**:
+- Passive thermal decay (Newton does this)
+- That "it's warm at 3pm" (time-of-day ≠ causation)
+- Future outdoor temperature trends (forecast provides this)
+
+### Design principles
+
+- **Modular capabilities**: forecast, retrospective HVAC features, Newton integration,
+  and ML prediction are independent modules. Each can be improved or replaced without
+  touching the others.
+- **Physics as guardrails, not targets**: Newton provides sweep-time floor/ceiling on
+  all-off predictions. The ML model predicts absolute temperatures with physics features
+  as inputs. We do NOT train on residuals (risk of overfitting to Newton's errors and
+  compounding).
+- **Keep the model boundary visible**: the sweep, cost function, and physics layers
+  should be inspectable. The "squishy middle" (LightGBM) handles what it's good at;
+  everything else is explicit.
+
+---
+
+## Modular Capabilities Roadmap
+
+### 1. Weather Forecast Integration (next)
+
+**The biggest single improvement available.** Currently Newton features and ML predictions
+use current outdoor temp for all horizons — wrong by 10–15°F at 6h in shoulder seasons.
+
+**Data source**: HA `weather.get_forecasts` service on `weather.forecast_home` (met.no).
+Returns hourly forecasts with: temperature, condition, wind speed, precipitation.
+
+**Components**:
+- **Forecast fetcher**: Python module to call HA forecast service via REST API.
+  Returns structured hourly forecast for next 12–24h.
+- **Piecewise Newton integration**: Chain hourly segments using forecast outdoor temps:
+  ```
+  T(t₁) = T_out_h0 + (T₀ - T_out_h0) × exp(-1/τ)
+  T(t₂) = T_out_h1 + (T(t₁) - T_out_h1) × exp(-1/τ)
+  ```
+  Exact for piecewise-constant outdoor temps (which hourly forecasts provide).
+- **Forecast ML features**: at each horizon, include forecast outdoor temp, cloud cover
+  (proxy for solar irradiance), and wind speed. Combined with solar elevation at the
+  future timestamp → approximate solar irradiance estimate.
+- **Collector storage**: store forecast snapshots alongside sensor snapshots so training
+  data includes what was predicted at each point in time.
+
+### 2. Retrospective HVAC Features (next, parallel with forecast)
+
+**Current gap**: "boiler ON" doesn't capture how much heat is stored in the slab.
+The hydronic thermal mass means the boiler running for 3 hours has deposited far more
+energy than 5 minutes of runtime. Current features only see the instantaneous state.
+
+**Features to add** (computed from recent history already fetched):
+- `heating_minutes_{1h,2h,4h}`: cumulative 5-min intervals with heating ON
+- `heating_duty_cycle_{1h,2h}`: fraction of time heating was on
+- `time_since_heat_start`: minutes since last off→on transition
+- `time_since_heat_stop`: minutes since last on→off transition
+- Same for each mini-split and blower
+- `navien_runtime_{1h,2h,4h}`: cumulative Navien Space Heating minutes
+
+These capture the slab's thermal charge state. Combined with the HVAC transfer function
+the model learns, this enables understanding "the slab is fully charged and will radiate
+for 2 more hours" vs "the boiler just kicked on."
+
+### 3. Solar Irradiance Estimation
+
+**Approximate solar irradiance** from existing + forecast data:
+- `solar_elevation` (already computed per-row)
+- `cloud_cover` (from forecast condition: sunny=0, partly_cloudy=0.5, cloudy=1.0)
+- `irradiance_estimate = max(0, sin(elevation)) × (1 - cloud_factor) × PEAK_IRRADIANCE`
+
+This is crude but captures the key dynamics: south-facing rooms warm in winter
+afternoon sun, not on cloudy days. Per-room coefficients (window orientation, area)
+are for the ML model to learn.
+
+---
+
+## Sweep Scalability
+
+Batch prediction (approach #1) is done — 148× speedup. Remaining approaches are
+relevant when the device count grows.
+
+### Current cost (post-batch)
+
+| Component | Combos | Batch calls | Wall time |
 |-----------|--------|-------------|-----------|
-| HVAC sweep | 180 (pruned from 324) | 180 × 40 = 7,200 | ~2.4s |
-| Window advisory | 2^7 = 128 | 128 × 40 = 5,120 | ~2.0s |
+| HVAC sweep | 180 | 40 | ~30ms |
+| Window advisory | 128 | 40 | ~28ms |
 
-## Projected cost at 6 blowers + 10 windows
+### Future optimization (in priority order)
 
-| Component | Combos | Model calls |
-|-----------|--------|-------------|
-| HVAC sweep | ~26,000 (4 × 3^6 × 9 before pruning) | ~1,000,000 |
-| Window advisory | 2^10 = 1,024 | 40,960 |
+**2. Window decomposition** — O(N) vs O(2^N). Independent toggle per window,
+verification pass on combined result. Needed at 10+ windows.
 
-## Optimization approaches (in implementation order)
+**3. Greedy coordinate descent** — O(Σ levels) vs O(∏ levels). Iterative
+single-device optimization. Needed at 6+ blowers.
 
-### 1. Batch prediction
+**4. Marginal screening** — Fast linear approximation, full eval on top-K.
+Best of both worlds for large action spaces.
 
-**Effort:** small (refactor inner loop). **Impact:** 10–50× on current code. **Risk:** none.
+**5. Spatial decomposition** — Only re-predict rooms affected by each device
+change. Composes with all above approaches.
 
-The current inner loop calls `model.predict(X)` on a single row per scenario per
-model target — 7,200 individual calls for the HVAC sweep. LightGBM is optimized
-for batch prediction. Stack all scenario feature rows into one DataFrame and call
-`model.predict(X_batch)` once per model target. This turns 7,200 calls into 40
-calls, each predicting 180 rows. Eliminates Python call overhead and improves CPU
-cache utilization.
+---
 
-Applies identically to the window advisory sweep.
+## Other Future Work
 
-### 2. Window decomposition
+### Pre-Heating Logic
+Uses forecast + HVAC response curves to start heating before outdoor temp drops.
+Critical for hydronic floor heat with 2–4 hour thermal lag. Requires forecast
+integration (#1) and retrospective features (#2) to estimate slab charge state.
 
-**Effort:** small (replace 2^N loop). **Impact:** O(N) instead of O(2^N). **Risk:** low.
+### MPC Trajectory Planning
+Optimize HVAC *sequences* (heat 2h then coast 4h) instead of single settings.
+Requires fast-evaluating thermal model. The physics + modular ML approach provides
+the foundation — evaluate Newton + ML correction for each step in the trajectory.
 
-Windows barely interact with each other in the model — opening the bedroom window
-doesn't change what the kitchen window does to the kitchen temperature. Replace the
-full 2^N sweep with:
+### Virtual Thermostats
+Per-room HA climate entities for user-adjustable comfort targets from the dashboard.
 
-1. Compute baseline (current window state).
-2. For each window independently, compute the cost of toggling it.
-3. Toggle all windows where toggling improves cost.
-4. One full-model verification pass on the combined result.
-
-O(N) evaluations instead of O(2^N): 10 instead of 1,024 at 10 windows.
-
-The failure mode is correlated windows (e.g., multiple upstairs windows creating
-cross-breeze). The verification pass catches this, and the model is unlikely to have
-learned multi-window interactions from the current training data.
-
-### 3. Greedy coordinate descent (HVAC)
-
-**Effort:** medium (new sweep logic). **Impact:** ~300× at 6 blowers. **Risk:** misses some device interactions.
-
-Replace the Cartesian product with iterative single-device optimization:
-
-1. Start from all-off (or current state).
-2. For each device, evaluate all its settings while holding others fixed.
-3. Apply the single-device change with the best cost reduction.
-4. Repeat until no single-device change improves by more than threshold.
-
-Cost per iteration: Σ(levels per device) = 6×3 + 2×2 + 2×3 = 28 evaluations.
-Converges in 2–3 passes → ~84 evaluations vs 26,244.
-
-The existing zone-blower constraint already assumes approximate separability. To
-handle known interactions, group correlated devices: sweep (zone_heat, zone_blowers)
-jointly, then mini-splits independently. Still much smaller than the full product.
-
-### 4. Marginal contribution screening (two-stage)
-
-**Effort:** medium (two-stage pipeline). **Impact:** best of both worlds. **Risk:** slightly more complex.
-
-Exploit approximate additivity for a fast screening pass:
-
-1. Compute baseline (all-off) predictions once.
-2. For each device at each level, compute its marginal delta on each room prediction.
-3. Approximate any combination as `baseline + Σ(marginal deltas)` — free linear
-   combination, no model calls.
-4. Score all combinations using the linear approximation.
-5. Run full LightGBM predictions only for the top-K candidates (10–20).
-
-Screening cost is O(Σ levels_i) model calls (same as one coordinate descent pass).
-Full eval is O(K). The linear approximation isn't perfect — LightGBM captures
-interactions — but it's excellent for ranking. The top candidates from the linear
-screen almost always include the true optimum.
-
-### 5. Spatial decomposition
-
-**Effort:** medium (device-room influence map). **Impact:** 3–5× per evaluation. **Risk:** needs maintenance as devices change.
-
-Most devices primarily affect one or two rooms:
-- `blower_office` → office (maybe downstairs aggregate)
-- `mini_split_bedroom` → bedroom
-- `thermostat_upstairs` → upstairs, bedroom, kitchen, piano, bathroom
-
-Formalize a device → affected rooms map (derivable from YAML `rooms.zone` + window
-`rooms`). When evaluating a single-device change, only re-run room models for
-affected rooms. Reduces per-evaluation cost from 40 model calls to 8–12 for a
-single-device change.
-
-Combines well with coordinate descent: each greedy step only re-predicts the rooms
-that the candidate device influences.
-
-## Interaction with Unified Action Framework
-
-When HVAC and window actions merge into a single optimization (see PLAN.md,
-"Unified Action Framework"), the combined search space is the product of electronic
-and advisory actions. The approaches above compose naturally:
-
-- Batch prediction speeds up any sweep strategy.
-- Window decomposition applies to the advisory subset of the unified action space.
-- Coordinate descent generalizes to all action types — evaluate one action at a time.
-- Marginal screening provides fast approximate scoring for the full unified space.
-- Spatial decomposition prunes re-prediction per action regardless of action type.
-
-The likely end state is marginal screening (stage 4) over the full unified action
-space, with spatial decomposition (stage 5) making each screening evaluation cheap,
-and full-model verification on the top-K candidates.
+### HA Packaging
+See PLAN.md for integration levels (add-on, integration, hybrid).
