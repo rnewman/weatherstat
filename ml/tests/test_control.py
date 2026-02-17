@@ -17,6 +17,7 @@ from weatherstat.control import (
     ABSOLUTE_MIN,
     CONTROL_HORIZONS,
     HORIZON_WEIGHTS,
+    _apply_newton_floor,
     _cautious_setpoint,
     _in_quiet_hours,
     _zone_comfort_max,
@@ -197,7 +198,11 @@ class TestMinImprovement:
     """Test minimum improvement threshold."""
 
     def test_min_improvement_reverts_to_all_off(self) -> None:
-        """Best active scenario improves cost by 0.5 (< 1.0 threshold) -> all-off."""
+        """Best active scenario improves cost by 0.5 (< 1.0 threshold) -> all-off.
+
+        Rooms at 69.5°F — below comfort min (70°F) but within the cold-room
+        override threshold (1°F), so the override doesn't fire.
+        """
         schedules = make_schedules()
         feature_cols = _standard_feature_columns()
         preds = _all_room_predictions(72.0)
@@ -205,13 +210,13 @@ class TestMinImprovement:
         base_row = make_base_row(feature_cols)
 
         current_temps = {
-            "upstairs": 69.0, "downstairs": 73.0,
+            "upstairs": 69.5, "downstairs": 73.0,
             "bedroom": 73.0, "kitchen": 73.0, "piano": 73.0,
             "bathroom": 73.0, "family_room": 73.0, "office": 73.0,
         }
         decision = sweep_scenarios(
             base_row, feature_cols, models,
-            up_current=69.0, dn_current=73.0,
+            up_current=69.5, dn_current=73.0,
             current_split_temps={}, current_temps=current_temps,
             schedules=schedules, base_hour=12,
         )
@@ -267,6 +272,274 @@ class TestMinImprovement:
         )
         # With 65F predicted for all-off vs 72F for heating -> huge improvement
         assert decision.upstairs_heating or decision.downstairs_heating
+
+
+# ── Cold room override tests ─────────────────────────────────────────────
+
+
+class TestColdRoomOverride:
+    """Test cold-room safety override forces heating when model doesn't differentiate."""
+
+    def test_cold_room_forces_zone_heating(self) -> None:
+        """Model predicts same temp for all scenarios, but bedroom at 67°F
+        (>1°F below 69°F comfort min) -> force upstairs heating."""
+        schedules = make_schedules()
+        feature_cols = _standard_feature_columns()
+        # Model predicts 72°F regardless of HVAC — doesn't differentiate
+        preds = _all_room_predictions(72.0)
+        models = make_mock_models(preds)
+        base_row = make_base_row(feature_cols)
+
+        current_temps = {
+            "upstairs": 71.0, "downstairs": 70.0,
+            "bedroom": 67.0, "kitchen": 72.0, "piano": 72.0,
+            "bathroom": 72.0, "family_room": 72.0, "office": 72.0,
+        }
+        decision = sweep_scenarios(
+            base_row, feature_cols, models,
+            up_current=71.0, dn_current=70.0,
+            current_split_temps={}, current_temps=current_temps,
+            schedules=schedules, base_hour=20,  # 8pm: bedroom min=69°F
+        )
+        # Bedroom is in upstairs zone, 67°F is 2°F below 69°F min -> override
+        assert decision.upstairs_heating
+
+    def test_cold_room_no_override_within_threshold(self) -> None:
+        """Room 0.5°F below comfort min -> no override (within threshold)."""
+        schedules = make_schedules()
+        feature_cols = _standard_feature_columns()
+        preds = _all_room_predictions(72.0)
+        models = make_mock_models(preds)
+        base_row = make_base_row(feature_cols)
+
+        current_temps = {
+            "upstairs": 71.0, "downstairs": 70.0,
+            "bedroom": 68.5, "kitchen": 72.0, "piano": 72.0,
+            "bathroom": 72.0, "family_room": 72.0, "office": 72.0,
+        }
+        decision = sweep_scenarios(
+            base_row, feature_cols, models,
+            up_current=71.0, dn_current=70.0,
+            current_split_temps={}, current_temps=current_temps,
+            schedules=schedules, base_hour=20,  # bedroom min=69°F, 68.5 is only 0.5 below
+        )
+        # 68.5°F is only 0.5°F below 69°F — within threshold, no override
+        assert not decision.upstairs_heating
+        assert not decision.downstairs_heating
+
+
+# ── Newton floor tests ───────────────────────────────────────────────────
+
+
+class TestNewtonFloor:
+    """Test Newton's law floor on all-off predictions.
+
+    The ML model can't predict passive cooling at low temps because the
+    controller keeps the house warm (exploration-exploitation problem).
+    Newton's law provides the physics-correct passive prediction as a cap.
+    """
+
+    def test_newton_floor_caps_all_off_and_triggers_heating(self) -> None:
+        """Model predicts 72°F for all scenarios. Newton predicts 67°F passive cooling.
+        All-off predictions capped at 67°F → large cost vs heating → sweep picks heat."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = _standard_feature_columns()
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        schedules = make_schedules()
+        preds = _all_room_predictions(72.0)
+        models = make_mock_models(preds)
+
+        base_values: dict[str, float] = {"outdoor_temp": 40.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 67.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        current_temps = {room: 69.5 for room in PREDICTION_ROOMS}
+
+        decision = sweep_scenarios(
+            base_row, feature_cols, models,
+            up_current=69.5, dn_current=69.5,
+            current_split_temps={}, current_temps=current_temps,
+            schedules=schedules, base_hour=12,
+        )
+        # Newton caps all-off to 67°F (3°F below 70°F comfort min)
+        # while active HVAC scenarios stay at 72°F → any active HVAC wins
+        is_all_off = (
+            not decision.upstairs_heating
+            and not decision.downstairs_heating
+            and all(b.mode == "off" for b in decision.blowers)
+            and all(s.mode == "off" for s in decision.mini_splits)
+        )
+        assert not is_all_off, "Newton floor should make all-off too expensive"
+
+    def test_newton_ceiling_caps_when_indoor_below_outdoor(self) -> None:
+        """When indoor < outdoor (summer), Newton predicts warming toward outdoor.
+        Model may over-predict coolness. Ceiling caps predictions upward."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = _standard_feature_columns()
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        # Outdoor warmer than indoor (summer scenario)
+        base_values: dict[str, float] = {"outdoor_temp": 80.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 75.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        # Indoor 69.5°F, outdoor 80°F -> Newton predicts warming to 75°F
+        current_temps = {room: 69.5 for room in PREDICTION_ROOMS}
+        # Model predicts 72°F (too optimistic about staying cool)
+        preds = {f"{room}_temp_t+{h}": 72.0
+                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
+
+        caps = _apply_newton_floor(preds, base_row, current_temps)
+
+        # Newton ceiling should raise all predictions from 72°F to 75°F
+        assert len(caps) > 0
+        for key, val in preds.items():
+            assert val == 75.0, f"{key} should be raised to 75.0, got {val}"
+        # Verify log messages say "ceiling"
+        for cap in caps:
+            assert "ceiling" in cap
+
+    def test_apply_newton_floor_unit(self) -> None:
+        """Direct test of _apply_newton_floor: caps predictions above Newton values."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = ["outdoor_temp"]
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        base_values: dict[str, float] = {"outdoor_temp": 40.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 67.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
+        preds = {f"{room}_temp_t+{h}": 72.0
+                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
+
+        caps = _apply_newton_floor(preds, base_row, current_temps)
+
+        assert len(caps) > 0
+        for key, val in preds.items():
+            assert val == 67.0, f"{key} should be capped to 67.0, got {val}"
+
+    def test_newton_floor_winter_caps_downward(self) -> None:
+        """Direct unit test: winter (indoor > outdoor) caps predictions downward."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = ["outdoor_temp"]
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        base_values: dict[str, float] = {"outdoor_temp": 40.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 67.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
+        preds = {f"{room}_temp_t+{h}": 72.0
+                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
+
+        caps = _apply_newton_floor(preds, base_row, current_temps)
+
+        assert len(caps) > 0
+        for key, val in preds.items():
+            assert val == 67.0, f"{key} should be capped to 67.0, got {val}"
+        for cap in caps:
+            assert "floor" in cap
+
+    def test_newton_ceiling_summer_caps_upward(self) -> None:
+        """Direct unit test: summer (indoor < outdoor) caps predictions upward."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = ["outdoor_temp"]
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        base_values: dict[str, float] = {"outdoor_temp": 85.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 78.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        current_temps = {room: 72.0 for room in PREDICTION_ROOMS}
+        # Model predicts 74°F — too optimistic about staying cool
+        preds = {f"{room}_temp_t+{h}": 74.0
+                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
+
+        caps = _apply_newton_floor(preds, base_row, current_temps)
+
+        assert len(caps) > 0
+        for key, val in preds.items():
+            assert val == 78.0, f"{key} should be raised to 78.0, got {val}"
+        for cap in caps:
+            assert "ceiling" in cap
+
+    def test_newton_skipped_when_indoor_equals_outdoor(self) -> None:
+        """When indoor == outdoor, no thermal gradient — skip entirely."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = ["outdoor_temp"]
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        base_values: dict[str, float] = {"outdoor_temp": 70.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 70.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
+        preds = {f"{room}_temp_t+{h}": 72.0
+                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
+
+        caps = _apply_newton_floor(preds, base_row, current_temps)
+
+        assert len(caps) == 0
+        for val in preds.values():
+            assert val == 72.0  # unchanged
+
+    def test_newton_floor_no_cap_when_model_below_newton(self) -> None:
+        """When model predicts lower than Newton, no cap needed."""
+        from weatherstat.config import PREDICTION_ROOMS
+
+        feature_cols = ["outdoor_temp"]
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                feature_cols.append(f"{room}_newton_sealed_{label}")
+
+        base_values: dict[str, float] = {"outdoor_temp": 40.0}
+        for room in PREDICTION_ROOMS:
+            for label in ["1h", "2h", "4h", "6h"]:
+                base_values[f"{room}_newton_sealed_{label}"] = 67.0
+        base_row = make_base_row(feature_cols, **base_values)
+
+        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
+        # Model already predicts colder than Newton
+        preds = {f"{room}_temp_t+{h}": 65.0
+                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
+
+        caps = _apply_newton_floor(preds, base_row, current_temps)
+
+        assert len(caps) == 0
+        for val in preds.values():
+            assert val == 65.0  # unchanged
 
 
 # ── Comfort cost tests ────────────────────────────────────────────────────
@@ -365,9 +638,9 @@ class TestCautiousSetpoint:
         assert sp == 72.0
 
     def test_cautious_setpoint_off_uses_comfort_min(self) -> None:
-        """Heating off: setpoint = comfort_min (safety net at comfort floor)."""
+        """Heating off: setpoint = comfort_min - 1 (safety net just below comfort floor)."""
         sp = _cautious_setpoint(70.0, heating=False, comfort_min=70.0)
-        assert sp == 70.0
+        assert sp == 69.0
 
     def test_cautious_setpoint_off_defaults_to_absolute_min(self) -> None:
         """Heating off without comfort_min: defaults to ABSOLUTE_MIN."""

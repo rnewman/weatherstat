@@ -103,6 +103,11 @@ HORIZON_WEIGHTS: dict[int, float] = {
 # one horizon before turning on heating.
 MIN_IMPROVEMENT = 1.0
 
+# Cold-room override: force zone heating when a room's current temperature is
+# this far below its comfort min. Compensates for undertrained models that
+# predict rooms warming without HVAC (because training data is all HVAC-on).
+COLD_ROOM_OVERRIDE = 1.0  # °F below comfort_min
+
 # Control loop interval
 LOOP_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 
@@ -318,6 +323,59 @@ def _cautious_setpoint(current_temp: float, heating: bool, comfort_min: float = 
     return max(ABSOLUTE_MIN, min(ABSOLUTE_MAX, sp))
 
 
+def _apply_newton_floor(
+    preds: dict[str, float],
+    base_row: pd.DataFrame,
+    current_temps: dict[str, float],
+) -> list[str]:
+    """Cap passive (all-off) predictions at Newton's law values.
+
+    The ML model was trained mostly with HVAC on, so it structurally cannot
+    predict passive temperature drift accurately (exploration-exploitation
+    problem). Newton's law of cooling provides the physics-correct prediction.
+
+    Handles both thermal directions:
+    - Winter (indoor > outdoor): Newton predicts cooling. Model may over-predict
+      warmth. Cap downward with min(model, newton) — "floor".
+    - Summer (indoor < outdoor): Newton predicts warming. Model may over-predict
+      coolness. Cap upward with max(model, newton) — "ceiling".
+
+    Modifies preds in-place. Returns list of cap descriptions for logging.
+    """
+    if "outdoor_temp" not in base_row.columns:
+        return []
+    outdoor_temp = float(base_row["outdoor_temp"].iloc[0])
+    if np.isnan(outdoor_temp):
+        return []
+
+    caps: list[str] = []
+    for room in PREDICTION_ROOMS:
+        room_temp = current_temps.get(room)
+        if room_temp is None or room_temp == outdoor_temp:
+            continue
+        winter = room_temp > outdoor_temp  # cooling toward outdoor
+        for h in CONTROL_HORIZONS:
+            label = HORIZON_LABELS[h]
+            newton_col = f"{room}_newton_sealed_{label}"
+            if newton_col not in base_row.columns:
+                continue
+            newton_pred = float(base_row[newton_col].iloc[0])
+            if np.isnan(newton_pred):
+                continue
+            key = f"{room}_temp_t+{h}"
+            if key not in preds:
+                continue
+            if winter and preds[key] > newton_pred:
+                direction = "floor"
+                caps.append(f"{room} {label} {direction}: {preds[key]:.1f}→{newton_pred:.1f}°F")
+                preds[key] = newton_pred
+            elif not winter and preds[key] < newton_pred:
+                direction = "ceiling"
+                caps.append(f"{room} {label} {direction}: {preds[key]:.1f}→{newton_pred:.1f}°F")
+                preds[key] = newton_pred
+    return caps
+
+
 # ── Scenario generation & sweep ──────────────────────────────────────────
 
 
@@ -489,6 +547,24 @@ def sweep_scenarios(
     target_names, pred_matrix = _batch_predict(base_row, overrides_list, models)
     target_idx = {t: j for j, t in enumerate(target_names)}
 
+    # ── Newton floor for all-off predictions ──
+    # ML models can't predict passive cooling at low temps (trained on HVAC-on
+    # data). Newton's law provides the physics-correct passive prediction.
+    # Cap all-off model predictions so the sweep sees realistic cooling costs.
+    for i, scenario in enumerate(scenarios):
+        if not _is_all_off(scenario):
+            continue
+        off_preds_i = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
+        caps = _apply_newton_floor(off_preds_i, base_row, current_temps)
+        if caps:
+            for t, j in target_idx.items():
+                pred_matrix[i, j] = off_preds_i[t]
+            print(f"  Newton floor ({len(caps)} caps):")
+            for cap in caps[:8]:
+                print(f"    {cap}")
+            if len(caps) > 8:
+                print(f"    ... and {len(caps) - 8} more")
+
     # ── Phase 2: score each scenario ──
     best_idx = -1
     best_cost = float("inf")
@@ -523,6 +599,52 @@ def sweep_scenarios(
                 f" < threshold {MIN_IMPROVEMENT:.1f}"
             )
             best_idx = off_idx
+
+    # ── Cold-room safety override ──
+    # When the model is undertrained it may predict rooms warming without HVAC
+    # (because all training data had HVAC on). If the sweep chose all-off but
+    # a room is significantly below comfort min, force zone heating regardless.
+    if _is_all_off(scenarios[best_idx]):
+        cold_zones: set[str] = set()
+        cold_rooms_info: list[str] = []
+        for schedule in schedules:
+            room = schedule.room
+            temp = current_temps.get(room)
+            if temp is None:
+                continue
+            comfort = schedule.comfort_at(base_hour)
+            if comfort is None:
+                continue
+            if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
+                zone = ROOM_TO_ZONE.get(room)
+                if zone:
+                    cold_zones.add(zone)
+                    cold_rooms_info.append(f"{room} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
+
+        # Only override zones where heating is allowed (not blocked by comfort max)
+        if not up_allow:
+            cold_zones.discard("upstairs")
+        if not dn_allow:
+            cold_zones.discard("downstairs")
+
+        if cold_zones:
+            # Find cheapest scenario that heats all cold zones
+            constrained_best = -1
+            constrained_cost = float("inf")
+            for i, scenario in enumerate(scenarios):
+                if "upstairs" in cold_zones and not scenario.upstairs_heating:
+                    continue
+                if "downstairs" in cold_zones and not scenario.downstairs_heating:
+                    continue
+                predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
+                c = compute_comfort_cost(predictions, schedules, base_hour)
+                e = compute_energy_cost(scenario)
+                if c + e < constrained_cost:
+                    constrained_cost = c + e
+                    constrained_best = i
+            if constrained_best >= 0:
+                print(f"  Cold room override: {', '.join(cold_rooms_info)}")
+                best_idx = constrained_best
 
     # ── Phase 3: build ControlDecision for winner ──
     scenario = scenarios[best_idx]
@@ -1088,6 +1210,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     off_overrides = build_hvac_overrides(all_off, current_split_temps)
     off_targets, off_matrix = _batch_predict(base_row, [off_overrides], models)
     off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
+    _apply_newton_floor(off_preds, base_row, current_temps)
     off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
 
     print(f"\n  All-off baseline: comfort={off_comfort:.4f}")
