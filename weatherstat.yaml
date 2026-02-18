@@ -117,6 +117,9 @@ windows:
   piano:
     entity_id: binary_sensor.window_piano_is_open
     rooms: [piano]
+  bathroom:
+    entity_id: binary_sensor.bathroom_high_window_open
+    rooms: [bathroom]
 
 weather:
   entity_id: weather.forecast_home
@@ -148,7 +151,7 @@ rooms:
     zone: downstairs
 
 comfort:
-  window_open_offset: { min: -3, max: 2 }
+  window_open_offset: { min: -2, max: 2 }
   upstairs:
     - { hours: [0, 24], min: 70, max: 74 }
   downstairs:
@@ -167,7 +170,7 @@ comfort:
   piano:
     - { hours: [0, 24], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
   bathroom:
-    - { hours: [0, 24], min: 67, max: 76, cold_penalty: 0.5, hot_penalty: 0.3 }
+    - { hours: [0, 24], min: 68, max: 76, cold_penalty: 0.5, hot_penalty: 0.3 }
 
 notifications:
   target: notify.mobile_app_richard_s_15_pro
