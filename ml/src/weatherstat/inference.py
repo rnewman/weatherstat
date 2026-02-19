@@ -9,11 +9,14 @@ Run:
   uv run python -m weatherstat.inference --snapshot  # from snapshot files
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import sqlite3
 import sys
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import lightgbm as lgb
 import numpy as np
@@ -35,6 +38,9 @@ from weatherstat.config import (
 from weatherstat.features import ROOM_TEMP_COLUMNS, build_features
 from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision
 from weatherstat.yaml_config import load_config
+
+if TYPE_CHECKING:
+    from weatherstat.forecast import ForecastEntry
 
 _CFG = load_config()
 
@@ -81,11 +87,10 @@ def _prepare_feature_row(
 # ── Live prediction from HA ────────────────────────────────────────────────
 
 
-def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
-    """Fetch recent entity history from HA for prediction context.
+def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[ForecastEntry] | None]:
+    """Fetch recent entity history AND hourly forecast from HA.
 
-    Returns a DataFrame in the same schema as extract_history() but for
-    a short recent window — enough for lag/rolling feature computation.
+    Returns (history_df, forecast_entries). Forecast is None on failure.
     """
     from datetime import timedelta
 
@@ -205,7 +210,17 @@ def fetch_recent_history(hours_back: int = 14) -> pd.DataFrame:
     if "outdoor_wind_speed" in result.columns:
         result = result.rename(columns={"outdoor_wind_speed": "wind_speed"})
 
-    return result
+    # Fetch hourly forecast (non-fatal)
+    forecast: list[ForecastEntry] | None = None
+    try:
+        from weatherstat.forecast import fetch_forecast
+
+        forecast = fetch_forecast()
+        print(f"  Fetched {len(forecast)} forecast entries")
+    except Exception as e:
+        print(f"  Warning: forecast fetch failed: {e}")
+
+    return result, forecast
 
 
 def _resample_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
@@ -241,6 +256,7 @@ def _predict_with_model(
     mode: str,
     prefix: str,
     horizons: list[int],
+    forecast_data: list[ForecastEntry] | None = None,
 ) -> dict[str, float] | None:
     """Build features and predict with a model set. Returns None if models unavailable."""
     feature_columns = load_feature_columns(prefix)
@@ -248,7 +264,7 @@ def _predict_with_model(
     if not models or not feature_columns:
         return None
 
-    df_feat = build_features(df.copy(), mode=mode)
+    df_feat = build_features(df.copy(), mode=mode, forecast_data=forecast_data)
     X = _prepare_feature_row(df_feat, feature_columns)
 
     predictions: dict[str, float] = {}
@@ -265,7 +281,7 @@ def predict_live() -> None:
     _check_config()
 
     print("Fetching recent history from Home Assistant...")
-    df_raw = fetch_recent_history(hours_back=14)
+    df_raw, forecast = fetch_recent_history(hours_back=14)
     n_rows = len(df_raw)
     print(f"  Retrieved {n_rows} rows (5-min intervals, ~{n_rows * 5 / 60:.0f} hours)")
 
@@ -289,14 +305,28 @@ def predict_live() -> None:
     print(f"  Downstairs:  {_fmt_temp(dn_now)} (action: {dn_action})")
     print(f"  Outdoor:     {_fmt_temp(out_now)} ({weather})")
 
+    # Show forecast summary if available
+    if forecast:
+        from weatherstat.forecast import forecast_at_horizons
+
+        ref_time = datetime.now(UTC)
+        at_horizons = forecast_at_horizons(forecast, ref_time, [1, 2, 4, 6, 12])
+        parts: list[str] = []
+        for label in ["1h", "2h", "4h", "6h", "12h"]:
+            entry = at_horizons.get(label)
+            if entry is not None:
+                parts.append(f"{label}:{entry.temperature:.0f}°F")
+        if parts:
+            print(f"  Forecast:    {', '.join(parts)}")
+
     # Full model predictions (5-min data, all features)
     print("\nRunning full model (5-min, all features)...")
-    full_preds = _predict_with_model(df_raw, "full", "full", HORIZONS_5MIN)
+    full_preds = _predict_with_model(df_raw, "full", "full", HORIZONS_5MIN, forecast_data=forecast)
 
     # Baseline model predictions (resample to hourly, temp-only)
     print("Running baseline model (hourly, temp-only)...")
     df_hourly = _resample_to_hourly(df_raw)
-    baseline_preds = _predict_with_model(df_hourly, "baseline", "baseline", HORIZONS_HOURLY)
+    baseline_preds = _predict_with_model(df_hourly, "baseline", "baseline", HORIZONS_HOURLY, forecast_data=forecast)
 
     # Print results table
     print(f"\n{'=' * 58}")
@@ -450,7 +480,7 @@ def predict_counterfactual() -> None:
     _check_config()
 
     print("Fetching recent history from Home Assistant...")
-    df_raw = fetch_recent_history(hours_back=14)
+    df_raw, forecast = fetch_recent_history(hours_back=14)
     n_rows = len(df_raw)
     print(f"  Retrieved {n_rows} rows")
 
@@ -486,7 +516,7 @@ def predict_counterfactual() -> None:
         print("Error: full models not found. Run `just train-full` first.", file=sys.stderr)
         sys.exit(1)
 
-    df_feat = build_features(df_raw.copy(), mode="full")
+    df_feat = build_features(df_raw.copy(), mode="full", forecast_data=forecast)
     base_row = _prepare_feature_row(df_feat, feature_columns)
 
     # Named scenarios

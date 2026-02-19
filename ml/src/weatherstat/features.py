@@ -4,13 +4,21 @@ Both train.py and inference.py call build_features() to ensure
 consistent feature sets (no training/serving skew).
 """
 
+from __future__ import annotations
+
+from datetime import UTC
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 from astral import LocationInfo
 from astral.sun import azimuth, elevation
 
-from weatherstat.weather import add_weather_features
+from weatherstat.weather import add_weather_features, encode_weather_condition
 from weatherstat.yaml_config import load_config
+
+if TYPE_CHECKING:
+    from weatherstat.forecast import ForecastEntry
 
 _CFG = load_config()
 
@@ -141,6 +149,91 @@ def encode_hvac_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── Retrospective HVAC features ──────────────────────────────────────────
+
+
+# HVAC devices to track, keyed by encoded column name.
+# Each value describes how to detect "device is active" from the encoded column.
+# "positive" means any value > 0 is active (blowers on at any level).
+# "nonzero" means any value != 0 is active (mini splits in heat OR cool).
+# "heating" means value == 1 is active (thermostats heating, navien space heating).
+_HVAC_RETRO_DEVICES: dict[str, str] = {
+    "thermostat_upstairs_action_enc": "heating",
+    "thermostat_downstairs_action_enc": "heating",
+    "navien_heating_mode_enc": "heating",
+    "mini_split_bedroom_mode_enc": "nonzero",
+    "mini_split_living_room_mode_enc": "nonzero",
+    "blower_family_room_mode_enc": "positive",
+    "blower_office_mode_enc": "positive",
+}
+
+
+def add_retrospective_hvac_features(df: pd.DataFrame, mode: str = "full") -> pd.DataFrame:
+    """Add retrospective HVAC features: cumulative runtime, duty cycle, time-since-transition.
+
+    For each HVAC device, computes:
+    - Rolling ON-minutes at 1h/2h/4h windows
+    - Duty cycle at 1h/2h windows
+    - Minutes since last OFF→ON and ON→OFF transitions
+
+    Must be called after encode_hvac_features() (needs _enc columns).
+    """
+    df = df.copy()
+    dt_minutes = 5 if mode == "full" else 60
+    windows_minutes = [60, 120, 240]
+
+    for col, active_type in _HVAC_RETRO_DEVICES.items():
+        if col not in df.columns:
+            continue
+
+        # Build binary ON signal
+        if active_type == "heating":
+            on_signal = (df[col] == 1.0).astype(float)
+        elif active_type == "nonzero":
+            on_signal = (df[col] != 0).astype(float)
+        else:  # "positive"
+            on_signal = (df[col] > 0).astype(float)
+
+        base = col.replace("_enc", "")
+
+        # Rolling ON-minutes and duty cycle
+        for window_min in windows_minutes:
+            window_periods = window_min // dt_minutes
+            if window_periods < 1:
+                continue
+            label = f"{window_min // 60}h"
+            rolling = on_signal.rolling(window_periods, min_periods=1)
+            df[f"{base}_on_minutes_{label}"] = rolling.sum() * dt_minutes
+            if window_min <= 120:
+                df[f"{base}_duty_cycle_{label}"] = rolling.mean()
+
+        # Time since last transition (ON→OFF and OFF→ON)
+        diff = on_signal.diff()
+        # diff == 1 means OFF→ON, diff == -1 means ON→OFF
+        turned_on = (diff == 1)
+        turned_off = (diff == -1)
+
+        # Cumulative time since each transition type
+        since_on = pd.Series(np.nan, index=df.index)
+        since_off = pd.Series(np.nan, index=df.index)
+        last_on_idx = np.nan
+        last_off_idx = np.nan
+        for i in range(len(df)):
+            if turned_on.iloc[i]:
+                last_on_idx = i
+            if turned_off.iloc[i]:
+                last_off_idx = i
+            if not np.isnan(last_on_idx):
+                since_on.iloc[i] = (i - last_on_idx) * dt_minutes
+            if not np.isnan(last_off_idx):
+                since_off.iloc[i] = (i - last_off_idx) * dt_minutes
+
+        df[f"{base}_since_on"] = since_on
+        df[f"{base}_since_off"] = since_off
+
+    return df
+
+
 # ── Delta features ───────────────────────────────────────────────────────────
 
 def add_delta_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -219,6 +312,121 @@ def add_physics_features(df: pd.DataFrame, mode: str = "full") -> pd.DataFrame:
     return df
 
 
+# ── Forecast features ─────────────────────────────────────────────────────
+
+# Horizon labels → shift periods for "perfect forecast" columns
+_FORECAST_HORIZONS = {"1h": 1, "2h": 2, "4h": 4, "6h": 6, "12h": 12}
+
+
+def add_forecast_features(
+    df: pd.DataFrame,
+    mode: str,
+    forecast_data: list[ForecastEntry] | None = None,
+) -> pd.DataFrame:
+    """Add forecast outdoor temp, condition, and wind at each prediction horizon.
+
+    Two modes of operation:
+    - Training (forecast_data=None): shift outdoor_temp forward to create
+      "perfect forecast" columns. The model learns the relationship between
+      future outdoor temp and room behavior. At inference, real forecast substitutes.
+    - Inference (forecast_data provided): inject actual HA forecast values
+      into the last row.
+
+    Features per horizon (1h, 2h, 4h, 6h, 12h):
+      - forecast_outdoor_temp_{label}     (°F)
+      - forecast_condition_code_{label}   (encoded)
+      - forecast_wind_speed_{label}       (mph)
+
+    Also adds hourly forecast_outdoor_temp_{N}h for N=1..12, used by
+    piecewise Newton integration.
+    """
+    df = df.copy()
+
+    # Period multiplier: how many DataFrame rows per hour
+    periods_per_hour = 12 if mode == "full" else 1
+
+    if forecast_data is not None:
+        # ── Inference mode: inject real forecast into last row ──
+        from datetime import datetime, timedelta
+
+        from weatherstat.forecast import forecast_at_horizons
+
+        # Parse reference time from last row
+        ref_str = df["timestamp"].iloc[-1]
+        try:
+            ref_time = datetime.fromisoformat(ref_str)
+            if ref_time.tzinfo is None:
+                ref_time = ref_time.replace(tzinfo=UTC)
+        except (ValueError, TypeError):
+            ref_time = datetime.now(UTC)
+
+        # Get forecast at key horizons
+        horizon_hours = [float(h) for h in _FORECAST_HORIZONS.values()]
+        at_horizons = forecast_at_horizons(forecast_data, ref_time, horizon_hours)
+
+        last_idx = df.index[-1]
+        for label, _hours in _FORECAST_HORIZONS.items():
+            entry = at_horizons.get(label)
+            if entry is not None:
+                df.loc[last_idx, f"forecast_outdoor_temp_{label}"] = entry.temperature
+                df.loc[last_idx, f"forecast_condition_code_{label}"] = encode_weather_condition(
+                    entry.condition
+                )
+                df.loc[last_idx, f"forecast_wind_speed_{label}"] = (
+                    entry.wind_speed if entry.wind_speed is not None else np.nan
+                )
+            else:
+                df.loc[last_idx, f"forecast_outdoor_temp_{label}"] = np.nan
+                df.loc[last_idx, f"forecast_condition_code_{label}"] = np.nan
+                df.loc[last_idx, f"forecast_wind_speed_{label}"] = np.nan
+
+        # Hourly forecast temps for piecewise Newton (1h through 12h)
+        sorted_entries = sorted(forecast_data, key=lambda e: e.datetime)
+        for h in range(1, 13):
+            target_time = ref_time + timedelta(hours=h)
+            best: ForecastEntry | None = None
+            best_diff = float("inf")
+            for entry in sorted_entries:
+                try:
+                    edt = datetime.fromisoformat(entry.datetime)
+                    if edt.tzinfo is None:
+                        edt = edt.replace(tzinfo=UTC)
+                    diff = abs((edt - target_time).total_seconds())
+                    if diff < best_diff:
+                        best_diff = diff
+                        best = entry
+                except (ValueError, TypeError):
+                    continue
+            if best is not None and best_diff <= 5400:
+                df.loc[last_idx, f"forecast_outdoor_temp_{h}h"] = best.temperature
+            else:
+                df.loc[last_idx, f"forecast_outdoor_temp_{h}h"] = np.nan
+
+    else:
+        # ── Training mode: shift outdoor_temp forward ("perfect forecast") ──
+        if "outdoor_temp" in df.columns:
+            for label, hours in _FORECAST_HORIZONS.items():
+                shift = hours * periods_per_hour
+                df[f"forecast_outdoor_temp_{label}"] = df["outdoor_temp"].shift(-shift)
+
+            if "weather_condition_code" in df.columns:
+                for label, hours in _FORECAST_HORIZONS.items():
+                    shift = hours * periods_per_hour
+                    df[f"forecast_condition_code_{label}"] = df["weather_condition_code"].shift(-shift)
+
+            if "wind_speed" in df.columns:
+                for label, hours in _FORECAST_HORIZONS.items():
+                    shift = hours * periods_per_hour
+                    df[f"forecast_wind_speed_{label}"] = df["wind_speed"].shift(-shift)
+
+            # Hourly forecast temps for piecewise Newton (1h through 12h)
+            for h in range(1, 13):
+                shift = h * periods_per_hour
+                df[f"forecast_outdoor_temp_{h}h"] = df["outdoor_temp"].shift(-shift)
+
+    return df
+
+
 # ── Newton's law of cooling features ───────────────────────────────────────
 
 # Hours ahead for each horizon label
@@ -232,6 +440,11 @@ def add_newton_cooling_features(df: pd.DataFrame, mode: str = "full") -> pd.Data
       T_newton = T_outdoor + (T_room - T_outdoor) * exp(-hours / tau)
       delta    = T_newton - T_room  (expected passive change, ≤ 0 when warmer)
 
+    When forecast_outdoor_temp_{N}h columns are present (from add_forecast_features),
+    uses piecewise Newton integration that chains hourly segments with different
+    outdoor temps — much more accurate at 4h+ horizons where outdoor temp changes
+    significantly (e.g., sunrise warming from 40°F to 55°F).
+
     Two τ values per room (sealed = windows closed, ventilated = windows open)
     let LightGBM split on window state to pick the right physics prediction.
 
@@ -240,8 +453,16 @@ def add_newton_cooling_features(df: pd.DataFrame, mode: str = "full") -> pd.Data
     During HVAC sweep, Newton features stay unchanged (passive prediction);
     HVAC features capture the heating effect. LightGBM combines them.
     """
+    from weatherstat.forecast import piecewise_newton_prediction
+
     thermal = _CFG.thermal
     new_cols: dict[str, pd.Series] = {}
+
+    # Check which hourly forecast columns are available for piecewise integration
+    max_forecast_hour = 0
+    for h in range(1, 13):
+        if f"forecast_outdoor_temp_{h}h" in df.columns:
+            max_forecast_hour = h
 
     for room, temp_col in _CFG.room_temp_columns.items():
         if temp_col not in df.columns or "outdoor_temp" not in df.columns:
@@ -253,15 +474,32 @@ def add_newton_cooling_features(df: pd.DataFrame, mode: str = "full") -> pd.Data
         t_outdoor = df["outdoor_temp"]
 
         for label, hours in HORIZON_HOURS.items():
-            # Sealed (windows closed)
-            decay_s = np.exp(-hours / tau_s)
-            pred_s = t_outdoor + (t_room - t_outdoor) * decay_s
+            hours_int = int(hours)
+
+            # Check if we have enough forecast data for piecewise integration
+            if max_forecast_hour >= hours_int and hours_int >= 2:
+                # Piecewise Newton: chain hourly segments with forecast outdoor temps
+                # Vectorized over DataFrame rows
+                forecast_cols = [f"forecast_outdoor_temp_{h}h" for h in range(1, hours_int + 1)]
+
+                pred_s = pd.Series(np.nan, index=df.index)
+                pred_v = pd.Series(np.nan, index=df.index)
+                for idx in df.index:
+                    room_t = t_room.loc[idx]
+                    outdoor_temps = [df.loc[idx, c] for c in forecast_cols]
+                    if np.isnan(room_t) or any(np.isnan(t) for t in outdoor_temps):
+                        continue
+                    pred_s.loc[idx] = piecewise_newton_prediction(room_t, outdoor_temps, tau_s, hours)
+                    pred_v.loc[idx] = piecewise_newton_prediction(room_t, outdoor_temps, tau_v, hours)
+            else:
+                # Fallback: constant outdoor temp (existing behavior)
+                decay_s = np.exp(-hours / tau_s)
+                pred_s = t_outdoor + (t_room - t_outdoor) * decay_s
+                decay_v = np.exp(-hours / tau_v)
+                pred_v = t_outdoor + (t_room - t_outdoor) * decay_v
+
             new_cols[f"{room}_newton_sealed_{label}"] = pred_s
             new_cols[f"{room}_newton_sealed_delta_{label}"] = pred_s - t_room
-
-            # Ventilated (windows open)
-            decay_v = np.exp(-hours / tau_v)
-            pred_v = t_outdoor + (t_room - t_outdoor) * decay_v
             new_cols[f"{room}_newton_vent_{label}"] = pred_v
             new_cols[f"{room}_newton_vent_delta_{label}"] = pred_v - t_room
 
@@ -343,6 +581,7 @@ def add_future_targets(
 def build_features(
     df: pd.DataFrame,
     mode: str = "full",
+    forecast_data: list[ForecastEntry] | None = None,
 ) -> pd.DataFrame:
     """Full feature engineering pipeline.
 
@@ -352,6 +591,9 @@ def build_features(
     Args:
         df: Raw snapshot or statistics DataFrame.
         mode: "full" for 5-min full-feature data, "baseline" for hourly temp-only.
+        forecast_data: Optional forecast entries from HA. When provided (inference),
+            injects real forecast values into the last row. When None (training),
+            creates "perfect forecast" columns by shifting outdoor_temp forward.
     """
     df = df.sort_values("timestamp").reset_index(drop=True)
 
@@ -367,13 +609,20 @@ def build_features(
         # HVAC encoding (only in full mode)
         df = encode_hvac_features(df)
 
+        # Retrospective HVAC features (cumulative runtime, duty cycle, time-since-transition)
+        df = add_retrospective_hvac_features(df, mode="full")
+
         # Delta features (only in full mode)
         df = add_delta_features(df)
 
         # Physics-informed features (dT/dt, acceleration, heating power)
         df = add_physics_features(df, mode="full")
 
+        # Forecast features (before Newton so piecewise integration can use them)
+        df = add_forecast_features(df, mode="full", forecast_data=forecast_data)
+
         # Newton's law of cooling predictions (passive thermal decay)
+        # Uses forecast columns when available for piecewise integration
         df = add_newton_cooling_features(df, mode="full")
 
         # Temperature lags and rolling at 5-min intervals
@@ -385,11 +634,17 @@ def build_features(
         # HVAC encoding (when HVAC columns are present from merged data)
         df = encode_hvac_features(df)
 
+        # Retrospective HVAC features (cumulative runtime, duty cycle, time-since-transition)
+        df = add_retrospective_hvac_features(df, mode="baseline")
+
         # Delta features (target-current, indoor-outdoor, room-zone)
         df = add_delta_features(df)
 
         # Physics-informed features (dT/dt, acceleration, heating power)
         df = add_physics_features(df, mode="baseline")
+
+        # Forecast features (before Newton so piecewise integration can use them)
+        df = add_forecast_features(df, mode="baseline", forecast_data=forecast_data)
 
         # Newton's law of cooling predictions (passive thermal decay)
         df = add_newton_cooling_features(df, mode="baseline")

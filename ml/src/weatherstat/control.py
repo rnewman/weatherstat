@@ -1065,7 +1065,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Fetch data
     print("[control] Fetching recent history from Home Assistant...")
-    df_raw = fetch_recent_history(hours_back=14)
+    df_raw, forecast = fetch_recent_history(hours_back=14)
     n_rows = len(df_raw)
     print(f"  Retrieved {n_rows} rows")
 
@@ -1128,6 +1128,24 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         target = latest.get(f"mini_split_{cfg.name}_target", "?")
         print(f"  split_{cfg.name:<12} {mode} @ {target}°F")
 
+    # Show forecast summary
+    if forecast:
+        from datetime import UTC as _utc
+
+        from weatherstat.forecast import forecast_at_horizons
+
+        ref_time = datetime.now(_utc)
+        at_horizons = forecast_at_horizons(forecast, ref_time, [1, 2, 4, 6, 12])
+        parts: list[str] = []
+        for label in ["1h", "2h", "4h", "6h", "12h"]:
+            entry = at_horizons.get(label)
+            if entry is not None:
+                parts.append(f"{label}:{entry.temperature:.0f}°F")
+        if parts:
+            print(f"  Forecast:    {', '.join(parts)}")
+    else:
+        print("  Forecast:    unavailable")
+
     # Load models
     feature_columns = load_feature_columns("full")
     models = load_models("full", HORIZONS_5MIN)
@@ -1135,8 +1153,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         print("  ERROR: Full models not found. Run `just train-full` first.", file=sys.stderr)
         return None
 
-    # Build features
-    df_feat = build_features(df_raw.copy(), mode="full")
+    # Build features (with forecast for piecewise Newton + ML forecast features)
+    df_feat = build_features(df_raw.copy(), mode="full", forecast_data=forecast)
     base_row = _prepare_feature_row(df_feat, feature_columns)
 
     # Current local hour for comfort schedule lookup
