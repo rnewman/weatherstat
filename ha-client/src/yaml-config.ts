@@ -226,6 +226,32 @@ function loadYamlConfig() {
     extract: entityState(weatherId, "unknown"),
   });
 
+  // 6b. Forecast columns (populated by collector from service call, not entity state)
+  // Hourly outdoor temperature forecasts (1h through 12h)
+  for (let h = 1; h <= 12; h++) {
+    columnDefs.push({
+      snake: `forecast_temp_${h}h`,
+      camel: `forecastTemp${h}h`,
+      sqlType: "REAL",
+      extract: () => 0,  // placeholder — collector injects real values
+    });
+  }
+  // Condition and wind at key horizons (1h, 2h, 4h, 6h, 12h)
+  for (const h of [1, 2, 4, 6, 12]) {
+    columnDefs.push({
+      snake: `forecast_condition_${h}h`,
+      camel: `forecastCondition${h}h`,
+      sqlType: "TEXT",
+      extract: () => "",  // placeholder — collector injects real values
+    });
+    columnDefs.push({
+      snake: `forecast_wind_${h}h`,
+      camel: `forecastWind${h}h`,
+      sqlType: "REAL",
+      extract: () => 0,  // placeholder — collector injects real values
+    });
+  }
+
   // 7. Humidity sensors
   for (const [col, sensor] of Object.entries(raw.sensors.humidity)) {
     columnDefs.push({

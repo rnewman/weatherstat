@@ -92,6 +92,21 @@ export class WebSocketHAClient implements HAClient {
     });
   }
 
+  async callServiceWithResponse(call: HAServiceCall): Promise<Record<string, unknown>> {
+    const conn = await this.ensureConnection();
+
+    const result = await conn.sendMessagePromise({
+      type: "call_service",
+      domain: call.domain,
+      service: call.service,
+      target: call.target,
+      service_data: call.serviceData,
+      return_response: true,
+    });
+
+    return (result as { response?: Record<string, unknown> })?.response ?? {};
+  }
+
   async subscribeEntities(
     entityIds: string[],
     callback: (state: HAEntityState) => void,

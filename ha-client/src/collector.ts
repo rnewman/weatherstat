@@ -11,7 +11,7 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type { Database as DatabaseType } from "better-sqlite3";
 
-import type { HAClient, HAEntityState, SnapshotRow } from "./types.ts";
+import type { HAClient, HAEntityState, SnapshotRow, WeatherForecastEntry } from "./types.ts";
 import type { Config } from "./config.ts";
 import { config } from "./yaml-config.ts";
 
@@ -88,9 +88,70 @@ function writeSnapshot(snapshot: SnapshotRow, dbPath: string): string {
   return dbPath;
 }
 
+/** Fetch hourly forecast and flatten into snapshot row fields. */
+async function injectForecast(
+  client: HAClient,
+  row: SnapshotRow,
+  weatherEntityId: string,
+): Promise<void> {
+  try {
+    const response = await client.callServiceWithResponse({
+      domain: "weather",
+      service: "get_forecasts",
+      target: { entity_id: weatherEntityId },
+      serviceData: { type: "hourly" },
+    });
+
+    const entityData = response[weatherEntityId] as { forecast?: WeatherForecastEntry[] } | undefined;
+    const entries = entityData?.forecast ?? [];
+    if (entries.length === 0) return;
+
+    // Sort by datetime
+    const sorted = [...entries].sort((a, b) => a.datetime.localeCompare(b.datetime));
+
+    const now = new Date();
+
+    // Find the entry closest to each hour ahead
+    const findClosest = (hoursAhead: number): WeatherForecastEntry | null => {
+      const target = new Date(now.getTime() + hoursAhead * 3600_000);
+      let best: WeatherForecastEntry | null = null;
+      let bestDiff = Infinity;
+      for (const entry of sorted) {
+        const diff = Math.abs(new Date(entry.datetime).getTime() - target.getTime());
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = entry;
+        }
+      }
+      // Accept if within 90 minutes
+      return bestDiff <= 5400_000 ? best : null;
+    };
+
+    // Hourly temps (1h through 12h)
+    for (let h = 1; h <= 12; h++) {
+      const entry = findClosest(h);
+      const camel = `forecastTemp${h}h`;
+      row[camel] = entry?.temperature ?? 0;
+    }
+
+    // Condition and wind at key horizons
+    for (const h of [1, 2, 4, 6, 12]) {
+      const entry = findClosest(h);
+      row[`forecastCondition${h}h`] = entry?.condition ?? "";
+      row[`forecastWind${h}h`] = entry?.windSpeed ?? 0;
+    }
+  } catch (err) {
+    console.warn("[collector] Forecast fetch failed (non-fatal):", err);
+  }
+}
+
 export async function collectOnce(client: HAClient, appConfig: Config): Promise<void> {
   await mkdir(dirname(appConfig.dbPath), { recursive: true });
   const snapshot = await buildSnapshot(client);
+
+  // Inject forecast data from service call
+  await injectForecast(client, snapshot, config.weatherEntity);
+
   const filepath = writeSnapshot(snapshot, appConfig.dbPath);
   console.log(
     `[collector] Wrote snapshot to ${filepath} (ts: ${roundToFiveMinutes(snapshot.timestamp)})`,

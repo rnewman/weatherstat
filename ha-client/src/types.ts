@@ -29,6 +29,9 @@ export interface HAClient {
   /** Call a Home Assistant service. */
   callService(call: HAServiceCall): Promise<void>;
 
+  /** Call a Home Assistant service and return the response data. */
+  callServiceWithResponse(call: HAServiceCall): Promise<Record<string, unknown>>;
+
   /** Subscribe to entity state changes. Returns an unsubscribe function. */
   subscribeEntities(
     entityIds: string[],
@@ -96,6 +99,7 @@ export interface WeatherForecastEntry {
   condition: string;
   precipitation: number | null;
   windSpeed: number | null;
+  cloud_coverage: number | null;
 }
 
 // ---- Snapshot (written to SQLite) ----
