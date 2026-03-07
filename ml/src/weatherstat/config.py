@@ -17,6 +17,7 @@ MODELS_DIR = DATA_DIR / "models"
 METRICS_DIR = DATA_DIR / "metrics"
 CONTROL_STATE_FILE = DATA_DIR / "control_state.json"
 ADVISORY_STATE_FILE = DATA_DIR / "advisory_state.json"
+DECISION_LOG_DB = DATA_DIR / "decision_log.db"
 
 
 def experiment_models_dir(name: str) -> Path:
@@ -26,6 +27,7 @@ def experiment_models_dir(name: str) -> Path:
     The control loop always reads from MODELS_DIR (production).
     """
     return MODELS_DIR / name
+
 
 # Snapshot collection interval (should match HA client config)
 SNAPSHOT_INTERVAL_SECONDS = 300
@@ -123,7 +125,8 @@ MINI_SPLIT_SWEEP_TARGET = 72.0
 
 # Mini-split mode encoding (from YAML, filtered to sweep modes for control)
 MINI_SPLIT_MODE_ENC: dict[str, float] = {
-    mode: enc for mode, enc in next(iter(_CFG.mini_splits.values())).mode_encoding.items()
+    mode: enc
+    for mode, enc in next(iter(_CFG.mini_splits.values())).mode_encoding.items()
     if mode in MINI_SPLIT_SWEEP_MODES
 }
 

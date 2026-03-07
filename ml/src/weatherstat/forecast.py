@@ -48,9 +48,11 @@ def fetch_forecast(entity_id: str = "weather.forecast_home") -> list[ForecastEnt
 
     resp = requests.post(url, headers=headers, json=payload, params={"return_response": ""}, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
+    result = resp.json()
 
-    # HA returns {"weather.forecast_home": {"forecast": [...]}}
+    # With ?return_response, HA returns:
+    #   {"changed_states": [...], "service_response": {"weather.forecast_home": {"forecast": [...]}}}
+    data = result.get("service_response", result)
     entity_data = data.get(entity_id, {})
     raw_entries = entity_data.get("forecast", [])
 

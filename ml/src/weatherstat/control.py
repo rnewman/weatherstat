@@ -414,9 +414,7 @@ def generate_scenarios() -> list[HVACScenario]:
                     per_blower_levels.append(("off",))
 
             for levels in product(*per_blower_levels):
-                blowers = tuple(
-                    BlowerDecision(b.name, lvl) for b, lvl in zip(BLOWERS, levels, strict=True)
-                )
+                blowers = tuple(BlowerDecision(b.name, lvl) for b, lvl in zip(BLOWERS, levels, strict=True))
                 for splits in split_combos:
                     scenarios.append(HVACScenario(up_on, dn_on, blowers, splits))
 
@@ -497,8 +495,7 @@ def sweep_scenarios(
     dn_allow = dn_current < dn_max
     if not up_allow or not dn_allow:
         scenarios = [
-            s for s in scenarios
-            if (up_allow or not s.upstairs_heating) and (dn_allow or not s.downstairs_heating)
+            s for s in scenarios if (up_allow or not s.upstairs_heating) and (dn_allow or not s.downstairs_heating)
         ]
         if not up_allow:
             blocked_reasons.append(f"upstairs at/above max ({up_current:.1f}°F >= {up_max:.0f}°F)")
@@ -594,10 +591,7 @@ def sweep_scenarios(
     if off_idx >= 0 and best_idx != off_idx:
         improvement = off_cost - best_cost
         if improvement < MIN_IMPROVEMENT:
-            print(
-                f"  Reverting to all-off: improvement {improvement:.3f}"
-                f" < threshold {MIN_IMPROVEMENT:.1f}"
-            )
+            print(f"  Reverting to all-off: improvement {improvement:.3f} < threshold {MIN_IMPROVEMENT:.1f}")
             best_idx = off_idx
 
     # ── Cold-room safety override ──
@@ -684,11 +678,13 @@ def sweep_scenarios(
         upstairs_heating=scenario.upstairs_heating,
         downstairs_heating=scenario.downstairs_heating,
         upstairs_setpoint=_cautious_setpoint(
-            up_current, scenario.upstairs_heating,
+            up_current,
+            scenario.upstairs_heating,
             comfort_min=_zone_comfort_min("upstairs", schedules, base_hour),
         ),
         downstairs_setpoint=_cautious_setpoint(
-            dn_current, scenario.downstairs_heating,
+            dn_current,
+            scenario.downstairs_heating,
             comfort_min=_zone_comfort_min("downstairs", schedules, base_hour),
         ),
         blowers=scenario.blowers,
@@ -720,13 +716,15 @@ def build_advisory_actions(window_states: dict[str, bool]) -> list[Action]:
         open_opt = ActionOption(name="open", feature_overrides={col: 1.0})
         closed_opt = ActionOption(name="closed", feature_overrides={col: 0.0})
         current = "open" if window_states.get(name, False) else "closed"
-        actions.append(Action(
-            name=name,
-            options=(open_opt, closed_opt),
-            current=current,
-            execution=ExecutionType.ADVISORY,
-            effort_cost=ADVISORY_EFFORT_COST,
-        ))
+        actions.append(
+            Action(
+                name=name,
+                options=(open_opt, closed_opt),
+                current=current,
+                execution=ExecutionType.ADVISORY,
+                effort_cost=ADVISORY_EFFORT_COST,
+            )
+        )
     return actions
 
 
@@ -785,9 +783,7 @@ def _build_advisory_message(
     if len(changed_windows) == 1:
         window_desc = f"the {changed_windows[0]} window"
     else:
-        window_desc = "the " + " and ".join(
-            ", ".join(changed_windows).rsplit(", ", 1)
-        ) + " windows"
+        window_desc = "the " + " and ".join(", ".join(changed_windows).rsplit(", ", 1)) + " windows"
 
     parts = [f"{action_verb} {window_desc}"]
     if room_effects:
@@ -833,10 +829,7 @@ def evaluate_advisories(
             X_base[col] = val
 
     # Build current state index (for skipping)
-    current_indices = tuple(
-        0 if a.current == a.options[0].name else 1
-        for a in advisory_actions
-    )
+    current_indices = tuple(0 if a.current == a.options[0].name else 1 for a in advisory_actions)
 
     has_any_window = "any_window_open" in X_base.columns
 
@@ -854,10 +847,7 @@ def evaluate_advisories(
             window_overrides.update(option.feature_overrides)
 
         if has_any_window:
-            any_open = any(
-                advisory_actions[i].options[combo[i]].name == "open"
-                for i in range(n)
-            )
+            any_open = any(advisory_actions[i].options[combo[i]].name == "open" for i in range(n))
             window_overrides["any_window_open"] = float(any_open)
 
         combos.append(combo)
@@ -894,11 +884,13 @@ def evaluate_advisories(
     for i, (new_idx, cur_idx) in enumerate(zip(best_combo, current_indices, strict=True)):
         if new_idx != cur_idx:
             action = advisory_actions[i]
-            changed.append((
-                action.name,
-                action.options[new_idx].name,
-                action.current,
-            ))
+            changed.append(
+                (
+                    action.name,
+                    action.options[new_idx].name,
+                    action.current,
+                )
+            )
 
     num_changes = len(changed)
     effort_threshold = ADVISORY_EFFORT_COST * num_changes
@@ -909,18 +901,24 @@ def evaluate_advisories(
     recommend_open = any(rec == "open" for _, rec, _ in changed)
     changed_names = [name for name, _, _ in changed]
     message = _build_advisory_message(
-        changed_names, best_improvement, best_preds, baseline_preds, recommend_open,
+        changed_names,
+        best_improvement,
+        best_preds,
+        baseline_preds,
+        recommend_open,
     )
 
     recommendations: list[ActionRecommendation] = []
     for name, recommended, current in changed:
-        recommendations.append(ActionRecommendation(
-            action_name=name,
-            recommended_state=recommended,
-            current_state=current,
-            comfort_improvement=best_improvement,
-            message=message,
-        ))
+        recommendations.append(
+            ActionRecommendation(
+                action_name=name,
+                recommended_state=recommended,
+                current_state=current,
+                comfort_improvement=best_improvement,
+                message=message,
+            )
+        )
 
     return sorted(recommendations, key=lambda r: r.action_name)
 
@@ -1005,10 +1003,7 @@ def check_prediction_sanity(
         if pred_1h is None or current is None:
             continue
         if abs(pred_1h - current) > MAX_1H_CHANGE:
-            print(
-                f"  WARNING: {room} 1h prediction {pred_1h:.1f}°F is"
-                f" >{MAX_1H_CHANGE}°F from current {current:.1f}°F"
-            )
+            print(f"  WARNING: {room} 1h prediction {pred_1h:.1f}°F is >{MAX_1H_CHANGE}°F from current {current:.1f}°F")
             safe = False
     return safe
 
@@ -1062,6 +1057,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     from weatherstat.extract import _check_config
 
     _check_config()
+
+    # Backfill outcomes for previous decisions before starting this cycle
+    from weatherstat.decision_log import backfill_outcomes
+
+    n_backfilled = backfill_outcomes()
+    if n_backfilled:
+        print(f"[control] Backfilled outcomes for {n_backfilled} previous decision(s)")
 
     # Fetch data
     print("[control] Fetching recent history from Home Assistant...")
@@ -1166,12 +1168,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Sweep all HVAC combinations
     schedules = default_comfort_schedules()
-    window_states_dict = {
-        name: bool(latest.get(f"window_{name}_open", False))
-        for name in _CFG.windows
-    }
+    window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     schedules = adjust_schedules_for_windows(
-        schedules, window_states_dict, _CFG.windows, *_CFG.window_open_offset,
+        schedules,
+        window_states_dict,
+        _CFG.windows,
+        *_CFG.window_open_offset,
     )
     rooms_with_open = set()
     for wn, ws in window_states_dict.items():
@@ -1221,7 +1223,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Compute all-off baseline prediction for comparison
     all_off = HVACScenario(
-        False, False,
+        False,
+        False,
         tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
         tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
     )
@@ -1264,6 +1267,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     cmd_path = write_command_json(decision)
     print(f"\n  Command JSON: {cmd_path}")
 
+    # Log decision for outcome tracking
+    from weatherstat.decision_log import log_decision
+
+    log_decision(decision, current_temps, latest, schedules, base_hour, live)
+    print("  Decision logged")
+
     if live:
         if not sane:
             print("  SKIPPED: prediction sanity check failed")
@@ -1281,9 +1290,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     n_combos = 2 ** len(advisory_actions)
     t1 = time.monotonic()
     recommendations = evaluate_advisories(
-        base_row, feature_columns, models,
-        electronic_overrides, advisory_actions,
-        schedules, base_hour,
+        base_row,
+        feature_columns,
+        models,
+        electronic_overrides,
+        advisory_actions,
+        schedules,
+        base_hour,
     )
     adv_ms = (time.monotonic() - t1) * 1000
 
