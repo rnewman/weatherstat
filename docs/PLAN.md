@@ -58,33 +58,40 @@
 
 ## Near-Term
 
-### Experiment Infrastructure
-- Git worktrees sharing `data/` so experiments don't disrupt the running collector/control loop
-- Experiment-namespaced model directories (`data/models/{experiment}/`)
-- Eval harness comparing experiment models against production baseline
-- Enables physics features and MPC work in parallel without risk
+### Weather Forecast Integration (next)
+- Fetch hourly forecasts from HA (`weather.get_forecasts` service on `weather.forecast_home`)
+- Forecast outdoor temp, condition, wind speed at each prediction horizon
+- Piecewise Newton integration: chain hourly segments using forecast outdoor temps
+  instead of constant current outdoor temp
+- Forecast features for ML: outdoor temp, cloud cover, wind at each horizon
+- Solar irradiance estimate: solar elevation × cloud factor from forecast condition
+- Store forecast snapshots in collector for training data
+- See `docs/FUTURE.md` for full design
 
-### Physics-Informed Features
-- Heating/cooling rate (dT/dt), thermal deficit, estimated time-to-setpoint
-- Helps the model learn control-relevant dynamics without a physics simulation
-- Implement as an experiment branch first, promote if metrics improve
+### Retrospective HVAC Features (parallel with forecast)
+- Cumulative heating minutes, duty cycle, time-since-transition features
+- Captures slab thermal charge state — "boiler ran 3h" ≠ "boiler ran 5min"
+- Computed from recent history already fetched during feature engineering
+- See `docs/FUTURE.md` for feature list
+
+### Physics as Sweep Guardrails (done)
+- Newton floor/ceiling on all-off predictions during HVAC sweep
+- Handles winter (model over-predicts warmth) and summer (model over-predicts coolness)
+- Cold-room safety override as secondary fallback
+- Design: physics guardrails at sweep level, ML predicts absolute temps with physics features
 
 ### Virtual Thermostats (Per-Room Climate Entities)
 - Expose per-room target high/low as HA climate entities
 - User adjusts comfort targets from the HA dashboard or phone (no YAML editing)
 - Control loop reads targets from HA each cycle instead of (or defaulting from) YAML
 - Solves the "adjust from bed at 2 AM" problem — change targets without restarting the loop
-- Complements device-level override detection (target overrides vs device overrides)
-- Climate entity shows: current room temp, target range, heating/cooling/idle action
-- YAML comfort schedule provides defaults; HA entities override when set
-- Could add "reset to schedule" automation that restores YAML defaults at a set time
 
 ## Medium-Term
 
-### Hybrid Physics + ML
-- Blend ML predictions (good at short horizons) with exponential-decay physics model (long horizons)
-- Fixes extrapolation issues when setpoints move outside training distribution
-- See `docs/modeling-strategy.md` for the math
+### Pre-Heating Logic
+- Uses forecast + HVAC response curves to start heating before outdoor temp drops
+- Critical for hydronic floor heat with 2–4 hour thermal lag
+- Requires forecast integration + retrospective features to estimate slab charge state
 
 ### Automated Retraining
 - Cron job or launchd plist to retrain weekly
@@ -107,26 +114,15 @@ should be unified; only the execution method differs.
 - Output splits into electronic commands (executor) and advisory notifications
 - Effort cost penalizes bothering the human — only suggest physical actions when
   the predicted improvement materially exceeds what electronic actions achieve alone
-- Naturally discovers cross-domain optimizations: "open the window instead of running
-  the mini split on cool", "close blinds to prevent afternoon overshoot"
-
-**Replaces rule-based advisories:**
-- Current `advisory.py` heuristics (free cooling, close windows) become emergent
-  properties of the optimizer rather than hand-coded rules
-- Advisory suggestions come with predicted temperature impact ("closing the bedroom
-  window would keep the room at 69°F instead of dropping to 66°F")
 
 **Prerequisites:**
-- Window→room mapping in YAML (needed for targeted suggestions) ✓ done
-- Blind sensors in HA (cover entities or binary sensors)
-- Effort cost tuning (how much "cost" to assign to human interruption)
-- Sweep scalability — unified action space is the product of all actions; see `docs/FUTURE.md`
+- Window→room mapping in YAML ✓ done
+- Sweep scalability for larger action spaces — see `docs/FUTURE.md`
 
 ### Full MPC
 - Model Predictive Control: optimize over multi-step HVAC trajectories
-- Exploration vs exploitation strategy for broadening training distribution
 - Multi-zone coordination (upstairs heat is ceiling heat for downstairs)
-- Multi-step trajectories multiply the single-step search space — scalability work (`docs/FUTURE.md`) is prerequisite
+- Requires fast-evaluating thermal model — physics + modular ML approach provides foundation
 
 ## Long-Term
 
