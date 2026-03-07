@@ -129,15 +129,11 @@ dT/dt = (1/C) * [
 ]
 ```
 
-**Known parameters (already fitted):**
-- `tau_sealed`, `tau_ventilated` per room — envelope loss time constants, fitted from overnight cooling data (Feb 2026).
-- `k_out = C / tau` — envelope conductance relative to thermal capacity.
-
-**Parameters to fit:**
-- `Q_heat` gain and `lag` per heating zone — from thermostat on/off step responses.
-- `Q_split` gain per mini split — from on/off transitions.
-- `k_ij` inter-room coupling coefficients — from single-zone heating episodes.
-- `Q_solar` — see Solar Gain Model.
+**Parameters (fitted by sysid):**
+- `tau_sealed`, `tau_ventilated` per sensor — envelope loss time constants, fitted from all nighttime HVAC-off periods (stage 1). YAML values from single-night fit (Feb 2026) serve as fallbacks.
+- `Q_heat` gain and `lag` per effector × sensor — from regression on Newton residuals (stage 2). Captures floor heat delays (30–90 min), mini split immediacy (2–10 min), and cross-zone coupling.
+- `Q_solar` per sensor × hour-of-day — solar gain profile from hour indicators in residual regression (stage 2).
+- `k_ij` inter-room coupling — implicit in the effector × sensor gain matrix (e.g., upstairs thermostat warms piano at +1.0°F/hr).
 
 **Integration:** Euler steps at 5-minute resolution, chaining hourly weather forecast segments for the outdoor temperature trajectory. `forecast.py` already implements piecewise Newton for the cooling-only case; this extends it with heating and solar terms.
 
@@ -153,19 +149,24 @@ Solar gain depends on window orientation, size, shading, and cloud patterns — 
 
 Even a few weeks of collector data should produce a useful initial model since the solar pattern is strongly periodic.
 
-#### 3c. System Identification
+#### 3c. System Identification (`ml/src/weatherstat/sysid.py`)
 
-Fits all thermal model parameters from observed data, treating every thermostat cycle and user intervention as a natural experiment.
+Fits all thermal model parameters from observed data using a two-stage approach that uses ALL collector data, not just rare clean episodes.
+
+**Stage 1 — Tau fitting:** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off. Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via `curve_fit` on each contiguous segment, separated by window state. Multiple segments → weighted median → tighter estimate than single-night fitting. Produces `tau_sealed` and `tau_ventilated` per sensor.
+
+**Stage 2 — Effector gains and solar profiles:** With tau fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on lagged effector activity (coarse time bins capturing delay) and hour-of-day indicators (capturing solar gain). One regression per sensor; coefficients across all sensors form the full coupling matrix.
 
 **What it extracts:**
-- **Heating step response** per zone: find every OFF->ON and ON->OFF transition. Align temperature trajectories. Subtract Newton cooling baseline. Fit delay, gain (degrees/hour above baseline), and ramp time constant.
-- **Mini split response**: same approach, faster response, typically no lag.
-- **Inter-room coupling**: when one zone heats alone, measure the warming rate of adjacent unheated rooms. Fit coupling coefficients.
-- **Solar residuals**: extracted and fed to the solar gain model.
+- **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.
+- **Solar gain profiles**: per-sensor, per-hour-of-day gain coefficients.
+- **Tau per sensor**: envelope loss time constants (sealed and ventilated), more robust than single-night fits.
 
-**Output:** Parameter file (JSON or YAML in `data/thermal_params/`) consumed by the physics core. Updated periodically as new data accumulates.
+**Config-driven:** Effectors and sensors enumerated from `weatherstat.yaml`. Adding a device or sensor = YAML edit + rerun.
 
-**Key insight:** Every thermostat cycle is a free experiment. Every manual adjustment produces a step response. The system treats all state transitions as learning opportunities.
+**Output:** `data/thermal_params.json` — the full coupling matrix, tau fits, and solar profiles. Run via `just sysid`.
+
+**Safeguards:** Sanity checks (ventilated tau must be < sealed tau), minimum data threshold for regression (500 rows), negligible-gain flagging (|gain| < 0.05°F/hr AND |t-stat| < 2.0), ridge regression fallback for collinear effectors.
 
 #### 3d. Prediction Interface
 

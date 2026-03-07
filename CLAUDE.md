@@ -19,10 +19,11 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 1. **Pipeline & data** (done) — Collector running, historical extraction, LightGBM training (baseline + full), evaluation framework.
 2. **Control loop** (done) — Setpoint sweep, comfort schedules, safety rails, dry-run + live execution.
 3. **Data accumulation** (in progress) — Collector running since Feb 2026. Retrain weekly. All data is winter so far.
-4. **Per-room models & blower control** (next) — Extend to office/bedroom predictions, add blower fan speed to control sweep.
-5. **Hybrid physics + ML** (future) — Blend ML with exponential-decay model for long-horizon accuracy.
+4. **System identification** (done) — `sysid.py` fits tau, effector×sensor gains, and solar profiles from collector data.
+5. **Per-room models & blower control** (next) — Extend to office/bedroom predictions, add blower fan speed to control sweep.
+6. **Grey-box physics + ML** (future) — Use sysid parameters in forward simulator for counterfactual prediction.
 
-See `docs/PLAN.md` for the full roadmap.
+See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
 ## Commands
 
@@ -44,6 +45,7 @@ just control          # Single control cycle (dry-run)
 just control-loop     # 15-min control loop (dry-run)
 just control-live     # Single control cycle with live execution
 just execute          # Apply latest command JSON to HA
+just sysid            # System identification (fit thermal params from data)
 just lint             # Lint both packages
 just test             # Test both packages
 just typecheck        # TypeScript type-check
@@ -62,6 +64,7 @@ just experiments      # List all experiments
 - Entity IDs: `ha-client/src/entities.ts`
 - Snapshot schema: `ha-client/src/types.ts` (SnapshotRow interface)
 - Python mirror: `ml/src/weatherstat/types.py`
+- System identification: `ml/src/weatherstat/sysid.py`
 
 ## Conventions
 

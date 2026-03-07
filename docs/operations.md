@@ -84,14 +84,28 @@ Models are saved to `data/models/`.
 just retrain           # re-extract historical + retrain both models
 ```
 
-## 4. Prediction & Counterfactual
+## 4. System Identification
+
+Extract thermal parameters (tau, effector gains, solar profiles) from collector data:
+
+```bash
+just sysid             # fit all parameters, write data/thermal_params.json
+just sysid -v          # verbose: show per-sensor details
+just sysid --output custom_path.json  # custom output path
+```
+
+This uses all accumulated collector data. Rerun periodically as data grows.
+The output (`data/thermal_params.json`) contains the full effector × sensor
+coupling matrix, fitted tau values, and solar gain profiles.
+
+## 5. Prediction & Counterfactual
 
 ```bash
 just predict           # fetch live state from HA, predict with both models
 just counterfactual    # "what if setpoints were 68/70/72/74/76?"
 ```
 
-## 5. Control Loop
+## 6. Control Loop
 
 The controller picks optimal thermostat setpoints by sweeping 81 setpoint pairs
 and evaluating comfort + energy cost over a 6-hour horizon.
@@ -142,7 +156,8 @@ Defaults in `ml/src/weatherstat/control.py:default_comfort_schedules()`:
 just collect-durable &       # background, or in a tmux/screen session
 just extract                 # get historical data for initial training
 
-# Day 1: Train initial models
+# Day 1: Run system identification + train initial models
+just sysid
 just train
 
 # Day 1+: Verify predictions look sane
@@ -175,6 +190,7 @@ data/
     prediction_*.json          # diagnostic predictions
     counterfactual_*.json      # setpoint sweep results
     command_*.json             # control decisions (executor reads these)
+  thermal_params.json          # sysid output (effector gains, tau, solar)
   control_state.json           # last setpoint decision (anti-cycling)
 logs/
   collector.log                # collector + health check output

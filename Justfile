@@ -133,6 +133,10 @@ execute:
 execute-force:
     cd ha-client && npx tsx src/index.ts execute --force
 
+# System identification: extract thermal parameters from collector data
+sysid *ARGS:
+    cd ml && uv run python -m weatherstat.sysid {{ARGS}}
+
 # Fit thermal time constants (τ) from overnight cooling fixture
 fit-tau:
     cd ml && uv run python scripts/fit_tau.py
