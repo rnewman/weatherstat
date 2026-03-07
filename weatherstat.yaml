@@ -47,6 +47,12 @@ sensors:
     living_room_temp:
       entity_id: sensor.living_room_aggregate_temperature
       statistics: true
+    living_room_climate_temp:
+      entity_id: sensor.climate_living_room_air_temperature
+      statistics: true
+    basement_temp:
+      entity_id: sensor.climate_basement_air_temperature
+      statistics: true
     outdoor_temp:
       entity_id: sensor.climate_side_air_temperature
       statistics: true
@@ -153,7 +159,7 @@ rooms:
 comfort:
   window_open_offset: { min: -2, max: 2 }
   upstairs:
-    - { hours: [0, 24], min: 70, max: 74 }
+    - { hours: [0, 24], min: 70, max: 75, hot_penalty: 0.5 }
   downstairs:
     - { hours: [0, 24], min: 70, max: 74 }
   bedroom:
