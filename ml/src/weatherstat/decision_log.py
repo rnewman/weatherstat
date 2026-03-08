@@ -6,6 +6,7 @@ by reading collector snapshots that have arrived since the decision was made.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     energy_cost REAL,
     total_cost REAL,
     comfort_bounds TEXT,
+    trajectory TEXT,
     outcomes TEXT,
     actual_comfort_cost REAL,
     outcome_backfilled INTEGER DEFAULT 0
@@ -55,6 +57,9 @@ def init_db(db_path: Path | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.execute(_SCHEMA)
+    # Schema migration: add trajectory column if upgrading from pre-PLAN-7
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN trajectory TEXT")
     conn.commit()
     conn.close()
     return path
@@ -102,6 +107,9 @@ def log_decision(
                 comfort_bounds[sched.room] = {"min": c.min_temp, "max": c.max_temp}
     comfort_bounds_json = json.dumps(comfort_bounds)
 
+    # Serialize trajectory info (if present)
+    trajectory_json = json.dumps(decision.trajectory_info) if decision.trajectory_info else None
+
     conn = sqlite3.connect(str(path))
     conn.execute(
         """\
@@ -109,8 +117,8 @@ def log_decision(
             timestamp, live, outdoor_temp, outdoor_humidity, wind_speed, weather_condition,
             current_temps, upstairs_heating, downstairs_heating, upstairs_setpoint, downstairs_setpoint,
             blowers, mini_splits, predictions, comfort_cost, energy_cost, total_cost,
-            comfort_bounds, outcome_backfilled
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            comfort_bounds, trajectory, outcome_backfilled
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         """,
         (
             decision.timestamp,
@@ -131,6 +139,7 @@ def log_decision(
             decision.energy_cost,
             decision.total_cost,
             comfort_bounds_json,
+            trajectory_json,
         ),
     )
     conn.commit()

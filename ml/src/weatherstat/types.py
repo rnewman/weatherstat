@@ -220,6 +220,34 @@ class HVACScenario:
 
 
 @dataclass(frozen=True)
+class ThermostatTrajectory:
+    """Trajectory for a slow effector: [OFF × delay] → [ON × duration] → [OFF × remainder].
+
+    Used in the physics sweep where constant-action evaluation systematically
+    mis-evaluates slow effectors (hydronic floor heat: 45-75 min lag).
+    """
+
+    heating: bool
+    delay_steps: int = 0  # 5-min steps before activation (0 = start now)
+    duration_steps: int | None = None  # 5-min steps of activation (None = full horizon)
+
+
+@dataclass(frozen=True)
+class TrajectoryScenario:
+    """HVAC scenario with trajectory parameters for slow effectors (thermostats).
+
+    Fast effectors (mini-splits, blowers) use constant activity over the full horizon.
+    Blower timelines follow their zone thermostat's on/off pattern.
+    Boiler timeline is derived as the OR of both thermostat timelines.
+    """
+
+    upstairs: ThermostatTrajectory
+    downstairs: ThermostatTrajectory
+    blowers: tuple[BlowerDecision, ...]
+    mini_splits: tuple[MiniSplitDecision, ...]
+
+
+@dataclass(frozen=True)
 class ControlDecision:
     """A single control decision: all HVAC devices and derived setpoints."""
 
@@ -234,6 +262,8 @@ class ControlDecision:
     comfort_cost: float = 0.0
     energy_cost: float = 0.0
     room_predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # room -> {horizon -> temp}
+    # zone -> {delay_steps, duration_steps}
+    trajectory_info: dict[str, dict[str, int | None]] = field(default_factory=dict)
     dry_run: bool = True
 
 

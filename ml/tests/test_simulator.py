@@ -14,7 +14,13 @@ from weatherstat.simulator import (
     load_sim_params,
     simulate_sensor,
 )
-from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision
+from weatherstat.types import (
+    BlowerDecision,
+    HVACScenario,
+    MiniSplitDecision,
+    ThermostatTrajectory,
+    TrajectoryScenario,
+)
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -116,6 +122,28 @@ def test_timeline_truncates_long_history() -> None:
     assert len(tl) == 20  # 18 history + 2 future
     assert all(v == 1.0 for v in tl[:18])
     assert all(v == 0.0 for v in tl[18:])
+
+
+def test_timeline_with_delay() -> None:
+    """Activity starts at switch_on_step, not at step 0."""
+    tl = build_activity_timeline(1.0, [], n_future_steps=6, switch_on_step=3)
+    assert len(tl) == 18 + 6  # padded history + future
+    # Future: [0, 0, 0, 1, 1, 1]
+    assert tl[18:] == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+
+
+def test_timeline_with_switch_off() -> None:
+    """Activity ends at switch_off_step."""
+    tl = build_activity_timeline(1.0, [], n_future_steps=6, switch_off_step=3)
+    # Future: [1, 1, 1, 0, 0, 0]
+    assert tl[18:] == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+
+
+def test_timeline_with_delay_and_switch_off() -> None:
+    """Activity only during [switch_on_step, switch_off_step)."""
+    tl = build_activity_timeline(1.0, [], n_future_steps=8, switch_on_step=2, switch_off_step=5)
+    # Future: [0, 0, 1, 1, 1, 0, 0, 0]
+    assert tl[18:] == [0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
 
 
 # ── _scenario_to_activities ──────────────────────────────────────────────
@@ -266,16 +294,127 @@ def test_all_off_cooling(sim_params: SimParams) -> None:
 
 
 def test_performance(sim_params: SimParams) -> None:
-    """Full sweep should complete in under 200ms."""
+    """Full trajectory sweep should complete in reasonable time."""
     import time
 
-    from weatherstat.control import generate_scenarios
+    from weatherstat.control import generate_trajectory_scenarios
 
-    scenarios = generate_scenarios()
+    scenarios = generate_trajectory_scenarios()
     t0 = time.monotonic()
     batch_simulate(
         _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
         scenarios, sim_params, 14.5, [12, 24, 48, 72],
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
-    assert elapsed_ms < 200, f"Full sweep took {elapsed_ms:.0f}ms (should be <200ms)"
+    assert elapsed_ms < 5000, f"Full sweep took {elapsed_ms:.0f}ms (should be <5000ms)"
+
+
+# ── Trajectory scenario tests ──────────────────────────────────────────
+
+
+def _traj_all_off() -> TrajectoryScenario:
+    return TrajectoryScenario(
+        ThermostatTrajectory(heating=False),
+        ThermostatTrajectory(heating=False),
+        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+    )
+
+
+def _traj_heat_2h() -> TrajectoryScenario:
+    """Both thermostats heat for 2h starting now."""
+    return TrajectoryScenario(
+        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
+        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
+        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+    )
+
+
+def _traj_delayed_heat() -> TrajectoryScenario:
+    """Upstairs heats after 1h delay for 2h."""
+    return TrajectoryScenario(
+        ThermostatTrajectory(heating=True, delay_steps=12, duration_steps=24),
+        ThermostatTrajectory(heating=False),
+        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+    )
+
+
+def test_trajectory_all_off_matches_hvac_all_off(sim_params: SimParams) -> None:
+    """TrajectoryScenario all-off should match HVACScenario all-off."""
+    _, preds_hvac = batch_simulate(
+        _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
+        [_all_off()], sim_params, 14.5, [12, 24, 48, 72],
+    )
+    _, preds_traj = batch_simulate(
+        _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
+        [_traj_all_off()], sim_params, 14.5, [12, 24, 48, 72],
+    )
+    np.testing.assert_allclose(preds_hvac, preds_traj, atol=0.01)
+
+
+def test_trajectory_2h_warmer_than_off(sim_params: SimParams) -> None:
+    """2h heating trajectory should produce warmer temps than all-off."""
+    targets, preds = batch_simulate(
+        _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
+        [_traj_all_off(), _traj_heat_2h()], sim_params, 14.5, [12, 24, 48, 72],
+    )
+    # At 2h horizon (step 24), heating should be warmer
+    for j, t in enumerate(targets):
+        if "upstairs" in t and "t+24" in t:
+            assert preds[1, j] > preds[0, j], f"{t}: 2h heating should be warmer than off"
+
+
+def test_trajectory_2h_cooler_than_6h(sim_params: SimParams) -> None:
+    """2h heating should produce cooler 6h temps than 6h continuous heating."""
+    traj_6h = TrajectoryScenario(
+        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
+        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
+        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+    )
+    targets, preds = batch_simulate(
+        _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
+        [_traj_heat_2h(), traj_6h], sim_params, 14.5, [72],
+    )
+    # At 6h, 2h-heating should be cooler than 6h-heating (it turned off at 2h)
+    for j, t in enumerate(targets):
+        if "upstairs" in t:
+            assert preds[0, j] < preds[1, j], f"{t}: 2h should be cooler than 6h at 6h horizon"
+
+
+def test_trajectory_delayed_heat_delayed_effect(sim_params: SimParams) -> None:
+    """Delayed heating should have minimal effect at 1h but warm up by 4h."""
+    targets, preds = batch_simulate(
+        _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
+        [_traj_all_off(), _traj_delayed_heat()], sim_params, 2.0, [12, 48],
+    )
+    for j, t in enumerate(targets):
+        if "upstairs" in t and "t+12" in t:
+            # At 1h, delayed heat hasn't started yet — should be similar to all-off
+            assert abs(preds[0, j] - preds[1, j]) < 0.5, f"{t}: delayed heat shouldn't affect 1h prediction"
+        if "upstairs" in t and "t+48" in t:
+            # At 4h, delayed heat has been running for 2h — should be warmer
+            assert preds[1, j] > preds[0, j], f"{t}: delayed heat should warm by 4h"
+
+
+def test_trajectory_performance(sim_params: SimParams) -> None:
+    """Trajectory sweep should complete in under 10 seconds.
+
+    ~7K scenarios at ~0.5ms each ≈ 3.5s. Budget 10s for CI variability.
+    Acceptable for a 15-minute control loop.
+    """
+    import time
+
+    from weatherstat.control import generate_trajectory_scenarios
+
+    scenarios = generate_trajectory_scenarios()
+    assert len(scenarios) > 1000, f"Expected >1000 trajectory scenarios, got {len(scenarios)}"
+    t0 = time.monotonic()
+    batch_simulate(
+        _CURRENT_TEMPS, 42.0, [42.0] * 12, {},
+        scenarios, sim_params, 14.5, [12, 24, 48, 72],
+    )
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    assert elapsed_ms < 10000, f"Trajectory sweep took {elapsed_ms:.0f}ms (should be <10000ms)"

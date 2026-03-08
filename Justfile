@@ -85,7 +85,7 @@ test-py:
 typecheck:
     cd ha-client && pnpm exec tsc --noEmit
 
-# Single control cycle (dry-run)
+# Single control cycle (dry-run, physics trajectory sweep)
 control:
     cd ml && uv run python -m weatherstat.control
 
@@ -96,14 +96,6 @@ control-loop:
 # Single control cycle with live execution
 control-live:
     cd ml && uv run python -m weatherstat.control --live
-
-# Single control cycle using physics simulator
-control-physics:
-    cd ml && uv run python -m weatherstat.control --physics
-
-# Compare ML vs physics predictions side by side
-simulate:
-    cd ml && uv run python -m weatherstat.control --compare
 
 # Live control loop (15-min interval, generates + executes via HA)
 control-loop-live:

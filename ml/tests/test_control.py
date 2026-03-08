@@ -1,15 +1,11 @@
 """Tests for control optimizer constraints.
 
-Tests the sweep constraints without HA or real models. Mock models return
-configurable predictions, so tests verify the **constraint logic**, not ML accuracy.
+Tests the sweep constraints without HA or real models. Verifies the
+**constraint logic**: comfort cost, energy cost, cautious setpoints,
+trajectory generation, window schedule adjustment, and quiet hours.
 """
 
 from __future__ import annotations
-
-from unittest.mock import MagicMock
-
-import numpy as np
-import pandas as pd
 
 from weatherstat.config import BLOWERS, MINI_SPLITS
 from weatherstat.control import (
@@ -17,17 +13,12 @@ from weatherstat.control import (
     ABSOLUTE_MIN,
     CONTROL_HORIZONS,
     HORIZON_WEIGHTS,
-    _apply_newton_floor,
     _cautious_setpoint,
     _in_quiet_hours,
-    _zone_comfort_max,
     adjust_schedules_for_windows,
-    build_advisory_actions,
     compute_comfort_cost,
     compute_energy_cost,
-    evaluate_advisories,
-    generate_scenarios,
-    sweep_scenarios,
+    generate_trajectory_scenarios,
 )
 from weatherstat.types import (
     BlowerDecision,
@@ -36,6 +27,8 @@ from weatherstat.types import (
     HVACScenario,
     MiniSplitDecision,
     RoomComfort,
+    ThermostatTrajectory,
+    TrajectoryScenario,
 )
 
 # ── Test helpers ──────────────────────────────────────────────────────────
@@ -53,493 +46,6 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
     for room, entries in overrides.items():
         defaults[room] = ComfortSchedule(room=room, entries=tuple(entries))
     return list(defaults.values())
-
-
-def make_mock_models(predictions: dict[str, float]) -> dict[str, object]:
-    """Return dict of mock models that always predict the given values.
-
-    Returns per-row arrays matching input batch size (works with both
-    single-row and batch prediction).
-
-    Args:
-        predictions: Target name -> predicted value.
-    """
-    models: dict[str, object] = {}
-    for target, value in predictions.items():
-        mock = MagicMock()
-        mock.predict.side_effect = lambda X, v=value: np.full(len(X), v)
-        models[target] = mock
-    return models
-
-
-def make_base_row(feature_columns: list[str], **values: float) -> pd.DataFrame:
-    """Return a 1-row DataFrame with all feature columns, defaults + overrides.
-
-    Missing columns default to 0.0.
-    """
-    data = {col: [values.get(col, 0.0)] for col in feature_columns}
-    return pd.DataFrame(data)
-
-
-def _standard_feature_columns() -> list[str]:
-    """Return a representative set of feature columns for testing."""
-    from weatherstat.yaml_config import load_config
-
-    cfg = load_config()
-    cols = [
-        "thermostat_upstairs_temp",
-        "thermostat_downstairs_temp",
-        "outdoor_temp",
-        "thermostat_upstairs_action_enc",
-        "thermostat_downstairs_action_enc",
-        "navien_heating_mode_enc",
-        "hour", "hour_sin", "hour_cos",
-        "solar_elevation", "solar_azimuth",
-    ]
-    for b in BLOWERS:
-        cols.append(b.feature_col)
-    for s in MINI_SPLITS:
-        cols.extend([s.mode_feature_col, s.target_feature_col, s.delta_feature_col])
-    # Window columns
-    for name in cfg.windows:
-        cols.append(f"window_{name}_open")
-    cols.append("any_window_open")
-    return cols
-
-
-def _all_room_predictions(temp: float) -> dict[str, float]:
-    """Return predictions for all rooms at all horizons with the same temp."""
-    from weatherstat.config import PREDICTION_ROOMS
-
-    preds: dict[str, float] = {}
-    for room in PREDICTION_ROOMS:
-        for h in CONTROL_HORIZONS:
-            preds[f"{room}_temp_t+{h}"] = temp
-    return preds
-
-
-def _room_predictions_varying(room_temps: dict[str, float]) -> dict[str, float]:
-    """Return predictions for specified rooms at all horizons."""
-    preds: dict[str, float] = {}
-    for room, temp in room_temps.items():
-        for h in CONTROL_HORIZONS:
-            preds[f"{room}_temp_t+{h}"] = temp
-    return preds
-
-
-# ── Zone comfort max tests ────────────────────────────────────────────────
-
-
-class TestZoneComfortMax:
-    """Test that zone thermostat at/above comfort max blocks heating."""
-
-    def test_zone_above_comfort_max_blocks_heating(self) -> None:
-        """Upstairs at 75F, comfort max 74F -> all upstairs-heating scenarios pruned."""
-        schedules = make_schedules()
-        feature_cols = _standard_feature_columns()
-        preds = _all_room_predictions(72.0)
-        models = make_mock_models(preds)
-        base_row = make_base_row(feature_cols)
-
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=75.0, dn_current=70.0,
-            current_split_temps={}, current_temps={"upstairs": 75.0, "downstairs": 70.0},
-            schedules=schedules, base_hour=12,
-        )
-        assert not decision.upstairs_heating
-
-    def test_zone_below_comfort_max_allows_heating(self) -> None:
-        """Upstairs at 69F, comfort max 74F -> upstairs-heating scenarios present."""
-        schedules = make_schedules()
-        up_max = _zone_comfort_max("upstairs", schedules, 12)
-        assert up_max > 69.0  # confirms comfort max constraint allows heating
-
-
-# ── Thermal direction tests ───────────────────────────────────────────────
-
-
-class TestThermalDirection:
-    """Test thermal direction constraint."""
-
-    def test_thermal_direction_blocks_heating_when_warm(self) -> None:
-        """All rooms above comfort min at all future horizons -> heating blocked."""
-        schedules = make_schedules()
-        feature_cols = _standard_feature_columns()
-        preds = _all_room_predictions(73.0)
-        models = make_mock_models(preds)
-        base_row = make_base_row(feature_cols)
-
-        current_temps = {
-            "upstairs": 73.0, "downstairs": 73.0,
-            "bedroom": 73.0, "kitchen": 73.0, "piano": 73.0,
-            "bathroom": 73.0, "family_room": 73.0, "office": 73.0,
-        }
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=73.0, dn_current=73.0,
-            current_split_temps={}, current_temps=current_temps,
-            schedules=schedules, base_hour=12,
-        )
-        assert not decision.upstairs_heating
-        assert not decision.downstairs_heating
-
-    def test_thermal_direction_allows_heating_when_cold(self) -> None:
-        """One room below comfort min -> heating allowed."""
-        scenarios = generate_scenarios()
-        heating_scenarios = [s for s in scenarios if s.upstairs_heating or s.downstairs_heating]
-        assert len(heating_scenarios) > 0  # heating scenarios exist in the pool
-
-
-# ── Min improvement tests ─────────────────────────────────────────────────
-
-
-class TestMinImprovement:
-    """Test minimum improvement threshold."""
-
-    def test_min_improvement_reverts_to_all_off(self) -> None:
-        """Best active scenario improves cost by 0.5 (< 1.0 threshold) -> all-off.
-
-        Rooms at 69.5°F — below comfort min (70°F) but within the cold-room
-        override threshold (1°F), so the override doesn't fire.
-        """
-        schedules = make_schedules()
-        feature_cols = _standard_feature_columns()
-        preds = _all_room_predictions(72.0)
-        models = make_mock_models(preds)
-        base_row = make_base_row(feature_cols)
-
-        current_temps = {
-            "upstairs": 69.5, "downstairs": 73.0,
-            "bedroom": 73.0, "kitchen": 73.0, "piano": 73.0,
-            "bathroom": 73.0, "family_room": 73.0, "office": 73.0,
-        }
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=69.5, dn_current=73.0,
-            current_split_temps={}, current_temps=current_temps,
-            schedules=schedules, base_hour=12,
-        )
-        # Since all predictions are the same regardless of HVAC scenario,
-        # improvement over all-off = energy_cost (tiny) which is < MIN_IMPROVEMENT.
-        assert not decision.upstairs_heating
-        assert not decision.downstairs_heating
-        assert all(b.mode == "off" for b in decision.blowers)
-        assert all(s.mode == "off" for s in decision.mini_splits)
-
-    def test_min_improvement_keeps_active_when_significant(self) -> None:
-        """Large comfort improvement -> active decision kept."""
-        feature_cols = _standard_feature_columns()
-        schedules = make_schedules()
-
-        warm_preds = _room_predictions_varying({
-            "upstairs": 72.0, "downstairs": 72.0,
-            "bedroom": 72.0, "kitchen": 72.0, "piano": 72.0,
-            "bathroom": 72.0, "family_room": 72.0, "office": 72.0,
-        })
-        cold_preds = _room_predictions_varying({
-            "upstairs": 65.0, "downstairs": 65.0,
-            "bedroom": 65.0, "kitchen": 65.0, "piano": 65.0,
-            "bathroom": 65.0, "family_room": 65.0, "office": 65.0,
-        })
-
-        # Create models that predict differently based on thermostat action
-        models: dict[str, object] = {}
-        for target in warm_preds:
-            mock = MagicMock()
-
-            def _make_predict(warm_val: float, cold_val: float):
-                def predict(X: pd.DataFrame) -> np.ndarray:
-                    mask = X["thermostat_upstairs_action_enc"] > 0.5
-                    return np.where(mask, warm_val, cold_val)
-                return predict
-
-            mock.predict = _make_predict(warm_preds[target], cold_preds[target])
-            models[target] = mock
-
-        base_row = make_base_row(feature_cols)
-
-        current_temps = {
-            "upstairs": 65.0, "downstairs": 65.0,
-            "bedroom": 65.0, "kitchen": 65.0, "piano": 65.0,
-            "bathroom": 65.0, "family_room": 65.0, "office": 65.0,
-        }
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=65.0, dn_current=65.0,
-            current_split_temps={}, current_temps=current_temps,
-            schedules=schedules, base_hour=12,
-        )
-        # With 65F predicted for all-off vs 72F for heating -> huge improvement
-        assert decision.upstairs_heating or decision.downstairs_heating
-
-
-# ── Cold room override tests ─────────────────────────────────────────────
-
-
-class TestColdRoomOverride:
-    """Test cold-room safety override forces heating when model doesn't differentiate."""
-
-    def test_cold_room_forces_zone_heating(self) -> None:
-        """Model predicts same temp for all scenarios, but bedroom at 67°F
-        (>1°F below 69°F comfort min) -> force upstairs heating."""
-        schedules = make_schedules()
-        feature_cols = _standard_feature_columns()
-        # Model predicts 72°F regardless of HVAC — doesn't differentiate
-        preds = _all_room_predictions(72.0)
-        models = make_mock_models(preds)
-        base_row = make_base_row(feature_cols)
-
-        current_temps = {
-            "upstairs": 71.0, "downstairs": 70.0,
-            "bedroom": 67.0, "kitchen": 72.0, "piano": 72.0,
-            "bathroom": 72.0, "family_room": 72.0, "office": 72.0,
-        }
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=71.0, dn_current=70.0,
-            current_split_temps={}, current_temps=current_temps,
-            schedules=schedules, base_hour=20,  # 8pm: bedroom min=69°F
-        )
-        # Bedroom is in upstairs zone, 67°F is 2°F below 69°F min -> override
-        assert decision.upstairs_heating
-
-    def test_cold_room_no_override_within_threshold(self) -> None:
-        """Room 0.5°F below comfort min -> no override (within threshold)."""
-        schedules = make_schedules()
-        feature_cols = _standard_feature_columns()
-        preds = _all_room_predictions(72.0)
-        models = make_mock_models(preds)
-        base_row = make_base_row(feature_cols)
-
-        current_temps = {
-            "upstairs": 71.0, "downstairs": 70.0,
-            "bedroom": 68.5, "kitchen": 72.0, "piano": 72.0,
-            "bathroom": 72.0, "family_room": 72.0, "office": 72.0,
-        }
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=71.0, dn_current=70.0,
-            current_split_temps={}, current_temps=current_temps,
-            schedules=schedules, base_hour=20,  # bedroom min=69°F, 68.5 is only 0.5 below
-        )
-        # 68.5°F is only 0.5°F below 69°F — within threshold, no override
-        assert not decision.upstairs_heating
-        assert not decision.downstairs_heating
-
-
-# ── Newton floor tests ───────────────────────────────────────────────────
-
-
-class TestNewtonFloor:
-    """Test Newton's law floor on all-off predictions.
-
-    The ML model can't predict passive cooling at low temps because the
-    controller keeps the house warm (exploration-exploitation problem).
-    Newton's law provides the physics-correct passive prediction as a cap.
-    """
-
-    def test_newton_floor_caps_all_off_and_triggers_heating(self) -> None:
-        """Model predicts 72°F for all scenarios. Newton predicts 67°F passive cooling.
-        All-off predictions capped at 67°F → large cost vs heating → sweep picks heat."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = _standard_feature_columns()
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        schedules = make_schedules()
-        preds = _all_room_predictions(72.0)
-        models = make_mock_models(preds)
-
-        base_values: dict[str, float] = {"outdoor_temp": 40.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 67.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        current_temps = {room: 69.5 for room in PREDICTION_ROOMS}
-
-        decision = sweep_scenarios(
-            base_row, feature_cols, models,
-            up_current=69.5, dn_current=69.5,
-            current_split_temps={}, current_temps=current_temps,
-            schedules=schedules, base_hour=12,
-        )
-        # Newton caps all-off to 67°F (3°F below 70°F comfort min)
-        # while active HVAC scenarios stay at 72°F → any active HVAC wins
-        is_all_off = (
-            not decision.upstairs_heating
-            and not decision.downstairs_heating
-            and all(b.mode == "off" for b in decision.blowers)
-            and all(s.mode == "off" for s in decision.mini_splits)
-        )
-        assert not is_all_off, "Newton floor should make all-off too expensive"
-
-    def test_newton_ceiling_caps_when_indoor_below_outdoor(self) -> None:
-        """When indoor < outdoor (summer), Newton predicts warming toward outdoor.
-        Model may over-predict coolness. Ceiling caps predictions upward."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = _standard_feature_columns()
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        # Outdoor warmer than indoor (summer scenario)
-        base_values: dict[str, float] = {"outdoor_temp": 80.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 75.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        # Indoor 69.5°F, outdoor 80°F -> Newton predicts warming to 75°F
-        current_temps = {room: 69.5 for room in PREDICTION_ROOMS}
-        # Model predicts 72°F (too optimistic about staying cool)
-        preds = {f"{room}_temp_t+{h}": 72.0
-                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
-
-        caps = _apply_newton_floor(preds, base_row, current_temps)
-
-        # Newton ceiling should raise all predictions from 72°F to 75°F
-        assert len(caps) > 0
-        for key, val in preds.items():
-            assert val == 75.0, f"{key} should be raised to 75.0, got {val}"
-        # Verify log messages say "ceiling"
-        for cap in caps:
-            assert "ceiling" in cap
-
-    def test_apply_newton_floor_unit(self) -> None:
-        """Direct test of _apply_newton_floor: caps predictions above Newton values."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = ["outdoor_temp"]
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        base_values: dict[str, float] = {"outdoor_temp": 40.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 67.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
-        preds = {f"{room}_temp_t+{h}": 72.0
-                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
-
-        caps = _apply_newton_floor(preds, base_row, current_temps)
-
-        assert len(caps) > 0
-        for key, val in preds.items():
-            assert val == 67.0, f"{key} should be capped to 67.0, got {val}"
-
-    def test_newton_floor_winter_caps_downward(self) -> None:
-        """Direct unit test: winter (indoor > outdoor) caps predictions downward."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = ["outdoor_temp"]
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        base_values: dict[str, float] = {"outdoor_temp": 40.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 67.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
-        preds = {f"{room}_temp_t+{h}": 72.0
-                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
-
-        caps = _apply_newton_floor(preds, base_row, current_temps)
-
-        assert len(caps) > 0
-        for key, val in preds.items():
-            assert val == 67.0, f"{key} should be capped to 67.0, got {val}"
-        for cap in caps:
-            assert "floor" in cap
-
-    def test_newton_ceiling_summer_caps_upward(self) -> None:
-        """Direct unit test: summer (indoor < outdoor) caps predictions upward."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = ["outdoor_temp"]
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        base_values: dict[str, float] = {"outdoor_temp": 85.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 78.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        current_temps = {room: 72.0 for room in PREDICTION_ROOMS}
-        # Model predicts 74°F — too optimistic about staying cool
-        preds = {f"{room}_temp_t+{h}": 74.0
-                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
-
-        caps = _apply_newton_floor(preds, base_row, current_temps)
-
-        assert len(caps) > 0
-        for key, val in preds.items():
-            assert val == 78.0, f"{key} should be raised to 78.0, got {val}"
-        for cap in caps:
-            assert "ceiling" in cap
-
-    def test_newton_skipped_when_indoor_equals_outdoor(self) -> None:
-        """When indoor == outdoor, no thermal gradient — skip entirely."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = ["outdoor_temp"]
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        base_values: dict[str, float] = {"outdoor_temp": 70.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 70.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
-        preds = {f"{room}_temp_t+{h}": 72.0
-                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
-
-        caps = _apply_newton_floor(preds, base_row, current_temps)
-
-        assert len(caps) == 0
-        for val in preds.values():
-            assert val == 72.0  # unchanged
-
-    def test_newton_floor_no_cap_when_model_below_newton(self) -> None:
-        """When model predicts lower than Newton, no cap needed."""
-        from weatherstat.config import PREDICTION_ROOMS
-
-        feature_cols = ["outdoor_temp"]
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                feature_cols.append(f"{room}_newton_sealed_{label}")
-
-        base_values: dict[str, float] = {"outdoor_temp": 40.0}
-        for room in PREDICTION_ROOMS:
-            for label in ["1h", "2h", "4h", "6h"]:
-                base_values[f"{room}_newton_sealed_{label}"] = 67.0
-        base_row = make_base_row(feature_cols, **base_values)
-
-        current_temps = {room: 70.0 for room in PREDICTION_ROOMS}
-        # Model already predicts colder than Newton
-        preds = {f"{room}_temp_t+{h}": 65.0
-                 for room in PREDICTION_ROOMS for h in CONTROL_HORIZONS}
-
-        caps = _apply_newton_floor(preds, base_row, current_temps)
-
-        assert len(caps) == 0
-        for val in preds.values():
-            assert val == 65.0  # unchanged
 
 
 # ── Comfort cost tests ────────────────────────────────────────────────────
@@ -601,26 +107,6 @@ class TestComfortCost:
         assert cost_both > cost_one
 
 
-# ── Blower constraint tests ──────────────────────────────────────────────
-
-
-class TestBlowerConstraints:
-    """Test that blowers are forced off when their zone isn't heating."""
-
-    def test_blowers_only_active_when_zone_heating(self) -> None:
-        """When downstairs off -> family_room and office blowers forced to off."""
-        scenarios = generate_scenarios()
-
-        for scenario in scenarios:
-            if not scenario.downstairs_heating:
-                for blower in scenario.blowers:
-                    if blower.name in ("family_room", "office"):
-                        assert blower.mode == "off", (
-                            f"Blower {blower.name} should be off when downstairs not heating, "
-                            f"got {blower.mode}"
-                        )
-
-
 # ── Cautious setpoint tests ──────────────────────────────────────────────
 
 
@@ -652,223 +138,6 @@ class TestCautiousSetpoint:
         # Current temp below comfort min — setpoint should use comfort_min + offset
         sp = _cautious_setpoint(67.0, heating=True, comfort_min=70.0)
         assert sp == 72.0
-
-
-# ── Scenario generation tests ────────────────────────────────────────────
-
-
-class TestScenarioGeneration:
-    """Test scenario count from cartesian product."""
-
-    def test_generate_scenarios_count(self) -> None:
-        """2 thermo x blower levels x split modes -> expected count."""
-        scenarios = generate_scenarios()
-
-        # Both on:      3*3=9 blower combos * 3*3=9 split combos = 81
-        # Up on, Dn off: 1*1=1 blower combos (both downstairs zone) * 9 = 9
-        # Up off, Dn on: 3*3=9 blower combos * 9 = 81
-        # Both off:      1*1=1 blower combos * 9 = 9
-        # Total = 81 + 9 + 81 + 9 = 180
-        expected = 81 + 9 + 81 + 9
-        assert len(scenarios) == expected, f"Expected {expected} scenarios, got {len(scenarios)}"
-
-
-# ── Advisory evaluation tests ────────────────────────────────────────────
-
-
-class TestAdvisoryEvaluation:
-    """Test model-based window advisory sweep."""
-
-    def test_build_advisory_actions_from_window_states(self) -> None:
-        """Verify one Action per YAML window with correct current states and overrides."""
-        from weatherstat.yaml_config import load_config
-
-        cfg = load_config()
-        window_states = {name: False for name in cfg.windows}
-        window_states["bedroom"] = True
-
-        actions = build_advisory_actions(window_states)
-        assert len(actions) == len(cfg.windows)
-
-        bedroom_action = next(a for a in actions if a.name == "bedroom")
-        assert bedroom_action.current == "open"
-        assert len(bedroom_action.options) == 2
-        # open option sets window_bedroom_open=1.0
-        open_opt = next(o for o in bedroom_action.options if o.name == "open")
-        assert open_opt.feature_overrides == {"window_bedroom_open": 1.0}
-        closed_opt = next(o for o in bedroom_action.options if o.name == "closed")
-        assert closed_opt.feature_overrides == {"window_bedroom_open": 0.0}
-
-        basement_action = next(a for a in actions if a.name == "basement")
-        assert basement_action.current == "closed"
-
-    def test_window_sweep_recommends_closing(self) -> None:
-        """Mock models predict colder with window_bedroom_open=1 -> recommend closing."""
-        feature_cols = _standard_feature_columns()
-        schedules = make_schedules()
-
-        # Models sensitive to bedroom window: open -> 65°F (cold), closed -> 72°F (comfy)
-        def _make_predict(target: str):
-            def predict(X: pd.DataFrame) -> np.ndarray:
-                temp = np.full(len(X), 72.0)
-                if "window_bedroom_open" in X.columns:
-                    temp = np.where(X["window_bedroom_open"] > 0.5, 65.0, temp)
-                return temp
-            return predict
-
-        preds = _all_room_predictions(72.0)
-        models: dict[str, object] = {}
-        for target in preds:
-            mock = MagicMock()
-            mock.predict = _make_predict(target)
-            models[target] = mock
-
-        base_row = make_base_row(feature_cols, window_bedroom_open=1.0)
-        # All windows closed except bedroom
-        window_states = {name: False for name, _ in _cfg_windows()}
-        window_states["bedroom"] = True
-        advisory_actions = build_advisory_actions(window_states)
-
-        recommendations = evaluate_advisories(
-            base_row, feature_cols, models,
-            electronic_overrides={},
-            advisory_actions=advisory_actions,
-            schedules=schedules,
-            base_hour=12,
-        )
-
-        assert len(recommendations) >= 1
-        bedroom_rec = next(r for r in recommendations if r.action_name == "bedroom")
-        assert bedroom_rec.recommended_state == "closed"
-        assert bedroom_rec.current_state == "open"
-        assert bedroom_rec.comfort_improvement > 0
-
-    def test_window_sweep_recommends_multiple(self) -> None:
-        """Mock models sensitive to two windows -> recommends closing both."""
-        feature_cols = _standard_feature_columns()
-        schedules = make_schedules()
-
-        # Models sensitive to bedroom AND kitchen windows
-        def _make_predict(target: str):
-            def predict(X: pd.DataFrame) -> np.ndarray:
-                temp = np.full(len(X), 72.0)
-                if "window_bedroom_open" in X.columns:
-                    temp = np.where(X["window_bedroom_open"] > 0.5, temp - 4.0, temp)
-                if "window_kitchen_open" in X.columns:
-                    temp = np.where(X["window_kitchen_open"] > 0.5, temp - 3.0, temp)
-                return temp
-            return predict
-
-        preds = _all_room_predictions(72.0)
-        models: dict[str, object] = {}
-        for target in preds:
-            mock = MagicMock()
-            mock.predict = _make_predict(target)
-            models[target] = mock
-
-        base_row = make_base_row(
-            feature_cols, window_bedroom_open=1.0, window_kitchen_open=1.0,
-        )
-        window_states = {name: False for name, _ in _cfg_windows()}
-        window_states["bedroom"] = True
-        window_states["kitchen"] = True
-        advisory_actions = build_advisory_actions(window_states)
-
-        recommendations = evaluate_advisories(
-            base_row, feature_cols, models,
-            electronic_overrides={},
-            advisory_actions=advisory_actions,
-            schedules=schedules,
-            base_hour=12,
-        )
-
-        rec_names = {r.action_name for r in recommendations}
-        assert "bedroom" in rec_names
-        assert "kitchen" in rec_names
-
-    def test_window_sweep_skips_below_effort_cost(self) -> None:
-        """Mock models predict same temp regardless of window -> no recommendations."""
-        feature_cols = _standard_feature_columns()
-        schedules = make_schedules()
-
-        # Models insensitive to windows — always return 72°F
-        preds = _all_room_predictions(72.0)
-        models = make_mock_models(preds)
-
-        base_row = make_base_row(feature_cols, window_bedroom_open=1.0)
-        window_states = {name: False for name, _ in _cfg_windows()}
-        window_states["bedroom"] = True
-        advisory_actions = build_advisory_actions(window_states)
-
-        recommendations = evaluate_advisories(
-            base_row, feature_cols, models,
-            electronic_overrides={},
-            advisory_actions=advisory_actions,
-            schedules=schedules,
-            base_hour=12,
-        )
-
-        assert recommendations == []
-
-    def test_effort_cost_scales_with_changes(self) -> None:
-        """Closing 2 windows requires 2x effort threshold vs closing 1."""
-        from weatherstat.config import ADVISORY_EFFORT_COST
-
-        feature_cols = _standard_feature_columns()
-        schedules = make_schedules()
-
-        # Tiny improvement per window (just above 1x effort, below 2x)
-        improvement_per_window = ADVISORY_EFFORT_COST * 0.8
-
-        def _make_predict(target: str):
-            def predict(X: pd.DataFrame) -> np.ndarray:
-                temp = np.full(len(X), 72.0)
-                if "window_bedroom_open" in X.columns:
-                    temp = np.where(X["window_bedroom_open"] > 0.5, temp - improvement_per_window * 0.3, temp)
-                if "window_kitchen_open" in X.columns:
-                    temp = np.where(X["window_kitchen_open"] > 0.5, temp - improvement_per_window * 0.3, temp)
-                return temp
-            return predict
-
-        preds = _all_room_predictions(72.0)
-        models: dict[str, object] = {}
-        for target in preds:
-            mock = MagicMock()
-            mock.predict = _make_predict(target)
-            models[target] = mock
-
-        # Both windows open — small improvement each
-        base_row = make_base_row(
-            feature_cols, window_bedroom_open=1.0, window_kitchen_open=1.0,
-        )
-        window_states = {name: False for name, _ in _cfg_windows()}
-        window_states["bedroom"] = True
-        window_states["kitchen"] = True
-        advisory_actions = build_advisory_actions(window_states)
-
-        recommendations = evaluate_advisories(
-            base_row, feature_cols, models,
-            electronic_overrides={},
-            advisory_actions=advisory_actions,
-            schedules=schedules,
-            base_hour=12,
-        )
-
-        # The sweep might find closing both (2x effort) or just one (1x effort)
-        # depending on whether the total improvement exceeds the scaled threshold.
-        # With small improvements, closing both may not clear 2x threshold,
-        # but closing just one might clear 1x threshold.
-        # The key assertion: if any recommendations, effort cost was cleared.
-        for rec in recommendations:
-            assert rec.comfort_improvement > 0
-
-
-def _cfg_windows() -> list[tuple[str, object]]:
-    """Return list of (name, config) for all YAML windows."""
-    from weatherstat.yaml_config import load_config
-
-    cfg = load_config()
-    return list(cfg.windows.items())
 
 
 # ── Window comfort adjustment tests ─────────────────────────────────────
@@ -1004,3 +273,103 @@ class TestQuietHours:
     def test_boundary_end(self) -> None:
         """End hour is exclusive."""
         assert _in_quiet_hours(7, (22, 7)) is False
+
+
+# ── Trajectory scenario generation tests ─────────────────────────────
+
+
+class TestTrajectoryScenarioGeneration:
+    """Test trajectory scenario generation for physics sweep."""
+
+    def test_trajectory_scenarios_include_all_off(self) -> None:
+        """All-off should be in the trajectory scenario set."""
+        scenarios = generate_trajectory_scenarios()
+        all_off = [
+            s for s in scenarios
+            if not s.upstairs.heating and not s.downstairs.heating
+            and all(b.mode == "off" for b in s.blowers)
+            and all(sp.mode == "off" for sp in s.mini_splits)
+        ]
+        assert len(all_off) == 1
+
+    def test_trajectory_scenarios_include_delayed_start(self) -> None:
+        """Trajectories with delay > 0 should exist."""
+        scenarios = generate_trajectory_scenarios()
+        delayed = [s for s in scenarios if s.upstairs.heating and s.upstairs.delay_steps > 0]
+        assert len(delayed) > 0
+
+    def test_trajectory_scenarios_include_short_duration(self) -> None:
+        """Trajectories with finite duration should exist."""
+        scenarios = generate_trajectory_scenarios()
+        short = [
+            s for s in scenarios
+            if s.upstairs.heating and s.upstairs.duration_steps is not None and s.upstairs.duration_steps < 72
+        ]
+        assert len(short) > 0
+
+    def test_trajectory_scenarios_nontrivial(self) -> None:
+        """Trajectory search space should be substantial (more than just all-off)."""
+        trajectory_count = len(generate_trajectory_scenarios())
+        # With 2 zones × (1 off + delay×duration grid) × blowers × mini-splits,
+        # expect hundreds of scenarios
+        assert trajectory_count > 100
+
+    def test_trajectory_no_delay_past_horizon(self) -> None:
+        """No trajectory should have delay >= max horizon (would be equivalent to OFF)."""
+        max_horizon = max(CONTROL_HORIZONS)
+        scenarios = generate_trajectory_scenarios()
+        for s in scenarios:
+            if s.upstairs.heating:
+                assert s.upstairs.delay_steps < max_horizon
+            if s.downstairs.heating:
+                assert s.downstairs.delay_steps < max_horizon
+
+    def test_trajectory_duration_capped_at_horizon(self) -> None:
+        """delay + duration should not exceed max horizon."""
+        max_horizon = max(CONTROL_HORIZONS)
+        scenarios = generate_trajectory_scenarios()
+        for s in scenarios:
+            if s.upstairs.heating and s.upstairs.duration_steps is not None:
+                assert s.upstairs.delay_steps + s.upstairs.duration_steps <= max_horizon
+            if s.downstairs.heating and s.downstairs.duration_steps is not None:
+                assert s.downstairs.delay_steps + s.downstairs.duration_steps <= max_horizon
+
+
+class TestTrajectoryEnergyCost:
+    """Test that trajectory energy cost scales with duration."""
+
+    def test_shorter_duration_lower_cost(self) -> None:
+        """2h trajectory should cost less than 6h trajectory."""
+        short = TrajectoryScenario(
+            ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
+            ThermostatTrajectory(heating=False),
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+        )
+        long = TrajectoryScenario(
+            ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
+            ThermostatTrajectory(heating=False),
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+        )
+        assert compute_energy_cost(short) < compute_energy_cost(long)
+
+    def test_off_trajectory_no_gas_cost(self) -> None:
+        """All-off trajectory should have no gas zone cost."""
+        off = TrajectoryScenario(
+            ThermostatTrajectory(heating=False),
+            ThermostatTrajectory(heating=False),
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+        )
+        assert compute_energy_cost(off) == 0.0
+
+    def test_hvac_scenario_energy_cost_unchanged(self) -> None:
+        """HVACScenario energy cost should be unchanged (backward compat)."""
+        hvac = HVACScenario(
+            True, False,
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+        )
+        from weatherstat.config import ENERGY_COST_GAS_ZONE
+        assert compute_energy_cost(hvac) == ENERGY_COST_GAS_ZONE

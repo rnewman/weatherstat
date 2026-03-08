@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from weatherstat.config import DATA_DIR, PREDICTION_ROOMS
-from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision
+from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision, TrajectoryScenario
 
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
@@ -148,18 +148,31 @@ def build_activity_timeline(
     scenario_activity: float,
     recent_history: list[float],
     n_future_steps: int,
+    switch_on_step: int = 0,
+    switch_off_step: int | None = None,
 ) -> list[float]:
-    """Build complete activity timeline: [...history, scenario, scenario, ...].
+    """Build complete activity timeline: [...history, future...].
 
     Index 0 = oldest history step. Index len(history) = t=0 (start of scenario).
-    Steps [len(history)..] use scenario_activity.
+    Future steps use scenario_activity when active, 0.0 otherwise.
 
-    If recent_history is shorter than _HISTORY_STEPS, pad with zeros at the front.
+    Args:
+        scenario_activity: Activity level when active.
+        recent_history: Recent activity values (oldest first).
+        n_future_steps: Number of future steps to generate.
+        switch_on_step: Future step at which activity begins (0 = immediate).
+        switch_off_step: Future step at which activity ends (None = never).
     """
-    # Pad history to _HISTORY_STEPS
     padded = [0.0] * max(0, _HISTORY_STEPS - len(recent_history)) + recent_history[-_HISTORY_STEPS:]
-    # Append future steps
-    return padded + [scenario_activity] * n_future_steps
+    if switch_on_step == 0 and switch_off_step is None:
+        # Fast path: constant activity over entire future
+        return padded + [scenario_activity] * n_future_steps
+    # Segment-based construction: [OFF × delay] + [ON × duration] + [OFF × remainder]
+    start = min(switch_on_step, n_future_steps)
+    end = min(switch_off_step if switch_off_step is not None else n_future_steps, n_future_steps)
+    on_len = max(0, end - start)
+    off_after = max(0, n_future_steps - end)
+    return padded + [0.0] * start + [scenario_activity] * on_len + [0.0] * off_after
 
 
 # ── Core simulation: single sensor, single scenario ─────────────────────
@@ -266,6 +279,120 @@ def _outdoor_at(current: float, forecast: list[float], hours_ahead: float) -> fl
     return forecast[idx]
 
 
+# ── Trajectory timelines for TrajectoryScenario ─────────────────────────
+
+
+def _get_blower_zones() -> dict[str, str]:
+    """Cache blower name -> zone mapping from config."""
+    from weatherstat.config import BLOWERS as _BLOWERS
+    return {b.name: b.zone for b in _BLOWERS}
+
+
+_BLOWER_ZONES: dict[str, str] | None = None
+
+
+def _blower_zone_map() -> dict[str, str]:
+    global _BLOWER_ZONES
+    if _BLOWER_ZONES is None:
+        _BLOWER_ZONES = _get_blower_zones()
+    return _BLOWER_ZONES
+
+
+def _build_trajectory_timelines(
+    scenario: TrajectoryScenario,
+    params: SimParams,
+    recent_history: dict[str, list[float]],
+    n_future_steps: int,
+) -> dict[str, list[float]]:
+    """Build per-effector timelines from a TrajectoryScenario.
+
+    Thermostats use piecewise schedules (delay/duration). Boiler is derived
+    as the OR of both thermostat timelines. Blowers follow their zone
+    thermostat's on/off pattern. Mini-splits use constant activity.
+    """
+    timelines: dict[str, list[float]] = {}
+    blower_zones = _blower_zone_map()
+
+    # Phase 1: build thermostat timelines (needed for boiler derivation)
+    for eff in params.effectors:
+        if eff["device_type"] != "thermostat":
+            continue
+        name = eff["name"]
+        encoding = eff["encoding"]
+        hist = recent_history.get(name, [])
+        zone = name.removeprefix("thermostat_")
+        traj = scenario.upstairs if zone == "upstairs" else scenario.downstairs
+        if not traj.heating:
+            timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
+        else:
+            activity = encoding.get("heating", 1.0)
+            switch_off = (traj.delay_steps + traj.duration_steps) if traj.duration_steps is not None else None
+            timelines[name] = build_activity_timeline(
+                activity, hist, n_future_steps,
+                switch_on_step=traj.delay_steps,
+                switch_off_step=switch_off,
+            )
+
+    # Phase 2: build remaining effector timelines
+    for eff in params.effectors:
+        name = eff["name"]
+        if name in timelines:
+            continue
+        encoding = eff["encoding"]
+        dtype = eff["device_type"]
+        hist = recent_history.get(name, [])
+
+        if dtype == "boiler":
+            # Boiler fires whenever either thermostat is on.
+            # Build future from trajectory parameters directly (no per-step timeline lookup).
+            boiler_on = encoding.get("Space Heating", 1.0)
+            boiler_off = encoding.get("Idle", 0.0)
+            padded_hist = [0.0] * max(0, _HISTORY_STEPS - len(hist)) + hist[-_HISTORY_STEPS:]
+            future = [boiler_off] * n_future_steps
+            for traj in [scenario.upstairs, scenario.downstairs]:
+                if traj.heating:
+                    start = traj.delay_steps
+                    end = (start + traj.duration_steps) if traj.duration_steps is not None else n_future_steps
+                    for step in range(start, min(end, n_future_steps)):
+                        future[step] = boiler_on
+            timelines[name] = padded_hist + future
+
+        elif dtype == "blower":
+            blower_name = name.removeprefix("blower_")
+            bd = _find_blower(scenario.blowers, blower_name)
+            mode = bd.mode if bd else "off"
+            activity = encoding.get(mode, 0.0)
+            if activity == 0.0:
+                timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
+            else:
+                # Blower follows its zone thermostat's on/off pattern
+                zone = blower_zones.get(blower_name, "downstairs")
+                zone_traj = scenario.upstairs if zone == "upstairs" else scenario.downstairs
+                if not zone_traj.heating:
+                    timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
+                else:
+                    switch_off = (
+                        zone_traj.delay_steps + zone_traj.duration_steps
+                    ) if zone_traj.duration_steps is not None else None
+                    timelines[name] = build_activity_timeline(
+                        activity, hist, n_future_steps,
+                        switch_on_step=zone_traj.delay_steps,
+                        switch_off_step=switch_off,
+                    )
+
+        elif dtype == "mini_split":
+            split_name = name.removeprefix("mini_split_")
+            sd = _find_split(scenario.mini_splits, split_name)
+            mode = sd.mode if sd else "off"
+            activity = encoding.get(mode, 0.0)
+            timelines[name] = build_activity_timeline(activity, hist, n_future_steps)
+
+        else:
+            timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
+
+    return timelines
+
+
 # ── Batch simulate: all sensors, all scenarios ──────────────────────────
 
 
@@ -274,7 +401,7 @@ def batch_simulate(
     outdoor_temp: float,
     forecast_temps: list[float],
     window_states: dict[str, bool],
-    scenarios: list[HVACScenario],
+    scenarios: list[HVACScenario] | list[TrajectoryScenario],
     params: SimParams,
     hour_of_day: float,
     horizons: list[int],
@@ -353,18 +480,20 @@ def batch_simulate(
 
     # Simulate each scenario
     for i, scenario in enumerate(scenarios):
-        activities = _scenario_to_activities(scenario, params)
-
-        # Build timelines for each effector
-        timelines: dict[str, list[float]] = {}
-        for eff in params.effectors:
-            eff_name = eff["name"]
-            hist = recent_history.get(eff_name, [])
-            timelines[eff_name] = build_activity_timeline(
-                activities.get(eff_name, 0.0),
-                hist,
-                max_horizon + 1,
-            )
+        # Build timelines: trajectory-aware for TrajectoryScenario, constant for HVACScenario
+        if isinstance(scenario, TrajectoryScenario):
+            timelines = _build_trajectory_timelines(scenario, params, recent_history, max_horizon + 1)
+        else:
+            activities = _scenario_to_activities(scenario, params)
+            timelines: dict[str, list[float]] = {}
+            for eff in params.effectors:
+                eff_name = eff["name"]
+                hist = recent_history.get(eff_name, [])
+                timelines[eff_name] = build_activity_timeline(
+                    activities.get(eff_name, 0.0),
+                    hist,
+                    max_horizon + 1,
+                )
 
         # Simulate each needed sensor
         sensor_trajectories: dict[str, list[float]] = {}
