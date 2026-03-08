@@ -47,15 +47,10 @@ HA_URL = os.environ.get("HA_URL", "")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 
 # Prediction horizons (in steps). At 5-min intervals: 12=1h, 24=2h, 48=4h, etc.
-# At hourly intervals: 1=1h, 2=2h, 4=4h, etc.
 HORIZONS_5MIN = [12, 24, 48, 72, 144]  # 1h, 2h, 4h, 6h, 12h
-HORIZONS_HOURLY = [1, 2, 4, 6, 12]  # 1h, 2h, 4h, 6h, 12h
 
 # Rooms to predict temperatures for (from YAML config)
 PREDICTION_ROOMS = _CFG.prediction_rooms
-
-# Backward-compatible alias
-PREDICTION_ZONES = PREDICTION_ROOMS
 
 # ── HVAC device configuration ─────────────────────────────────────────────
 
@@ -152,19 +147,5 @@ LGBM_PARAMS: dict[str, object] = {
     "learning_rate": 0.05,
     "n_estimators": 500,
     "early_stopping_rounds": 50,
-    "verbose": -1,
-}
-
-# More conservative params for the small 10-day dataset
-LGBM_PARAMS_SMALL: dict[str, object] = {
-    "objective": "regression",
-    "metric": "rmse",
-    "num_leaves": 15,
-    "learning_rate": 0.03,
-    "n_estimators": 300,
-    "min_child_samples": 10,
-    "reg_alpha": 0.1,
-    "reg_lambda": 1.0,
-    "early_stopping_rounds": 30,
     "verbose": -1,
 }

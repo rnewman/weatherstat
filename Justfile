@@ -24,20 +24,12 @@ health:
 extract *ARGS:
     cd ml && uv run python -m weatherstat.extract {{ARGS}}
 
-# Train on collector data (full model, collector-only)
+# Train LightGBM models on collector data
 train:
-    cd ml && uv run python -m weatherstat.train --mode full --collector-only
+    cd ml && uv run python -m weatherstat.train
 
 # Retrain from collector data (no extraction needed)
 retrain: train
-
-# Train LightGBM baseline model (hourly stats, 7+ months — for experiments)
-train-baseline:
-    cd ml && uv run python -m weatherstat.train --mode baseline
-
-# Train LightGBM full model including historical parquet (for experiments)
-train-full:
-    cd ml && uv run python -m weatherstat.train --mode full
 
 # Evaluate and compare models
 evaluate:
@@ -51,7 +43,7 @@ metrics *ARGS:
 visualize *ARGS:
     cd ml && uv run python -m weatherstat.visualize {{ARGS}}
 
-# Predict: fetch live state from HA, predict with both models
+# Predict: fetch live state from HA, predict with full model
 predict:
     cd ml && uv run python -m weatherstat.inference
 
@@ -105,6 +97,14 @@ control-loop:
 control-live:
     cd ml && uv run python -m weatherstat.control --live
 
+# Single control cycle using physics simulator
+control-physics:
+    cd ml && uv run python -m weatherstat.control --physics
+
+# Compare ML vs physics predictions side by side
+simulate:
+    cd ml && uv run python -m weatherstat.control --compare
+
 # Live control loop (15-min interval, generates + executes via HA)
 control-loop-live:
     #!/usr/bin/env bash
@@ -147,23 +147,9 @@ fit-tau:
 worktree NAME *PATH:
     bash scripts/worktree.sh {{NAME}} {{PATH}}
 
-# Train both models into an experiment directory
+# Train models into an experiment directory
 train-experiment NAME:
-    cd ml && uv run python -m weatherstat.train --mode baseline --experiment {{NAME}}
-    cd ml && uv run python -m weatherstat.train --mode full --experiment {{NAME}}
-
-# Train just the full model into an experiment directory
-train-experiment-full NAME:
-    cd ml && uv run python -m weatherstat.train --mode full --experiment {{NAME}}
-
-# Train Newton cooling experiment (both models)
-train-experiment-newton:
-    cd ml && uv run python -m weatherstat.train --mode baseline --experiment newton_cooling
-    cd ml && uv run python -m weatherstat.train --mode full --experiment newton_cooling
-
-# Train full model using only collector data (no historical parquet)
-train-experiment-collector NAME:
-    cd ml && uv run python -m weatherstat.train --mode full --collector-only --experiment {{NAME}}
+    cd ml && uv run python -m weatherstat.train --experiment {{NAME}}
 
 # Backtest against overnight cooling test case (production model)
 backtest:

@@ -19,7 +19,6 @@ import pandas as pd
 
 from weatherstat.config import (
     HORIZONS_5MIN,
-    HORIZONS_HOURLY,
     MODELS_DIR,
     PREDICTION_ROOMS,
     experiment_models_dir,
@@ -88,14 +87,10 @@ def _evaluate_dir(
     return results
 
 
-def _load_data(mode: str) -> pd.DataFrame:
-    """Load evaluation data for a mode."""
-    if mode == "full":
-        from weatherstat.train import load_full_data
-        return load_full_data()
-    else:
-        from weatherstat.train import load_baseline_data
-        return load_baseline_data()
+def _load_data() -> pd.DataFrame:
+    """Load evaluation data from collector."""
+    from weatherstat.train import load_training_data
+    return load_training_data()
 
 
 def compare(experiment_name: str) -> None:
@@ -111,17 +106,16 @@ def compare(experiment_name: str) -> None:
 
     for mode, horizons, prefix in [
         ("full", HORIZONS_5MIN, "full"),
-        ("baseline", HORIZONS_HOURLY, "baseline"),
     ]:
         # Check if experiment has this model type
         if not (exp_dir / f"{prefix}_feature_columns.txt").exists():
             continue
 
         print(f"{'=' * 72}")
-        print(f"  {mode.upper()} MODEL COMPARISON")
+        print("  MODEL COMPARISON")
         print(f"{'=' * 72}")
 
-        df = _load_data(mode)
+        df = _load_data()
         prod_results = _evaluate_dir(MODELS_DIR, prefix, mode, df, horizons)
         exp_results = _evaluate_dir(exp_dir, prefix, mode, df, horizons)
 
@@ -197,13 +191,7 @@ def list_experiments() -> None:
     print("Experiments:")
     for exp_dir in sorted(experiments):
         has_full = (exp_dir / "full_feature_columns.txt").exists()
-        has_baseline = (exp_dir / "baseline_feature_columns.txt").exists()
-        models = []
-        if has_full:
-            models.append("full")
-        if has_baseline:
-            models.append("baseline")
-        model_str = ", ".join(models) if models else "empty"
+        model_str = "full" if has_full else "empty"
         print(f"  {exp_dir.name:<20} [{model_str}]")
 
 

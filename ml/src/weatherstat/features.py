@@ -36,20 +36,12 @@ _LOCATION = LocationInfo(
 # All temperature columns available in the full snapshot schema
 TEMP_COLUMNS_FULL = _CFG.all_temp_columns
 
-# Temperature columns available in hourly statistics (same set — all have statistics)
-TEMP_COLUMNS_HOURLY = _CFG.all_temp_columns
-
 # Room temperature columns used as prediction targets
 ROOM_TEMP_COLUMNS = _CFG.room_temp_columns
 
-# Backward-compatible alias
-ZONE_TEMP_COLUMNS = ROOM_TEMP_COLUMNS
-
 # Lag and rolling parameters — adjusted per data frequency
 LAG_PERIODS_5MIN = [1, 3, 6, 12]  # 5min, 15min, 30min, 1hr
-LAG_PERIODS_HOURLY = [1, 2, 4, 6]  # 1hr, 2hr, 4hr, 6hr
 ROLLING_WINDOWS_5MIN = [6, 12, 24]  # 30min, 1hr, 2hr
-ROLLING_WINDOWS_HOURLY = [3, 6, 12]  # 3hr, 6hr, 12hr
 
 
 # ── Time and solar features ─────────────────────────────────────────────────
@@ -403,26 +395,42 @@ def add_forecast_features(
                 df.loc[last_idx, f"forecast_outdoor_temp_{h}h"] = np.nan
 
     else:
-        # ── Training mode: shift outdoor_temp forward ("perfect forecast") ──
+        # ── Training mode ──
+        # Prefer stored forecasts from collector (real met.no data).
+        # Fall back to shifted actuals ("perfect forecast") for pre-collector rows.
         if "outdoor_temp" in df.columns:
             for label, hours in _FORECAST_HORIZONS.items():
-                shift = hours * periods_per_hour
-                df[f"forecast_outdoor_temp_{label}"] = df["outdoor_temp"].shift(-shift)
+                stored_temp = f"forecast_temp_{label}"
+                if stored_temp in df.columns:
+                    df[f"forecast_outdoor_temp_{label}"] = df[stored_temp]
+                else:
+                    shift = hours * periods_per_hour
+                    df[f"forecast_outdoor_temp_{label}"] = df["outdoor_temp"].shift(-shift)
 
-            if "weather_condition_code" in df.columns:
-                for label, hours in _FORECAST_HORIZONS.items():
+                stored_cond = f"forecast_condition_{label}"
+                if stored_cond in df.columns:
+                    df[f"forecast_condition_code_{label}"] = df[stored_cond].map(
+                        encode_weather_condition
+                    )
+                elif "weather_condition_code" in df.columns:
                     shift = hours * periods_per_hour
                     df[f"forecast_condition_code_{label}"] = df["weather_condition_code"].shift(-shift)
 
-            if "wind_speed" in df.columns:
-                for label, hours in _FORECAST_HORIZONS.items():
+                stored_wind = f"forecast_wind_{label}"
+                if stored_wind in df.columns:
+                    df[f"forecast_wind_speed_{label}"] = df[stored_wind]
+                elif "wind_speed" in df.columns:
                     shift = hours * periods_per_hour
                     df[f"forecast_wind_speed_{label}"] = df["wind_speed"].shift(-shift)
 
             # Hourly forecast temps for piecewise Newton (1h through 12h)
             for h in range(1, 13):
-                shift = h * periods_per_hour
-                df[f"forecast_outdoor_temp_{h}h"] = df["outdoor_temp"].shift(-shift)
+                stored = f"forecast_temp_{h}h"
+                if stored in df.columns:
+                    df[f"forecast_outdoor_temp_{h}h"] = df[stored]
+                else:
+                    shift = h * periods_per_hour
+                    df[f"forecast_outdoor_temp_{h}h"] = df["outdoor_temp"].shift(-shift)
 
     return df
 
@@ -629,29 +637,5 @@ def build_features(
         temp_cols = [c for c in TEMP_COLUMNS_FULL if c in df.columns]
         df = add_lag_features(df, temp_cols, LAG_PERIODS_5MIN)
         df = add_rolling_features(df, temp_cols, ROLLING_WINDOWS_5MIN)
-
-    elif mode == "baseline":
-        # HVAC encoding (when HVAC columns are present from merged data)
-        df = encode_hvac_features(df)
-
-        # Retrospective HVAC features (cumulative runtime, duty cycle, time-since-transition)
-        df = add_retrospective_hvac_features(df, mode="baseline")
-
-        # Delta features (target-current, indoor-outdoor, room-zone)
-        df = add_delta_features(df)
-
-        # Physics-informed features (dT/dt, acceleration, heating power)
-        df = add_physics_features(df, mode="baseline")
-
-        # Forecast features (before Newton so piecewise integration can use them)
-        df = add_forecast_features(df, mode="baseline", forecast_data=forecast_data)
-
-        # Newton's law of cooling predictions (passive thermal decay)
-        df = add_newton_cooling_features(df, mode="baseline")
-
-        # Temperature lags and rolling at hourly intervals
-        temp_cols = [c for c in TEMP_COLUMNS_HOURLY if c in df.columns]
-        df = add_lag_features(df, temp_cols, LAG_PERIODS_HOURLY)
-        df = add_rolling_features(df, temp_cols, ROLLING_WINDOWS_HOURLY)
 
     return df

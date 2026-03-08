@@ -698,6 +698,215 @@ def sweep_scenarios(
     return best_decision
 
 
+# ── Physics-based sweep ──────────────────────────────────────────────────
+
+
+def sweep_scenarios_physics(
+    current_temps: dict[str, float],
+    outdoor_temp: float,
+    forecast_temps: list[float],
+    window_states: dict[str, bool],
+    sim_params: object,
+    hour_of_day: float,
+    recent_history: dict[str, list[float]],
+    up_current: float,
+    dn_current: float,
+    current_split_temps: dict[str, float],
+    schedules: list[ComfortSchedule],
+    base_hour: int,
+) -> ControlDecision:
+    """Sweep all HVAC combinations using physics simulator predictions."""
+    from weatherstat.simulator import SimParams, batch_simulate
+
+    assert isinstance(sim_params, SimParams)
+
+    scenarios = generate_scenarios()
+    pre_count = len(scenarios)
+    blocked_reasons: list[str] = []
+
+    # ── Physical constraints (same as ML sweep) ──
+    up_max = _zone_comfort_max("upstairs", schedules, base_hour)
+    dn_max = _zone_comfort_max("downstairs", schedules, base_hour)
+    up_allow = up_current < up_max
+    dn_allow = dn_current < dn_max
+    if not up_allow or not dn_allow:
+        scenarios = [
+            s for s in scenarios if (up_allow or not s.upstairs_heating) and (dn_allow or not s.downstairs_heating)
+        ]
+        if not up_allow:
+            blocked_reasons.append(f"upstairs at/above max ({up_current:.1f}°F >= {up_max:.0f}°F)")
+        if not dn_allow:
+            blocked_reasons.append(f"downstairs at/above max ({dn_current:.1f}°F >= {dn_max:.0f}°F)")
+
+    # Thermal direction constraint
+    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
+    any_room_cold = False
+    for schedule in schedules:
+        room = schedule.room
+        temp = current_temps.get(room)
+        if temp is None:
+            continue
+        for h in CONTROL_HORIZONS:
+            hours_ahead = horizon_hours.get(h, h // 12)
+            future_hour = (base_hour + hours_ahead) % 24
+            comfort = schedule.comfort_at(future_hour)
+            if comfort is not None and temp < comfort.min_temp:
+                any_room_cold = True
+                break
+        if any_room_cold:
+            break
+
+    if not any_room_cold and (up_allow or dn_allow):
+        scenarios = [s for s in scenarios if not s.upstairs_heating and not s.downstairs_heating]
+        blocked_reasons.append("no room below comfort min")
+
+    if blocked_reasons:
+        print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
+        print(f"  Reduced scenarios: {pre_count} → {len(scenarios)}")
+
+    def _is_all_off(s: HVACScenario) -> bool:
+        return (
+            not s.upstairs_heating
+            and not s.downstairs_heating
+            and all(b.mode == "off" for b in s.blowers)
+            and all(sp.mode == "off" for sp in s.mini_splits)
+        )
+
+    # ── Batch simulate all scenarios ──
+    target_names, pred_matrix = batch_simulate(
+        current_temps, outdoor_temp, forecast_temps,
+        window_states, scenarios, sim_params, hour_of_day,
+        CONTROL_HORIZONS, recent_history,
+    )
+    target_idx = {t: j for j, t in enumerate(target_names)}
+
+    # ── Score each scenario ──
+    best_idx = -1
+    best_cost = float("inf")
+    off_idx = -1
+    off_cost = float("inf")
+
+    for i, scenario in enumerate(scenarios):
+        predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
+        comfort = compute_comfort_cost(predictions, schedules, base_hour)
+        energy = compute_energy_cost(scenario)
+        total = comfort + energy
+
+        if _is_all_off(scenario):
+            off_idx = i
+            off_cost = total
+
+        if total < best_cost:
+            best_cost = total
+            best_idx = i
+
+    if best_idx < 0:
+        raise RuntimeError("No HVAC scenarios evaluated")
+
+    # Minimum improvement safeguard
+    if off_idx >= 0 and best_idx != off_idx:
+        improvement = off_cost - best_cost
+        if improvement < MIN_IMPROVEMENT:
+            print(f"  Reverting to all-off: improvement {improvement:.3f} < threshold {MIN_IMPROVEMENT:.1f}")
+            best_idx = off_idx
+
+    # ── Cold-room safety override ──
+    if _is_all_off(scenarios[best_idx]):
+        cold_zones: set[str] = set()
+        cold_rooms_info: list[str] = []
+        for schedule in schedules:
+            room = schedule.room
+            temp = current_temps.get(room)
+            if temp is None:
+                continue
+            comfort = schedule.comfort_at(base_hour)
+            if comfort is None:
+                continue
+            if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
+                zone = ROOM_TO_ZONE.get(room)
+                if zone:
+                    cold_zones.add(zone)
+                    cold_rooms_info.append(f"{room} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
+
+        if not up_allow:
+            cold_zones.discard("upstairs")
+        if not dn_allow:
+            cold_zones.discard("downstairs")
+
+        if cold_zones:
+            constrained_best = -1
+            constrained_cost = float("inf")
+            for i, scenario in enumerate(scenarios):
+                if "upstairs" in cold_zones and not scenario.upstairs_heating:
+                    continue
+                if "downstairs" in cold_zones and not scenario.downstairs_heating:
+                    continue
+                predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
+                c = compute_comfort_cost(predictions, schedules, base_hour)
+                e = compute_energy_cost(scenario)
+                if c + e < constrained_cost:
+                    constrained_cost = c + e
+                    constrained_best = i
+            if constrained_best >= 0:
+                print(f"  Cold room override: {', '.join(cold_rooms_info)}")
+                best_idx = constrained_best
+
+    # ── Build ControlDecision ──
+    scenario = scenarios[best_idx]
+    predictions = {t: float(pred_matrix[best_idx, j]) for t, j in target_idx.items()}
+    comfort = compute_comfort_cost(predictions, schedules, base_hour)
+    energy = compute_energy_cost(scenario)
+    total = comfort + energy
+
+    room_preds: dict[str, dict[str, float]] = {}
+    for room in PREDICTION_ROOMS:
+        rpred: dict[str, float] = {}
+        for h in CONTROL_HORIZONS:
+            key = f"{room}_temp_t+{h}"
+            val = predictions.get(key)
+            if val is not None:
+                rpred[HORIZON_LABELS[h]] = round(val, 2)
+        if rpred:
+            room_preds[room] = rpred
+
+    # Mini-split command targets from comfort schedule
+    final_splits: list[MiniSplitDecision] = []
+    for sd in scenario.mini_splits:
+        if sd.mode == "off":
+            final_splits.append(sd)
+        else:
+            target_temp = MINI_SPLIT_SWEEP_TARGET
+            for sched in schedules:
+                if sched.room == sd.name:
+                    comfort_entry = sched.comfort_at(base_hour)
+                    if comfort_entry is not None:
+                        target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
+                    break
+            final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
+
+    return ControlDecision(
+        timestamp=datetime.now(UTC).isoformat(),
+        upstairs_heating=scenario.upstairs_heating,
+        downstairs_heating=scenario.downstairs_heating,
+        upstairs_setpoint=_cautious_setpoint(
+            up_current,
+            scenario.upstairs_heating,
+            comfort_min=_zone_comfort_min("upstairs", schedules, base_hour),
+        ),
+        downstairs_setpoint=_cautious_setpoint(
+            dn_current,
+            scenario.downstairs_heating,
+            comfort_min=_zone_comfort_min("downstairs", schedules, base_hour),
+        ),
+        blowers=scenario.blowers,
+        mini_splits=tuple(final_splits),
+        total_cost=round(total, 4),
+        comfort_cost=round(comfort, 4),
+        energy_cost=round(energy, 4),
+        room_predictions=room_preds,
+    )
+
+
 # ── Advisory (window) sweep ────────────────────────────────────────────────
 
 
@@ -1045,11 +1254,12 @@ def write_command_json(decision: ControlDecision) -> Path:
 # ── Main control cycle ────────────────────────────────────────────────────
 
 
-def run_control_cycle(live: bool = False) -> ControlDecision | None:
+def run_control_cycle(live: bool = False, physics: bool = False) -> ControlDecision | None:
     """Run a single control cycle.
 
     Args:
         live: If True, write command JSON for executor. If False, dry-run only.
+        physics: If True, use physics simulator instead of ML models.
 
     Returns:
         The control decision, or None if skipped.
@@ -1148,25 +1358,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     else:
         print("  Forecast:    unavailable")
 
-    # Load models
-    feature_columns = load_feature_columns("full")
-    models = load_models("full", HORIZONS_5MIN)
-    if not models or not feature_columns:
-        print("  ERROR: Full models not found. Run `just train-full` first.", file=sys.stderr)
-        return None
-
-    # Build features (with forecast for piecewise Newton + ML forecast features)
-    df_feat = build_features(df_raw.copy(), mode="full", forecast_data=forecast)
-    base_row = _prepare_feature_row(df_feat, feature_columns)
-
     # Current local hour for comfort schedule lookup
     from zoneinfo import ZoneInfo
 
     from weatherstat.config import TIMEZONE
 
-    base_hour = datetime.now(ZoneInfo(TIMEZONE)).hour
+    local_now = datetime.now(ZoneInfo(TIMEZONE))
+    base_hour = local_now.hour
 
-    # Sweep all HVAC combinations
+    # Comfort schedules + window adjustments
     schedules = default_comfort_schedules()
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     schedules = adjust_schedules_for_windows(
@@ -1182,22 +1382,83 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 rooms_with_open.add(r)
     if rooms_with_open:
         print(f"  Comfort adjusted for open windows: {', '.join(sorted(rooms_with_open))}")
-    n_scenarios = len(generate_scenarios())
-    print(f"\n[control] Sweeping {n_scenarios} HVAC combinations...")
-    t0 = time.monotonic()
-    decision = sweep_scenarios(
-        base_row,
-        feature_columns,
-        models,
-        up_current,
-        dn_current,
-        current_split_temps,
-        current_temps,
-        schedules,
-        base_hour,
-    )
-    elapsed_ms = (time.monotonic() - t0) * 1000
-    print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
+
+    if physics:
+        # Physics-based sweep using forward simulator
+        from weatherstat.simulator import extract_recent_history, load_sim_params
+
+        sim_params = load_sim_params()
+        recent_hist = extract_recent_history(df_raw, sim_params)
+
+        # Build forecast temp list for simulator
+        forecast_temp_list: list[float] = []
+        if forecast:
+            from weatherstat.forecast import forecast_at_horizons
+
+            ref_time = datetime.now(UTC)
+            # Get hourly forecasts for the next 12 hours
+            at_h = forecast_at_horizons(forecast, ref_time, list(range(1, 13)))
+            for h in range(1, 13):
+                entry = at_h.get(f"{h}h")
+                if entry is not None:
+                    forecast_temp_list.append(entry.temperature)
+                elif forecast_temp_list:
+                    forecast_temp_list.append(forecast_temp_list[-1])
+                else:
+                    forecast_temp_list.append(float(out_temp) if out_temp is not None else 50.0)
+
+        fractional_hour = base_hour + local_now.minute / 60.0
+
+        n_scenarios = len(generate_scenarios())
+        print(f"\n[control] Sweeping {n_scenarios} HVAC combinations (physics)...")
+        t0 = time.monotonic()
+        outdoor = float(out_temp) if out_temp is not None and not (
+            isinstance(out_temp, float) and np.isnan(out_temp)
+        ) else 50.0
+        decision = sweep_scenarios_physics(
+            current_temps,
+            outdoor,
+            forecast_temp_list,
+            window_states_dict,
+            sim_params,
+            fractional_hour,
+            recent_hist,
+            up_current,
+            dn_current,
+            current_split_temps,
+            schedules,
+            base_hour,
+        )
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
+    else:
+        # ML-based sweep
+        feature_columns = load_feature_columns("full")
+        models = load_models("full", HORIZONS_5MIN)
+        if not models or not feature_columns:
+            print("  ERROR: Full models not found. Run `just train` first.", file=sys.stderr)
+            return None
+
+        # Build features (with forecast for piecewise Newton + ML forecast features)
+        df_feat = build_features(df_raw.copy(), mode="full", forecast_data=forecast)
+        base_row = _prepare_feature_row(df_feat, feature_columns)
+
+        n_scenarios = len(generate_scenarios())
+        print(f"\n[control] Sweeping {n_scenarios} HVAC combinations...")
+        t0 = time.monotonic()
+        decision = sweep_scenarios(
+            base_row,
+            feature_columns,
+            models,
+            up_current,
+            dn_current,
+            current_split_temps,
+            current_temps,
+            schedules,
+            base_hour,
+        )
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
 
     up_label = "ON" if decision.upstairs_heating else "OFF"
     dn_label = "ON" if decision.downstairs_heating else "OFF"
@@ -1228,10 +1489,21 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
         tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
     )
-    off_overrides = build_hvac_overrides(all_off, current_split_temps)
-    off_targets, off_matrix = _batch_predict(base_row, [off_overrides], models)
-    off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
-    _apply_newton_floor(off_preds, base_row, current_temps)
+
+    if physics:
+        from weatherstat.simulator import batch_simulate as _batch_sim
+
+        off_targets, off_matrix = _batch_sim(
+            current_temps, float(out_temp) if out_temp is not None else 50.0,
+            forecast_temp_list, window_states_dict, [all_off],
+            sim_params, fractional_hour, CONTROL_HORIZONS, recent_hist,
+        )
+        off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
+    else:
+        off_overrides = build_hvac_overrides(all_off, current_split_temps)
+        off_targets, off_matrix = _batch_predict(base_row, [off_overrides], models)
+        off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
+        _apply_newton_floor(off_preds, base_row, current_temps)
     off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
 
     print(f"\n  All-off baseline: comfort={off_comfort:.4f}")
@@ -1283,76 +1555,225 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     else:
         print("  Mode: DRY-RUN — command written but not executed")
 
-    # ── Model-based advisory sweep ──
-    advisory_actions = build_advisory_actions(window_states_dict)
-    electronic_overrides = _decision_to_overrides(decision, current_split_temps)
+    # ── Model-based advisory sweep (ML mode only) ──
+    if not physics:
+        advisory_actions = build_advisory_actions(window_states_dict)
+        electronic_overrides = _decision_to_overrides(decision, current_split_temps)
 
-    n_combos = 2 ** len(advisory_actions)
-    t1 = time.monotonic()
-    recommendations = evaluate_advisories(
-        base_row,
-        feature_columns,
-        models,
-        electronic_overrides,
-        advisory_actions,
-        schedules,
-        base_hour,
-    )
-    adv_ms = (time.monotonic() - t1) * 1000
+        n_combos = 2 ** len(advisory_actions)
+        t1 = time.monotonic()
+        recommendations = evaluate_advisories(
+            base_row,
+            feature_columns,
+            models,
+            electronic_overrides,
+            advisory_actions,
+            schedules,
+            base_hour,
+        )
+        adv_ms = (time.monotonic() - t1) * 1000
 
-    if recommendations:
-        # All recommendations share the same message (multi-window)
-        print(f"\n[advisory] Window sweep ({n_combos} combos, {adv_ms:.0f}ms):")
-        print(f"  {recommendations[0].message}")
-        # Dispatch notifications for live mode
-        if live:
-            from weatherstat.advisory import (
-                Advisory,
-                AdvisoryType,
-                is_on_cooldown,
-                load_advisory_state,
-                save_advisory_state,
-                send_ha_notification,
-            )
-
-            state = load_advisory_state()
-            # Map recommendation direction to advisory type
-            rec_open = any(r.recommended_state == "open" for r in recommendations)
-            adv_type = AdvisoryType.FREE_COOLING if rec_open else AdvisoryType.CLOSE_WINDOWS
-            if _in_quiet_hours(base_hour, ADVISORY_QUIET_HOURS):
-                print("  (quiet hours, not sent)")
-            elif not is_on_cooldown(state, adv_type):
-                advisory = Advisory(
-                    advisory_type=adv_type,
-                    title="Window advisory",
-                    message=recommendations[0].message,
+        if recommendations:
+            # All recommendations share the same message (multi-window)
+            print(f"\n[advisory] Window sweep ({n_combos} combos, {adv_ms:.0f}ms):")
+            print(f"  {recommendations[0].message}")
+            # Dispatch notifications for live mode
+            if live:
+                from weatherstat.advisory import (
+                    Advisory,
+                    AdvisoryType,
+                    is_on_cooldown,
+                    load_advisory_state,
+                    save_advisory_state,
+                    send_ha_notification,
                 )
-                if send_ha_notification(advisory, target=_CFG.notification_target):
-                    state[adv_type.value] = time.time()
-                    save_advisory_state(state)
-                    print(f"  → Sent to HA ({_CFG.notification_target})")
-            else:
-                print("  (on cooldown, not sent)")
-    else:
-        print(f"\n[advisory] No window recommendations ({n_combos} combos, {adv_ms:.0f}ms)")
+
+                state = load_advisory_state()
+                # Map recommendation direction to advisory type
+                rec_open = any(r.recommended_state == "open" for r in recommendations)
+                adv_type = AdvisoryType.FREE_COOLING if rec_open else AdvisoryType.CLOSE_WINDOWS
+                if _in_quiet_hours(base_hour, ADVISORY_QUIET_HOURS):
+                    print("  (quiet hours, not sent)")
+                elif not is_on_cooldown(state, adv_type):
+                    advisory = Advisory(
+                        advisory_type=adv_type,
+                        title="Window advisory",
+                        message=recommendations[0].message,
+                    )
+                    if send_ha_notification(advisory, target=_CFG.notification_target):
+                        state[adv_type.value] = time.time()
+                        save_advisory_state(state)
+                        print(f"  → Sent to HA ({_CFG.notification_target})")
+                else:
+                    print("  (on cooldown, not sent)")
+        else:
+            print(f"\n[advisory] No window recommendations ({n_combos} combos, {adv_ms:.0f}ms)")
 
     return decision
 
 
-def run_control_loop(live: bool = False) -> None:
+def run_control_loop(live: bool = False, physics: bool = False) -> None:
     """Run the control loop indefinitely at 15-minute intervals."""
     mode_str = "LIVE" if live else "DRY-RUN"
-    print(f"[control] Starting control loop ({mode_str}, interval: {LOOP_INTERVAL_SECONDS}s)")
+    pred_str = " (physics)" if physics else ""
+    print(f"[control] Starting control loop ({mode_str}{pred_str}, interval: {LOOP_INTERVAL_SECONDS}s)")
     print("  Press Ctrl+C to stop\n")
 
     while True:
         try:
-            run_control_cycle(live=live)
+            run_control_cycle(live=live, physics=physics)
         except Exception as e:
             print(f"[control] Error in control cycle: {e}", file=sys.stderr)
             traceback.print_exc()
         print(f"\n[control] Next cycle in {LOOP_INTERVAL_SECONDS // 60} minutes...\n")
         time.sleep(LOOP_INTERVAL_SECONDS)
+
+
+# ── Comparison mode ──────────────────────────────────────────────────────────
+
+
+def run_comparison() -> None:
+    """Run both ML and physics predictions side by side for comparison."""
+    from weatherstat.extract import _check_config
+
+    _check_config()
+
+    # Fetch data
+    print("[compare] Fetching recent history from Home Assistant...")
+    df_raw, forecast = fetch_recent_history(hours_back=14)
+    n_rows = len(df_raw)
+    print(f"  Retrieved {n_rows} rows")
+
+    if n_rows < 24:
+        print(f"  ERROR: only {n_rows} rows, need >= 24.", file=sys.stderr)
+        return
+
+    from weatherstat.features import ROOM_TEMP_COLUMNS
+
+    latest = df_raw.iloc[-1]
+    out_temp = latest.get("outdoor_temp")
+
+    current_temps: dict[str, float] = {}
+    for room, col in ROOM_TEMP_COLUMNS.items():
+        val = latest.get(col)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            current_temps[room] = float(val)
+
+    current_split_temps: dict[str, float] = {}
+    for cfg in MINI_SPLITS:
+        val = latest.get(cfg.temp_col)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            current_split_temps[cfg.name] = float(val)
+
+    from zoneinfo import ZoneInfo
+
+    from weatherstat.config import TIMEZONE
+
+    local_now = datetime.now(ZoneInfo(TIMEZONE))
+    base_hour = local_now.hour
+    fractional_hour = base_hour + local_now.minute / 60.0
+
+    window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
+
+    # ── ML predictions ──
+    feature_columns = load_feature_columns("full")
+    models = load_models("full", HORIZONS_5MIN)
+    if not models or not feature_columns:
+        print("  ERROR: Full models not found.", file=sys.stderr)
+        return
+
+    df_feat = build_features(df_raw.copy(), mode="full", forecast_data=forecast)
+    base_row = _prepare_feature_row(df_feat, feature_columns)
+
+    # Select a few representative scenarios
+    all_off = HVACScenario(
+        False, False,
+        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+        tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
+    )
+    both_on = HVACScenario(
+        True, True,
+        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+        tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
+    )
+    up_only = HVACScenario(
+        True, False,
+        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+        tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
+    )
+    test_scenarios = [("all_off", all_off), ("both_on", both_on), ("up_only", up_only)]
+
+    # ML batch predict
+    overrides_list = [build_hvac_overrides(s, current_split_temps) for _, s in test_scenarios]
+    ml_targets, ml_matrix = _batch_predict(base_row, overrides_list, models)
+
+    # Apply Newton floor to all-off ML predictions
+    ml_off_preds = {t: float(ml_matrix[0, j]) for j, t in enumerate(ml_targets)}
+    _apply_newton_floor(ml_off_preds, base_row, current_temps)
+    for j, t in enumerate(ml_targets):
+        if t in ml_off_preds:
+            ml_matrix[0, j] = ml_off_preds[t]
+
+    # ── Physics predictions ──
+    from weatherstat.simulator import batch_simulate, extract_recent_history, load_sim_params
+
+    sim_params = load_sim_params()
+    recent_hist = extract_recent_history(df_raw, sim_params)
+
+    forecast_temp_list: list[float] = []
+    if forecast:
+        from weatherstat.forecast import forecast_at_horizons
+
+        ref_time = datetime.now(UTC)
+        at_h = forecast_at_horizons(forecast, ref_time, list(range(1, 13)))
+        for h in range(1, 13):
+            entry = at_h.get(f"{h}h")
+            if entry is not None:
+                forecast_temp_list.append(entry.temperature)
+            elif forecast_temp_list:
+                forecast_temp_list.append(forecast_temp_list[-1])
+            else:
+                forecast_temp_list.append(float(out_temp) if out_temp is not None else 50.0)
+
+    scenario_list = [s for _, s in test_scenarios]
+    phys_targets, phys_matrix = batch_simulate(
+        current_temps, float(out_temp) if out_temp is not None else 50.0,
+        forecast_temp_list, window_states_dict, scenario_list,
+        sim_params, fractional_hour, CONTROL_HORIZONS, recent_hist,
+    )
+
+    # ── Print comparison table ──
+    horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
+    ml_target_idx = {t: j for j, t in enumerate(ml_targets)}
+    phys_target_idx = {t: j for j, t in enumerate(phys_targets)}
+
+    print(f"\n{'=' * 80}")
+    print("ML vs Physics Prediction Comparison")
+    print(f"{'=' * 80}")
+    if out_temp is not None:
+        print(f"Outdoor: {float(out_temp):.1f}°F")
+
+    for i, (label, _scenario) in enumerate(test_scenarios):
+        print(f"\n── Scenario: {label} ──")
+        header = f"  {'Room':<14}" + "".join(f"{'ML ' + h:>8}{'Phy ' + h:>8}{'diff':>7}" for h in horizons)
+        print(header)
+        print(f"  {'-' * (14 + 23 * len(horizons))}")
+
+        for room in PREDICTION_ROOMS:
+            row = f"  {room:<14}"
+            has_any = False
+            for h in CONTROL_HORIZONS:
+                key = f"{room}_temp_t+{h}"
+                ml_val = ml_matrix[i, ml_target_idx[key]] if key in ml_target_idx else None
+                ph_val = phys_matrix[i, phys_target_idx[key]] if key in phys_target_idx else None
+                if ml_val is not None and ph_val is not None and not np.isnan(ml_val) and not np.isnan(ph_val):
+                    has_any = True
+                    diff = ph_val - ml_val
+                    row += f"{ml_val:>7.1f}°{ph_val:>7.1f}°{diff:>+6.1f}"
+                else:
+                    row += f"{'--':>8}{'--':>8}{'':>7}"
+            if has_any:
+                print(row)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -1370,12 +1791,24 @@ def main() -> None:
         action="store_true",
         help="Run continuously at 15-minute intervals",
     )
+    parser.add_argument(
+        "--physics",
+        action="store_true",
+        help="Use physics simulator instead of ML models for prediction",
+    )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run both ML and physics predictions side by side",
+    )
     args = parser.parse_args()
 
     if args.loop:
-        run_control_loop(live=args.live)
+        run_control_loop(live=args.live, physics=args.physics)
+    elif args.compare:
+        run_comparison()
     else:
-        run_control_cycle(live=args.live)
+        run_control_cycle(live=args.live, physics=args.physics)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,5 @@
 """Inference pipeline — fetch live state from HA and predict temperatures.
 
-Two modes:
-- Live: Fetch recent history from HA, build features, predict with both models
-- Snapshot: Use collector snapshot files (for when collector is running)
-
 Run:
   uv run python -m weatherstat.inference          # live from HA
   uv run python -m weatherstat.inference --snapshot  # from snapshot files
@@ -26,7 +22,6 @@ from weatherstat.config import (
     BLOWER_MODE_ENC,
     BLOWERS,
     HORIZONS_5MIN,
-    HORIZONS_HOURLY,
     MINI_SPLIT_MODE_ENC,
     MINI_SPLIT_SWEEP_TARGET,
     MINI_SPLITS,
@@ -223,34 +218,6 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
     return result, forecast
 
 
-def _resample_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
-    """Resample 5-min snapshot data to hourly for baseline model.
-
-    Numeric columns use mean; categorical columns use last value per hour.
-    This preserves HVAC features (setpoints, actions, modes) for baseline
-    models that include them.
-    """
-    df = df.copy()
-    df["_ts"] = pd.to_datetime(df["timestamp"])
-
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    cat_cols = df.select_dtypes(exclude=["number"]).columns.difference(
-        ["timestamp", "_ts"]
-    ).tolist()
-
-    grouped = df.set_index("_ts")
-    parts: list[pd.DataFrame] = []
-    if numeric_cols:
-        parts.append(grouped[numeric_cols].resample("1h").mean())
-    if cat_cols:
-        parts.append(grouped[cat_cols].resample("1h").last())
-
-    hourly = pd.concat(parts, axis=1) if parts else pd.DataFrame()
-    hourly = hourly.reset_index().rename(columns={"_ts": "timestamp"})
-    hourly["timestamp"] = hourly["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    return hourly
-
-
 def _predict_with_model(
     df: pd.DataFrame,
     mode: str,
@@ -323,32 +290,25 @@ def predict_live() -> None:
     print("\nRunning full model (5-min, all features)...")
     full_preds = _predict_with_model(df_raw, "full", "full", HORIZONS_5MIN, forecast_data=forecast)
 
-    # Baseline model predictions (resample to hourly, temp-only)
-    print("Running baseline model (hourly, temp-only)...")
-    df_hourly = _resample_to_hourly(df_raw)
-    baseline_preds = _predict_with_model(df_hourly, "baseline", "baseline", HORIZONS_HOURLY, forecast_data=forecast)
-
     # Print results table
-    print(f"\n{'=' * 58}")
+    print(f"\n{'=' * 42}")
     print("TEMPERATURE PREDICTIONS")
-    print(f"{'=' * 58}")
-    print(f"  {'Room':<14} {'Horizon':<10} {'Baseline':>10} {'Full':>10}")
-    print(f"  {'-' * 50}")
+    print(f"{'=' * 42}")
+    print(f"  {'Room':<14} {'Horizon':<10} {'Predicted':>10}")
+    print(f"  {'-' * 38}")
 
-    horizon_labels = {1: "1h", 2: "2h", 4: "4h", 6: "6h", 12: "12h"}
+    horizon_labels = {12: "1h", 24: "2h", 48: "4h", 72: "6h", 144: "12h"}
 
     for room in PREDICTION_ROOMS:
         has_any = False
-        for bh, fh in zip(HORIZONS_HOURLY, HORIZONS_5MIN, strict=True):
-            b_key = f"{room}_temp_t+{bh}"
+        for fh in HORIZONS_5MIN:
             f_key = f"{room}_temp_t+{fh}"
-            b_val = baseline_preds.get(b_key, float("nan")) if baseline_preds else float("nan")
             f_val = full_preds.get(f_key, float("nan")) if full_preds else float("nan")
-            if np.isnan(b_val) and np.isnan(f_val):
+            if np.isnan(f_val):
                 continue
             has_any = True
-            label = horizon_labels[bh]
-            print(f"  {room:<14} {label:<10} {_fmt_temp(b_val):>10} {_fmt_temp(f_val):>10}")
+            label = horizon_labels[fh]
+            print(f"  {room:<14} {label:<10} {_fmt_temp(f_val):>10}")
         if has_any:
             print()  # blank line between rooms
 
@@ -366,8 +326,7 @@ def predict_live() -> None:
     output: dict[str, object] = {
         "timestamp": now_str,
         "current": current,
-        "baseline": {k: round(v, 2) for k, v in baseline_preds.items()} if baseline_preds else {},
-        "full": {k: round(v, 2) for k, v in full_preds.items()} if full_preds else {},
+        "predictions": {k: round(v, 2) for k, v in full_preds.items()} if full_preds else {},
     }
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -513,7 +472,7 @@ def predict_counterfactual() -> None:
     feature_columns = load_feature_columns("full")
     models = load_models("full", HORIZONS_5MIN)
     if not models or not feature_columns:
-        print("Error: full models not found. Run `just train-full` first.", file=sys.stderr)
+        print("Error: full models not found. Run `just train` first.", file=sys.stderr)
         sys.exit(1)
 
     df_feat = build_features(df_raw.copy(), mode="full", forecast_data=forecast)
@@ -643,7 +602,7 @@ def infer_snapshot() -> None:
     feature_columns = load_feature_columns("full")
     models = load_models("full", HORIZONS_5MIN)
     if not models:
-        print("Error: full models not found. Run `just train-full` first.", file=sys.stderr)
+        print("Error: full models not found. Run `just train` first.", file=sys.stderr)
         sys.exit(1)
 
     df = load_latest_snapshots()

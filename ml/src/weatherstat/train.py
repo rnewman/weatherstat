@@ -1,17 +1,12 @@
 """LightGBM training pipeline with multi-horizon temperature prediction.
 
-Two training modes:
-- baseline: Train on hourly data (7+ months of statistics + HVAC features)
-- full: Train on 5-min full-feature data (~10 days of raw history)
-
-Both modes use HVAC features (setpoints, actions, modes) when available.
-The baseline merges HVAC data from collector/extraction into the hourly
-statistics. LightGBM handles NaN natively, so pre-collector rows (where
-HVAC features are missing) still contribute temperature learning.
+Trains on 5-min collector data with full features (HVAC, weather, forecasts,
+Newton cooling). Uses stored met.no forecasts from collector when available,
+falling back to shifted actuals for pre-collector rows.
 
 Run:
-  uv run python -m weatherstat.train --mode baseline
-  uv run python -m weatherstat.train --mode full
+  uv run python -m weatherstat.train
+  uv run python -m weatherstat.train --experiment my_experiment
 """
 
 import argparse
@@ -26,14 +21,11 @@ import pandas as pd
 
 from weatherstat.config import (
     HORIZONS_5MIN,
-    HORIZONS_HOURLY,
     LGBM_PARAMS,
-    LGBM_PARAMS_SMALL,
     METRICS_DIR,
     MODELS_DIR,
     PREDICTION_ROOMS,
     SNAPSHOTS_DB,
-    SNAPSHOTS_DIR,
     experiment_models_dir,
 )
 from weatherstat.extract import load_collector_snapshots
@@ -49,144 +41,33 @@ _CFG = load_config()
 # Columns to exclude from features (from YAML config: identifiers, raw categoricals, targets)
 EXCLUDE_COLUMNS_BASE = _CFG.exclude_columns
 
-# HVAC columns to merge from full-feature sources into baseline hourly data (from YAML config).
-# Temperature columns are NOT included — those come from hourly statistics
-# (actual hourly means computed by HA, more accurate than resampled snapshots).
-HVAC_MERGE_COLUMNS = _CFG.hvac_merge_columns
 
+def load_training_data() -> pd.DataFrame:
+    """Load 5-min collector data for training.
 
-def _resample_to_hourly(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """Resample 5-min data to hourly, keeping only specified columns.
-
-    Numeric columns use mean; categorical/bool use last value per hour.
+    Reads from snapshots.db (ongoing collector data with full HVAC features,
+    weather, and stored met.no forecasts).
     """
-    available = [c for c in columns if c in df.columns]
-    if not available:
-        return pd.DataFrame()
-
-    subset = df[["timestamp"] + available].copy()
-    subset["_ts"] = pd.to_datetime(subset["timestamp"], format="ISO8601", utc=True)
-
-    numeric = subset[available].select_dtypes(include=["number", "bool"]).columns.tolist()
-    other = [c for c in available if c not in numeric]
-
-    grouped = subset.set_index("_ts")
-    parts: list[pd.DataFrame] = []
-    if numeric:
-        parts.append(grouped[numeric].resample("1h").mean())
-    if other:
-        parts.append(grouped[other].resample("1h").last())
-
-    if not parts:
-        return pd.DataFrame()
-
-    result = pd.concat(parts, axis=1).reset_index()
-    result = result.rename(columns={"_ts": "timestamp"})
-    result["timestamp"] = result["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    return result
-
-
-def load_baseline_data() -> pd.DataFrame:
-    """Load hourly statistics + HVAC features for baseline training.
-
-    Temperatures come from HA long-term statistics (7+ months of hourly means).
-    HVAC features (setpoints, actions, modes) come from full-feature sources
-    (historical extraction + collector), resampled to hourly and merged.
-    Pre-collector rows have NaN for HVAC features — LightGBM handles this.
-    """
-    path = SNAPSHOTS_DIR / "historical_hourly.parquet"
-    if not path.exists():
-        print(f"Error: {path} not found. Run `just extract` first.", file=sys.stderr)
-        sys.exit(1)
-    df = pd.read_parquet(path)
-    print(f"Loaded {len(df)} hourly rows from {path}")
-
-    # Merge HVAC features from full-feature sources
-    hvac_frames: list[pd.DataFrame] = []
-
-    parquet_path = SNAPSHOTS_DIR / "historical_full.parquet"
-    if parquet_path.exists():
-        full = pd.read_parquet(parquet_path)
-        print(f"  HVAC source: {len(full)} rows from {parquet_path.name}")
-        hvac_frames.append(full)
-
-    if SNAPSHOTS_DB.exists():
-        collector = load_collector_snapshots(SNAPSHOTS_DB)
-        print(f"  HVAC source: {len(collector)} rows from {SNAPSHOTS_DB.name}")
-        hvac_frames.append(collector)
-
-    if hvac_frames:
-        hvac_all = pd.concat(hvac_frames, ignore_index=True)
-        hvac_all = hvac_all.drop_duplicates(subset="timestamp", keep="last")
-        hvac_hourly = _resample_to_hourly(hvac_all, HVAC_MERGE_COLUMNS)
-
-        if not hvac_hourly.empty:
-            df = df.merge(hvac_hourly, on="timestamp", how="left")
-            hvac_cols = [c for c in hvac_hourly.columns if c != "timestamp"]
-            n_with_hvac = df[hvac_cols].notna().any(axis=1).sum()
-            print(f"  Merged HVAC features: {n_with_hvac}/{len(df)} rows have data")
-    else:
-        print("  No HVAC sources available (run `just extract` or `just collect`)")
-
-    return df
-
-
-def load_full_data(collector_only: bool = False) -> pd.DataFrame:
-    """Load 5-min full-feature data for full training.
-
-    Merges two optional sources:
-    - historical_full.parquet (bootstrap extraction from HA)
-    - snapshots.db (ongoing collector data)
-
-    At least one source must exist. On timestamp collision the collector
-    row wins (it's the live truth).
-
-    If collector_only=True, skip historical_full.parquet entirely — train
-    only on collector data where every row has full HVAC features.
-    """
-    frames: list[pd.DataFrame] = []
-
-    # Source 1: historical extraction (optional, skipped in collector-only mode)
-    parquet_path = SNAPSHOTS_DIR / "historical_full.parquet"
-    if collector_only:
-        print("Collector-only mode: skipping historical_full.parquet")
-    elif parquet_path.exists():
-        hist = pd.read_parquet(parquet_path)
-        print(f"Loaded {len(hist)} rows from {parquet_path.name}")
-        frames.append(hist)
-
-    # Source 2: collector SQLite (optional)
-    if SNAPSHOTS_DB.exists():
-        collector = load_collector_snapshots(SNAPSHOTS_DB)
-        print(f"Loaded {len(collector)} rows from {SNAPSHOTS_DB.name}")
-        frames.append(collector)
-
-    if not frames:
+    if not SNAPSHOTS_DB.exists():
         print(
-            "Error: no training data found. Need historical_full.parquet or snapshots.db.\n"
-            "Run `just extract` or `just collect` first.",
+            "Error: no training data found. Need snapshots.db.\n"
+            "Run `just collect` first.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    df = pd.concat(frames, ignore_index=True)
+    df = load_collector_snapshots(SNAPSHOTS_DB)
+    print(f"Loaded {len(df)} rows from {SNAPSHOTS_DB.name}")
 
-    # Dedup on timestamp — keep last (collector appended second, so it wins)
-    pre_dedup = len(df)
-    df = df.drop_duplicates(subset="timestamp", keep="last")
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    if pre_dedup > len(df):
-        print(f"Deduped: {pre_dedup} → {len(df)} rows ({pre_dedup - len(df)} overlapping timestamps removed)")
-
-    # Normalize timestamp format (SQLite has .000Z milliseconds, Parquet doesn't)
+    # Normalize timestamp format (SQLite has .000Z milliseconds)
     df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601").dt.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-    # Normalize window columns to bool (INTEGER in SQLite, bool in Parquet)
+    # Normalize window columns to bool (INTEGER in SQLite)
     for col in _CFG.window_bool_columns:
         if col in df.columns:
             df[col] = df[col].astype(bool)
 
-    print(f"Full dataset: {len(df)} rows")
+    print(f"Training dataset: {len(df)} rows")
     return df
 
 
@@ -241,36 +122,19 @@ def _save_metrics(
     print(f"Metrics saved to {path}")
 
 
-def train_mode(mode: str, output_dir: Path | None = None, collector_only: bool = False) -> None:
-    """Run training for the specified mode.
+def train(output_dir: Path | None = None) -> None:
+    """Run training on collector data.
 
     Args:
-        mode: "baseline" or "full".
         output_dir: Override model output directory (default: MODELS_DIR).
             Used for experiment workflows to write to data/models/{experiment}/.
-        collector_only: If True, skip historical_full.parquet and train only on
-            collector data. Only applies to full mode.
     """
     models_dir = output_dir or MODELS_DIR
-    if mode == "baseline":
-        df = load_baseline_data()
-        horizons = HORIZONS_HOURLY
-        params = LGBM_PARAMS
-        model_prefix = "baseline"
-    elif mode == "full":
-        df = load_full_data(collector_only=collector_only)
-        horizons = HORIZONS_5MIN
-        # Auto-select params: ~17 days of 5-min data ≈ 5000 rows
-        if len(df) >= 5000:
-            params = LGBM_PARAMS
-            print(f"Using full LGBM params ({len(df)} rows >= 5000)")
-        else:
-            params = LGBM_PARAMS_SMALL
-            print(f"Using small LGBM params ({len(df)} rows < 5000)")
-        model_prefix = "full"
-    else:
-        print(f"Unknown mode: {mode}", file=sys.stderr)
-        sys.exit(1)
+    mode = "full"
+    df = load_training_data()
+    horizons = HORIZONS_5MIN
+    params = LGBM_PARAMS
+    model_prefix = "full"
 
     # Capture data date range before any row drops
     data_start = str(df["timestamp"].min())
@@ -421,25 +285,14 @@ def train_mode(mode: str, output_dir: Path | None = None, collector_only: bool =
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train weatherstat LightGBM models")
     parser.add_argument(
-        "--mode",
-        choices=["baseline", "full"],
-        required=True,
-        help="Training mode: baseline (hourly temp-only) or full (5-min all features)",
-    )
-    parser.add_argument(
         "--experiment",
         type=str,
         default=None,
         help="Write models to data/models/{name}/ instead of production",
     )
-    parser.add_argument(
-        "--collector-only",
-        action="store_true",
-        help="Train only on collector data (skip historical_full.parquet). Only applies to --mode full.",
-    )
     args = parser.parse_args()
     output_dir = experiment_models_dir(args.experiment) if args.experiment else None
-    train_mode(args.mode, output_dir=output_dir, collector_only=args.collector_only)
+    train(output_dir=output_dir)
 
 
 if __name__ == "__main__":

@@ -112,37 +112,6 @@ def test_add_future_targets() -> None:
     assert pd.isna(result["downstairs_temp_t+2"].iloc[4])
 
 
-def test_build_features_baseline_mode() -> None:
-    """Test that baseline mode produces expected feature columns."""
-    df = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-15 00:00", periods=10, freq="h").strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        ),
-        "thermostat_upstairs_temp": np.linspace(70, 74, 10),
-        "thermostat_downstairs_temp": np.linspace(68, 72, 10),
-        "outdoor_temp": np.linspace(35, 40, 10),
-    })
-
-    result = build_features(df, mode="baseline")
-
-    # Should have time features
-    assert "hour_sin" in result.columns
-    assert "solar_elevation" in result.columns
-
-    # Should have lag features at hourly intervals
-    assert "thermostat_upstairs_temp_lag_1" in result.columns
-    assert "thermostat_upstairs_temp_lag_6" in result.columns
-
-    # Should have rolling features
-    assert "outdoor_temp_rolling_3" in result.columns
-
-    # Should have outdoor delta
-    assert "upstairs_outdoor_delta" in result.columns
-
-    # Should NOT have HVAC encoding (baseline mode)
-    assert "thermostat_upstairs_action_enc" not in result.columns
-
-
 def test_build_features_full_mode() -> None:
     """Test that full mode produces HVAC encoded features."""
     df = pd.DataFrame({
@@ -270,23 +239,8 @@ def test_newton_cooling_nan_outdoor() -> None:
             assert pd.isna(result[f"upstairs_newton_{variant}_delta_{horizon}"].iloc[0])
 
 
-def test_newton_cooling_in_build_features_both_modes() -> None:
-    """Newton cooling features should appear in both full and baseline build_features output."""
-    df_baseline = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-15 00:00", periods=10, freq="h").strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        ),
-        "thermostat_upstairs_temp": np.linspace(70, 74, 10),
-        "thermostat_downstairs_temp": np.linspace(68, 72, 10),
-        "outdoor_temp": np.linspace(35, 40, 10),
-    })
-
-    result_baseline = build_features(df_baseline, mode="baseline")
-    assert "upstairs_newton_sealed_1h" in result_baseline.columns
-    assert "upstairs_newton_vent_1h" in result_baseline.columns
-    assert "upstairs_newton_sealed_delta_12h" in result_baseline.columns
-    assert "downstairs_newton_vent_4h" in result_baseline.columns
-
+def test_newton_cooling_in_build_features() -> None:
+    """Newton cooling features should appear in build_features output."""
     df_full = pd.DataFrame({
         "timestamp": pd.date_range("2024-01-15 00:00", periods=20, freq="5min").strftime(
             "%Y-%m-%dT%H:%M:%S"
@@ -405,42 +359,78 @@ def test_retrospective_features_in_build_features() -> None:
 # ── Forecast features ─────────────────────────────────────────────────────
 
 
-def test_forecast_features_training_mode() -> None:
-    """In training mode, forecast features should be shifted outdoor temps."""
-    n = 30
+def test_forecast_features_training_mode_shifted() -> None:
+    """Without stored forecasts, training uses shifted outdoor temps."""
+    n = 200
     df = pd.DataFrame({
         "outdoor_temp": np.arange(40.0, 40.0 + n),
         "weather_condition_code": list(range(n)),
         "wind_speed": np.arange(5.0, 5.0 + n),
     })
 
-    result = add_forecast_features(df, mode="baseline")
+    result = add_forecast_features(df, mode="full")
 
-    # forecast_outdoor_temp_1h should be outdoor_temp shifted by -1 (baseline = hourly)
-    assert result["forecast_outdoor_temp_1h"].iloc[0] == 41.0
+    # forecast_outdoor_temp_1h: shift by -12 (5-min intervals)
+    assert result["forecast_outdoor_temp_1h"].iloc[0] == 52.0
     assert pd.isna(result["forecast_outdoor_temp_1h"].iloc[-1])
-
-    # forecast_outdoor_temp_4h should be shifted by -4
-    assert result["forecast_outdoor_temp_4h"].iloc[0] == 44.0
 
     # Hourly columns for piecewise Newton
     assert "forecast_outdoor_temp_1h" in result.columns
     assert "forecast_outdoor_temp_12h" in result.columns
 
 
-def test_forecast_features_full_mode_shifts() -> None:
-    """In full mode (5-min), shift is 12 periods per hour."""
-    n = 200
+def test_forecast_features_stored_forecasts() -> None:
+    """When stored forecast columns exist, use them instead of shifting."""
+    n = 20
     df = pd.DataFrame({
-        "outdoor_temp": np.arange(40.0, 40.0 + n),
+        "outdoor_temp": [40.0] * n,
+        # Stored forecasts from collector (different from actual outdoor temp)
+        "forecast_temp_1h": [42.0] * n,
+        "forecast_temp_2h": [44.0] * n,
+        "forecast_temp_4h": [38.0] * n,
+        "forecast_temp_6h": [36.0] * n,
+        "forecast_temp_12h": [35.0] * n,
+        "forecast_condition_1h": ["cloudy"] * n,
+        "forecast_condition_2h": ["sunny"] * n,
+        "forecast_wind_1h": [8.0] * n,
+        "forecast_wind_2h": [6.0] * n,
     })
 
     result = add_forecast_features(df, mode="full")
 
-    # forecast_outdoor_temp_1h: shift by -12
-    assert result["forecast_outdoor_temp_1h"].iloc[0] == 52.0  # 40 + 12
-    # forecast_outdoor_temp_2h: shift by -24
-    assert result["forecast_outdoor_temp_2h"].iloc[0] == 64.0  # 40 + 24
+    # Should use stored values, not shifted actuals
+    assert result["forecast_outdoor_temp_1h"].iloc[0] == 42.0
+    assert result["forecast_outdoor_temp_2h"].iloc[0] == 44.0
+    assert result["forecast_outdoor_temp_4h"].iloc[0] == 38.0
+    assert result["forecast_outdoor_temp_6h"].iloc[0] == 36.0
+
+    # Condition codes should be encoded from stored condition strings
+    assert "forecast_condition_code_1h" in result.columns
+    assert result["forecast_condition_code_1h"].notna().all()
+
+    # Wind should use stored values
+    assert result["forecast_wind_speed_1h"].iloc[0] == 8.0
+    assert result["forecast_wind_speed_2h"].iloc[0] == 6.0
+
+    # Hourly forecast temps for Newton should also use stored values
+    assert result["forecast_outdoor_temp_1h"].iloc[0] == 42.0
+
+
+def test_forecast_features_mixed_stored_and_shifted() -> None:
+    """When only some forecast columns exist, mix stored and shifted."""
+    n = 200
+    df = pd.DataFrame({
+        "outdoor_temp": np.arange(40.0, 40.0 + n),
+        # Only 1h stored, rest should fall back to shifted
+        "forecast_temp_1h": [42.0] * n,
+    })
+
+    result = add_forecast_features(df, mode="full")
+
+    # 1h should use stored value
+    assert result["forecast_outdoor_temp_1h"].iloc[0] == 42.0
+    # 2h should fall back to shifted (40 + 24 = 64)
+    assert result["forecast_outdoor_temp_2h"].iloc[0] == 64.0
 
 
 def test_forecast_features_inference_mode() -> None:

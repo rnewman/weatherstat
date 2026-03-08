@@ -1,7 +1,7 @@
-"""Model evaluation and comparison.
+"""Model evaluation.
 
-Compares baseline vs full model on the validation window.
-Reports per-zone per-horizon RMSE, MAE, and feature importance.
+Evaluates the full model on the validation window.
+Reports per-room per-horizon RMSE, MAE, and feature importance.
 
 Run: uv run python -m weatherstat.evaluate
 """
@@ -12,11 +12,11 @@ import pandas as pd
 
 from weatherstat.config import (
     HORIZONS_5MIN,
-    HORIZONS_HOURLY,
     MODELS_DIR,
     PREDICTION_ROOMS,
-    SNAPSHOTS_DIR,
+    SNAPSHOTS_DB,
 )
+from weatherstat.extract import load_collector_snapshots
 from weatherstat.features import (
     ROOM_TEMP_COLUMNS,
     add_future_targets,
@@ -156,87 +156,29 @@ def main() -> None:
     print("WEATHERSTAT MODEL EVALUATION")
     print("=" * 60)
 
-    # Evaluate baseline model
-    hourly_path = SNAPSHOTS_DIR / "historical_hourly.parquet"
-    baseline_results = None
-    if hourly_path.exists():
-        print("\n--- Baseline model (hourly temp-only, 5+ months) ---")
-        hourly_df = pd.read_parquet(hourly_path)
-        print(f"  Data: {len(hourly_df)} hourly rows")
-        baseline_results = evaluate_model(
-            "baseline", hourly_df, HORIZONS_HOURLY, "baseline"
-        )
-        if baseline_results is not None:
-            print(baseline_results.to_string(index=False))
-            print_feature_importance("baseline")
+    # Evaluate full model on collector data
+    if not SNAPSHOTS_DB.exists():
+        print("\nNo collector data found — nothing to evaluate")
+        return
+
+    print("\n--- Full model (5-min, all features) ---")
+    full_df = load_collector_snapshots(SNAPSHOTS_DB)
+    print(f"  Data: {len(full_df)} rows")
+    full_results = evaluate_model("full", full_df, HORIZONS_5MIN, "full")
+    if full_results is not None:
+        print(full_results.to_string(index=False))
+        print_feature_importance("full")
     else:
-        print("\nNo hourly data found — skipping baseline evaluation")
-
-    # Evaluate full model
-    full_path = SNAPSHOTS_DIR / "historical_full.parquet"
-    full_results = None
-    if full_path.exists():
-        print("\n--- Full model (5-min all features, ~10 days) ---")
-        full_df = pd.read_parquet(full_path)
-        print(f"  Data: {len(full_df)} rows")
-        full_results = evaluate_model(
-            "full", full_df, HORIZONS_5MIN, "full"
-        )
-        if full_results is not None:
-            print(full_results.to_string(index=False))
-            print_feature_importance("full")
-    else:
-        print("\nNo full-feature data found — skipping full evaluation")
-
-    # Comparison
-    if baseline_results is not None and full_results is not None:
-        print(f"\n{'=' * 60}")
-        print("COMPARISON: Baseline vs Full")
-        print(f"{'=' * 60}")
-
-        # Compare at 1h horizon (common between both)
-        bl_1h = baseline_results[baseline_results["horizon"] == "1"]
-        # Full model's 1h horizon is 12 steps at 5-min intervals
-        fu_1h = full_results[full_results["horizon"] == "12"]
-
-        if not bl_1h.empty and not fu_1h.empty:
-            for room in PREDICTION_ROOMS:
-                bl_row = bl_1h[bl_1h["room"] == room]
-                fu_row = fu_1h[fu_1h["room"] == room]
-                if bl_row.empty or fu_row.empty:
-                    continue
-                bl_rmse = float(bl_row["rmse"].iloc[0])
-                fu_rmse = float(fu_row["rmse"].iloc[0])
-                diff = fu_rmse - bl_rmse
-                better = "BETTER" if diff < 0 else "WORSE" if diff > 0 else "SAME"
-                print(f"  {room} (1h): baseline={bl_rmse:.3f}, full={fu_rmse:.3f}, "
-                      f"delta={diff:+.3f} ({better})")
-        else:
-            print("  Cannot compare — different horizon formats or missing data")
+        print("  No full models found or insufficient data")
 
     # Assessment
     print(f"\n{'=' * 60}")
     print("ASSESSMENT")
     print(f"{'=' * 60}")
 
-    if baseline_results is not None:
-        avg_rmse = baseline_results["rmse"].mean()
-        if avg_rmse < 2.0:
-            print(f"  Baseline avg RMSE {avg_rmse:.3f}F < 2.0F — thermal model captures dynamics")
-        else:
-            print(f"  Baseline avg RMSE {avg_rmse:.3f}F >= 2.0F — model needs more data or tuning")
-
     if full_results is not None:
         avg_rmse = full_results["rmse"].mean()
         print(f"  Full model avg RMSE: {avg_rmse:.3f}F")
-
-    if baseline_results is not None and full_results is not None:
-        bl_avg = baseline_results["rmse"].mean()
-        fu_avg = full_results["rmse"].mean()
-        if fu_avg < bl_avg:
-            print("  Full model outperforms baseline — HVAC features add signal")
-        else:
-            print("  Full model does not beat baseline — need more data for HVAC features")
 
     print("\nEvaluation complete.")
 
