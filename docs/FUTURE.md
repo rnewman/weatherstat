@@ -4,17 +4,23 @@ Items are roughly in priority order within each section.
 
 ---
 
-## Trajectory Search (PLAN-7, next)
+## Virtual Effectors / Advisory Planning (PLAN-8, next)
 
-Expand the control sweep from constant-action scenarios to parameterized
-trajectories: each slow effector (thermostats, boiler) gets a delay and
-duration, producing piecewise schedules like "wait 2h, heat for 2h, coast."
-The existing multi-sensor scorer evaluates whole-house comfort across all
-trajectories without zone-specific heuristics.
+Model human-actionable changes (windows, blinds, space heaters, doors) as
+virtual effectors. After the electronic trajectory sweep commits to a plan,
+evaluate whether toggling virtual effectors would improve comfort and send
+advisories via HA notifications. The electronic plan never depends on human
+compliance. See `docs/plans/PLAN-8-virtual-effectors.md`.
 
-This subsumes pre-heating logic (delayed starts are trajectory candidates),
-and is a constrained form of MPC (single-segment trajectories, not arbitrary
-sequences). See `docs/plans/PLAN-7-effector-inertia.md`.
+---
+
+## Archive ML Pipeline
+
+The LightGBM training/inference/experiment pipeline is orphaned — the
+control loop uses the physics simulator exclusively. Move training, inference,
+evaluation, experiment, and metrics modules to `archive/ml/`. Extract
+`fetch_recent_history` to `extract.py` first (it's data plumbing used by
+the live control path). See `docs/plans/PLAN-archive-ml.md`.
 
 ---
 
