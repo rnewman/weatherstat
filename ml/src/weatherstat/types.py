@@ -210,16 +210,6 @@ class MiniSplitDecision:
 
 
 @dataclass(frozen=True)
-class HVACScenario:
-    """One combination of all HVAC device states to evaluate during sweep."""
-
-    upstairs_heating: bool
-    downstairs_heating: bool
-    blowers: tuple[BlowerDecision, ...]
-    mini_splits: tuple[MiniSplitDecision, ...]
-
-
-@dataclass(frozen=True)
 class ThermostatTrajectory:
     """Trajectory for a slow effector: [OFF × delay] → [ON × duration] → [OFF × remainder].
 

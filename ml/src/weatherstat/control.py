@@ -45,7 +45,6 @@ from weatherstat.types import (
     ComfortScheduleEntry,
     ControlDecision,
     ControlState,
-    HVACScenario,
     MiniSplitDecision,
     RoomComfort,
     ThermostatTrajectory,
@@ -262,25 +261,19 @@ def compute_comfort_cost(
     return cost
 
 
-def compute_energy_cost(scenario: HVACScenario | TrajectoryScenario) -> float:
+def compute_energy_cost(scenario: TrajectoryScenario) -> float:
     """Tiered energy penalty: gas zones > mini-splits > blower fans.
 
     Used as tiebreaker when comfort cost is equal — prefer less energy usage.
-    For trajectory scenarios, gas zone cost is scaled by heating duration.
+    Gas zone cost is proportional to heating duration within the horizon.
     """
     cost = 0.0
     # Gas zones (Navien boiler via thermostat)
-    if isinstance(scenario, TrajectoryScenario):
-        max_h = max(CONTROL_HORIZONS)
-        for traj in [scenario.upstairs, scenario.downstairs]:
-            if traj.heating:
-                dur = traj.duration_steps if traj.duration_steps is not None else (max_h - traj.delay_steps)
-                cost += ENERGY_COST_GAS_ZONE * dur / max_h
-    else:
-        if scenario.upstairs_heating:
-            cost += ENERGY_COST_GAS_ZONE
-        if scenario.downstairs_heating:
-            cost += ENERGY_COST_GAS_ZONE
+    max_h = max(CONTROL_HORIZONS)
+    for traj in [scenario.upstairs, scenario.downstairs]:
+        if traj.heating:
+            dur = traj.duration_steps if traj.duration_steps is not None else (max_h - traj.delay_steps)
+            cost += ENERGY_COST_GAS_ZONE * dur / max_h
     # Mini-splits (heat pump — efficient but uses electricity)
     for sd in scenario.mini_splits:
         if sd.mode != "off":
@@ -410,7 +403,7 @@ def sweep_scenarios_physics(
     Thermostats are evaluated over a delay × duration grid (trajectory search).
     Fast effectors (blowers, mini-splits) use constant modes.
     """
-    from weatherstat.simulator import SimParams, batch_simulate
+    from weatherstat.simulator import HouseState, SimParams, predict
 
     assert isinstance(sim_params, SimParams)
 
@@ -468,11 +461,15 @@ def sweep_scenarios_physics(
         )
 
     # ── Batch simulate all scenarios ──
-    target_names, pred_matrix = batch_simulate(
-        current_temps, outdoor_temp, forecast_temps,
-        window_states, scenarios, sim_params, hour_of_day,
-        CONTROL_HORIZONS, recent_history,
+    sweep_state = HouseState(
+        current_temps=current_temps,
+        outdoor_temp=outdoor_temp,
+        forecast_temps=forecast_temps,
+        window_states=window_states,
+        hour_of_day=hour_of_day,
+        recent_history=recent_history,
     )
+    target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
     target_idx = {t: j for j, t in enumerate(target_names)}
 
     # ── Score each scenario ──
@@ -952,20 +949,25 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
 
     # Compute all-off baseline prediction for comparison
-    all_off = HVACScenario(
-        False,
-        False,
+    all_off = TrajectoryScenario(
+        ThermostatTrajectory(heating=False),
+        ThermostatTrajectory(heating=False),
         tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
         tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
     )
 
-    from weatherstat.simulator import batch_simulate as _batch_sim
+    from weatherstat.simulator import HouseState as _HS
+    from weatherstat.simulator import predict as _predict
 
-    off_targets, off_matrix = _batch_sim(
-        current_temps, float(out_temp) if out_temp is not None else 50.0,
-        forecast_temp_list, window_states_dict, [all_off],
-        sim_params, fractional_hour, CONTROL_HORIZONS, recent_hist,
+    off_state = _HS(
+        current_temps=current_temps,
+        outdoor_temp=float(out_temp) if out_temp is not None else 50.0,
+        forecast_temps=forecast_temp_list,
+        window_states=window_states_dict,
+        hour_of_day=fractional_hour,
+        recent_history=recent_hist,
     )
+    off_targets, off_matrix = _predict(off_state, [all_off], sim_params, CONTROL_HORIZONS)
     off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
     off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
 

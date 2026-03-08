@@ -3,23 +3,21 @@
 Physics-based temperature prediction: Euler integration of Newton cooling
 with effector gains, delays, and solar profiles from system identification.
 
-Drop-in replacement for ML batch_predict in the control sweep:
-same (target_names, np.ndarray) output format.
-
 Usage:
-  from weatherstat.simulator import load_sim_params, batch_simulate
+  from weatherstat.simulator import HouseState, load_sim_params, predict
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from weatherstat.config import DATA_DIR, PREDICTION_ROOMS
-from weatherstat.types import BlowerDecision, HVACScenario, MiniSplitDecision, TrajectoryScenario
+from weatherstat.types import BlowerDecision, MiniSplitDecision, TrajectoryScenario
 
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
@@ -34,6 +32,24 @@ class SimParams:
     sensors: list[str]  # sensor names with params
     effectors: list[dict]  # raw effector dicts (name, encoding, device_type)
     sensor_window_cols: dict[str, list[str]]  # sensor -> window column names
+
+
+@dataclass(frozen=True)
+class HouseState:
+    """Current state of the house for prediction.
+
+    Bundles everything about "where the house is now" into a single object.
+    Scenarios describe "what HVAC actions to evaluate"; HouseState describes
+    the starting point and environment.
+    """
+
+    current_temps: dict[str, float]  # sensor/room name -> temperature (F)
+    outdoor_temp: float  # current outdoor temperature (F)
+    forecast_temps: list[float]  # hourly outdoor temps [h+1, h+2, ..., h+N]
+    window_states: dict[str, bool]  # window_name -> is_open
+    hour_of_day: float  # fractional hour of day (0-23.99)
+    recent_history: dict[str, list[float]] = field(default_factory=dict)
+    # effector_name -> recent activity values (oldest first)
 
 
 def load_sim_params(path: Path | None = None) -> SimParams:
@@ -75,54 +91,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     )
 
 
-# ── Scenario → effector activity conversion ──────────────────────────────
-
-
-def _scenario_to_activities(scenario: HVACScenario, params: SimParams) -> dict[str, float]:
-    """Convert an HVACScenario to per-effector numeric activity levels."""
-    activities: dict[str, float] = {}
-
-    for eff in params.effectors:
-        name = eff["name"]
-        encoding = eff["encoding"]
-        dtype = eff["device_type"]
-
-        if dtype == "thermostat":
-            # thermostat_upstairs / thermostat_downstairs
-            zone = name.removeprefix("thermostat_")
-            if zone == "upstairs":
-                state = "heating" if scenario.upstairs_heating else "idle"
-            elif zone == "downstairs":
-                state = "heating" if scenario.downstairs_heating else "idle"
-            else:
-                state = "idle"
-            activities[name] = encoding.get(state, 0.0)
-
-        elif dtype == "boiler":
-            # Navien fires when either thermostat is on
-            if scenario.upstairs_heating or scenario.downstairs_heating:
-                activities[name] = encoding.get("Space Heating", 1.0)
-            else:
-                activities[name] = encoding.get("Idle", 0.0)
-
-        elif dtype == "mini_split":
-            # mini_split_bedroom / mini_split_living_room
-            split_name = name.removeprefix("mini_split_")
-            sd = _find_split(scenario.mini_splits, split_name)
-            mode = sd.mode if sd else "off"
-            activities[name] = encoding.get(mode, 0.0)
-
-        elif dtype == "blower":
-            # blower_family_room / blower_office
-            blower_name = name.removeprefix("blower_")
-            bd = _find_blower(scenario.blowers, blower_name)
-            mode = bd.mode if bd else "off"
-            activities[name] = encoding.get(mode, 0.0)
-
-        else:
-            activities[name] = 0.0
-
-    return activities
+# ── Helpers ──────────────────────────────────────────────────────────────
 
 
 def _find_split(splits: tuple[MiniSplitDecision, ...], name: str) -> MiniSplitDecision | None:
@@ -139,7 +108,7 @@ def _find_blower(blowers: tuple[BlowerDecision, ...], name: str) -> BlowerDecisi
     return None
 
 
-# ── Activity timeline: merge recent history + scenario ───────────────────
+# ── Activity timeline: single-scenario utility ───────────────────────────
 
 _HISTORY_STEPS = 18  # 90 minutes of 5-min history
 
@@ -279,165 +248,144 @@ def _outdoor_at(current: float, forecast: list[float], hours_ahead: float) -> fl
     return forecast[idx]
 
 
-# ── Trajectory timelines for TrajectoryScenario ─────────────────────────
+# ── Vectorized batch prediction ──────────────────────────────────────────
 
 
-def _get_blower_zones() -> dict[str, str]:
-    """Cache blower name -> zone mapping from config."""
-    from weatherstat.config import BLOWERS as _BLOWERS
-    return {b.name: b.zone for b in _BLOWERS}
-
-
-_BLOWER_ZONES: dict[str, str] | None = None
-
-
-def _blower_zone_map() -> dict[str, str]:
-    global _BLOWER_ZONES
-    if _BLOWER_ZONES is None:
-        _BLOWER_ZONES = _get_blower_zones()
-    return _BLOWER_ZONES
-
-
-def _build_trajectory_timelines(
-    scenario: TrajectoryScenario,
+def _build_activity_matrices(
+    scenarios: list[TrajectoryScenario],
     params: SimParams,
     recent_history: dict[str, list[float]],
-    n_future_steps: int,
-) -> dict[str, list[float]]:
-    """Build per-effector timelines from a TrajectoryScenario.
+    n_future: int,
+) -> dict[str, np.ndarray]:
+    """Build per-effector activity matrices for all scenarios.
 
-    Thermostats use piecewise schedules (delay/duration). Boiler is derived
-    as the OR of both thermostat timelines. Blowers follow their zone
-    thermostat's on/off pattern. Mini-splits use constant activity.
+    Uses numpy broadcasting to construct (n_scenarios, n_total_steps) matrices
+    for each effector, replacing the per-scenario Python loop.
+
+    Returns:
+        effector_name -> np.ndarray of shape (n_scenarios, _HISTORY_STEPS + n_future).
     """
-    timelines: dict[str, list[float]] = {}
-    blower_zones = _blower_zone_map()
+    from weatherstat.config import BLOWERS as _BLOWERS
 
-    # Phase 1: build thermostat timelines (needed for boiler derivation)
-    for eff in params.effectors:
-        if eff["device_type"] != "thermostat":
-            continue
-        name = eff["name"]
-        encoding = eff["encoding"]
-        hist = recent_history.get(name, [])
-        zone = name.removeprefix("thermostat_")
-        traj = scenario.upstairs if zone == "upstairs" else scenario.downstairs
-        if not traj.heating:
-            timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
-        else:
-            activity = encoding.get("heating", 1.0)
-            switch_off = (traj.delay_steps + traj.duration_steps) if traj.duration_steps is not None else None
-            timelines[name] = build_activity_timeline(
-                activity, hist, n_future_steps,
-                switch_on_step=traj.delay_steps,
-                switch_off_step=switch_off,
-            )
+    n = len(scenarios)
+    n_total = _HISTORY_STEPS + n_future
+    steps = np.arange(n_future)  # [0, 1, ..., n_future-1]
 
-    # Phase 2: build remaining effector timelines
+    # Pre-extract thermostat parameters as numpy arrays
+    up_heating = np.array([s.upstairs.heating for s in scenarios])
+    up_delay = np.array([s.upstairs.delay_steps for s in scenarios])
+    up_dur = np.array([
+        s.upstairs.duration_steps if s.upstairs.duration_steps is not None
+        else (n_future - s.upstairs.delay_steps)
+        for s in scenarios
+    ])
+    dn_heating = np.array([s.downstairs.heating for s in scenarios])
+    dn_delay = np.array([s.downstairs.delay_steps for s in scenarios])
+    dn_dur = np.array([
+        s.downstairs.duration_steps if s.downstairs.duration_steps is not None
+        else (n_future - s.downstairs.delay_steps)
+        for s in scenarios
+    ])
+
+    # Thermostat active masks: (n, n_future) boolean
+    # Broadcasting: (n, 1) op (1, n_future) -> (n, n_future)
+    up_active = (
+        up_heating[:, None]
+        & (steps[None, :] >= up_delay[:, None])
+        & (steps[None, :] < (up_delay + up_dur)[:, None])
+    )
+    dn_active = (
+        dn_heating[:, None]
+        & (steps[None, :] >= dn_delay[:, None])
+        & (steps[None, :] < (dn_delay + dn_dur)[:, None])
+    )
+
+    blower_zones = {b.name: b.zone for b in _BLOWERS}
+    matrices: dict[str, np.ndarray] = {}
+
     for eff in params.effectors:
         name = eff["name"]
-        if name in timelines:
-            continue
         encoding = eff["encoding"]
         dtype = eff["device_type"]
-        hist = recent_history.get(name, [])
 
-        if dtype == "boiler":
-            # Boiler fires whenever either thermostat is on.
-            # Build future from trajectory parameters directly (no per-step timeline lookup).
+        # History: shared across all scenarios
+        hist = recent_history.get(name, [])
+        padded = [0.0] * max(0, _HISTORY_STEPS - len(hist)) + hist[-_HISTORY_STEPS:]
+        hist_arr = np.array(padded)  # (_HISTORY_STEPS,)
+
+        # Future: varies by device type
+        if dtype == "thermostat":
+            zone = name.removeprefix("thermostat_")
+            active = up_active if zone == "upstairs" else dn_active
+            future = active.astype(np.float64) * encoding.get("heating", 1.0)
+
+        elif dtype == "boiler":
             boiler_on = encoding.get("Space Heating", 1.0)
-            boiler_off = encoding.get("Idle", 0.0)
-            padded_hist = [0.0] * max(0, _HISTORY_STEPS - len(hist)) + hist[-_HISTORY_STEPS:]
-            future = [boiler_off] * n_future_steps
-            for traj in [scenario.upstairs, scenario.downstairs]:
-                if traj.heating:
-                    start = traj.delay_steps
-                    end = (start + traj.duration_steps) if traj.duration_steps is not None else n_future_steps
-                    for step in range(start, min(end, n_future_steps)):
-                        future[step] = boiler_on
-            timelines[name] = padded_hist + future
+            future = (up_active | dn_active).astype(np.float64) * boiler_on
 
         elif dtype == "blower":
             blower_name = name.removeprefix("blower_")
-            bd = _find_blower(scenario.blowers, blower_name)
-            mode = bd.mode if bd else "off"
-            activity = encoding.get(mode, 0.0)
-            if activity == 0.0:
-                timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
-            else:
-                # Blower follows its zone thermostat's on/off pattern
-                zone = blower_zones.get(blower_name, "downstairs")
-                zone_traj = scenario.upstairs if zone == "upstairs" else scenario.downstairs
-                if not zone_traj.heating:
-                    timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
-                else:
-                    switch_off = (
-                        zone_traj.delay_steps + zone_traj.duration_steps
-                    ) if zone_traj.duration_steps is not None else None
-                    timelines[name] = build_activity_timeline(
-                        activity, hist, n_future_steps,
-                        switch_on_step=zone_traj.delay_steps,
-                        switch_off_step=switch_off,
-                    )
+            enc_vals = np.array([
+                encoding.get(bd.mode, 0.0) if (bd := _find_blower(s.blowers, blower_name)) else 0.0
+                for s in scenarios
+            ])
+            zone = blower_zones.get(blower_name, "downstairs")
+            zone_active = up_active if zone == "upstairs" else dn_active
+            future = zone_active.astype(np.float64) * enc_vals[:, None]
 
         elif dtype == "mini_split":
             split_name = name.removeprefix("mini_split_")
-            sd = _find_split(scenario.mini_splits, split_name)
-            mode = sd.mode if sd else "off"
-            activity = encoding.get(mode, 0.0)
-            timelines[name] = build_activity_timeline(activity, hist, n_future_steps)
+            enc_vals = np.array([
+                encoding.get(sd.mode, 0.0) if (sd := _find_split(s.mini_splits, split_name)) else 0.0
+                for s in scenarios
+            ])
+            future = np.broadcast_to(enc_vals[:, None], (n, n_future))
 
         else:
-            timelines[name] = build_activity_timeline(0.0, hist, n_future_steps)
+            future = np.zeros((n, n_future))
 
-    return timelines
+        # Combine history + future into (n, n_total)
+        matrix = np.empty((n, n_total))
+        matrix[:, :_HISTORY_STEPS] = hist_arr  # broadcasts across rows
+        matrix[:, _HISTORY_STEPS:] = future
+        matrices[name] = matrix
+
+    return matrices
 
 
-# ── Batch simulate: all sensors, all scenarios ──────────────────────────
-
-
-def batch_simulate(
-    current_temps: dict[str, float],
-    outdoor_temp: float,
-    forecast_temps: list[float],
-    window_states: dict[str, bool],
-    scenarios: list[HVACScenario] | list[TrajectoryScenario],
+def predict(
+    state: HouseState,
+    scenarios: list[TrajectoryScenario],
     params: SimParams,
-    hour_of_day: float,
     horizons: list[int],
-    recent_history: dict[str, list[float]] | None = None,
 ) -> tuple[list[str], np.ndarray]:
-    """Simulate all scenarios and return predictions in the same format as _batch_predict.
+    """Predict room temperatures for multiple HVAC scenarios.
+
+    Vectorized Euler integration: loops over timesteps (72) but processes
+    all scenarios simultaneously via numpy. Activity matrices are built
+    once using numpy broadcasting, and effector forcing is pre-computed
+    per sensor as a single slice operation per effector.
 
     Args:
-        current_temps: sensor_name -> current temperature (F). Keys should use
-            the sensor column names from sysid (e.g., "bedroom_temp").
-        outdoor_temp: Current outdoor temperature (F).
-        forecast_temps: Hourly forecast [h+1, h+2, ..., h+N].
-        window_states: window_name -> is_open (e.g., "bedroom" -> True).
-        scenarios: List of HVACScenario to evaluate.
-        params: Loaded SimParams from thermal_params.json.
-        hour_of_day: Current fractional hour of day (0-23.99).
+        state: Current house state (temps, weather, windows, effector history).
+        scenarios: HVAC trajectory scenarios to evaluate.
+        params: Thermal model parameters from sysid.
         horizons: Prediction horizons in 5-min steps (e.g., [12, 24, 48, 72]).
-        recent_history: effector_name -> list of recent activity values (oldest first).
-            If None, assumes all effectors were off.
 
     Returns:
         (target_names, predictions) where predictions shape is (n_scenarios, n_targets).
         target_names like "bedroom_temp_t+12".
     """
-    if recent_history is None:
-        recent_history = {}
-
     max_horizon = max(horizons)
     n_scenarios = len(scenarios)
+    n_future = max_horizon + 1
+    n_total = _HISTORY_STEPS + n_future
+    horizon_set = set(horizons)
 
     # Build target names: room_temp_t+horizon for each room in PREDICTION_ROOMS
-    # Map room names to sensor column names
     room_to_sensor = _room_to_sensor_map(params.sensors)
-
     target_names: list[str] = []
-    target_info: list[tuple[str, int]] = []  # (sensor_col, horizon_step)
+    target_info: list[tuple[str, int]] = []
     for room in PREDICTION_ROOMS:
         sensor_col = room_to_sensor.get(room)
         if sensor_col is None:
@@ -449,93 +397,101 @@ def batch_simulate(
     n_targets = len(target_names)
     result = np.empty((n_scenarios, n_targets))
 
-    # Pre-compute per-sensor static info
-    sensor_info: dict[str, dict] = {}
-    for sensor_col in set(sc for sc, _ in target_info):
+    # Build activity matrices for all effectors: (n_scenarios, n_total) each
+    activity_matrices = _build_activity_matrices(scenarios, params, state.recent_history, n_future)
+
+    # Group targets by sensor for efficient per-sensor simulation
+    sensor_targets: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for j, (sc, h) in enumerate(target_info):
+        sensor_targets[sc].append((j, h))
+
+    # Pre-compute outdoor temperature and solar gain vectors (shared across sensors)
+    outdoor_vec = np.array([
+        _outdoor_at(state.outdoor_temp, state.forecast_temps, step * _DT_HOURS)
+        for step in range(1, max_horizon + 1)
+    ])
+
+    # Simulate each sensor (vectorized across all scenarios)
+    for sensor_col, col_targets in sensor_targets.items():
         tau_s, tau_v = params.taus.get(sensor_col, (40.0, 17.6))
-        # Window state for this sensor
         win_cols = params.sensor_window_cols.get(sensor_col, [])
         is_vent = any(
-            window_states.get(wc.removeprefix("window_").removesuffix("_open"), False)
+            state.window_states.get(wc.removeprefix("window_").removesuffix("_open"), False)
             for wc in win_cols
         )
+
+        tau = tau_v if is_vent else tau_s
+        if tau <= 0:
+            tau = 40.0
+
         # Gains for this sensor
         sensor_gains: dict[str, tuple[float, float]] = {}
         for (eff, sens), (gain, lag) in params.gains.items():
             if sens == sensor_col:
                 sensor_gains[eff] = (gain, lag)
-        # Solar profile
+
+        # Solar profile for this sensor
         solar: dict[int, float] = {}
         for (sens, hour), gain in params.solar.items():
             if sens == sensor_col:
                 solar[hour] = gain
 
-        sensor_info[sensor_col] = {
-            "tau_sealed": tau_s,
-            "tau_vent": tau_v,
-            "is_vent": is_vent,
-            "gains": sensor_gains,
-            "solar": solar,
-        }
+        solar_vec = np.array([
+            solar.get(int((state.hour_of_day + step * _DT_HOURS) % 24), 0.0)
+            for step in range(1, max_horizon + 1)
+        ])
 
-    # Simulate each scenario
-    for i, scenario in enumerate(scenarios):
-        # Build timelines: trajectory-aware for TrajectoryScenario, constant for HVACScenario
-        if isinstance(scenario, TrajectoryScenario):
-            timelines = _build_trajectory_timelines(scenario, params, recent_history, max_horizon + 1)
-        else:
-            activities = _scenario_to_activities(scenario, params)
-            timelines: dict[str, list[float]] = {}
-            for eff in params.effectors:
-                eff_name = eff["name"]
-                hist = recent_history.get(eff_name, [])
-                timelines[eff_name] = build_activity_timeline(
-                    activities.get(eff_name, 0.0),
-                    hist,
-                    max_horizon + 1,
-                )
+        # Current temp (try sensor col name, then room name)
+        cur_temp = state.current_temps.get(sensor_col)
+        if cur_temp is None:
+            for room, sc in room_to_sensor.items():
+                if sc == sensor_col:
+                    cur_temp = state.current_temps.get(room)
+                    break
+        if cur_temp is None:
+            cur_temp = 70.0
 
-        # Simulate each needed sensor
-        sensor_trajectories: dict[str, list[float]] = {}
-        for sensor_col in sensor_info:
-            if sensor_col in sensor_trajectories:
-                continue
-            info = sensor_info[sensor_col]
-            cur_temp = current_temps.get(sensor_col)
-            if cur_temp is None:
-                # Try room name mapping
-                for room, sc in room_to_sensor.items():
-                    if sc == sensor_col:
-                        cur_temp = current_temps.get(room)
-                        break
-            if cur_temp is None:
-                cur_temp = 70.0  # fallback
+        # Pre-compute total effector forcing: (n_scenarios, max_horizon + 1)
+        # Vectorized over both scenarios AND timesteps — one slice op per effector
+        total_eff = np.zeros((n_scenarios, max_horizon + 1))
+        for eff_name, (gain, lag_min) in sensor_gains.items():
+            lag_s = int(round(lag_min / 5.0))
+            mat = activity_matrices[eff_name]
+            # Source: activity matrix columns for steps 1..max_horizon, shifted by lag
+            src_start = _HISTORY_STEPS + 1 - lag_s
+            src_end = _HISTORY_STEPS + max_horizon + 1 - lag_s
+            # Destination: total_eff columns 1..max_horizon
+            dst_start = 1
+            dst_end = max_horizon + 1
+            # Handle boundary clipping
+            if src_start < 0:
+                dst_start += -src_start
+                src_start = 0
+            if src_end > n_total:
+                dst_end -= src_end - n_total
+                src_end = n_total
+            if dst_start < dst_end:
+                total_eff[:, dst_start:dst_end] += gain * mat[:, src_start:src_end]
 
-            traj = simulate_sensor(
-                sensor=sensor_col,
-                current_temp=cur_temp,
-                outdoor_temp=outdoor_temp,
-                forecast_temps=forecast_temps,
-                tau_sealed=info["tau_sealed"],
-                tau_vent=info["tau_vent"],
-                is_ventilated=info["is_vent"],
-                effector_timelines=timelines,
-                gains=info["gains"],
-                solar_profile=info["solar"],
-                start_hour=hour_of_day,
-                n_steps=max_horizon,
-            )
-            sensor_trajectories[sensor_col] = traj
+        # Euler integration: loop over timesteps, vectorized over scenarios
+        T = np.full(n_scenarios, cur_temp)
+        horizon_results: dict[int, np.ndarray] = {}
 
-        # Extract horizon values
-        for j, (sensor_col, h_step) in enumerate(target_info):
-            traj = sensor_trajectories.get(sensor_col)
-            if traj is not None and h_step - 1 < len(traj):
-                result[i, j] = traj[h_step - 1]  # traj[0] = t+1, traj[11] = t+12
-            else:
-                result[i, j] = np.nan
+        for step_idx in range(max_horizon):
+            step = step_idx + 1
+            dTdt = (outdoor_vec[step_idx] - T) / tau + total_eff[:, step] + solar_vec[step_idx]
+            T = T + _DT_HOURS * dTdt
+            if step in horizon_set:
+                horizon_results[step] = T.copy()
+
+        # Fill result columns for this sensor
+        for j, h in col_targets:
+            result[:, j] = horizon_results.get(h, np.nan)
 
     return target_names, result
+
+
+# ── Room name mapping ────────────────────────────────────────────────────
 
 
 def _room_to_sensor_map(sensor_names: list[str]) -> dict[str, str]:

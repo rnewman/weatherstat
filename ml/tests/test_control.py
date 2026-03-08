@@ -24,7 +24,6 @@ from weatherstat.types import (
     BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
-    HVACScenario,
     MiniSplitDecision,
     RoomComfort,
     ThermostatTrajectory,
@@ -88,17 +87,17 @@ class TestComfortCost:
 
     def test_energy_cost_tiebreaker(self) -> None:
         """Two scenarios with identical comfort cost -> lower energy wins."""
-        scenario_both = HVACScenario(
-            upstairs_heating=True,
-            downstairs_heating=True,
-            blowers=tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-            mini_splits=tuple(MiniSplitDecision(s.name, "off", 72.0) for s in MINI_SPLITS),
+        scenario_both = TrajectoryScenario(
+            ThermostatTrajectory(heating=True),
+            ThermostatTrajectory(heating=True),
+            tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+            tuple(MiniSplitDecision(s.name, "off", 72.0) for s in MINI_SPLITS),
         )
-        scenario_one = HVACScenario(
-            upstairs_heating=True,
-            downstairs_heating=False,
-            blowers=tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-            mini_splits=tuple(MiniSplitDecision(s.name, "off", 72.0) for s in MINI_SPLITS),
+        scenario_one = TrajectoryScenario(
+            ThermostatTrajectory(heating=True),
+            ThermostatTrajectory(heating=False),
+            tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+            tuple(MiniSplitDecision(s.name, "off", 72.0) for s in MINI_SPLITS),
         )
 
         cost_both = compute_energy_cost(scenario_both)
@@ -364,12 +363,13 @@ class TestTrajectoryEnergyCost:
         )
         assert compute_energy_cost(off) == 0.0
 
-    def test_hvac_scenario_energy_cost_unchanged(self) -> None:
-        """HVACScenario energy cost should be unchanged (backward compat)."""
-        hvac = HVACScenario(
-            True, False,
+    def test_full_horizon_trajectory_energy_cost(self) -> None:
+        """Full-horizon trajectory should cost one gas zone unit."""
+        traj = TrajectoryScenario(
+            ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
+            ThermostatTrajectory(heating=False),
             (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
             (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
         )
         from weatherstat.config import ENERGY_COST_GAS_ZONE
-        assert compute_energy_cost(hvac) == ENERGY_COST_GAS_ZONE
+        assert compute_energy_cost(traj) == ENERGY_COST_GAS_ZONE

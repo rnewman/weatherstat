@@ -130,7 +130,7 @@ Where:
 
 **Integration:** Euler steps at 5-minute resolution, chaining hourly weather forecast segments for the outdoor temperature trajectory.
 
-**Batch simulation:** The controller calls `batch_simulate()` with thousands of candidate scenarios. Each scenario specifies effector timelines (constant or trajectory-parameterized), and the simulator evaluates all of them against the same initial conditions.
+**Batch simulation:** The controller calls `predict()` with thousands of candidate scenarios. Each scenario specifies effector timelines (trajectory-parameterized), and the simulator evaluates all of them against the same initial conditions. Internally, Euler integration is vectorized across all scenarios using numpy — the outer loop is over sensors and timesteps, with numpy broadcasting handling all scenarios simultaneously.
 
 #### 3b. System Identification (`ml/src/weatherstat/sysid.py`)
 
@@ -155,18 +155,16 @@ The regression uses `np.linalg.lstsq` (OLS) with automatic fallback to ridge reg
 
 #### 3c. Prediction Interface
 
-The thermal model exposes a batch prediction interface to the controller:
+The thermal model exposes a clean prediction interface to the controller:
 
 ```python
-batch_simulate(
-    current_temps, outdoor_temp, forecast_temps, window_states,
-    scenarios, sim_params, hour_of_day, horizons, recent_history
-) -> (target_names, prediction_matrix)
+predict(state: HouseState, scenarios: list[TrajectoryScenario],
+        params: SimParams, horizons: list[int]) -> (target_names, prediction_matrix)
 ```
 
-Where `prediction_matrix[i, j]` is the predicted temperature for scenario `i` at target `j` (room × horizon). The controller doesn't know or care about the simulation internals — it provides scenarios and receives predictions.
+`HouseState` bundles all environmental state (current room temps, outdoor temp, forecast temps, window states, hour of day, recent HVAC history). `TrajectoryScenario` encodes the HVAC plan (thermostat trajectories with delay/duration, blower and mini-split modes). The controller treats this as a black box — it provides state and candidate actions, and receives `prediction_matrix[i, j]` (predicted temperature for scenario `i` at target `j`, where targets are room × horizon combinations).
 
-**Current gap:** This interface is functional but tightly coupled to the simulator's parameter types. A cleaner `predict(state, actions, horizons)` abstraction would allow swapping prediction engines (e.g., a hybrid physics+ML model) without touching the controller.
+**Vectorization:** Activity matrices `(n_scenarios, n_total_steps)` are built per effector using numpy broadcasting over delay/duration parameters. Total effector forcing is pre-computed per sensor via slice operations, so the Euler integration loop (72 timesteps) contains only numpy vector operations over all scenarios. This reduces Python loop iterations from ~4.3M to ~576 for a typical 7400-scenario sweep.
 
 ---
 
@@ -277,9 +275,9 @@ The collector is language-agnostic from the model's perspective.
 
 ### Thermal Model -> Controller
 
-**Interface:** `batch_simulate(state, scenarios, params, horizons) -> prediction_matrix`
+**Interface:** `predict(state: HouseState, scenarios, params, horizons) -> (target_names, prediction_matrix)`
 
-The controller treats the thermal model as a black box. This is the key abstraction: the prediction engine can be swapped without touching sweep logic, scoring, or constraints. The interface should evolve toward a cleaner `predict(state, actions, horizons) -> {room: {horizon: temperature}}` signature that hides simulator internals.
+The controller treats the thermal model as a black box. `HouseState` bundles all environmental inputs; `TrajectoryScenario` encodes all HVAC plans. The prediction engine can be swapped without touching sweep logic, scoring, or constraints.
 
 ### Controller -> Executor
 
