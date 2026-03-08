@@ -38,9 +38,7 @@ from weatherstat.config import (
     PREDICTION_ROOMS,
     PREDICTIONS_DIR,
 )
-from weatherstat.inference import (
-    fetch_recent_history,
-)
+from weatherstat.extract import fetch_recent_history
 from weatherstat.types import (
     BlowerDecision,
     ComfortSchedule,
@@ -784,7 +782,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         return None
 
     # Current state
-    from weatherstat.features import ROOM_TEMP_COLUMNS
+    room_temp_columns = _CFG.room_temp_columns
 
     latest = df_raw.iloc[-1]
     up_current = float(latest.get("thermostat_upstairs_temp", 70))
@@ -796,7 +794,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Build current temperature dict for all rooms (for sanity checks and display)
     current_temps: dict[str, float] = {}
-    for room, col in ROOM_TEMP_COLUMNS.items():
+    for room, col in room_temp_columns.items():
         val = latest.get(col)
         if val is not None and not (isinstance(val, float) and np.isnan(val)):
             current_temps[room] = float(val)

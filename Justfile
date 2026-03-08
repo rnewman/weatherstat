@@ -24,37 +24,6 @@ health:
 extract *ARGS:
     cd ml && uv run python -m weatherstat.extract {{ARGS}}
 
-# Train LightGBM models on collector data
-train:
-    cd ml && uv run python -m weatherstat.train
-
-# Retrain from collector data (no extraction needed)
-retrain: train
-
-# Evaluate and compare models
-evaluate:
-    cd ml && uv run python -m weatherstat.evaluate
-
-# View training metrics (latest summary, history, or compare two runs)
-metrics *ARGS:
-    cd ml && uv run python -m weatherstat.metrics {{ARGS}}
-
-# Visualize extracted data
-visualize *ARGS:
-    cd ml && uv run python -m weatherstat.visualize {{ARGS}}
-
-# Predict: fetch live state from HA, predict with full model
-predict:
-    cd ml && uv run python -m weatherstat.inference
-
-# Predict from collector snapshot files
-predict-snapshot:
-    cd ml && uv run python -m weatherstat.inference --snapshot
-
-# Counterfactual: predict under HVAC on/off scenarios
-counterfactual:
-    cd ml && uv run python -m weatherstat.inference --counterfactual
-
 # Lint both packages
 lint: lint-ts lint-py
 
@@ -128,59 +97,6 @@ execute-force:
 # System identification: extract thermal parameters from collector data
 sysid *ARGS:
     cd ml && uv run python -m weatherstat.sysid {{ARGS}}
-
-# Fit thermal time constants (τ) from overnight cooling fixture
-fit-tau:
-    cd ml && uv run python scripts/fit_tau.py
-
-# ── Experiments ──────────────────────────────────────────────────────────
-
-# Create a git worktree for an experiment branch (shares data/)
-worktree NAME *PATH:
-    bash scripts/worktree.sh {{NAME}} {{PATH}}
-
-# Train models into an experiment directory
-train-experiment NAME:
-    cd ml && uv run python -m weatherstat.train --experiment {{NAME}}
-
-# Backtest against overnight cooling test case (production model)
-backtest:
-    cd ml && uv run python scripts/backtest_overnight.py
-
-# Backtest production + experiment against overnight cooling
-backtest-experiment NAME:
-    cd ml && uv run python scripts/backtest_overnight.py --experiment {{NAME}}
-
-# Backtest production + all experiments against overnight cooling
-backtest-all:
-    cd ml && uv run python scripts/backtest_overnight.py --all
-
-# Compare an experiment's models against production
-experiment-compare NAME:
-    cd ml && uv run python -m weatherstat.experiment compare {{NAME}}
-
-# List all experiments
-experiments:
-    cd ml && uv run python -m weatherstat.experiment list
-
-# ── Retraining ─────────────────────────────────────────────────────────
-
-# Run manual retrain (extract + train, with logging)
-retrain-manual:
-    bash scripts/run-retrain.sh
-
-# Install weekly retrain launchd agent (Sunday 3 AM)
-retrain-install:
-    mkdir -p ~/Library/LaunchAgents
-    cp com.twinql.weatherstat.retrain.plist ~/Library/LaunchAgents/
-    launchctl load ~/Library/LaunchAgents/com.twinql.weatherstat.retrain.plist
-    @echo "Retrain agent installed (Sunday 3:00 AM)"
-
-# Uninstall weekly retrain launchd agent
-retrain-uninstall:
-    -launchctl unload ~/Library/LaunchAgents/com.twinql.weatherstat.retrain.plist
-    rm -f ~/Library/LaunchAgents/com.twinql.weatherstat.retrain.plist
-    @echo "Retrain agent uninstalled"
 
 # ── Setup ────────────────────────────────────────────────────────────────
 

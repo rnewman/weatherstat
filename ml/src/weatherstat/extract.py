@@ -16,6 +16,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,9 @@ import websockets.client
 
 from weatherstat.config import HA_TOKEN, HA_URL, SNAPSHOTS_DB, SNAPSHOTS_DIR
 from weatherstat.yaml_config import load_config
+
+if TYPE_CHECKING:
+    from weatherstat.forecast import ForecastEntry
 
 _CFG = load_config()
 
@@ -530,6 +534,130 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
             df[col] = df[col].astype(bool)
 
     return df
+
+
+# ── Live state fetch ─────────────────────────────────────────────────────────
+
+
+def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[ForecastEntry] | None]:
+    """Fetch recent entity history AND hourly forecast from HA.
+
+    Returns (history_df, forecast_entries). Forecast is None on failure.
+    """
+    _check_config()
+
+    end = datetime.now(UTC)
+    start = end - timedelta(hours=hours_back)
+
+    # Fetch sensor entities (no attributes needed)
+    sensor_ids = list(STATISTICS_ENTITIES.values()) + list(SENSOR_ENTITIES.values())
+    sensor_history = fetch_history(sensor_ids, start, end)
+
+    # Fetch climate + fan + weather entities (with attributes)
+    attr_ids = list(CLIMATE_ENTITIES.values()) + list(FAN_ENTITIES.values()) + [WEATHER_ENTITY]
+    attr_history = fetch_history_with_attributes(attr_ids, start, end)
+
+    # Fetch window sensors
+    window_history = fetch_history(WINDOW_SENSORS, start, end)
+
+    # Build 5-minute time index
+    time_index = pd.date_range(start=start, end=end, freq="5min", tz=UTC)
+    result = pd.DataFrame(index=time_index)
+    result.index.name = "timestamp"
+
+    # Process temperature/numeric sensors
+    for col_name, entity_id in {**STATISTICS_ENTITIES, **SENSOR_ENTITIES}.items():
+        records = sensor_history.get(entity_id, [])
+        if not records:
+            result[col_name] = np.nan
+            continue
+        if col_name == "navien_heating_mode":
+            series = _history_to_series(records, value_fn=lambda s: s)
+        else:
+            series = _history_to_series(records)
+        series = series[~series.index.duplicated(keep="last")]
+        result[col_name] = series.reindex(time_index, method="ffill")
+
+    # Process climate entities
+    for name, entity_id in CLIMATE_ENTITIES.items():
+        records = attr_history.get(entity_id, [])
+        if not records:
+            continue
+        series_dict = _climate_to_series(records)
+        if name.startswith("thermostat_"):
+            for suffix, series in [("target", series_dict["target"]), ("action", series_dict["action"])]:
+                s = series[~series.index.duplicated(keep="last")]
+                result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
+        else:
+            for suffix, series in [
+                ("temp", series_dict["temp"]),
+                ("target", series_dict["target"]),
+                ("mode", series_dict["mode"]),
+            ]:
+                s = series[~series.index.duplicated(keep="last")]
+                result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
+
+    # Process fan entities
+    for name, entity_id in FAN_ENTITIES.items():
+        records = attr_history.get(entity_id, [])
+        if not records:
+            result[f"{name}_mode"] = "off"
+            continue
+        series = _fan_to_series(records)
+        series = series[~series.index.duplicated(keep="last")]
+        result[f"{name}_mode"] = series.reindex(time_index, method="ffill")
+
+    # Process weather entity
+    weather_records = attr_history.get(WEATHER_ENTITY, [])
+    if weather_records:
+        weather_dict = _weather_to_series(weather_records)
+        for suffix, series in weather_dict.items():
+            col = f"outdoor_{suffix}" if suffix != "condition" else "weather_condition"
+            s = series[~series.index.duplicated(keep="last")]
+            result[col] = s.reindex(time_index, method="ffill")
+
+    # Process window sensors → per-window columns + any_window_open
+    window_column_map = _CFG.window_column_map
+    window_cols_present: list[str] = []
+    for entity_id, col_name in window_column_map.items():
+        records = window_history.get(entity_id, [])
+        if records:
+            s = _history_to_series(records, value_fn=lambda s: s == "on")
+            s = s[~s.index.duplicated(keep="last")]
+            result[col_name] = s.reindex(time_index, method="ffill").astype(bool)
+            window_cols_present.append(col_name)
+        else:
+            result[col_name] = False
+
+    if window_cols_present:
+        result["any_window_open"] = result[window_cols_present].any(axis=1).astype(bool)
+    else:
+        result["any_window_open"] = False
+
+    # Finalize
+    result = result.reset_index()
+    result["timestamp"] = result["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    # Ensure numeric columns (from YAML config)
+    numeric_cols = _CFG.numeric_extract_columns
+    for col in numeric_cols:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce")
+
+    if "outdoor_wind_speed" in result.columns:
+        result = result.rename(columns={"outdoor_wind_speed": "wind_speed"})
+
+    # Fetch hourly forecast (non-fatal)
+    forecast: list[ForecastEntry] | None = None
+    try:
+        from weatherstat.forecast import fetch_forecast
+
+        forecast = fetch_forecast()
+        print(f"  Fetched {len(forecast)} forecast entries")
+    except Exception as e:
+        print(f"  Warning: forecast fetch failed: {e}")
+
+    return result, forecast
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

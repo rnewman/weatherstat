@@ -59,7 +59,22 @@
       "Bash(just lint-py:*)",
       "Bash(just train-experiment-newton:*)",
       "Bash(just backtest-experiment:*)",
-      "Bash(just fit-tau:*)"
+      "Bash(just fit-tau:*)",
+      "WebFetch(domain:hub.docker.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.home-assistant.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(container ls:*)",
+      "Bash(docker ls:*)",
+      "Bash(container exec:*)",
+      "Bash(sftp:*)",
+      "WebFetch(domain:vowpalwabbit.org)",
+      "Bash(cat:*)",
+      "mcp__Home_Assistant__ha_call_service",
+      "mcp__Home_Assistant__ha_deep_search",
+      "mcp__Home_Assistant__ha_get_device",
+      "mcp__Home_Assistant__ha_get_logbook",
+      "Bash(just sysid:*)"
     ]
   }
 }
