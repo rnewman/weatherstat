@@ -4,64 +4,70 @@ Items are roughly in priority order within each section.
 
 ---
 
-## Grey-Box Forward Simulator
+## Trajectory Search (PLAN-7, next)
 
-The next major step: use sysid parameters to build a physics-based forward
-simulator that answers counterfactual questions causally.
+Expand the control sweep from constant-action scenarios to parameterized
+trajectories: each slow effector (thermostats, boiler) gets a delay and
+duration, producing piecewise schedules like "wait 2h, heat for 2h, coast."
+The existing multi-sensor scorer evaluates whole-house comfort across all
+trajectories without zone-specific heuristics.
 
-**What we have now:**
-- `sysid.py` fits the full effector × sensor gain matrix, delays, tau values,
-  and solar profiles from collector data
-- The controller sweeps candidate actions and scores them using ML predictions
-- Newton cooling is used as guardrails (floor/ceiling) on ML predictions
-
-**What's needed:**
-- Forward-simulate from current state using sysid parameters:
-  ```
-  T(t+dt) = T(t) + dt * [
-      (T_outdoor - T) / tau           # envelope loss
-      + Σ gain_e * activity_e(t-lag)  # effector heating
-      + Q_solar(hour)                 # solar gain
-  ]
-  ```
-- Euler integration at 5-minute steps, chaining hourly forecast outdoor temps
-- Replace ML predictions in the sweep with physics predictions (or blend)
-- The key payoff: reliable counterfactual reasoning ("what if heat is off?")
-  that the ML model can't provide due to observational confounding
-
-**Prerequisites:** sysid output is stable and reasonable (done — verified Mar 2026).
+This subsumes pre-heating logic (delayed starts are trajectory candidates),
+and is a constrained form of MPC (single-segment trajectories, not arbitrary
+sequences). See `docs/plans/PLAN-7-effector-inertia.md`.
 
 ---
 
-## Forecast Collector Storage
+## Full MPC Trajectory Planning
 
-Store weather forecast snapshots alongside sensor snapshots so training data
-includes what the forecast predicted at each point in time. Currently forecasts
-are fetched at inference time but not persisted for training.
+Optimize multi-segment HVAC sequences ("heat 2h, off 1h, heat 1h") instead
+of the single-segment trajectories in PLAN-7. The trajectory search captures
+most of the value; full MPC handles cases where the optimal plan has multiple
+heating/cooling phases within one horizon.
 
-This would allow training models that learn forecast accuracy patterns (e.g.,
-met.no consistently underestimates overnight cooling in Seattle winters).
-
----
-
-## Pre-Heating Logic
-
-Use forecast + sysid HVAC response curves to start heating before outdoor temp
-drops. Critical for hydronic floor heat with 2-4 hour thermal lag.
-
-Requires the forward simulator — the controller needs to simulate "if I start
-heating now, will the slab be charged by the time the cold front arrives?"
+The physics simulator is fast enough; the question is whether the multi-segment
+optimization surface is tractable or whether receding-horizon re-evaluation
+(every 15 min) effectively discovers multi-segment plans through repeated
+single-segment decisions.
 
 ---
 
-## MPC Trajectory Planning
+## Discrete Hazard / Survival Model for Comfort
 
-Optimize HVAC *sequences* (heat 2h then coast 4h) instead of single-step
-settings. The current controller picks the best action for *right now* and
-re-evaluates every 15 minutes. Full MPC would plan multi-step trajectories.
+Frame comfort prediction probabilistically: at each future timestep, for each
+sensor, estimate a hazard rate h(t, s) = P(breach at t | no breach before t)
+conditional on the chosen trajectory. The survival function S(t) = P(staying
+within comfort through time t) replaces point-prediction scoring.
 
-Requires a fast forward simulator (above). The physics model is fast enough;
-the question is whether the optimization surface is tractable.
+**Why this matters:**
+- Point predictions ignore uncertainty. The simulator says "room hits 68.0F at
+  step 48" but the real outcome is a distribution (forecast error, model error,
+  unmodeled disturbances like doors opening).
+- A survival framing values trajectories that keep breach probability low across
+  the full horizon, not just at scored checkpoints (1h, 2h, 4h, 6h).
+- It naturally handles asymmetric risk: a trajectory where the 95th-percentile
+  outcome breaches comfort is worse than one where the median is slightly
+  further from optimal but the tail is safe.
+
+**How it connects to the trajectory search:**
+- Each trajectory candidate produces a different hazard curve for each sensor.
+  "Heat now for 2h then coast" front-loads hazard reduction. "Delay 2h then
+  heat" has higher near-term hazard but similar long-term reduction.
+- The scorer becomes: maximize expected comfort-survival across all sensors,
+  weighted by room importance and penalty asymmetry.
+
+**Practical approach:**
+- Estimate prediction uncertainty from historical residuals (simulator
+  prediction vs actual outcome, binned by horizon and conditions).
+- At each scored horizon, compute P(T < comfort_min) and P(T > comfort_max)
+  from the predicted mean and estimated variance.
+- Weight comfort cost by breach probability rather than deterministic penalty.
+- This is incremental over the deterministic scorer — same structure, but
+  penalties are expected values over the predictive distribution.
+
+**Prerequisites:** enough decision-log history to estimate prediction error
+distributions by horizon. The trajectory search (PLAN-7) should come first;
+probabilistic scoring refines it.
 
 ---
 
