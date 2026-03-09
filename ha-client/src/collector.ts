@@ -1,9 +1,9 @@
 /**
  * State snapshot collector.
  *
- * Periodically reads entity states via HAClient and writes snapshots
- * to a SQLite database. Column definitions and entity dispatch are
- * driven by weatherstat.yaml via the config loader.
+ * Periodically reads entity states via HAClient and writes readings
+ * to a SQLite EAV table (timestamp, name, value). Entity dispatch and
+ * column definitions are driven by weatherstat.yaml via the config loader.
  */
 
 import { mkdir } from "node:fs/promises";
@@ -14,13 +14,6 @@ import type { Database as DatabaseType } from "better-sqlite3";
 import type { HAClient, HAEntityState, SnapshotRow, WeatherForecastEntry } from "./types.ts";
 import type { Config } from "./config.ts";
 import { config } from "./yaml-config.ts";
-
-const INSERT_WIDE_SQL = `
-INSERT OR IGNORE INTO snapshots (
-  timestamp, ${config.snapshotColumns.join(", ")}
-) VALUES (
-  @timestamp, ${config.snapshotColumns.map((c) => `@${c}`).join(", ")}
-)`;
 
 const INSERT_READING_SQL = `
 INSERT OR IGNORE INTO readings (timestamp, name, value)
@@ -35,20 +28,7 @@ function getDb(dbPath: string): DatabaseType {
   _db = new Database(dbPath);
   _db.pragma("journal_mode = WAL");
 
-  // Wide table (legacy, kept during transition)
-  _db.exec(config.createTableSql);
-
-  // Generic migration: add any columns from config that are missing
-  const existing = new Set(
-    (_db.pragma("table_info(snapshots)") as Array<{ name: string }>).map((r) => r.name),
-  );
-  for (const col of config.columnDefs) {
-    if (!existing.has(col.snake)) {
-      _db.exec(`ALTER TABLE snapshots ADD COLUMN ${col.snake} ${col.sqlType}`);
-    }
-  }
-
-  // EAV table (new canonical format)
+  // EAV readings table — canonical format
   _db.exec(config.createReadingsTableSql);
 
   return _db;
@@ -83,25 +63,13 @@ function writeSnapshot(snapshot: SnapshotRow, dbPath: string): string {
   const db = getDb(dbPath);
   const roundedTs = roundToFiveMinutes(snapshot.timestamp);
 
-  // Build snake_case params for the wide INSERT
-  const params: Record<string, string | number> = { timestamp: roundedTs };
-  for (const [camel, snake] of Object.entries(config.camelToSnake)) {
-    const val = snapshot[camel];
-    if (typeof val === "boolean") {
-      params[snake] = val ? 1 : 0;
-    } else {
-      params[snake] = val as string | number;
-    }
-  }
-
-  // Dual-write: wide table + EAV readings table in one transaction
+  // Build snake_case (name, value) pairs for EAV insert
+  const insertReading = db.prepare(INSERT_READING_SQL);
   const writeAll = db.transaction(() => {
-    db.prepare(INSERT_WIDE_SQL).run(params);
-
-    const insertReading = db.prepare(INSERT_READING_SQL);
-    for (const [snake, value] of Object.entries(params)) {
-      if (snake === "timestamp") continue;
-      insertReading.run({ timestamp: roundedTs, name: snake, value: String(value) });
+    for (const [camel, snake] of Object.entries(config.camelToSnake)) {
+      const val = snapshot[camel];
+      const value = typeof val === "boolean" ? (val ? "1" : "0") : String(val);
+      insertReading.run({ timestamp: roundedTs, name: snake, value });
     }
   });
   writeAll();

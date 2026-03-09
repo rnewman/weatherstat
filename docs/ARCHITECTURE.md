@@ -81,15 +81,15 @@ The system is organized around five fundamental concepts:
 - **Sensors** — observable quantities (temperature, humidity) with entity IDs and types
 - **Effectors** — actuatable devices (thermostats, mini splits, blowers, boiler) with command/state encodings and optional health checks
 - **Constraints** — scoring objectives on sensor values, with time-of-day bounds and asymmetric penalty weights, referencing sensors directly (not rooms)
-- **Windows** — environmental modifiers with binary state; their effect on sensor dynamics is derived from naming convention (Phase 1) or learned by sysid (Phase 3)
-- **Zones** — topological grouping of effectors (which thermostat controls which heating circuit)
+- **Windows** — environmental modifiers with binary state; their effect on sensor dynamics is learned by sysid (per-window cooling rate coefficients in TauModel)
+- **Zones** — topological grouping of effectors (which thermostat controls which heating circuit). Sensor-to-zone mapping is derived from the sysid coupling matrix (which thermostat has the highest gain for each sensor), not configured.
 
 **Contents:**
 - `location` — lat/lon/elevation/timezone (for solar position)
 - `sensors` — temperature and humidity entities (10+ humidity sensors)
 - `effectors` — thermostats, mini splits, blowers, boiler with mode encodings and health check thresholds
-- `windows` — window/door sensors (no configured room associations — effects derived)
-- `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights
+- `windows` — window/door sensors (effects learned by sysid, not configured)
+- `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights (no zone assignment — derived from coupling matrix)
 - `zones` — thermostat-to-circuit mapping
 - `energy_costs` — per-device energy cost for the optimizer
 - `advisory` — effort costs, quiet hours, cooldown timers
@@ -112,9 +112,7 @@ Periodically sample the full state of the house and persist it for training and 
 - Extracts values using config-driven column definitions (temperature attributes, HVAC actions/modes/targets, window states, weather conditions).
 - Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`) from HA's met.no integration for use by the simulator.
 - Deduplicates by rounding timestamps to the snapshot interval.
-- Writes to SQLite (`data/snapshots/snapshots.db`) in two formats (dual-write transition):
-  - **`readings` table** (EAV): `(timestamp, name, value)` triples. No schema changes needed to add sensors.
-  - **`snapshots` table** (wide, legacy): one column per sensor. Kept during transition.
+- Writes to SQLite (`data/snapshots/snapshots.db`) in EAV format: `readings` table with `(timestamp, name, value)` triples. No schema changes needed to add sensors.
 
 **Output:** SQLite database with 5-minute resolution. The `readings` table stores `(timestamp, name, value)` triples (~74 readings per snapshot). The Python reader pivots this to a wide DataFrame at load time, applying types from config.
 

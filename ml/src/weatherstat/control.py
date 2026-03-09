@@ -199,13 +199,6 @@ def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
     return hour >= start or hour < end
 
 
-# ── Zone mapping ──────────────────────────────────────────────────────────
-# Maps rooms to HVAC zones. Used as fallback in compute_comfort_cost when
-# a room-specific model prediction is unavailable.
-
-ROOM_TO_ZONE: dict[str, str] = _CFG.room_to_zone
-
-
 # ── Cost function ─────────────────────────────────────────────────────────
 
 
@@ -228,10 +221,7 @@ def compute_comfort_cost(
     horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
 
     for schedule in schedules:
-        zone = ROOM_TO_ZONE.get(schedule.room)
-        if zone is None:
-            continue
-
+        room = schedule.room
         for h in CONTROL_HORIZONS:
             weight = HORIZON_WEIGHTS.get(h, 0.5)
             hours_ahead = horizon_hours.get(h, h // 12)
@@ -241,13 +231,7 @@ def compute_comfort_cost(
             if comfort is None:
                 continue
 
-            # Prefer room's own model prediction; fall back to zone thermostat prediction
-            room = schedule.room
-            pred_key = f"{room}_temp_t+{h}"
-            pred_temp = predictions.get(pred_key)
-            if pred_temp is None:
-                pred_key = f"{zone}_temp_t+{h}"
-                pred_temp = predictions.get(pred_key)
+            pred_temp = predictions.get(f"{room}_temp_t+{h}")
             if pred_temp is None:
                 continue
 
@@ -281,6 +265,29 @@ def compute_energy_cost(scenario: TrajectoryScenario) -> float:
     for bd in scenario.blowers:
         cost += ENERGY_COST_BLOWER.get(bd.mode, 0.0)
     return cost
+
+
+def _derive_sensor_zones(gains: dict[tuple[str, str], tuple[float, float]]) -> dict[str, str]:
+    """Derive sensor → zone mapping from the sysid coupling matrix.
+
+    For each sensor, find the thermostat effector with the highest positive gain.
+    Returns label -> zone_name (e.g., {"bedroom": "upstairs"}).
+    """
+    zones = _CFG.zones  # zone_name -> ZoneConfig(thermostat=...)
+    thermostat_to_zone = {f"thermostat_{z.thermostat}": z.name for z in zones.values()}
+
+    # Accumulate best thermostat gain per sensor
+    best: dict[str, tuple[str, float]] = {}  # sensor -> (zone, gain)
+    for (effector, sensor), (gain, _lag) in gains.items():
+        if effector not in thermostat_to_zone or gain <= 0:
+            continue
+        zone = thermostat_to_zone[effector]
+        label = sensor.removeprefix("thermostat_").removesuffix("_temp")
+        prev = best.get(label)
+        if prev is None or gain > prev[1]:
+            best[label] = (zone, gain)
+
+    return {label: zone for label, (zone, _) in best.items()}
 
 
 def _zone_comfort_max(zone: str, schedules: list[ComfortSchedule], hour: int) -> float:
@@ -406,6 +413,7 @@ def sweep_scenarios_physics(
 
     assert isinstance(sim_params, SimParams)
 
+    sensor_zones = _derive_sensor_zones(sim_params.gains)
     scenarios = generate_trajectory_scenarios()
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
@@ -515,7 +523,7 @@ def sweep_scenarios_physics(
             if comfort is None:
                 continue
             if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
-                zone = ROOM_TO_ZONE.get(room)
+                zone = sensor_zones.get(room)
                 if zone:
                     cold_zones.add(zone)
                     cold_rooms_info.append(f"{room} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")

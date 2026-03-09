@@ -8,10 +8,10 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 ## Architecture
 
 - HA interface is abstracted behind `HAClient` (types.ts). WebSocket is one implementation; add-on/integration would use HA internal API.
-- Collector writes 5-min snapshots to SQLite (`data/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Legacy wide `snapshots` table is also written (dual-write transition). Python reader uses `readings` table and pivots to wide DataFrame. Sysid reads this for parameter fitting. Control output goes to JSON in `data/predictions/`.
+- Collector writes 5-min snapshots to SQLite (`data/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Python reader pivots to wide DataFrame at load time, applying types from config. Sysid reads this for parameter fitting. Control output goes to JSON in `data/predictions/`.
 - Weather forecasts come from HA's `weather.forecast_home` entity (met.no). The collector stores hourly forecast snapshots; the simulator uses live forecasts for piecewise outdoor temp integration.
 - Entity IDs are real and live in `ha-client/src/entities.ts`. Full reference in `docs/entities.md`.
-- Collector SQLite uses EAV format (`readings` table with `timestamp, name, value` columns). Adding a sensor requires no schema change. The Python reader pivots to wide DataFrame at load time, applying types from config. Legacy wide `snapshots` table is maintained during transition.
+- Sensor-to-zone mapping is derived from the sysid coupling matrix (which thermostat has the highest gain for each sensor), not configured in YAML.
 
 ## Development Stages
 
@@ -24,8 +24,9 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 7. **Effector inertia planning** (done) — Trajectory search for slow effectors, physics-only control (ML removed).
 8. **Virtual effectors Phase 1** (done) — Physics-based window advisories integrated into control loop.
 9. **Generalized architecture Phase 1** (done) — Sensor/effector/constraint model replaces room-centric config. Generic device health checks. Boiler column generalization. Humidity sensor expansion.
-10. **Narrow storage Phase 2** (done) — EAV `readings` table replaces wide `snapshots` schema. Dual-write transition. No schema changes needed to add sensors.
+10. **Narrow storage Phase 2** (done) — EAV `readings` table is canonical storage. Legacy wide `snapshots` table and dual-write removed. No schema changes needed to add sensors.
 11. **Learned window effects Phase 3** (done) — `TauModel` with per-window `window_betas` replaces binary sealed/ventilated tau. Sysid learns window cooling rate coefficients and cross-breeze interactions from regression.
+12. **Derived zone mapping** (done) — Sensor-to-zone mapping derived from sysid coupling matrix (highest thermostat gain per sensor). Zone removed from constraints YAML and `ConstraintSchedule`. Legacy wide table dropped from collector.
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 

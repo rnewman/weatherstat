@@ -129,8 +129,8 @@ effectors:
           message: "Boiler return temp too low — may be in Zone Pump mode"
 
 # ── Windows: environmental modifiers ──────────────────────────────────────
-# No 'affects' — sysid learns per-window, per-sensor coupling (Phase 3).
-# Until then, window-sensor mapping is derived from naming convention.
+# No 'affects' — sysid learns per-window, per-sensor coupling coefficients
+# (window_betas in TauModel). Naming convention provides fallback mapping.
 
 windows:
   basement:
@@ -156,45 +156,37 @@ weather:
 # ── Constraints: scoring objectives on sensor values ─────────────────────
 # The optimizer minimizes penalty-weighted violations of these bounds.
 # Each constraint references a sensor directly (not a room).
-# Zone indicates which heating circuit affects this sensor (for cold-room
-# override and blower constraints). Will be derived from sysid in Phase 4.
+# Sensor-to-zone mapping is derived from the sysid coupling matrix
+# (which thermostat has the highest gain for each sensor).
 
 constraints:
   window_open_offset: { min: -2, max: 2 }
   schedules:
     - sensor: thermostat_upstairs_temp
-      zone: upstairs
       schedule:
         - { hours: [0, 24], min: 70, max: 75, hot_penalty: 0.5 }
     - sensor: thermostat_downstairs_temp
-      zone: downstairs
       schedule:
         - { hours: [0, 24], min: 70, max: 74 }
     - sensor: bedroom_temp
-      zone: upstairs
       schedule:
         - { hours: [6, 9], min: 70, max: 73, cold_penalty: 2.0, hot_penalty: 2.0 }
         - { hours: [9, 21], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
         - { hours: [21, 6], min: 68, max: 72, cold_penalty: 2.0, hot_penalty: 0.75 }
     - sensor: office_temp
-      zone: downstairs
       schedule:
         - { hours: [8, 18], min: 70, max: 74, cold_penalty: 2.0, hot_penalty: 2.0 }
         - { hours: [18, 8], min: 67, max: 76, cold_penalty: 1.0, hot_penalty: 0.5 }
     - sensor: family_room_temp
-      zone: downstairs
       schedule:
         - { hours: [0, 24], min: 70, max: 74 }
     - sensor: kitchen_temp
-      zone: upstairs
       schedule:
         - { hours: [0, 24], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
     - sensor: piano_temp
-      zone: upstairs
       schedule:
         - { hours: [0, 24], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
     - sensor: bathroom_temp
-      zone: upstairs
       schedule:
         - { hours: [0, 24], min: 68, max: 76, cold_penalty: 0.5, hot_penalty: 0.3 }
 

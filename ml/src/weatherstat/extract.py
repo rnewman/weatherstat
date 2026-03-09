@@ -535,8 +535,7 @@ def _load_from_readings(conn: sqlite3.Connection) -> pd.DataFrame:
 def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
     """Load all collector snapshots from the SQLite database.
 
-    Reads from the EAV ``readings`` table if it exists and has data,
-    otherwise falls back to the legacy wide ``snapshots`` table.
+    Reads from the EAV ``readings`` table and pivots to wide format.
 
     Args:
         db_path: Path to snapshots.db. Defaults to SNAPSHOTS_DB.
@@ -550,26 +549,7 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
         sys.exit(1)
 
     conn = sqlite3.connect(str(path))
-
-    # Check if readings table exists and has data
-    tables = {
-        row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-    }
-    if "readings" in tables:
-        count = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        if count > 0:
-            df = _load_from_readings(conn)
-            conn.close()
-            for col in _CFG.window_bool_columns:
-                if col in df.columns:
-                    df[col] = df[col].astype(bool)
-            return df
-
-    # Fallback to legacy wide table
-    df = pd.read_sql("SELECT * FROM snapshots ORDER BY timestamp", conn)
+    df = _load_from_readings(conn)
     conn.close()
 
     for col in _CFG.window_bool_columns:

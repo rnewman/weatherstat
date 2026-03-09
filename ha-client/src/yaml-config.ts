@@ -313,21 +313,10 @@ function loadYamlConfig() {
 
   // ── Derived arrays ───────────────────────────────────────────────────
 
-  const snapshotColumns = columnDefs.map((d) => d.snake);
-
   const camelToSnake: Record<string, string> = {};
   for (const d of columnDefs) {
     camelToSnake[d.camel] = d.snake;
   }
-
-  const createTableSql = [
-    "CREATE TABLE IF NOT EXISTS snapshots (",
-    "  timestamp TEXT PRIMARY KEY,",
-    ...columnDefs.map(
-      (d, i) => `  ${d.snake} ${d.sqlType}${i < columnDefs.length - 1 ? "," : ""}`,
-    ),
-    ")",
-  ].join("\n");
 
   const createReadingsTableSql = [
     "CREATE TABLE IF NOT EXISTS readings (",
@@ -402,9 +391,7 @@ function loadYamlConfig() {
 
     // Derived schema
     columnDefs,
-    snapshotColumns,
     camelToSnake,
-    createTableSql,
     createReadingsTableSql,
     allMonitoredEntities,
   } as const;

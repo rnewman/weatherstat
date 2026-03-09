@@ -115,7 +115,6 @@ class ConstraintSchedule:
     """Comfort constraint on a sensor's value over time."""
 
     sensor: str  # sensor column name (e.g., "bedroom_temp")
-    zone: str  # heating zone (e.g., "upstairs")
     label: str  # derived display label (e.g., "bedroom")
     entries: tuple[ComfortEntry, ...] = ()
 
@@ -143,28 +142,6 @@ class AdvisoryConfig:
 @dataclass(frozen=True)
 class SafetyConfig:
     cooldowns: dict[str, int] = field(default_factory=dict)
-
-
-# ── Backward compat (used by sysid, features until updated) ─────────────
-
-
-@dataclass(frozen=True)
-class RoomConfig:
-    """Backward compat — derived from constraints. Will be removed in Phase 4."""
-
-    name: str
-    temp_column: str
-    zone: str
-
-
-@dataclass(frozen=True)
-class ThermalConfig:
-    """Backward compat — replaced by defaults.tau + sysid. Will be removed in Phase 3."""
-
-    tau_sealed: dict[str, float]
-    tau_ventilated: dict[str, float]
-    default_tau_sealed: float = 45.0
-    default_tau_ventilated: float = 20.0
 
 
 # ── Top-level config ─────────────────────────────────────────────────────
@@ -203,11 +180,6 @@ class WeatherstatConfig:
     def room_temp_columns(self) -> dict[str, str]:
         """label -> sensor column name for prediction targets."""
         return {c.label: c.sensor for c in self.constraints}
-
-    @property
-    def room_to_zone(self) -> dict[str, str]:
-        """label -> zone_name for control constraints."""
-        return {c.label: c.zone for c in self.constraints}
 
     @property
     def statistics_entities(self) -> dict[str, str]:
@@ -302,21 +274,6 @@ class WeatherstatConfig:
     def comfort(self) -> dict[str, list[ComfortEntry]]:
         """label -> comfort entries. Backward compat for control.py."""
         return {c.label: list(c.entries) for c in self.constraints}
-
-    @property
-    def rooms(self) -> dict[str, RoomConfig]:
-        """Backward compat — derived from constraints."""
-        return {c.label: RoomConfig(name=c.label, temp_column=c.sensor, zone=c.zone) for c in self.constraints}
-
-    @property
-    def thermal(self) -> ThermalConfig:
-        """Backward compat — returns default tau for all rooms."""
-        return ThermalConfig(
-            tau_sealed={},
-            tau_ventilated={},
-            default_tau_sealed=self.default_tau,
-            default_tau_ventilated=self.default_tau * 0.45,
-        )
 
     @property
     def safety_navien(self) -> None:
@@ -567,7 +524,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     constraint_list: list[ConstraintSchedule] = []
     for sched in constraints_data.get("schedules", []):
         sensor = sched["sensor"]
-        zone = sched["zone"]
         label = sensor.removeprefix("thermostat_").removesuffix("_temp")
         entries: list[ComfortEntry] = []
         for entry in sched["schedule"]:
@@ -581,7 +537,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
                 hot_penalty=float(entry.get("hot_penalty", 1.0)),
             ))
         constraint_list.append(ConstraintSchedule(
-            sensor=sensor, zone=zone, label=label, entries=tuple(entries),
+            sensor=sensor, label=label, entries=tuple(entries),
         ))
 
     # ── Zones ────────────────────────────────────────────────────────
