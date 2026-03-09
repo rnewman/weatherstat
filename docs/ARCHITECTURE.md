@@ -137,7 +137,7 @@ dT/dt = (T_outdoor - T) / tau
 ```
 
 Where:
-- `tau` is the envelope loss time constant (sealed or ventilated, depending on window state)
+- `tau` is the effective envelope time constant, computed from `TauModel`: `1/tau_eff = 1/tau_base + Σ β_w × open_w + Σ β_{ww'} × open_w × open_w'`
 - Each effector `e` contributes a gain (°F/hr per activity unit) delayed by its fitted lag
 - Solar gain is a per-sensor, per-hour profile from sysid
 
@@ -149,16 +149,17 @@ Where:
 
 Fits all thermal model parameters from observed collector data using a two-stage approach.
 
-**Stage 1 — Tau fitting (scipy `curve_fit`):** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off. Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via nonlinear least squares on each contiguous segment, separated by window state. Multiple segments → weighted median → tighter estimate than single-night fitting. Produces `tau_sealed` and `tau_ventilated` per sensor. Window-sensor associations are derived by naming convention (e.g., `bedroom_temp` ↔ `window_bedroom_open`).
+**Stage 1 — Tau fitting (scipy `curve_fit`):** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off AND all windows are closed (sealed envelope). Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via nonlinear least squares on each contiguous segment. Multiple segments → weighted median → `tau_base` (sealed envelope time constant).
 
-**Stage 2 — Effector gains and solar profiles (numpy linear regression):** With tau fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on lagged effector activity (coarse time bins capturing delay) and hour-of-day indicators (capturing solar gain). One regression per sensor; coefficients across all sensors form the full coupling matrix.
+**Stage 2 — Effector gains, solar profiles, and window effects (numpy linear regression):** With tau_base fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on: lagged effector activity (coarse time bins capturing delay), hour-of-day indicators (solar gain), per-window `window_state × (T_out - T)` features (cooling rate when open), and window pair interactions (cross-breeze effects). One regression per sensor.
 
 The regression uses `np.linalg.lstsq` (OLS) with automatic fallback to ridge regression (`np.linalg.solve` with L2 penalty) when the condition number indicates collinear effectors. T-statistics flag negligible gains (|gain| < 0.05°F/hr AND |t-stat| < 2.0).
 
 **What it extracts:**
 - **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.
 - **Solar gain profiles**: per-sensor, per-hour-of-day gain coefficients.
-- **Tau per sensor**: envelope loss time constants (sealed and ventilated), more robust than single-night fits.
+- **Tau per sensor**: `tau_base` (sealed envelope time constant).
+- **Window coupling coefficients**: per-window `β_w` (additional cooling rate when window is open) and cross-breeze interaction terms `β_{ww'}`. The simulator computes effective tau as `1 / (1/tau_base + Σ β_w × open_w + Σ β_{ww'} × open_w × open_w')`.
 
 **Config-driven:** Effectors and sensors enumerated from `weatherstat.yaml`. Adding a device or sensor = YAML edit + rerun.
 

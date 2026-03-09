@@ -8,6 +8,7 @@ import pytest
 from weatherstat.simulator import (
     HouseState,
     SimParams,
+    TauModel,
     _outdoor_at,
     build_activity_timeline,
     load_sim_params,
@@ -86,10 +87,11 @@ def test_load_sim_params(sim_params: SimParams) -> None:
 
 
 def test_tau_values_reasonable(sim_params: SimParams) -> None:
-    for sensor, (tau_s, tau_v) in sim_params.taus.items():
-        assert tau_s > 0, f"{sensor} tau_sealed must be positive"
-        assert tau_v > 0, f"{sensor} tau_vent must be positive"
-        assert tau_v <= tau_s, f"{sensor} ventilated tau should be <= sealed"
+    for sensor, tau_model in sim_params.taus.items():
+        assert tau_model.tau_base > 0, f"{sensor} tau_base must be positive"
+        # Window betas should be non-negative (physical constraint)
+        for win, beta in tau_model.window_betas.items():
+            assert beta >= 0, f"{sensor} window {win} beta must be >= 0"
 
 
 # ── _outdoor_at ──────────────────────────────────────────────────────────
@@ -168,9 +170,7 @@ def test_passive_cooling_toward_outdoor() -> None:
         current_temp=70.0,
         outdoor_temp=42.0,
         forecast_temps=[42.0] * 12,
-        tau_sealed=40.0,
-        tau_vent=17.0,
-        is_ventilated=False,
+        tau=40.0,
         effector_timelines={},
         gains={},
         solar_profile={},
@@ -185,15 +185,16 @@ def test_passive_cooling_toward_outdoor() -> None:
 
 
 def test_ventilated_cools_faster() -> None:
-    """Ventilated (open windows) should cool faster."""
+    """Open windows (lower effective tau) should cool faster."""
+    tau_model = TauModel(tau_base=40.0, window_betas={"test_window": 0.04})
     kwargs = dict(
         sensor="test", current_temp=70.0, outdoor_temp=42.0,
-        forecast_temps=[42.0] * 12, tau_sealed=40.0, tau_vent=17.0,
+        forecast_temps=[42.0] * 12,
         effector_timelines={}, gains={}, solar_profile={},
         start_hour=2.0, n_steps=72,
     )
-    sealed = simulate_sensor(**kwargs, is_ventilated=False)
-    vent = simulate_sensor(**kwargs, is_ventilated=True)
+    sealed = simulate_sensor(**kwargs, tau=tau_model.effective_tau({}))
+    vent = simulate_sensor(**kwargs, tau=tau_model.effective_tau({"test_window": True}))
     # At every step, ventilated should be cooler
     assert all(v < s for v, s in zip(vent, sealed, strict=True))
 
@@ -206,9 +207,7 @@ def test_heating_warms_sensor() -> None:
         current_temp=68.0,
         outdoor_temp=42.0,
         forecast_temps=[42.0] * 12,
-        tau_sealed=40.0,
-        tau_vent=17.0,
-        is_ventilated=False,
+        tau=40.0,
         effector_timelines={"heater": timeline},
         gains={"heater": (2.0, 0.0)},  # 2°F/hr, no delay
         solar_profile={},

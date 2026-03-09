@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -66,20 +66,24 @@ class SensorSpec:
 
     name: str
     temp_column: str
-    window_columns: list[str]
-    yaml_tau_sealed: float
-    yaml_tau_ventilated: float
+    yaml_tau_base: float
 
 
 @dataclass(frozen=True)
 class FittedTau:
-    """Envelope loss rate fitted from overnight cooling data."""
+    """Envelope loss rate fitted from overnight cooling data.
+
+    tau_base: sealed envelope time constant (all windows closed).
+    window_betas: per-window additional cooling rate coefficients,
+        learned by regression in Stage 2.
+    interaction_betas: cross-breeze coefficients for window pairs.
+    """
 
     sensor: str
-    tau_sealed: float
-    tau_ventilated: float | None
-    n_segments_sealed: int
-    n_segments_ventilated: int
+    tau_base: float
+    n_segments: int
+    window_betas: dict[str, float] = field(default_factory=dict)
+    interaction_betas: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -191,11 +195,9 @@ def _enumerate_effectors() -> list[EffectorSpec]:
 def _enumerate_sensors() -> list[SensorSpec]:
     """Build sensor list from YAML config.
 
-    Window columns and initial tau values are derived from the config:
-    - Window mapping uses naming convention (Phase 1) — e.g., bedroom_temp
-      gets window_bedroom_open if a bedroom window exists.
-    - Tau uses defaults.tau as the initial guess for curve_fit. Sysid fits
-      the actual value from data.
+    Tau uses defaults.tau as the initial guess for curve_fit. Sysid fits
+    the actual value from data. Window effects are learned in Stage 2
+    regression — no configured window→sensor mapping needed.
     """
     sensors: list[SensorSpec] = []
 
@@ -203,14 +205,10 @@ def _enumerate_sensors() -> list[SensorSpec]:
         if col_name == "outdoor_temp":
             continue
 
-        window_cols = _CFG.window_columns_for_sensor(col_name)
-
         sensors.append(SensorSpec(
             name=col_name,
             temp_column=col_name,
-            window_columns=window_cols,
-            yaml_tau_sealed=_CFG.default_tau,
-            yaml_tau_ventilated=_CFG.default_tau * 0.45,
+            yaml_tau_base=_CFG.default_tau,
         ))
 
     return sensors
@@ -238,17 +236,15 @@ def _fit_tau_curve(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> 
         return None
 
 
-def _find_nighttime_hvac_off_segments(
+def _find_nighttime_sealed_segments(
     df: pd.DataFrame,
     effectors: list[EffectorSpec],
     sensor: SensorSpec,
-    verbose: bool = False,
-) -> tuple[list[tuple[pd.DataFrame, bool]], int]:
-    """Find contiguous nighttime HVAC-off segments for a sensor.
+) -> list[pd.DataFrame]:
+    """Find contiguous nighttime HVAC-off, all-windows-closed segments.
 
-    Returns:
-        (segments, total_count) where each segment is (sub_df, is_ventilated)
-        and total_count is number of qualifying segments found.
+    Only returns fully sealed segments (all windows closed) for tau_base
+    fitting. Window effects are learned separately in Stage 2 regression.
     """
     # Identify nighttime rows
     local_hour = df["_local_hour"]
@@ -265,40 +261,34 @@ def _find_nighttime_hvac_off_segments(
 
     mask = is_night & all_off
 
+    # All windows closed
+    all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
+    existing_win_cols = [c for c in all_win_cols if c in df.columns]
+    if existing_win_cols:
+        mask &= ~df[existing_win_cols].any(axis=1)
+
     # Drop rows where this sensor's temp is NaN
     temp_col = sensor.temp_column
     if temp_col not in df.columns:
-        return [], 0
+        return []
     mask &= df[temp_col].notna() & df["outdoor_temp"].notna()
 
     qualifying = df[mask].copy()
     if len(qualifying) < _MIN_SEGMENT_STEPS:
-        return [], 0
+        return []
 
     # Split into contiguous segments (gaps > 10 min break segments)
     dt = qualifying["_ts"].diff()
     breaks = dt > pd.Timedelta(minutes=10)
-
-    # Also break on window state changes
-    window_cols = [c for c in sensor.window_columns if c in df.columns]
-    any_ventilated_col = None
-    if window_cols:
-        any_ventilated_col = "_vent_" + sensor.name
-        qualifying[any_ventilated_col] = qualifying[window_cols].any(axis=1)
-        vent_changes = qualifying[any_ventilated_col].diff().abs() > 0
-        breaks |= vent_changes
-
     seg_ids = breaks.cumsum()
-    segments: list[tuple[pd.DataFrame, bool]] = []
+
+    segments: list[pd.DataFrame] = []
     for _, seg_df in qualifying.groupby(seg_ids):
         if len(seg_df) < _MIN_SEGMENT_STEPS:
             continue
-        is_vent = False
-        if any_ventilated_col and any_ventilated_col in seg_df.columns:
-            is_vent = bool(seg_df[any_ventilated_col].iloc[0])
-        segments.append((seg_df, is_vent))
+        segments.append(seg_df)
 
-    return segments, len(segments)
+    return segments
 
 
 def _fit_tau(
@@ -307,74 +297,42 @@ def _fit_tau(
     sensors: list[SensorSpec],
     verbose: bool = False,
 ) -> list[FittedTau]:
-    """Stage 1: Fit tau per sensor from overnight cooling data."""
+    """Stage 1: Fit tau_base per sensor from sealed overnight cooling data.
+
+    Only uses all-windows-closed segments. Window effects on tau are
+    learned separately in Stage 2 via regression on window × ΔT features.
+    """
     results: list[FittedTau] = []
 
     for sensor in sensors:
-        segments, n_total = _find_nighttime_hvac_off_segments(df, effectors, sensor, verbose)
+        segments = _find_nighttime_sealed_segments(df, effectors, sensor)
         if not segments:
             if verbose:
-                print(f"  {sensor.name}: no qualifying overnight segments")
-            # Use YAML defaults
+                print(f"  {sensor.name}: no qualifying sealed overnight segments")
             results.append(FittedTau(
                 sensor=sensor.name,
-                tau_sealed=sensor.yaml_tau_sealed,
-                tau_ventilated=sensor.yaml_tau_ventilated,
-                n_segments_sealed=0,
-                n_segments_ventilated=0,
+                tau_base=sensor.yaml_tau_base,
+                n_segments=0,
             ))
             continue
 
-        # Fit sealed and ventilated separately
-        sealed_taus: list[tuple[float, int]] = []  # (tau, segment_length)
-        vent_taus: list[tuple[float, int]] = []
-
-        for seg_df, is_vent in segments:
+        # Fit tau from each sealed segment
+        fitted_taus: list[tuple[float, int]] = []  # (tau, segment_length)
+        for seg_df in segments:
             t_hours = (seg_df["_ts"] - seg_df["_ts"].iloc[0]).dt.total_seconds().values / 3600.0
             temps = seg_df[sensor.temp_column].values
             t_outdoor = seg_df["outdoor_temp"].mean()
             tau = _fit_tau_curve(t_hours, temps, t_outdoor)
-            if tau is None:
-                continue
-            target = vent_taus if is_vent else sealed_taus
-            target.append((tau, len(seg_df)))
+            if tau is not None:
+                fitted_taus.append((tau, len(seg_df)))
 
-        # Weighted median by segment length
-        tau_sealed = _weighted_median(sealed_taus) if sealed_taus else sensor.yaml_tau_sealed
-        tau_vent = _weighted_median(vent_taus) if vent_taus else None
+        tau_base = _weighted_median(fitted_taus) if fitted_taus else sensor.yaml_tau_base
 
         results.append(FittedTau(
             sensor=sensor.name,
-            tau_sealed=tau_sealed,
-            tau_ventilated=tau_vent,
-            n_segments_sealed=len(sealed_taus),
-            n_segments_ventilated=len(vent_taus),
+            tau_base=tau_base,
+            n_segments=len(fitted_taus),
         ))
-
-    # Sanity check: ventilated tau must be less than sealed tau.
-    # If not (e.g., window sensor stuck open), discard the ventilated fit.
-    for i, ft in enumerate(results):
-        if ft.tau_ventilated is not None and ft.tau_sealed > 0 and ft.tau_ventilated > ft.tau_sealed:
-            results[i] = FittedTau(
-                sensor=ft.sensor,
-                tau_sealed=ft.tau_sealed,
-                tau_ventilated=None,
-                n_segments_sealed=ft.n_segments_sealed,
-                n_segments_ventilated=0,
-            )
-
-    # Estimate ventilated tau for sensors without measured data using ratio
-    # from a sensor that has both
-    ratio = _estimate_vent_ratio(results)
-    for i, ft in enumerate(results):
-        if ft.tau_ventilated is None:
-            results[i] = FittedTau(
-                sensor=ft.sensor,
-                tau_sealed=ft.tau_sealed,
-                tau_ventilated=round(ft.tau_sealed * ratio, 1),
-                n_segments_sealed=ft.n_segments_sealed,
-                n_segments_ventilated=0,
-            )
 
     return results
 
@@ -392,15 +350,6 @@ def _weighted_median(values_weights: list[tuple[float, int]]) -> float:
     mid = cumw[-1] / 2.0
     idx = np.searchsorted(cumw, mid)
     return round(float(vals[min(idx, len(vals) - 1)]), 1)
-
-
-def _estimate_vent_ratio(fitted: list[FittedTau]) -> float:
-    """Estimate ventilated/sealed ratio from sensors that have both."""
-    ratios: list[float] = []
-    for ft in fitted:
-        if ft.tau_ventilated is not None and ft.n_segments_ventilated > 0 and ft.tau_sealed > 0:
-            ratios.append(ft.tau_ventilated / ft.tau_sealed)
-    return float(np.median(ratios)) if ratios else 0.44
 
 
 # ── Preprocessing ─────────────────────────────────────────────────────────
@@ -505,6 +454,7 @@ def _preprocess(
 _GAIN_THRESHOLD = 0.05  # °F/hr — below this, gain is negligible
 _T_STAT_THRESHOLD = 2.0
 _MIN_REGRESSION_ROWS = 500  # need substantial data for reliable regression
+_MIN_INTERACTION_ROWS = 100  # min co-open rows for window interaction terms
 
 
 def _get_lag_columns(eff: EffectorSpec) -> list[str]:
@@ -530,29 +480,25 @@ def _fit_sensor_model(
     df: pd.DataFrame,
     sensor: SensorSpec,
     effectors: list[EffectorSpec],
-    tau: float,
-    tau_vent: float,
+    tau_base: float,
     verbose: bool = False,
-) -> tuple[list[EffectorSensorGain], list[SolarGainProfile]]:
-    """Stage 2: Fit regression for one sensor."""
+) -> tuple[list[EffectorSensorGain], list[SolarGainProfile], dict[str, float], dict[str, float]]:
+    """Stage 2: Fit regression for one sensor.
+
+    Returns (gains, solar_profiles, window_betas, interaction_betas).
+    Window betas are per-window additional cooling rate coefficients,
+    learned as regression coefficients on window_state × (T_out - T).
+    """
     temp_col = sensor.temp_column
     dTdt_col = f"_dTdt_{sensor.name}"
 
     if temp_col not in df.columns or dTdt_col not in df.columns:
-        return [], []
+        return [], [], {}, {}
     if "outdoor_temp" not in df.columns:
-        return [], []
+        return [], [], {}, {}
 
-    # Determine tau per row (sealed vs ventilated)
-    window_cols = [c for c in sensor.window_columns if c in df.columns]
-    if window_cols:
-        is_vent = df[window_cols].any(axis=1)
-        tau_per_row = np.where(is_vent, tau_vent, tau)
-    else:
-        tau_per_row = np.full(len(df), tau)
-
-    # Newton residual: observed dT/dt minus expected passive cooling
-    newton_dTdt = (df["outdoor_temp"].values - df[temp_col].values) / tau_per_row
+    # Newton residual using tau_base (all rows, not split by window state)
+    newton_dTdt = (df["outdoor_temp"].values - df[temp_col].values) / tau_base
     residual = df[dTdt_col].values - newton_dTdt
 
     # Build feature matrix
@@ -572,6 +518,33 @@ def _fit_sensor_model(
         if end > start:
             effector_feature_ranges[eff.name] = (start, end)
 
+    # Window × ΔT features: window_state × (T_outdoor - T_sensor)
+    # The coefficient β_w gives the additional cooling rate when the window is open.
+    all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
+    existing_win_cols = [c for c in all_win_cols if c in df.columns]
+    delta_t = df["outdoor_temp"].values - df[temp_col].values
+
+    window_feature_start = len(feature_names)
+    window_feature_names: list[str] = []  # bare window names in order
+    for wc in existing_win_cols:
+        win_name = wc.removeprefix("window_").removesuffix("_open")
+        feature_names.append(f"_win_{win_name}")
+        feature_cols.append(df[wc].values.astype(float) * delta_t)
+        window_feature_names.append(win_name)
+
+    # Window interaction features: pairs with enough co-open data
+    interaction_feature_start = len(feature_names)
+    interaction_feature_names: list[str] = []  # "w1+w2" in order
+    for i, wc1 in enumerate(existing_win_cols):
+        for wc2 in existing_win_cols[i + 1:]:
+            co_open = df[wc1].values.astype(bool) & df[wc2].values.astype(bool)
+            if co_open.sum() >= _MIN_INTERACTION_ROWS:
+                w1 = wc1.removeprefix("window_").removesuffix("_open")
+                w2 = wc2.removeprefix("window_").removesuffix("_open")
+                feature_names.append(f"_winx_{w1}+{w2}")
+                feature_cols.append(co_open.astype(float) * delta_t)
+                interaction_feature_names.append(f"{w1}+{w2}")
+
     # Solar hour indicators
     solar_start = len(feature_names)
     for h in range(7, 18):
@@ -580,7 +553,7 @@ def _fit_sensor_model(
             feature_names.append(col_name)
             feature_cols.append(df[col_name].values.astype(float))
     if not feature_cols:
-        return [], []
+        return [], [], {}, {}
 
     X = np.column_stack(feature_cols)
 
@@ -594,7 +567,6 @@ def _fit_sensor_model(
     if len(y) < max(X.shape[1] + 10, _MIN_REGRESSION_ROWS):
         if verbose:
             print(f"  {sensor.name}: insufficient data ({len(y)} rows, need {_MIN_REGRESSION_ROWS}+)")
-        # Return all-negligible gains
         gains = [
             EffectorSensorGain(
                 effector=e.name, sensor=sensor.name,
@@ -603,18 +575,16 @@ def _fit_sensor_model(
             )
             for e in effectors
         ]
-        return gains, []
+        return gains, [], {}, {}
 
     # Check condition number for collinearity
     cond = np.linalg.cond(X)
     use_ridge = cond > 1e6
 
     if use_ridge:
-        # Ridge regression: (X'X + λI)^-1 X'y
         lam = 0.01 * len(y)
         XtX = X.T @ X + lam * np.eye(X.shape[1])
         beta = np.linalg.solve(XtX, X.T @ y)
-        # Approximate standard errors
         resid = y - X @ beta
         s2 = np.sum(resid**2) / max(len(y) - X.shape[1], 1)
         try:
@@ -623,7 +593,6 @@ def _fit_sensor_model(
         except np.linalg.LinAlgError:
             se = np.full(len(beta), np.nan)
     else:
-        # OLS: numpy lstsq
         beta, residuals_sum, rank, sv = np.linalg.lstsq(X, y, rcond=None)
         resid = y - X @ beta
         s2 = np.sum(resid**2) / max(len(y) - X.shape[1], 1)
@@ -639,7 +608,6 @@ def _fit_sensor_model(
     gains: list[EffectorSensorGain] = []
     for eff in effectors:
         if eff.name not in effector_feature_ranges:
-            # Effector had no data columns
             gains.append(EffectorSensorGain(
                 effector=eff.name, sensor=sensor.name,
                 gain_f_per_hour=0.0, best_lag_minutes=0.0,
@@ -652,12 +620,10 @@ def _fit_sensor_model(
         lag_tstats = t_stats[start:end]
         lag_cols_used = feature_names[start:end]
 
-        # Best lag = bin with largest |beta|
         best_idx = int(np.argmax(np.abs(lag_betas)))
         best_lag_label = lag_cols_used[best_idx].split("_")[-2] + "_" + lag_cols_used[best_idx].split("_")[-1]
         best_lag_min = _lag_label_to_minutes(best_lag_label)
 
-        # Total gain = sum of betas across lag bins
         total_gain = float(np.sum(lag_betas))
         max_t = float(lag_tstats[best_idx])
 
@@ -672,6 +638,30 @@ def _fit_sensor_model(
             negligible=negligible,
         ))
 
+    # Extract window betas
+    # β_w > 0 is physical (window increases heat exchange rate).
+    # β_w < 0 is unphysical — flag as zero.
+    window_betas: dict[str, float] = {}
+    for i, win_name in enumerate(window_feature_names):
+        idx = window_feature_start + i
+        if idx < len(beta):
+            b = float(beta[idx])
+            t = float(t_stats[idx])
+            # Only keep physically sensible (positive) and statistically significant
+            if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
+                window_betas[win_name] = round(b, 6)
+            elif verbose:
+                print(f"    window {win_name}: β={b:.6f}, t={t:.1f} (dropped)")
+
+    interaction_betas: dict[str, float] = {}
+    for i, pair_name in enumerate(interaction_feature_names):
+        idx = interaction_feature_start + i
+        if idx < len(beta):
+            b = float(beta[idx])
+            t = float(t_stats[idx])
+            if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
+                interaction_betas[pair_name] = round(b, 6)
+
     # Extract solar profile
     solar_profiles: list[SolarGainProfile] = []
     for i, h in enumerate(range(7, 18)):
@@ -685,7 +675,7 @@ def _fit_sensor_model(
                 t_statistic=round(float(t_stats[idx]), 2),
             ))
 
-    return gains, solar_profiles
+    return gains, solar_profiles, window_betas, interaction_betas
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────
@@ -706,7 +696,7 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
             print(f"  {e.name} ({e.device_type}): {e.state_column}")
         print(f"\nSensors ({len(sensors)}):")
         for s in sensors:
-            print(f"  {s.name}: windows={s.window_columns}")
+            print(f"  {s.name}: tau_default={s.yaml_tau_base}")
 
     print("\nPreprocessing...")
     df = _preprocess(df, effectors, sensors)
@@ -716,30 +706,34 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
     data_end = str(ts.iloc[-1])
     print(f"  Data range: {data_start} to {data_end}")
 
-    # Stage 1: Fit tau
-    print("\n── Stage 1: Fitting tau (envelope loss) ──")
+    # Stage 1: Fit tau_base (sealed envelope)
+    print("\n── Stage 1: Fitting tau_base (sealed envelope loss) ──")
     fitted_taus = _fit_tau(df, effectors, sensors, verbose)
     for ft in fitted_taus:
-        src_s = f"fitted ({ft.n_segments_sealed} seg)" if ft.n_segments_sealed > 0 else "yaml default"
-        src_v = f"fitted ({ft.n_segments_ventilated} seg)" if ft.n_segments_ventilated > 0 else "estimated"
-        v_str = f"{ft.tau_ventilated:.1f}" if ft.tau_ventilated is not None else "N/A"
-        print(f"  {ft.sensor:30s}: sealed={ft.tau_sealed:5.1f}h ({src_s}), vent={v_str}h ({src_v})")
+        src = f"fitted ({ft.n_segments} seg)" if ft.n_segments > 0 else "yaml default"
+        print(f"  {ft.sensor:30s}: tau_base={ft.tau_base:5.1f}h ({src})")
 
     # Build tau lookup
-    tau_lookup: dict[str, tuple[float, float]] = {}
+    tau_lookup: dict[str, float] = {}
     for ft in fitted_taus:
-        tau_lookup[ft.sensor] = (ft.tau_sealed, ft.tau_ventilated or ft.tau_sealed * 0.44)
+        tau_lookup[ft.sensor] = ft.tau_base
 
-    # Stage 2: Regression per sensor
-    print("\n── Stage 2: Fitting effector gains and solar profiles ──")
+    # Stage 2: Regression per sensor (effector gains, solar, window effects)
+    print("\n── Stage 2: Fitting effector gains, solar, and window effects ──")
     all_gains: list[EffectorSensorGain] = []
     all_solar: list[SolarGainProfile] = []
+    all_window_betas: dict[str, dict[str, float]] = {}  # sensor -> {window -> beta}
+    all_interaction_betas: dict[str, dict[str, float]] = {}  # sensor -> {"w1+w2" -> beta}
 
     for sensor in sensors:
-        tau_s, tau_v = tau_lookup.get(sensor.name, (sensor.yaml_tau_sealed, sensor.yaml_tau_ventilated))
-        gains, solar = _fit_sensor_model(df, sensor, effectors, tau_s, tau_v, verbose)
+        tau_base = tau_lookup.get(sensor.name, sensor.yaml_tau_base)
+        gains, solar, win_betas, int_betas = _fit_sensor_model(df, sensor, effectors, tau_base, verbose)
         all_gains.extend(gains)
         all_solar.extend(solar)
+        if win_betas:
+            all_window_betas[sensor.name] = win_betas
+        if int_betas:
+            all_interaction_betas[sensor.name] = int_betas
 
         if verbose and gains:
             sig_gains = [g for g in gains if not g.negligible]
@@ -750,6 +744,19 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
                         f"    {g.effector}: {g.gain_f_per_hour:+.3f} °F/hr,"
                         f" lag={g.best_lag_minutes:.0f}min, t={g.t_statistic:.1f}"
                     )
+
+    # Merge window betas into FittedTau
+    for i, ft in enumerate(fitted_taus):
+        win_b = all_window_betas.get(ft.sensor, {})
+        int_b = all_interaction_betas.get(ft.sensor, {})
+        if win_b or int_b:
+            fitted_taus[i] = FittedTau(
+                sensor=ft.sensor,
+                tau_base=ft.tau_base,
+                n_segments=ft.n_segments,
+                window_betas=win_b,
+                interaction_betas=int_b,
+            )
 
     result = SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
@@ -792,18 +799,32 @@ def print_report(result: SysIdResult) -> None:
     print(f"\nData: {result.data_start} to {result.data_end} ({result.n_snapshots} snapshots)")
 
     # Tau fits
-    print("\n── Envelope Loss (tau, hours) ──")
-    hdr = f"  {'Sensor':<30s}  {'Sealed':>8s}  {'Vent':>8s}  {'YAML Sealed':>12s}  {'YAML Vent':>10s}  {'Seg':>8s}"
-    print(hdr)
-    print("  " + "-" * 82)
+    print("\n── Envelope Loss (tau_base, hours) ──")
     sensor_map = {s.name: s for s in result.sensors}
+    hdr = f"  {'Sensor':<30s}  {'tau_base':>8s}  {'Default':>8s}  {'Seg':>4s}  {'Windows':>8s}"
+    print(hdr)
+    print("  " + "-" * 66)
     for ft in result.fitted_taus:
         s = sensor_map.get(ft.sensor)
-        yaml_s = f"{s.yaml_tau_sealed:.1f}" if s else "?"
-        yaml_v = f"{s.yaml_tau_ventilated:.1f}" if s else "?"
-        vent_str = f"{ft.tau_ventilated:.1f}" if ft.tau_ventilated is not None else "N/A"
-        segs = f"{ft.n_segments_sealed}s/{ft.n_segments_ventilated}v"
-        print(f"  {ft.sensor:<30s}  {ft.tau_sealed:8.1f}  {vent_str:>8s}  {yaml_s:>12s}  {yaml_v:>10s}  {segs:>8s}")
+        default_str = f"{s.yaml_tau_base:.1f}" if s else "?"
+        n_win = len(ft.window_betas)
+        win_str = f"{n_win} β" if n_win > 0 else "–"
+        print(f"  {ft.sensor:<30s}  {ft.tau_base:8.1f}  {default_str:>8s}  {ft.n_segments:4d}  {win_str:>8s}")
+
+    # Window couplings (if any)
+    any_couplings = any(ft.window_betas for ft in result.fitted_taus)
+    if any_couplings:
+        print("\n── Window Couplings (β_w: additional cooling rate when open) ──")
+        for ft in result.fitted_taus:
+            if not ft.window_betas and not ft.interaction_betas:
+                continue
+            print(f"\n  {ft.sensor}:")
+            for win, beta in sorted(ft.window_betas.items()):
+                # Show effective tau when this window is open alone
+                eff_tau = 1.0 / (1.0 / ft.tau_base + beta) if beta > 0 else ft.tau_base
+                print(f"    {win:20s}: β={beta:.6f}  (eff tau={eff_tau:.1f}h)")
+            for pair, beta in sorted(ft.interaction_betas.items()):
+                print(f"    {pair:20s}: β={beta:.6f}  (interaction)")
 
     # Effector x sensor gain matrix
     print("\n── Effector × Sensor Gain Matrix (°F/hr, delay in parens) ──")

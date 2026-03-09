@@ -23,15 +23,42 @@ from weatherstat.types import BlowerDecision, MiniSplitDecision, TrajectoryScena
 
 
 @dataclass(frozen=True)
+class TauModel:
+    """Thermal envelope model with learned window effects.
+
+    tau_base: sealed envelope time constant (hours, all windows closed).
+    window_betas: per-window additional cooling rate coefficient.
+        When window is open, effective 1/tau += beta.
+    interaction_betas: cross-breeze coefficients for window pairs.
+        When both windows in a pair are open, effective 1/tau += beta.
+    """
+
+    tau_base: float
+    window_betas: dict[str, float] = field(default_factory=dict)
+    interaction_betas: dict[str, float] = field(default_factory=dict)
+
+    def effective_tau(self, window_states: dict[str, bool]) -> float:
+        """Compute effective tau given current window states."""
+        inv_tau = 1.0 / self.tau_base
+        for win, beta in self.window_betas.items():
+            if window_states.get(win, False):
+                inv_tau += beta
+        for key, beta in self.interaction_betas.items():
+            w1, w2 = key.split("+")
+            if window_states.get(w1, False) and window_states.get(w2, False):
+                inv_tau += beta
+        return 1.0 / max(inv_tau, 0.01)  # safety floor
+
+
+@dataclass(frozen=True)
 class SimParams:
     """Lookup structures for fast simulation from sysid output."""
 
-    taus: dict[str, tuple[float, float]]  # sensor -> (tau_sealed, tau_vent)
+    taus: dict[str, TauModel]  # sensor -> TauModel
     gains: dict[tuple[str, str], tuple[float, float]]  # (effector, sensor) -> (gain_f/hr, lag_min)
     solar: dict[tuple[str, int], float]  # (sensor, hour) -> gain_f/hr
     sensors: list[str]  # sensor names with params
     effectors: list[dict]  # raw effector dicts (name, encoding, device_type)
-    sensor_window_cols: dict[str, list[str]]  # sensor -> window column names
 
 
 @dataclass(frozen=True)
@@ -58,13 +85,21 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     with open(p) as f:
         data = json.load(f)
 
-    # Tau lookup
-    taus: dict[str, tuple[float, float]] = {}
+    # Tau lookup: build TauModel from fitted_taus
+    taus: dict[str, TauModel] = {}
     for ft in data["fitted_taus"]:
         sensor = ft["sensor"]
-        tau_s = ft["tau_sealed"]
-        tau_v = ft["tau_ventilated"] if ft["tau_ventilated"] is not None else tau_s * 0.44
-        taus[sensor] = (tau_s, tau_v)
+        if "tau_base" in ft:
+            # New format: tau_base + window_betas + interaction_betas
+            taus[sensor] = TauModel(
+                tau_base=ft["tau_base"],
+                window_betas=ft.get("window_betas", {}),
+                interaction_betas=ft.get("interaction_betas", {}),
+            )
+        else:
+            # Legacy format: tau_sealed / tau_ventilated
+            tau_s = ft["tau_sealed"]
+            taus[sensor] = TauModel(tau_base=tau_s)
 
     # Gain lookup (only non-negligible gains)
     gains: dict[tuple[str, str], tuple[float, float]] = {}
@@ -79,7 +114,6 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         solar[(sg["sensor"], sg["hour_of_day"])] = sg["gain_f_per_hour"]
 
     sensors = [s["name"] for s in data["sensors"]]
-    sensor_window_cols = {s["name"]: s["window_columns"] for s in data["sensors"]}
 
     return SimParams(
         taus=taus,
@@ -87,7 +121,6 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         solar=solar,
         sensors=sensors,
         effectors=data["effectors"],
-        sensor_window_cols=sensor_window_cols,
     )
 
 
@@ -154,9 +187,7 @@ def simulate_sensor(
     current_temp: float,
     outdoor_temp: float,
     forecast_temps: list[float],
-    tau_sealed: float,
-    tau_vent: float,
-    is_ventilated: bool,
+    tau: float,
     effector_timelines: dict[str, list[float]],
     gains: dict[str, tuple[float, float]],
     solar_profile: dict[int, float],
@@ -170,9 +201,8 @@ def simulate_sensor(
         current_temp: Temperature at t=0 (F).
         outdoor_temp: Current outdoor temp (F). Used if no forecast.
         forecast_temps: Hourly outdoor temps [h+1, h+2, ..., h+N].
-        tau_sealed: Envelope time constant, sealed (hours).
-        tau_vent: Envelope time constant, ventilated (hours).
-        is_ventilated: Whether windows are open for this sensor.
+        tau: Effective envelope time constant (hours), pre-computed from
+            TauModel.effective_tau(window_states).
         effector_timelines: effector_name -> full timeline (history + future).
             Timeline index `history_len` corresponds to t=0.
         gains: effector_name -> (gain_f_per_hour, lag_minutes) for this sensor.
@@ -183,7 +213,6 @@ def simulate_sensor(
     Returns:
         Temperature at each step [t+1, t+2, ..., t+n_steps].
     """
-    tau = tau_vent if is_ventilated else tau_sealed
     if tau <= 0:
         tau = 40.0  # safety fallback
 
@@ -415,14 +444,8 @@ def predict(
 
     # Simulate each sensor (vectorized across all scenarios)
     for sensor_col, col_targets in sensor_targets.items():
-        tau_s, tau_v = params.taus.get(sensor_col, (40.0, 17.6))
-        win_cols = params.sensor_window_cols.get(sensor_col, [])
-        is_vent = any(
-            state.window_states.get(wc.removeprefix("window_").removesuffix("_open"), False)
-            for wc in win_cols
-        )
-
-        tau = tau_v if is_vent else tau_s
+        tau_model = params.taus.get(sensor_col, TauModel(tau_base=40.0))
+        tau = tau_model.effective_tau(state.window_states)
         if tau <= 0:
             tau = 40.0
 

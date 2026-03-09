@@ -18,7 +18,7 @@ from weatherstat.advisory import (
     evaluate_window_advisories,
     process_advisories,
 )
-from weatherstat.simulator import HouseState, load_sim_params
+from weatherstat.simulator import HouseState, SimParams, TauModel, load_sim_params
 from weatherstat.types import (
     BlowerDecision,
     ComfortSchedule,
@@ -34,7 +34,37 @@ from weatherstat.types import (
 
 @pytest.fixture
 def sim_params():
-    return load_sim_params()
+    """Load sim params with synthetic window betas for advisory tests.
+
+    Sysid may not learn window betas if there's insufficient sealed/ventilated
+    data. Advisory tests need window effects to exist so toggling a window
+    changes simulation output.
+    """
+    params = load_sim_params()
+    # Inject window betas: each sensor with a matching window gets a beta
+    from weatherstat.yaml_config import load_config
+    cfg = load_config()
+    augmented_taus: dict[str, TauModel] = {}
+    for sensor, tau_model in params.taus.items():
+        win_cols = cfg.window_columns_for_sensor(sensor)
+        if win_cols and not tau_model.window_betas:
+            # Inject a reasonable beta: 1/tau_eff ≈ 1/tau_base + beta
+            # beta = 0.02 → effective tau ≈ 25h (from 45h base)
+            win_name = win_cols[0].removeprefix("window_").removesuffix("_open")
+            augmented_taus[sensor] = TauModel(
+                tau_base=tau_model.tau_base,
+                window_betas={win_name: 0.02},
+                interaction_betas=tau_model.interaction_betas,
+            )
+        else:
+            augmented_taus[sensor] = tau_model
+    return SimParams(
+        taus=augmented_taus,
+        gains=params.gains,
+        solar=params.solar,
+        sensors=params.sensors,
+        effectors=params.effectors,
+    )
 
 
 _CURRENT_TEMPS = {

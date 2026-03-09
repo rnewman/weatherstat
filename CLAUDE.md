@@ -25,6 +25,7 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 8. **Virtual effectors Phase 1** (done) — Physics-based window advisories integrated into control loop.
 9. **Generalized architecture Phase 1** (done) — Sensor/effector/constraint model replaces room-centric config. Generic device health checks. Boiler column generalization. Humidity sensor expansion.
 10. **Narrow storage Phase 2** (done) — EAV `readings` table replaces wide `snapshots` schema. Dual-write transition. No schema changes needed to add sensors.
+11. **Learned window effects Phase 3** (done) — `TauModel` with per-window `window_betas` replaces binary sealed/ventilated tau. Sysid learns window cooling rate coefficients and cross-breeze interactions from regression.
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
