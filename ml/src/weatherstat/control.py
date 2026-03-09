@@ -397,7 +397,7 @@ def sweep_scenarios_physics(
     current_split_temps: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
-) -> ControlDecision:
+) -> tuple[ControlDecision, TrajectoryScenario]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
     Thermostats are evaluated over a delay × duration grid (trajectory search).
@@ -597,7 +597,7 @@ def sweep_scenarios_physics(
                     break
             final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
 
-    return ControlDecision(
+    decision = ControlDecision(
         timestamp=datetime.now(UTC).isoformat(),
         upstairs_heating=up_heating_now,
         downstairs_heating=dn_heating_now,
@@ -619,6 +619,7 @@ def sweep_scenarios_physics(
         room_predictions=room_preds,
         trajectory_info=trajectory_info,
     )
+    return decision, scenario
 
 
 # ── State persistence ─────────────────────────────────────────────────────
@@ -902,7 +903,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     outdoor = float(out_temp) if out_temp is not None and not (
         isinstance(out_temp, float) and np.isnan(out_temp)
     ) else 50.0
-    decision = sweep_scenarios_physics(
+    decision, winning_scenario = sweep_scenarios_physics(
         current_temps,
         outdoor,
         forecast_temp_list,
@@ -997,7 +998,39 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if has_any:
             print(row)
 
-    # Safety checks
+    # ── Window advisories (physics-based) ──
+    from weatherstat.advisory import evaluate_window_advisories, process_advisories
+
+    original_schedules = default_comfort_schedules()
+    adv_state = _HS(
+        current_temps=current_temps,
+        outdoor_temp=outdoor,
+        forecast_temps=forecast_temp_list,
+        window_states=window_states_dict,
+        hour_of_day=fractional_hour,
+        recent_history=recent_hist,
+    )
+    window_advisories = evaluate_window_advisories(
+        adv_state, winning_scenario, sim_params, original_schedules, base_hour,
+    )
+    process_advisories(
+        window_advisories,
+        live=live,
+        notification_target=_CFG.notification_target,
+        current_hour=base_hour,
+    )
+
+    # ── Infrastructure safety checks ──
+    from weatherstat.safety import check_navien_health, check_thermostat_modes, process_safety_alerts
+
+    safety_alerts = check_thermostat_modes(latest, decision) + check_navien_health(latest)
+    process_safety_alerts(
+        safety_alerts,
+        live=live,
+        notification_target=_CFG.notification_target,
+    )
+
+    # Prediction sanity checks
     sane = check_prediction_sanity(decision, current_temps)
 
     # Write command JSON

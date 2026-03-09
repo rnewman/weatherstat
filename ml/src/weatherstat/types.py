@@ -82,72 +82,8 @@ class WeatherState:
     condition: WeatherCondition
 
 
-@dataclass(frozen=True)
-class SnapshotRow:
-    """Matches the Parquet schema written by the HA client."""
-
-    timestamp: str
-    # Thermostat zones
-    thermostat_upstairs_temp: float
-    thermostat_upstairs_target: float
-    thermostat_upstairs_action: str
-    thermostat_downstairs_temp: float
-    thermostat_downstairs_target: float
-    thermostat_downstairs_action: str
-    # Mini splits (named by location)
-    mini_split_bedroom_temp: float
-    mini_split_bedroom_target: float
-    mini_split_bedroom_mode: str
-    mini_split_living_room_temp: float
-    mini_split_living_room_target: float
-    mini_split_living_room_mode: str
-    # Blowers (mode captures speed level)
-    blower_family_room_mode: str
-    blower_office_mode: str
-    # Navien
-    navien_heating_mode: str
-    navien_heat_capacity: float
-    # Environment
-    outdoor_temp: float
-    outdoor_humidity: float
-    wind_speed: float
-    weather_condition: str
-    indoor_humidity: float
-    window_basement_open: bool
-    window_family_room_open: bool
-    window_balcony_open: bool
-    window_bedroom_open: bool
-    window_office_open: bool
-    window_kitchen_open: bool
-    window_piano_open: bool
-    any_window_open: bool
-    # Per-room temperatures
-    upstairs_aggregate_temp: float
-    downstairs_aggregate_temp: float
-    family_room_temp: float
-    office_temp: float
-    bedroom_temp: float
-    kitchen_temp: float
-    piano_temp: float
-    bathroom_temp: float
-    living_room_temp: float
-
-
-@dataclass(frozen=True)
-class Prediction:
-    """Output of the ML inference pipeline, written as JSON."""
-
-    timestamp: str
-    thermostat_upstairs_target: float
-    thermostat_downstairs_target: float
-    mini_split_bedroom_target: float
-    mini_split_bedroom_mode: HVACMode
-    mini_split_living_room_target: float
-    mini_split_living_room_mode: HVACMode
-    blower_family_room_mode: BlowerMode
-    blower_office_mode: BlowerMode
-    confidence: float
-
+# Snapshot schema is defined by weatherstat.yaml and generated dynamically.
+# See WeatherstatConfig.snapshot_column_defs().
 
 # ── Control types ──────────────────────────────────────────────────────────
 

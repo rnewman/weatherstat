@@ -42,6 +42,7 @@ class ThermostatConfig:
     name: str  # "upstairs", "downstairs"
     entity_id: str
     zone: str
+    state_device: str | None = None  # device that confirms actual delivery (e.g., boiler)
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,8 @@ class MiniSplitYamlConfig:
     name: str  # "bedroom", "living_room"
     entity_id: str
     sweep_modes: tuple[str, ...]
-    mode_encoding: dict[str, float]
+    mode_encoding: dict[str, float]  # command: what we set (for control)
+    action_encoding: dict[str, float] | None = None  # state: what it's doing (for sysid)
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,19 @@ class ThermalConfig:
 
 
 @dataclass(frozen=True)
+class NavienSafetyConfig:
+    return_temp_entity: str = ""
+    outlet_temp_entity: str = ""
+    disconnected_threshold: float = 33.0  # °F
+
+
+@dataclass(frozen=True)
+class SafetyConfig:
+    navien: NavienSafetyConfig = field(default_factory=NavienSafetyConfig)
+    cooldowns: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AdvisoryConfig:
     effort_cost: float
     cooldowns: dict[str, int]
@@ -141,6 +156,7 @@ class WeatherstatConfig:
     extra_temp_sensors: dict[str, ExtraTempSensorConfig] = field(default_factory=dict)
     thermal: ThermalConfig = field(default_factory=lambda: ThermalConfig(tau={}, default_tau=45.0))
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
     window_open_offset: tuple[float, float] = (-3.0, 2.0)  # (min_offset, max_offset)
 
     # ── Derived properties ────────────────────────────────────────────
@@ -322,6 +338,14 @@ class WeatherstatConfig:
             ))
         return pairs
 
+    @property
+    def safety_navien(self) -> NavienSafetyConfig | None:
+        """Navien safety check config, or None if not configured."""
+        cfg = self.safety.navien
+        if cfg.return_temp_entity:
+            return cfg
+        return None
+
     def snapshot_column_defs(self) -> list[tuple[str, str]]:
         """(column_name, SQL_type) for all snapshot columns.
 
@@ -336,12 +360,14 @@ class WeatherstatConfig:
                 (f"thermostat_{name}_action", "TEXT"),
             ])
         # Mini-splits
-        for name in self.mini_splits:
+        for name, cfg in self.mini_splits.items():
             defs.extend([
                 (f"mini_split_{name}_temp", "REAL"),
                 (f"mini_split_{name}_target", "REAL"),
                 (f"mini_split_{name}_mode", "TEXT"),
             ])
+            if cfg.action_encoding:
+                defs.append((f"mini_split_{name}_action", "TEXT"))
         # Blowers
         for name in self.blowers:
             defs.append((f"blower_{name}_mode", "TEXT"))
@@ -408,15 +434,19 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     for name, dev in data["devices"]["thermostats"].items():
         thermostats[name] = ThermostatConfig(
             name=name, entity_id=dev["entity_id"], zone=dev["zone"],
+            state_device=dev.get("state_device"),
         )
 
     mini_splits: dict[str, MiniSplitYamlConfig] = {}
     for name, dev in data["devices"]["mini_splits"].items():
+        action_enc_raw = dev.get("action_encoding")
+        action_enc = {str(k): float(v) for k, v in action_enc_raw.items()} if action_enc_raw else None
         mini_splits[name] = MiniSplitYamlConfig(
             name=name,
             entity_id=dev["entity_id"],
             sweep_modes=tuple(dev["sweep_modes"]),
             mode_encoding={str(k): float(v) for k, v in dev["mode_encoding"].items()},
+            action_encoding=action_enc,
         )
 
     blowers: dict[str, BlowerYamlConfig] = {}
@@ -505,6 +535,18 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
     )
 
+    # Safety config (optional)
+    safety_data = data.get("safety", {})
+    navien_data = safety_data.get("navien", {})
+    safety_config = SafetyConfig(
+        navien=NavienSafetyConfig(
+            return_temp_entity=str(navien_data.get("return_temp_entity", "")),
+            outlet_temp_entity=str(navien_data.get("outlet_temp_entity", "")),
+            disconnected_threshold=float(navien_data.get("disconnected_threshold", 33.0)),
+        ),
+        cooldowns={str(k): int(v) for k, v in safety_data.get("cooldowns", {}).items()},
+    )
+
     return WeatherstatConfig(
         location=location,
         temp_sensors=temp_sensors,
@@ -522,6 +564,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         extra_temp_sensors=extra_temp_sensors,
         thermal=thermal_config,
         advisory=advisory_config,
+        safety=safety_config,
         window_open_offset=window_open_offset,
     )
 

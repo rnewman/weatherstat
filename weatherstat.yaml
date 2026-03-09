@@ -2,8 +2,7 @@
 # column names, device definitions, and operational parameters.
 #
 # Read by both TypeScript (ha-client) and Python (ml) code.
-# Adding a sensor: add an entry here, retrain after data accumulates.
-# Removing a sensor: remove entry, old models degrade gracefully (NaN fill).
+# Adding a sensor: add an entry here, restart collector.
 
 location:
   latitude: 47.66
@@ -66,18 +65,22 @@ devices:
     upstairs:
       entity_id: climate.upstairs_thermostat
       zone: upstairs
+      state_device: navien  # measured delivery = thermostat calling × boiler firing
     downstairs:
       entity_id: climate.downstairs_thermostat
       zone: downstairs
+      state_device: navien
   mini_splits:
     bedroom:
       entity_id: climate.m5nanoc6_bed_split_bedroom_split
       sweep_modes: ["off", heat, cool]
       mode_encoding: { "off": 0, heat: 1, cool: -1, fan_only: 0.5, dry: 0.25, auto: 0.5, heat_cool: 0.5 }
+      action_encoding: { heating: 1, cooling: -1, drying: 0.25, idle: 0, "off": 0 }
     living_room:
       entity_id: climate.m5nanoc6_lr_split_living_room_split
       sweep_modes: ["off", heat, cool]
       mode_encoding: { "off": 0, heat: 1, cool: -1, fan_only: 0.5, dry: 0.25, auto: 0.5, heat_cool: 0.5 }
+      action_encoding: { heating: 1, cooling: -1, drying: 0.25, idle: 0, "off": 0 }
   blowers:
     family_room:
       entity_id: fan.blower_1
@@ -149,67 +152,46 @@ rooms:
   bathroom:
     temp_column: bathroom_temp
     zone: upstairs
-  family_room:
-    temp_column: family_room_temp
+  family_room: temp_column: family_room_temp
     zone: downstairs
   office:
-    temp_column: office_temp
-    zone: downstairs
+    temp_column: office_temp zone: downstairs
 
 comfort:
-  window_open_offset: { min: -2, max: 2 }
-  upstairs:
+  window_open_offset: { min: -2, max: 2 } upstairs:
     - { hours: [0, 24], min: 70, max: 75, hot_penalty: 0.5 }
   downstairs:
-    - { hours: [0, 24], min: 70, max: 74 }
-  bedroom:
+    - { hours: [0, 24], min: 70, max: 74 } bedroom:
     - { hours: [6, 9], min: 70, max: 73, cold_penalty: 2.0, hot_penalty: 2.0 }
     - { hours: [9, 21], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
-    - { hours: [21, 6], min: 68, max: 72, cold_penalty: 2.0, hot_penalty: 0.75 }
-  office:
+    - { hours: [21, 6], min: 68, max: 72, cold_penalty: 2.0, hot_penalty: 0.75 } office:
     - { hours: [8, 18], min: 70, max: 74, cold_penalty: 2.0, hot_penalty: 2.0 }
     - { hours: [18, 8], min: 67, max: 76, cold_penalty: 1.0, hot_penalty: 0.5 }
-  family_room:
-    - { hours: [0, 24], min: 70, max: 74 }
+  family_room: - { hours: [0, 24], min: 70, max: 74 }
   kitchen:
     - { hours: [0, 24], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
-  piano:
-    - { hours: [0, 24], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
+  piano: - { hours: [0, 24], min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
   bathroom:
     - { hours: [0, 24], min: 68, max: 76, cold_penalty: 0.5, hot_penalty: 0.3 }
-
 notifications:
   target: notify.mobile_app_richard_s_15_pro
 
-energy_costs:
-  gas_zone: 0.010
+energy_costs: gas_zone: 0.010
   mini_split: 0.005
   blower: { "off": 0.0, low: 0.001, high: 0.002 }
-
 thermal:
   # Thermal time constants (hours) — Newton's law of cooling
   # sealed = windows closed, ventilated = windows open
-  # Fitted from overnight cooling 2026-02-14; ventilated estimates use
-  # bedroom's measured ratio (0.44×) except bedroom itself (measured directly).
+  # Fitted from overnight cooling 2026-02-14; ventilated estimates use # bedroom's measured ratio (0.44×) except bedroom itself (measured directly).
   tau_sealed:
     upstairs: 35.7
-    downstairs: 44.3
-    bedroom: 53.4
+    downstairs: 44.3 bedroom: 53.4
     kitchen: 41.2
     piano: 37.3
-    bathroom: 43.7
-    family_room: 48.1
+    bathroom: 43.7 family_room: 48.1
     office: 47.7
   tau_ventilated:
-    upstairs: 15.7
-    downstairs: 19.5
-    bedroom: 23.5
-    kitchen: 18.1
-    piano: 16.4
-    bathroom: 19.2
-    family_room: 21.2
-    office: 21.0
-  default_tau_sealed: 45.0
+    upstairs: 15.7 downstairs: 19.5 bedroom: 23.5 kitchen: 18.1 piano: 16.4 bathroom: 19.2 family_room: 21.2 office: 21.0 default_tau_sealed: 45.0
   default_tau_ventilated: 20.0
 
 advisory:
@@ -218,3 +200,12 @@ advisory:
   cooldowns:
     free_cooling: 14400
     close_windows: 3600
+
+safety:
+  navien:
+    return_temp_entity: sensor.navien_navien_sh_return_temp
+    outlet_temp_entity: sensor.navien_navien_sh_outlet_temp
+    disconnected_threshold: 33  # °F — readings at/below this indicate ESPHome disconnection
+  cooldowns:
+    thermostat_off: 3600   # 1 hour
+    navien_fault: 1800     # 30 min

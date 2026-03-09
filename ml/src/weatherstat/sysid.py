@@ -39,13 +39,25 @@ _CFG = load_config()
 
 @dataclass(frozen=True)
 class EffectorSpec:
-    """An effector (HVAC device) derived from config."""
+    """An effector (HVAC device) derived from config.
+
+    Each effector has a command/state pair:
+    - state_column + encoding: what the device actually did (for sysid training)
+    - command_column + command_encoding: what we told it to do (for control scenarios)
+
+    When command_column is None, state_column serves both roles.
+    When state_effector is set, effective activity = self × state_effector
+    (e.g., thermostat calling × boiler responding = actual heat delivery).
+    """
 
     name: str
-    state_column: str
-    encoding: dict[str, float]
+    state_column: str  # column for measured state (what it did)
+    encoding: dict[str, float]  # encoding for state_column
     max_lag_minutes: int
     device_type: str
+    state_effector: str | None = None  # another effector confirming delivery
+    command_column: str | None = None  # column for command (what we told it)
+    command_encoding: dict[str, float] | None = None  # encoding for command_column
 
 
 @dataclass(frozen=True)
@@ -107,27 +119,54 @@ class SysIdResult:
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
 
 
+def _resolve_gate(device_name: str) -> str:
+    """Resolve a YAML device name to its sysid effector name."""
+    if device_name == _CFG.boiler.name:
+        return device_name
+    if device_name in _CFG.thermostats:
+        return f"thermostat_{device_name}"
+    if device_name in _CFG.mini_splits:
+        return f"mini_split_{device_name}"
+    if device_name in _CFG.blowers:
+        return f"blower_{device_name}"
+    return device_name  # assume already an effector name
+
+
 def _enumerate_effectors() -> list[EffectorSpec]:
     """Build effector list from YAML config."""
     effectors: list[EffectorSpec] = []
 
-    for name in _CFG.thermostats:
+    for name, therm_cfg in _CFG.thermostats.items():
+        state_eff = _resolve_gate(therm_cfg.state_device) if therm_cfg.state_device else None
         effectors.append(EffectorSpec(
             name=f"thermostat_{name}",
             state_column=f"thermostat_{name}_action",
             encoding={"heating": 1.0, "idle": 0.0, "off": 0.0},
             max_lag_minutes=90,
             device_type="thermostat",
+            state_effector=state_eff,
         ))
 
     for name, cfg in _CFG.mini_splits.items():
-        effectors.append(EffectorSpec(
-            name=f"mini_split_{name}",
-            state_column=f"mini_split_{name}_mode",
-            encoding={str(k): float(v) for k, v in cfg.mode_encoding.items()},
-            max_lag_minutes=15,
-            device_type="mini_split",
-        ))
+        if cfg.action_encoding:
+            # Prefer measured state (hvac_action) over command (hvac_mode)
+            effectors.append(EffectorSpec(
+                name=f"mini_split_{name}",
+                state_column=f"mini_split_{name}_action",
+                encoding=cfg.action_encoding,
+                max_lag_minutes=15,
+                device_type="mini_split",
+                command_column=f"mini_split_{name}_mode",
+                command_encoding=cfg.mode_encoding,
+            ))
+        else:
+            effectors.append(EffectorSpec(
+                name=f"mini_split_{name}",
+                state_column=f"mini_split_{name}_mode",
+                encoding={str(k): float(v) for k, v in cfg.mode_encoding.items()},
+                max_lag_minutes=15,
+                device_type="mini_split",
+            ))
 
     for name, cfg in _CFG.blowers.items():
         effectors.append(EffectorSpec(
@@ -139,8 +178,8 @@ def _enumerate_effectors() -> list[EffectorSpec]:
         ))
 
     effectors.append(EffectorSpec(
-        name="navien",
-        state_column="navien_heating_mode",
+        name=_CFG.boiler.name,
+        state_column=f"{_CFG.boiler.name}_heating_mode",
         encoding={str(k): float(v) for k, v in _CFG.boiler.mode_encoding.items()},
         max_lag_minutes=90,
         device_type="boiler",
@@ -403,13 +442,35 @@ def _preprocess(
     tz = _CFG.location.timezone
     df["_local_hour"] = df["_ts"].dt.tz_convert(tz).dt.hour
 
-    # Encode effector states to numeric
+    # Encode effector states to numeric.
+    # Each effector has a state column (measured action) and optionally a
+    # command column (intent) as fallback for rows where state isn't available.
     for eff in effectors:
         col = eff.state_column
         if col in df.columns:
-            df[f"_eff_{eff.name}"] = df[col].map(eff.encoding).fillna(0.0).astype(float)
+            encoded = df[col].map(eff.encoding)
+            # Fall back to command column where state is missing (e.g., old data
+            # before action column was captured)
+            if eff.command_column and eff.command_column in df.columns:
+                cmd_encoded = df[eff.command_column].map(eff.command_encoding or eff.encoding)
+                encoded = encoded.fillna(cmd_encoded)
+            df[f"_eff_{eff.name}"] = encoded.fillna(0.0).astype(float)
+        elif eff.command_column and eff.command_column in df.columns:
+            df[f"_eff_{eff.name}"] = (
+                df[eff.command_column].map(eff.command_encoding or eff.encoding).fillna(0.0).astype(float)
+            )
         else:
             df[f"_eff_{eff.name}"] = 0.0
+
+    # Apply state confirmation: effective activity requires paired device to confirm.
+    # E.g., a thermostat "calling for heat" only delivers heat when the boiler
+    # confirms it's responding. Without this, fault periods show intent-on
+    # with no temperature rise, diluting fitted gains.
+    for eff in effectors:
+        if eff.state_effector:
+            state_col = f"_eff_{eff.state_effector}"
+            if state_col in df.columns:
+                df[f"_eff_{eff.name}"] *= df[state_col]
 
     # Compute dT/dt for each sensor (°F/hr, central differences)
     dt_hours = 5.0 / 60.0  # 5-minute intervals

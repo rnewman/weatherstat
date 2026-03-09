@@ -22,6 +22,7 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 5. **Per-room models & blower control** (done) — 8 rooms × 5 horizons, blower fan speed in control sweep.
 6. **Forecast training + HVAC features** (done) — Training uses stored met.no forecasts (no train/serve skew), retrospective HVAC duty cycle features.
 7. **Effector inertia planning** (done) — Trajectory search for slow effectors, physics-only control (ML removed).
+8. **Virtual effectors Phase 1** (done) — Physics-based window advisories integrated into control loop.
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 

@@ -228,18 +228,20 @@ Applies the controller's commands to Home Assistant with safety checks.
 
 ### 6. Advisory System (`ml/src/weatherstat/advisory.py`)
 
-Generates human-actionable recommendations for things the system can't do electronically.
+Generates human-actionable recommendations for things the system can't do electronically. Uses the physics simulator to evaluate whether toggling window states would improve comfort, given the committed electronic plan.
 
-**Current advisories:**
-- **Free cooling:** "Open windows in [rooms] to cool down for free."
-- **Close windows:** "Heating is active — close windows in [rooms]."
+**Advisory types:**
+- **Free cooling:** "Open [window] — outdoor temp is lower, room cools toward comfort range."
+- **Close windows:** "Close [window] — heating efficiency improves with window sealed."
 
-**Behavior:**
-- Cooldown timers prevent notification fatigue.
+**Evaluation:** After the trajectory sweep commits to an electronic plan, the advisory system re-runs `predict()` for each window with modeled rooms, toggling its state. If toggling improves comfort cost (measured against original, non-adjusted schedules) by more than the effort threshold (from YAML `advisory.effort_cost`), an advisory is generated.
+
+**Key design constraint:** The electronic plan does NOT change based on advisories. The controller commits to the best electronic trajectory given current window states. Advisories are a separate, post-sweep evaluation. If the human acts on the advisory (e.g., opens a window), the next 15-minute cycle re-evaluates with the new state and naturally adjusts.
+
+**Dispatch:**
+- Per-window cooldown timers prevent notification fatigue.
 - Quiet hours suppress push notifications (still logged).
 - HA persistent notifications (replaces stale notification via `notification_id`).
-
-**Current status:** The advisory infrastructure exists but is not integrated into the control loop. See `docs/plans/PLAN-8-virtual-effectors.md` for the plan to reconnect it via virtual effector modeling.
 
 ---
 
@@ -291,7 +293,9 @@ Contains:
 
 ### Controller -> Advisory System
 
-**Interface:** Function call within the control loop. Receives current state + control decision + simulator predictions, emits notifications.
+**Interface:** Function calls within the control loop:
+1. `evaluate_window_advisories(state, winning_scenario, sim_params, schedules, base_hour)` — runs `predict()` per window toggle, returns advisories.
+2. `process_advisories(advisories, live, notification_target, current_hour)` — applies cooldowns, quiet hours, dispatches to HA.
 
 ### Configuration -> Everything
 
@@ -301,9 +305,9 @@ Contains:
 
 ## Future components
 
-### Virtual Effectors / Advisory-Driven Planning
+### Virtual Effectors / Advisory-Driven Planning (Phase 1 done)
 
-Model human-actionable changes (windows, blinds, space heaters, doors) as virtual effectors in the trajectory sweep. The controller finds the best electronic-only plan AND evaluates whether a human action would improve outcomes. See `docs/plans/PLAN-8-virtual-effectors.md`.
+Window advisories are implemented: after the electronic plan commits, the advisory system evaluates each window toggle via `predict()` and recommends actions that improve comfort. See `docs/plans/PLAN-8-virtual-effectors.md` for Phases 2-3: expanding to other virtual effectors (doors, blinds, space heaters) and combined advisory evaluation.
 
 ### Online Learning
 

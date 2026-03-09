@@ -305,7 +305,9 @@ def _build_activity_matrices(
 
     for eff in params.effectors:
         name = eff["name"]
-        encoding = eff["encoding"]
+        # For future scenarios, use command encoding (what we intend to set).
+        # For history, encoding (measured state) was already applied above.
+        encoding = eff.get("command_encoding") or eff["encoding"]
         dtype = eff["device_type"]
 
         # History: shared across all scenarios
@@ -540,10 +542,26 @@ def extract_recent_history(df_raw: dict | object, params: SimParams) -> dict[str
     for eff in params.effectors:
         col = eff["state_column"]
         encoding = eff["encoding"]
+        cmd_col = eff.get("command_column")
+        cmd_enc = eff.get("command_encoding") or encoding
         if col in tail.columns:
-            vals = [encoding.get(str(v), 0.0) for v in tail[col]]
+            vals = [encoding.get(str(v), cmd_enc.get(str(v), 0.0)) for v in tail[col]]
             history[eff["name"]] = vals
+        elif cmd_col and cmd_col in tail.columns:
+            history[eff["name"]] = [cmd_enc.get(str(v), 0.0) for v in tail[cmd_col]]
         else:
             history[eff["name"]] = [0.0] * len(tail)
+
+    # Apply state confirmation — matches sysid preprocessing.
+    # Intent-only signals (e.g., thermostat calling) are confirmed by a
+    # paired device (e.g., boiler responding) to reflect actual delivery.
+    for eff in params.effectors:
+        state_eff = eff.get("state_effector")
+        if state_eff:
+            state_hist = history.get(state_eff, [])
+            eff_name = eff["name"]
+            eff_hist = history.get(eff_name, [])
+            if state_hist and eff_hist:
+                history[eff_name] = [a * s for a, s in zip(eff_hist, state_hist, strict=True)]
 
     return history

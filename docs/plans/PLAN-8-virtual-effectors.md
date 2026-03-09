@@ -68,7 +68,7 @@ them (sealed vs ventilated tau), and binary sensors already exist.
 
 **After the trajectory sweep completes and commits to an electronic plan:**
 
-1. For each window (or combination of windows), re-run `batch_simulate`
+1. For each window (or combination of windows), re-run `predict()`
    with the winning electronic trajectory but with toggled window state(s).
 
 2. Score the toggled prediction against comfort schedules.

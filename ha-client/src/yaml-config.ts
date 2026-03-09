@@ -27,7 +27,12 @@ interface RawConfig {
     thermostats: Record<string, { entity_id: string; zone: string }>;
     mini_splits: Record<
       string,
-      { entity_id: string; sweep_modes: string[]; mode_encoding: Record<string, number> }
+      {
+        entity_id: string;
+        sweep_modes: string[];
+        mode_encoding: Record<string, number>;
+        action_encoding?: Record<string, number>;
+      }
     >;
     blowers: Record<
       string,
@@ -138,7 +143,7 @@ function loadYamlConfig() {
     });
   }
 
-  // 2. Mini splits (3 cols each: temp, target, mode)
+  // 2. Mini splits (3-4 cols each: temp, target, mode, action?)
   for (const [name, split] of Object.entries(raw.devices.mini_splits)) {
     const prefix = `mini_split_${name}`;
     columnDefs.push({
@@ -159,6 +164,15 @@ function loadYamlConfig() {
       sqlType: "TEXT",
       extract: entityState(split.entity_id, "off"),
     });
+    if (split.action_encoding) {
+      // Measured state: what the device is actually doing (e.g., compressor running)
+      columnDefs.push({
+        snake: `${prefix}_action`,
+        camel: snakeToCamel(`${prefix}_action`),
+        sqlType: "TEXT",
+        extract: attrStr(split.entity_id, "hvac_action", "off"),
+      });
+    }
   }
 
   // 3. Blowers (1 col each: mode)
