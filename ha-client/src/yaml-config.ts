@@ -20,18 +20,18 @@ const YAML_PATH = resolve(__dirname, "../../weatherstat.yaml");
 
 interface RawConfig {
   sensors: {
-    temperature: Record<string, { entity_id: string; statistics: boolean }>;
-    humidity: Record<string, { entity_id: string; statistics: boolean }>;
+    temperature: Record<string, { entity_id: string; statistics?: boolean; role?: string }>;
+    humidity: Record<string, { entity_id: string; statistics?: boolean }>;
   };
-  devices: {
-    thermostats: Record<string, { entity_id: string; zone: string }>;
+  effectors: {
+    thermostats: Record<string, { entity_id: string; zone: string; state_device?: string }>;
     mini_splits: Record<
       string,
       {
         entity_id: string;
         sweep_modes: string[];
-        mode_encoding: Record<string, number>;
-        action_encoding?: Record<string, number>;
+        command_encoding: Record<string, number>;
+        state_encoding?: Record<string, number>;
       }
     >;
     blowers: Record<
@@ -40,10 +40,14 @@ interface RawConfig {
     >;
     boiler: Record<
       string,
-      { mode_entity: string; capacity_entity: string; mode_encoding: Record<string, number> }
+      {
+        mode_entity: string;
+        capacity_entity: string;
+        mode_encoding: Record<string, number>;
+        health?: Array<{ entity: string; min_value?: number; max_value?: number; severity?: string; message?: string }>;
+      }
     >;
   };
-  extra_temp_sensors?: Record<string, { entity_id: string }>;
   windows: Record<string, { entity_id: string }>;
   weather: { entity_id: string };
   notifications: { target: string };
@@ -121,7 +125,7 @@ function loadYamlConfig() {
   const columnDefs: ColumnDef[] = [];
 
   // 1. Thermostats (3 cols each: temp, target, action)
-  for (const [name, therm] of Object.entries(raw.devices.thermostats)) {
+  for (const [name, therm] of Object.entries(raw.effectors.thermostats)) {
     const prefix = `thermostat_${name}`;
     columnDefs.push({
       snake: `${prefix}_temp`,
@@ -144,7 +148,7 @@ function loadYamlConfig() {
   }
 
   // 2. Mini splits (3-4 cols each: temp, target, mode, action?)
-  for (const [name, split] of Object.entries(raw.devices.mini_splits)) {
+  for (const [name, split] of Object.entries(raw.effectors.mini_splits)) {
     const prefix = `mini_split_${name}`;
     columnDefs.push({
       snake: `${prefix}_temp`,
@@ -164,7 +168,7 @@ function loadYamlConfig() {
       sqlType: "TEXT",
       extract: entityState(split.entity_id, "off"),
     });
-    if (split.action_encoding) {
+    if (split.state_encoding) {
       // Measured state: what the device is actually doing (e.g., compressor running)
       columnDefs.push({
         snake: `${prefix}_action`,
@@ -176,7 +180,7 @@ function loadYamlConfig() {
   }
 
   // 3. Blowers (1 col each: mode)
-  for (const [name, blw] of Object.entries(raw.devices.blowers)) {
+  for (const [name, blw] of Object.entries(raw.effectors.blowers)) {
     const snake = `blower_${name}_mode`;
     columnDefs.push({
       snake,
@@ -186,17 +190,17 @@ function loadYamlConfig() {
     });
   }
 
-  // 4. Boiler (2 cols each: heating_mode, heat_capacity)
-  for (const [name, boiler] of Object.entries(raw.devices.boiler)) {
+  // 4. Boiler (2 cols each: mode, capacity)
+  for (const [name, boiler] of Object.entries(raw.effectors.boiler)) {
     columnDefs.push({
-      snake: `${name}_heating_mode`,
-      camel: snakeToCamel(`${name}_heating_mode`),
+      snake: `boiler_${name}_mode`,
+      camel: snakeToCamel(`boiler_${name}_mode`),
       sqlType: "TEXT",
       extract: entityState(boiler.mode_entity, "Idle"),
     });
     columnDefs.push({
-      snake: `${name}_heat_capacity`,
-      camel: snakeToCamel(`${name}_heat_capacity`),
+      snake: `boiler_${name}_capacity`,
+      camel: snakeToCamel(`boiler_${name}_capacity`),
       sqlType: "REAL",
       extract: sensorNum(boiler.capacity_entity, 0),
     });
@@ -325,58 +329,63 @@ function loadYamlConfig() {
     ")",
   ].join("\n");
 
+  const createReadingsTableSql = [
+    "CREATE TABLE IF NOT EXISTS readings (",
+    "  timestamp TEXT NOT NULL,",
+    "  name      TEXT NOT NULL,",
+    "  value     TEXT NOT NULL,",
+    "  PRIMARY KEY (timestamp, name)",
+    ")",
+  ].join("\n");
+
   // All monitored entities (unique set)
   const allMonitoredEntities = Array.from(
     new Set([
-      ...Object.values(raw.devices.thermostats).map((t) => t.entity_id),
-      ...Object.values(raw.devices.mini_splits).map((s) => s.entity_id),
-      ...Object.values(raw.devices.blowers).map((b) => b.entity_id),
-      ...Object.values(raw.devices.boiler).flatMap((b) => [b.mode_entity, b.capacity_entity]),
+      ...Object.values(raw.effectors.thermostats).map((t) => t.entity_id),
+      ...Object.values(raw.effectors.mini_splits).map((s) => s.entity_id),
+      ...Object.values(raw.effectors.blowers).map((b) => b.entity_id),
+      ...Object.values(raw.effectors.boiler).flatMap((b) => [b.mode_entity, b.capacity_entity]),
       ...Object.values(raw.sensors.temperature).map((s) => s.entity_id),
       ...Object.values(raw.sensors.humidity).map((s) => s.entity_id),
       ...Object.values(raw.windows).map((w) => w.entity_id),
       raw.weather.entity_id,
-      ...Object.values(raw.extra_temp_sensors ?? {}).map((s) => s.entity_id),
     ]),
   );
 
-  // Window sensor entity IDs (for backward-compatible WINDOW_SENSORS export)
+  // Window sensor entity IDs
   const windowSensorEntityIds = Object.values(raw.windows).map((w) => w.entity_id);
 
-  // TEMP_SENSORS map: short name → entity_id (for backward compatibility)
-  // Includes non-thermostat, non-outdoor sensors from sensors.temperature + extra_temp_sensors.
+  // TEMP_SENSORS map: short name → entity_id
+  // Includes non-thermostat, non-outdoor sensors from sensors.temperature.
   const tempSensors: Record<string, string> = {};
   for (const [col, sensor] of Object.entries(raw.sensors.temperature)) {
     if (col.startsWith("thermostat_") || col === "outdoor_temp") continue;
     const key = col.replace(/_temp$/, "");
     tempSensors[key] = sensor.entity_id;
   }
-  for (const [name, sensor] of Object.entries(raw.extra_temp_sensors ?? {})) {
-    tempSensors[name] = sensor.entity_id;
-  }
 
   return {
-    // Raw device configs
+    // Raw effector configs
     thermostats: Object.fromEntries(
-      Object.entries(raw.devices.thermostats).map(([name, t]) => [
+      Object.entries(raw.effectors.thermostats).map(([name, t]) => [
         name,
         { entityId: t.entity_id, zone: t.zone },
       ]),
     ),
     miniSplits: Object.fromEntries(
-      Object.entries(raw.devices.mini_splits).map(([name, s]) => [
+      Object.entries(raw.effectors.mini_splits).map(([name, s]) => [
         name,
-        { entityId: s.entity_id, sweepModes: s.sweep_modes, modeEncoding: s.mode_encoding },
+        { entityId: s.entity_id, sweepModes: s.sweep_modes, commandEncoding: s.command_encoding },
       ]),
     ),
     blowers: Object.fromEntries(
-      Object.entries(raw.devices.blowers).map(([name, b]) => [
+      Object.entries(raw.effectors.blowers).map(([name, b]) => [
         name,
         { entityId: b.entity_id, zone: b.zone, levels: b.levels, levelEncoding: b.level_encoding },
       ]),
     ),
     boiler: Object.fromEntries(
-      Object.entries(raw.devices.boiler).map(([name, b]) => [
+      Object.entries(raw.effectors.boiler).map(([name, b]) => [
         name,
         { modeEntity: b.mode_entity, capacityEntity: b.capacity_entity },
       ]),
@@ -384,7 +393,6 @@ function loadYamlConfig() {
 
     // Sensor entity IDs
     outdoorTempEntity: raw.sensors.temperature["outdoor_temp"]?.entity_id ?? "",
-    indoorHumidityEntity: raw.sensors.humidity["indoor_humidity"]?.entity_id ?? "",
     weatherEntity: raw.weather.entity_id,
     notificationTarget: raw.notifications.target,
 
@@ -397,6 +405,7 @@ function loadYamlConfig() {
     snapshotColumns,
     camelToSnake,
     createTableSql,
+    createReadingsTableSql,
     allMonitoredEntities,
   } as const;
 }

@@ -138,40 +138,39 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
 def adjust_schedules_for_windows(
     schedules: list[ComfortSchedule],
     window_states: dict[str, bool],
-    window_config: dict[str, object],
+    constraint_labels: set[str],
     min_offset: float,
     max_offset: float,
 ) -> list[ComfortSchedule]:
-    """Widen comfort bounds for rooms with open windows.
+    """Widen comfort bounds for constrained sensors with open windows.
 
-    When a room's window is open, shift min_temp down and max_temp up.
-    This makes the optimizer less eager to heat/cool a room with an open window.
+    When a window is open, shift min_temp down and max_temp up for the
+    matching constraint (by naming convention: window "bedroom" affects
+    constraint label "bedroom"). This makes the optimizer less eager to
+    heat/cool a sensor with an open window nearby.
 
     Args:
-        schedules: Comfort schedules for all rooms.
+        schedules: Comfort schedules for all constrained sensors.
         window_states: window_name -> is_open for each window.
-        window_config: window_name -> WindowConfig from YAML.
+        constraint_labels: Set of all constraint labels.
         min_offset: Amount to add to min_temp (negative = lower).
         max_offset: Amount to add to max_temp (positive = higher).
 
     Returns:
-        New list of ComfortSchedule with adjusted bounds for affected rooms.
+        New list of ComfortSchedule with adjusted bounds for affected sensors.
     """
-    # Build set of rooms with open windows
-    rooms_with_open_windows: set[str] = set()
-    for wname, is_open in window_states.items():
-        if is_open:
-            wcfg = window_config.get(wname)
-            if wcfg is not None:
-                for room in wcfg.rooms:
-                    rooms_with_open_windows.add(room)
+    # Window name matches constraint label → that window affects that sensor
+    labels_with_open_windows: set[str] = {
+        wname for wname, is_open in window_states.items()
+        if is_open and wname in constraint_labels
+    }
 
-    if not rooms_with_open_windows:
+    if not labels_with_open_windows:
         return schedules
 
     adjusted: list[ComfortSchedule] = []
     for schedule in schedules:
-        if schedule.room not in rooms_with_open_windows:
+        if schedule.room not in labels_with_open_windows:
             adjusted.append(schedule)
             continue
         new_entries = tuple(
@@ -858,19 +857,16 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Comfort schedules + window adjustments
     schedules = default_comfort_schedules()
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
+    constraint_labels = {c.label for c in _CFG.constraints}
     schedules = adjust_schedules_for_windows(
         schedules,
         window_states_dict,
-        _CFG.windows,
+        constraint_labels,
         *_CFG.window_open_offset,
     )
-    rooms_with_open = set()
-    for wn, ws in window_states_dict.items():
-        if ws:
-            for r in _CFG.windows[wn].rooms:
-                rooms_with_open.add(r)
-    if rooms_with_open:
-        print(f"  Comfort adjusted for open windows: {', '.join(sorted(rooms_with_open))}")
+    labels_with_open = {wn for wn, ws in window_states_dict.items() if ws and wn in constraint_labels}
+    if labels_with_open:
+        print(f"  Comfort adjusted for open windows: {', '.join(sorted(labels_with_open))}")
 
     # Physics-based sweep using forward simulator
     from weatherstat.simulator import extract_recent_history, load_sim_params
@@ -1021,9 +1017,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     )
 
     # ── Infrastructure safety checks ──
-    from weatherstat.safety import check_navien_health, check_thermostat_modes, process_safety_alerts
+    from weatherstat.safety import check_device_health, check_thermostat_modes, process_safety_alerts
 
-    safety_alerts = check_thermostat_modes(latest, decision) + check_navien_health(latest)
+    safety_alerts = check_thermostat_modes(latest, decision) + check_device_health()
     process_safety_alerts(
         safety_alerts,
         live=live,

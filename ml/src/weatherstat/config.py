@@ -121,7 +121,7 @@ MINI_SPLIT_SWEEP_TARGET = 72.0
 # Mini-split mode encoding (from YAML, filtered to sweep modes for control)
 MINI_SPLIT_MODE_ENC: dict[str, float] = {
     mode: enc
-    for mode, enc in next(iter(_CFG.mini_splits.values())).mode_encoding.items()
+    for mode, enc in next(iter(_CFG.mini_splits.values())).command_encoding.items()
     if mode in MINI_SPLIT_SWEEP_MODES
 }
 

@@ -15,12 +15,17 @@ import type { HAClient, HAEntityState, SnapshotRow, WeatherForecastEntry } from 
 import type { Config } from "./config.ts";
 import { config } from "./yaml-config.ts";
 
-const INSERT_SQL = `
+const INSERT_WIDE_SQL = `
 INSERT OR IGNORE INTO snapshots (
   timestamp, ${config.snapshotColumns.join(", ")}
 ) VALUES (
   @timestamp, ${config.snapshotColumns.map((c) => `@${c}`).join(", ")}
 )`;
+
+const INSERT_READING_SQL = `
+INSERT OR IGNORE INTO readings (timestamp, name, value)
+VALUES (@timestamp, @name, @value)
+`;
 
 /** Module-level database handle — opened once and reused. */
 let _db: DatabaseType | null = null;
@@ -29,6 +34,8 @@ function getDb(dbPath: string): DatabaseType {
   if (_db) return _db;
   _db = new Database(dbPath);
   _db.pragma("journal_mode = WAL");
+
+  // Wide table (legacy, kept during transition)
   _db.exec(config.createTableSql);
 
   // Generic migration: add any columns from config that are missing
@@ -40,6 +47,9 @@ function getDb(dbPath: string): DatabaseType {
       _db.exec(`ALTER TABLE snapshots ADD COLUMN ${col.snake} ${col.sqlType}`);
     }
   }
+
+  // EAV table (new canonical format)
+  _db.exec(config.createReadingsTableSql);
 
   return _db;
 }
@@ -73,7 +83,7 @@ function writeSnapshot(snapshot: SnapshotRow, dbPath: string): string {
   const db = getDb(dbPath);
   const roundedTs = roundToFiveMinutes(snapshot.timestamp);
 
-  // Build snake_case params for the INSERT
+  // Build snake_case params for the wide INSERT
   const params: Record<string, string | number> = { timestamp: roundedTs };
   for (const [camel, snake] of Object.entries(config.camelToSnake)) {
     const val = snapshot[camel];
@@ -84,7 +94,18 @@ function writeSnapshot(snapshot: SnapshotRow, dbPath: string): string {
     }
   }
 
-  db.prepare(INSERT_SQL).run(params);
+  // Dual-write: wide table + EAV readings table in one transaction
+  const writeAll = db.transaction(() => {
+    db.prepare(INSERT_WIDE_SQL).run(params);
+
+    const insertReading = db.prepare(INSERT_READING_SQL);
+    for (const [snake, value] of Object.entries(params)) {
+      if (snake === "timestamp") continue;
+      insertReading.run({ timestamp: roundedTs, name: snake, value: String(value) });
+    }
+  });
+  writeAll();
+
   return dbPath;
 }
 

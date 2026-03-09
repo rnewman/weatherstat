@@ -95,10 +95,10 @@ def evaluate_window_advisories(
 ) -> list[Advisory]:
     """Evaluate whether toggling any window would improve comfort.
 
-    For each window with modeled rooms, simulates the winning electronic
-    plan with the window toggled and compares comfort cost against the
-    current state. Advisories are generated when improvement exceeds
-    the effort threshold from config.
+    For each window, simulates the winning electronic plan with the window
+    toggled and compares comfort cost against the current state. The
+    simulator determines which sensors each window affects (via the tau
+    model); no configured window→room mapping is needed.
 
     Uses original (non-window-adjusted) comfort schedules for both baseline
     and toggled evaluation to measure true comfort impact.
@@ -127,10 +127,7 @@ def evaluate_window_advisories(
 
     advisories: list[Advisory] = []
 
-    for window_name, wcfg in cfg.windows.items():
-        if not wcfg.rooms:
-            continue
-
+    for window_name in cfg.windows:
         is_open = state.window_states.get(window_name, False)
         toggled_windows = dict(state.window_states)
         toggled_windows[window_name] = not is_open
@@ -155,24 +152,35 @@ def evaluate_window_advisories(
         action = "Open" if not is_open else "Close"
         adv_type = AdvisoryType.FREE_COOLING if not is_open else AdvisoryType.CLOSE_WINDOWS
 
-        # Build message with temperature context for primary room
-        room = wcfg.rooms[0]
-        room_key = f"{room}_temp_t+24"  # 2h horizon
-        baseline_temp = baseline_dict.get(room_key)
-        toggled_temp = toggled_dict.get(room_key)
+        # Find the most-affected constrained sensor for the message
+        best_label = window_name
+        best_delta = 0.0
+        best_baseline_temp: float | None = None
+        best_toggled_temp: float | None = None
+        for c in cfg.constraints:
+            key_2h = f"{c.sensor}_t+24"  # 2h horizon (24 × 5min steps)
+            bt = baseline_dict.get(key_2h)
+            tt = toggled_dict.get(key_2h)
+            if bt is not None and tt is not None:
+                delta = abs(tt - bt)
+                if delta > best_delta:
+                    best_delta = delta
+                    best_label = c.label
+                    best_baseline_temp = bt
+                    best_toggled_temp = tt
 
-        if baseline_temp is not None and toggled_temp is not None:
+        if best_baseline_temp is not None and best_toggled_temp is not None:
             if not is_open:
                 message = (
                     f"{action} {window_name} window — {state.outdoor_temp:.0f}°F outside, "
-                    f"{room} predicted {toggled_temp:.0f}°F at 2h "
-                    f"(vs {baseline_temp:.0f}°F with window closed)"
+                    f"{best_label} predicted {best_toggled_temp:.0f}°F at 2h "
+                    f"(vs {best_baseline_temp:.0f}°F with window closed)"
                 )
             else:
                 message = (
-                    f"{action} {window_name} window — {room} predicted "
-                    f"{toggled_temp:.0f}°F at 2h "
-                    f"(vs {baseline_temp:.0f}°F with window open)"
+                    f"{action} {window_name} window — {best_label} predicted "
+                    f"{best_toggled_temp:.0f}°F at 2h "
+                    f"(vs {best_baseline_temp:.0f}°F with window open)"
                 )
         else:
             message = f"{action} {window_name} window (comfort improvement: {improvement:.1f})"

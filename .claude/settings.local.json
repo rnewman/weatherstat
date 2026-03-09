@@ -74,7 +74,9 @@
       "mcp__Home_Assistant__ha_deep_search",
       "mcp__Home_Assistant__ha_get_device",
       "mcp__Home_Assistant__ha_get_logbook",
-      "Bash(just sysid:*)"
+      "Bash(just sysid:*)",
+      "Bash(curl:*)",
+      "Bash(just test:*)"
     ]
   }
 }

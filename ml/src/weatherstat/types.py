@@ -29,10 +29,6 @@ class BlowerMode(StrEnum):
     HIGH = "high"
 
 
-class NavienHeatingMode(StrEnum):
-    SPACE_HEATING = "Space Heating"
-    IDLE = "Idle"
-
 
 class WeatherCondition(StrEnum):
     """All met.no weather conditions that HA can report."""

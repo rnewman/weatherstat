@@ -2,7 +2,7 @@
 
 Checks for conditions that prevent the control loop from working:
 - Thermostat turned off (hvac_mode=off) while control wants to heat
-- Navien boiler not responding to heat calls (wrong mode, disconnected)
+- Device health thresholds (configured per-effector in weatherstat.yaml)
 
 Called from the control loop after each decision cycle. Safety alerts
 use push notifications (no quiet hours — these are urgent).
@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import requests
+
+if TYPE_CHECKING:
+    from weatherstat.yaml_config import HealthCheck
 
 from weatherstat.advisory import (
     Advisory,
@@ -27,12 +31,10 @@ from weatherstat.config import HA_TOKEN, HA_URL
 # ── Types ─────────────────────────────────────────────────────────────────
 
 # Safety alerts reuse Advisory infrastructure but with distinct types/keys.
-# We use AdvisoryType.CLOSE_WINDOWS as a carrier (the actual key is the
-# safety alert's key, not the advisory type).
 
 _DEFAULT_COOLDOWNS: dict[str, int] = {
     "thermostat_off": 3600,   # 1 hour
-    "navien_fault": 1800,     # 30 min — more urgent
+    "device_fault": 1800,     # 30 min — more urgent
 }
 
 
@@ -49,7 +51,7 @@ def _get_cooldowns() -> dict[str, int]:
 class SafetyAlert:
     """A detected infrastructure problem."""
 
-    key: str        # "thermostat_off_upstairs", "navien_disconnected"
+    key: str        # "thermostat_off_upstairs", "navien_fault"
     title: str
     message: str
     severity: str = "warning"  # "warning" or "critical"
@@ -91,105 +93,81 @@ def check_thermostat_modes(latest: object, decision: object) -> list[SafetyAlert
     return alerts
 
 
-# ── Navien health check ──────────────────────────────────────────────────
+# ── Generic device health checks ────────────────────────────────────────
 
 
-def check_navien_health(latest: object) -> list[SafetyAlert]:
-    """Check for Navien boiler problems from snapshot data and HA API.
+def check_device_health() -> list[SafetyAlert]:
+    """Run health checks for all devices with configured thresholds.
 
-    Two-tier check:
-    1. Snapshot data: thermostat calling for heat but Navien not in Space Heating
-    2. HA REST API: Navien ESPHome sensors showing disconnected (return_temp ≤ 33°F)
+    Reads health check definitions from effector configs (e.g.,
+    effectors.boiler.navien.health). For each check, fetches the
+    entity's current state from HA and compares against min/max thresholds.
     """
+    from weatherstat.yaml_config import load_config
+
+    cfg = load_config()
     alerts: list[SafetyAlert] = []
 
-    # Helper to read from pandas Series or dict
-    def _get(key: str, default: object = "") -> object:
-        if hasattr(latest, key):
-            return getattr(latest, key)
-        return latest.get(key, default) if hasattr(latest, "get") else default
-
-    # Check 1: Heat call without boiler response
-    up_action = str(_get("thermostat_upstairs_action"))
-    dn_action = str(_get("thermostat_downstairs_action"))
-    navien_mode = str(_get("navien_heating_mode"))
-    any_calling = up_action == "heating" or dn_action == "heating"
-
-    # Log when thermostat is calling but Navien isn't in Space Heating.
-    # This is normal — Navien cycles between SH, DHW, and Idle. Only the
-    # ESPHome disconnection check (return_temp ≤ 33°F) is a real fault signal.
-    if any_calling and navien_mode not in ("Space Heating", ""):
-        print(f"  [safety] Note: thermostat calling for heat, Navien mode is '{navien_mode}'")
-
-    # Check 2: Navien ESPHome sensors (live HA fetch)
-    from weatherstat.yaml_config import load_config
-    cfg = load_config()
-    navien_cfg = cfg.safety_navien
-
-    if navien_cfg is not None:
-        try:
-            esphome_alerts = _check_navien_esphome(navien_cfg)
-            alerts.extend(esphome_alerts)
-        except Exception:
-            pass  # Don't fail the control cycle if HA fetch fails
+    for device_name, checks in cfg.device_health_checks.items():
+        for check in checks:
+            try:
+                alert = _check_health_threshold(device_name, check)
+                if alert is not None:
+                    alerts.append(alert)
+            except Exception:
+                pass  # Don't fail the control cycle if HA fetch fails
 
     return alerts
 
 
-def _check_navien_esphome(navien_cfg: object) -> list[SafetyAlert]:
-    """Fetch Navien ESPHome sensors from HA and check for disconnection.
-
-    When the Navien is in the wrong mode (Zone Pump instead of Zone Valve),
-    the ESPHome device shows all zeros: return_temp=32°F, outlet_temp=32°F.
-    """
-    alerts: list[SafetyAlert] = []
-    threshold = navien_cfg.disconnected_threshold
-
+def _check_health_threshold(device_name: str, check: HealthCheck) -> SafetyAlert | None:
+    """Fetch an entity from HA and compare against configured thresholds."""
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
         "Content-Type": "application/json",
     }
 
-    # Check return temp — most reliable indicator
-    if navien_cfg.return_temp_entity:
-        try:
-            resp = requests.get(
-                f"{HA_URL}/api/states/{navien_cfg.return_temp_entity}",
-                headers=headers,
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                state_data = resp.json()
-                state_val = state_data.get("state", "")
-                try:
-                    return_temp = float(state_val)
-                    if return_temp <= threshold:
-                        alerts.append(SafetyAlert(
-                            key="navien_disconnected",
-                            title="Navien appears disconnected",
-                            message=(
-                                f"Navien return temp is {return_temp:.0f}°F "
-                                f"(threshold: {threshold}°F). "
-                                f"The boiler may be in Zone Pump mode instead of Zone Valve. "
-                                f"Check the Navien unit."
-                            ),
-                            severity="critical",
-                        ))
-                except (ValueError, TypeError):
-                    if state_val in ("unavailable", "unknown"):
-                        alerts.append(SafetyAlert(
-                            key="navien_unavailable",
-                            title="Navien sensor unavailable",
-                            message=(
-                                f"Navien return temp sensor is '{state_val}'. "
-                                f"The ESPHome device may be offline."
-                            ),
-                            severity="warning",
-                        ))
-        except requests.RequestException:
-            pass  # HA unreachable — don't fail the cycle
+    resp = requests.get(
+        f"{HA_URL}/api/states/{check.entity_id}",
+        headers=headers,
+        timeout=5,
+    )
+    if resp.status_code != 200:
+        return None
 
-    return alerts
+    state_data = resp.json()
+    state_val = state_data.get("state", "")
+
+    if state_val in ("unavailable", "unknown"):
+        return SafetyAlert(
+            key=f"{device_name}_unavailable",
+            title=f"{device_name} sensor unavailable",
+            message=f"Diagnostic sensor {check.entity_id} is '{state_val}'.",
+            severity="warning",
+        )
+
+    try:
+        value = float(state_val)
+    except (ValueError, TypeError):
+        return None
+
+    if check.min_value is not None and value <= check.min_value:
+        return SafetyAlert(
+            key=f"{device_name}_fault",
+            title=f"{device_name} health check failed",
+            message=check.message or f"{check.entity_id} = {value}",
+            severity=check.severity,
+        )
+
+    if check.max_value is not None and value >= check.max_value:
+        return SafetyAlert(
+            key=f"{device_name}_fault",
+            title=f"{device_name} health check failed",
+            message=check.message or f"{check.entity_id} = {value}",
+            severity=check.severity,
+        )
+
+    return None
 
 
 # ── Dispatch ──────────────────────────────────────────────────────────────

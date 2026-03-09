@@ -154,7 +154,7 @@ class TestAdjustSchedulesForWindows:
         window_states = {name: False for name in cfg.windows}
 
         adjusted = adjust_schedules_for_windows(
-            schedules, window_states, cfg.windows, -3.0, 2.0,
+            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
         # Same number of schedules, same entries
         assert len(adjusted) == len(schedules)
@@ -175,7 +175,7 @@ class TestAdjustSchedulesForWindows:
         window_states["bedroom"] = True
 
         adjusted = adjust_schedules_for_windows(
-            schedules, window_states, cfg.windows, -3.0, 2.0,
+            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
         bedroom_sched = next(s for s in adjusted if s.room == "bedroom")
@@ -193,7 +193,7 @@ class TestAdjustSchedulesForWindows:
         window_states["bedroom"] = True
 
         adjusted = adjust_schedules_for_windows(
-            schedules, window_states, cfg.windows, -3.0, 2.0,
+            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
         upstairs_orig = next(s for s in schedules if s.room == "upstairs")
@@ -214,7 +214,7 @@ class TestAdjustSchedulesForWindows:
         window_states["bedroom"] = True
 
         adjusted = adjust_schedules_for_windows(
-            schedules, window_states, cfg.windows, -3.0, 2.0,
+            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
         bedroom_sched = next(s for s in adjusted if s.room == "bedroom")
@@ -222,8 +222,8 @@ class TestAdjustSchedulesForWindows:
         assert entry.comfort.cold_penalty == 3.0
         assert entry.comfort.hot_penalty == 0.5
 
-    def test_window_without_rooms_no_effect(self) -> None:
-        """Basement window (rooms=[]) open -> no schedules affected."""
+    def test_window_without_constraint_no_effect(self) -> None:
+        """Basement window (no matching constraint) open -> no schedules affected."""
         from weatherstat.yaml_config import load_config
 
         cfg = load_config()
@@ -232,7 +232,7 @@ class TestAdjustSchedulesForWindows:
         window_states["basement"] = True  # basement has rooms=[]
 
         adjusted = adjust_schedules_for_windows(
-            schedules, window_states, cfg.windows, -3.0, 2.0,
+            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
         for orig, adj in zip(schedules, adjusted, strict=True):

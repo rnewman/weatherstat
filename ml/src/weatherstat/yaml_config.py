@@ -1,4 +1,4 @@
-"""YAML config loader — single source of truth for all entity IDs, columns, and devices.
+"""YAML config loader — single source of truth for all entity IDs, columns, and effectors.
 
 Parses weatherstat.yaml (project root) into frozen dataclasses.
 Loaded once and cached. All modules import from here instead of hardcoding.
@@ -28,6 +28,7 @@ class TempSensorConfig:
     column_name: str  # snake_case column in SQLite/Parquet
     entity_id: str
     statistics: bool  # has long-term hourly stats
+    role: str = ""  # "outdoor" for the reference sensor
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,18 @@ class MiniSplitYamlConfig:
     name: str  # "bedroom", "living_room"
     entity_id: str
     sweep_modes: tuple[str, ...]
-    mode_encoding: dict[str, float]  # command: what we set (for control)
-    action_encoding: dict[str, float] | None = None  # state: what it's doing (for sysid)
+    command_encoding: dict[str, float]  # command: what we set (for control)
+    state_encoding: dict[str, float] | None = None  # state: what it's doing (for sysid)
+
+    @property
+    def mode_encoding(self) -> dict[str, float]:
+        """Backward compat alias for command_encoding."""
+        return self.command_encoding
+
+    @property
+    def action_encoding(self) -> dict[str, float] | None:
+        """Backward compat alias for state_encoding."""
+        return self.state_encoding
 
 
 @dataclass(frozen=True)
@@ -64,25 +75,29 @@ class BlowerYamlConfig:
 
 
 @dataclass(frozen=True)
+class HealthCheck:
+    """Generic device health threshold check."""
+
+    entity_id: str
+    min_value: float | None = None  # alert if reading <= this
+    max_value: float | None = None  # alert if reading >= this
+    severity: str = "warning"
+    message: str = ""
+
+
+@dataclass(frozen=True)
 class BoilerConfig:
     name: str  # "navien"
     mode_entity: str
     capacity_entity: str
     mode_encoding: dict[str, float]
+    health: tuple[HealthCheck, ...] = ()
 
 
 @dataclass(frozen=True)
 class WindowConfig:
     name: str  # "basement", "family_room", etc.
     entity_id: str
-    rooms: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class RoomConfig:
-    name: str
-    temp_column: str
-    zone: str
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,22 @@ class ComfortEntry:
 
 
 @dataclass(frozen=True)
+class ConstraintSchedule:
+    """Comfort constraint on a sensor's value over time."""
+
+    sensor: str  # sensor column name (e.g., "bedroom_temp")
+    zone: str  # heating zone (e.g., "upstairs")
+    label: str  # derived display label (e.g., "bedroom")
+    entries: tuple[ComfortEntry, ...] = ()
+
+
+@dataclass(frozen=True)
+class ZoneConfig:
+    name: str  # "upstairs", "downstairs"
+    thermostat: str  # thermostat name within this zone
+
+
+@dataclass(frozen=True)
 class EnergyCostConfig:
     gas_zone: float
     mini_split: float
@@ -103,37 +134,40 @@ class EnergyCostConfig:
 
 
 @dataclass(frozen=True)
-class ExtraTempSensorConfig:
-    name: str
-    entity_id: str
-
-
-@dataclass(frozen=True)
-class ThermalConfig:
-    tau_sealed: dict[str, float]  # room_name -> sealed time constant (hours)
-    tau_ventilated: dict[str, float]  # room_name -> ventilated time constant (hours)
-    default_tau_sealed: float = 45.0
-    default_tau_ventilated: float = 20.0
-
-
-@dataclass(frozen=True)
-class NavienSafetyConfig:
-    return_temp_entity: str = ""
-    outlet_temp_entity: str = ""
-    disconnected_threshold: float = 33.0  # °F
-
-
-@dataclass(frozen=True)
-class SafetyConfig:
-    navien: NavienSafetyConfig = field(default_factory=NavienSafetyConfig)
-    cooldowns: dict[str, int] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
 class AdvisoryConfig:
     effort_cost: float
     cooldowns: dict[str, int]
     quiet_hours: tuple[int, int] = (22, 7)
+
+
+@dataclass(frozen=True)
+class SafetyConfig:
+    cooldowns: dict[str, int] = field(default_factory=dict)
+
+
+# ── Backward compat (used by sysid, features until updated) ─────────────
+
+
+@dataclass(frozen=True)
+class RoomConfig:
+    """Backward compat — derived from constraints. Will be removed in Phase 4."""
+
+    name: str
+    temp_column: str
+    zone: str
+
+
+@dataclass(frozen=True)
+class ThermalConfig:
+    """Backward compat — replaced by defaults.tau + sysid. Will be removed in Phase 3."""
+
+    tau_sealed: dict[str, float]
+    tau_ventilated: dict[str, float]
+    default_tau_sealed: float = 45.0
+    default_tau_ventilated: float = 20.0
+
+
+# ── Top-level config ─────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -149,17 +183,31 @@ class WeatherstatConfig:
     boiler: BoilerConfig
     windows: dict[str, WindowConfig]
     weather_entity: str
-    rooms: dict[str, RoomConfig]
-    comfort: dict[str, list[ComfortEntry]]
+    constraints: list[ConstraintSchedule]
+    zones: dict[str, ZoneConfig]
     notification_target: str
     energy_costs: EnergyCostConfig
-    extra_temp_sensors: dict[str, ExtraTempSensorConfig] = field(default_factory=dict)
-    thermal: ThermalConfig = field(default_factory=lambda: ThermalConfig(tau={}, default_tau=45.0))
+    default_tau: float = 45.0
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
-    window_open_offset: tuple[float, float] = (-3.0, 2.0)  # (min_offset, max_offset)
+    window_open_offset: tuple[float, float] = (-3.0, 2.0)
 
-    # ── Derived properties ────────────────────────────────────────────
+    # ── Derived properties (primary) ─────────────────────────────────
+
+    @property
+    def prediction_rooms(self) -> list[str]:
+        """Ordered list of constraint labels (room-like names) for prediction."""
+        return [c.label for c in self.constraints]
+
+    @property
+    def room_temp_columns(self) -> dict[str, str]:
+        """label -> sensor column name for prediction targets."""
+        return {c.label: c.sensor for c in self.constraints}
+
+    @property
+    def room_to_zone(self) -> dict[str, str]:
+        """label -> zone_name for control constraints."""
+        return {c.label: c.zone for c in self.constraints}
 
     @property
     def statistics_entities(self) -> dict[str, str]:
@@ -179,21 +227,6 @@ class WeatherstatConfig:
         return list(self.temp_sensors.keys())
 
     @property
-    def room_temp_columns(self) -> dict[str, str]:
-        """room_name -> temp_column for prediction targets."""
-        return {name: cfg.temp_column for name, cfg in self.rooms.items()}
-
-    @property
-    def prediction_rooms(self) -> list[str]:
-        """Ordered list of room names for prediction."""
-        return list(self.rooms.keys())
-
-    @property
-    def room_to_zone(self) -> dict[str, str]:
-        """room_name -> zone_name for control constraints."""
-        return {name: cfg.zone for name, cfg in self.rooms.items()}
-
-    @property
     def climate_entities(self) -> dict[str, str]:
         """prefix -> entity_id for thermostats and mini-splits (history extraction)."""
         result: dict[str, str] = {}
@@ -210,11 +243,12 @@ class WeatherstatConfig:
 
     @property
     def sensor_entities(self) -> dict[str, str]:
-        """prefix -> entity_id for boiler sensors."""
-        result: dict[str, str] = {}
-        result["navien_heating_mode"] = self.boiler.mode_entity
-        result["navien_heat_capacity"] = self.boiler.capacity_entity
-        return result
+        """column_name -> entity_id for boiler sensors."""
+        name = self.boiler.name
+        return {
+            f"boiler_{name}_mode": self.boiler.mode_entity,
+            f"boiler_{name}_capacity": self.boiler.capacity_entity,
+        }
 
     @property
     def window_sensors(self) -> list[str]:
@@ -244,27 +278,69 @@ class WeatherstatConfig:
         return ids
 
     @property
+    def device_health_checks(self) -> dict[str, list[HealthCheck]]:
+        """device_name -> health checks, for generic safety monitoring."""
+        result: dict[str, list[HealthCheck]] = {}
+        if self.boiler.health:
+            result[self.boiler.name] = list(self.boiler.health)
+        return result
+
+    def window_columns_for_sensor(self, sensor_name: str) -> list[str]:
+        """Derive window columns that might affect a sensor via naming convention.
+
+        Until sysid learns per-window coupling (Phase 3), we use names:
+        bedroom_temp → window_bedroom_open (if bedroom window exists).
+        """
+        label = sensor_name.removeprefix("thermostat_").removesuffix("_temp")
+        if label in self.windows:
+            return [f"window_{label}_open"]
+        return []
+
+    # ── Backward compat properties ───────────────────────────────────
+
+    @property
+    def comfort(self) -> dict[str, list[ComfortEntry]]:
+        """label -> comfort entries. Backward compat for control.py."""
+        return {c.label: list(c.entries) for c in self.constraints}
+
+    @property
+    def rooms(self) -> dict[str, RoomConfig]:
+        """Backward compat — derived from constraints."""
+        return {c.label: RoomConfig(name=c.label, temp_column=c.sensor, zone=c.zone) for c in self.constraints}
+
+    @property
+    def thermal(self) -> ThermalConfig:
+        """Backward compat — returns default tau for all rooms."""
+        return ThermalConfig(
+            tau_sealed={},
+            tau_ventilated={},
+            default_tau_sealed=self.default_tau,
+            default_tau_ventilated=self.default_tau * 0.45,
+        )
+
+    @property
+    def safety_navien(self) -> None:
+        """Removed — use device_health_checks instead."""
+        return None
+
+    # ── Snapshot schema ──────────────────────────────────────────────
+
+    @property
     def exclude_columns(self) -> set[str]:
         """Columns to exclude from features during training.
 
         Raw categorical strings that have encoded versions.
         """
         cols: set[str] = {"timestamp"}
-        # Thermostat targets (binary controllers — setpoint is not meaningful)
         for name in self.thermostats:
             cols.add(f"thermostat_{name}_target")
             cols.add(f"thermostat_{name}_action")
-        # Mini-split raw mode strings
         for name in self.mini_splits:
             cols.add(f"mini_split_{name}_mode")
-        # Blower raw mode strings
         for name in self.blowers:
             cols.add(f"blower_{name}_mode")
-        # Boiler raw mode string
-        cols.add("navien_heating_mode")
-        # Weather condition string
+        cols.add(f"boiler_{self.boiler.name}_mode")
         cols.add("weather_condition")
-        # Redundant aggregate — per-window features are sufficient
         cols.add("any_window_open")
         return cols
 
@@ -272,18 +348,14 @@ class WeatherstatConfig:
     def hvac_merge_columns(self) -> list[str]:
         """HVAC columns to merge from full-feature sources into baseline hourly data."""
         cols: list[str] = []
-        # Thermostat actions
         for name in self.thermostats:
             cols.append(f"thermostat_{name}_action")
-        # Mini-split features
         for name in self.mini_splits:
             cols.extend([f"mini_split_{name}_temp", f"mini_split_{name}_target", f"mini_split_{name}_mode"])
-        # Blower modes
         for name in self.blowers:
             cols.append(f"blower_{name}_mode")
-        # Boiler
-        cols.extend(["navien_heating_mode", "navien_heat_capacity"])
-        # Weather + windows
+        bname = self.boiler.name
+        cols.extend([f"boiler_{bname}_mode", f"boiler_{bname}_capacity"])
         cols.extend(["weather_condition", "wind_speed", "outdoor_humidity"])
         for name in self.windows:
             cols.append(f"window_{name}_open")
@@ -296,7 +368,7 @@ class WeatherstatConfig:
         cols: list[str] = list(self.temp_sensors.keys())
         for col in self.humidity_sensors:
             cols.append(col)
-        cols.append("navien_heat_capacity")
+        cols.append(f"boiler_{self.boiler.name}_capacity")
         cols.extend(["outdoor_humidity", "outdoor_wind_speed"])
         for name in self.thermostats:
             cols.append(f"thermostat_{name}_target")
@@ -339,12 +411,12 @@ class WeatherstatConfig:
         return pairs
 
     @property
-    def safety_navien(self) -> NavienSafetyConfig | None:
-        """Navien safety check config, or None if not configured."""
-        cfg = self.safety.navien
-        if cfg.return_temp_entity:
-            return cfg
-        return None
+    def column_types(self) -> dict[str, str]:
+        """column_name -> SQL_type for all snapshot columns.
+
+        Used by the EAV reader to coerce values after pivoting.
+        """
+        return {col: sql_type for col, sql_type in self.snapshot_column_defs()}
 
     def snapshot_column_defs(self) -> list[tuple[str, str]]:
         """(column_name, SQL_type) for all snapshot columns.
@@ -366,13 +438,14 @@ class WeatherstatConfig:
                 (f"mini_split_{name}_target", "REAL"),
                 (f"mini_split_{name}_mode", "TEXT"),
             ])
-            if cfg.action_encoding:
+            if cfg.state_encoding:
                 defs.append((f"mini_split_{name}_action", "TEXT"))
         # Blowers
         for name in self.blowers:
             defs.append((f"blower_{name}_mode", "TEXT"))
         # Boiler
-        defs.extend([("navien_heating_mode", "TEXT"), ("navien_heat_capacity", "REAL")])
+        bname = self.boiler.name
+        defs.extend([(f"boiler_{bname}_mode", "TEXT"), (f"boiler_{bname}_capacity", "REAL")])
         # Environment
         defs.extend([
             ("outdoor_temp", "REAL"),
@@ -418,6 +491,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             column_name=col_name,
             entity_id=sensor["entity_id"],
             statistics=sensor.get("statistics", False),
+            role=sensor.get("role", ""),
         )
 
     # Humidity sensors
@@ -429,73 +503,76 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             statistics=sensor.get("statistics", False),
         )
 
-    # Devices
+    # ── Effectors ────────────────────────────────────────────────────
+    eff = data["effectors"]
+
     thermostats: dict[str, ThermostatConfig] = {}
-    for name, dev in data["devices"]["thermostats"].items():
+    for name, dev in eff["thermostats"].items():
         thermostats[name] = ThermostatConfig(
             name=name, entity_id=dev["entity_id"], zone=dev["zone"],
             state_device=dev.get("state_device"),
         )
 
     mini_splits: dict[str, MiniSplitYamlConfig] = {}
-    for name, dev in data["devices"]["mini_splits"].items():
-        action_enc_raw = dev.get("action_encoding")
-        action_enc = {str(k): float(v) for k, v in action_enc_raw.items()} if action_enc_raw else None
+    for name, dev in eff["mini_splits"].items():
+        state_enc_raw = dev.get("state_encoding")
+        state_enc = {str(k): float(v) for k, v in state_enc_raw.items()} if state_enc_raw else None
         mini_splits[name] = MiniSplitYamlConfig(
             name=name,
             entity_id=dev["entity_id"],
-            sweep_modes=tuple(dev["sweep_modes"]),
-            mode_encoding={str(k): float(v) for k, v in dev["mode_encoding"].items()},
-            action_encoding=action_enc,
+            sweep_modes=tuple(str(m) for m in dev["sweep_modes"]),
+            command_encoding={str(k): float(v) for k, v in dev["command_encoding"].items()},
+            state_encoding=state_enc,
         )
 
     blowers: dict[str, BlowerYamlConfig] = {}
-    for name, dev in data["devices"]["blowers"].items():
+    for name, dev in eff["blowers"].items():
         blowers[name] = BlowerYamlConfig(
             name=name,
             entity_id=dev["entity_id"],
             zone=dev["zone"],
-            levels=tuple(dev["levels"]),
+            levels=tuple(str(lv) for lv in dev["levels"]),
             level_encoding={str(k): float(v) for k, v in dev["level_encoding"].items()},
         )
 
-    boiler_data = list(data["devices"]["boiler"].values())[0]
-    boiler_name = list(data["devices"]["boiler"].keys())[0]
+    boiler_items = list(eff["boiler"].items())
+    boiler_name, boiler_data = boiler_items[0]
+    health_checks: list[HealthCheck] = []
+    for hc in boiler_data.get("health", []):
+        health_checks.append(HealthCheck(
+            entity_id=hc["entity"],
+            min_value=float(hc["min_value"]) if "min_value" in hc else None,
+            max_value=float(hc["max_value"]) if "max_value" in hc else None,
+            severity=hc.get("severity", "warning"),
+            message=hc.get("message", ""),
+        ))
     boiler = BoilerConfig(
         name=boiler_name,
         mode_entity=boiler_data["mode_entity"],
         capacity_entity=boiler_data["capacity_entity"],
         mode_encoding={str(k): float(v) for k, v in boiler_data["mode_encoding"].items()},
+        health=tuple(health_checks),
     )
 
-    # Windows
+    # ── Windows ──────────────────────────────────────────────────────
     windows: dict[str, WindowConfig] = {}
     for name, win in data["windows"].items():
-        windows[name] = WindowConfig(
-            name=name,
-            entity_id=win["entity_id"],
-            rooms=tuple(win.get("rooms", [])),
-        )
+        windows[name] = WindowConfig(name=name, entity_id=win["entity_id"])
 
-    # Rooms
-    rooms: dict[str, RoomConfig] = {}
-    for name, room in data["rooms"].items():
-        rooms[name] = RoomConfig(name=name, temp_column=room["temp_column"], zone=room["zone"])
-
-    # Window-open comfort offset (optional, in comfort section)
-    comfort_data = data["comfort"]
-    wo_offset = comfort_data.get("window_open_offset", {"min": -3, "max": 2})
+    # ── Constraints ──────────────────────────────────────────────────
+    constraints_data = data.get("constraints", {})
+    wo_offset = constraints_data.get("window_open_offset", {"min": -3, "max": 2})
     window_open_offset = (float(wo_offset["min"]), float(wo_offset["max"]))
 
-    # Comfort schedules
-    comfort: dict[str, list[ComfortEntry]] = {}
-    for room, entries in comfort_data.items():
-        if room == "window_open_offset":
-            continue
-        comfort[room] = []
-        for entry in entries:
+    constraint_list: list[ConstraintSchedule] = []
+    for sched in constraints_data.get("schedules", []):
+        sensor = sched["sensor"]
+        zone = sched["zone"]
+        label = sensor.removeprefix("thermostat_").removesuffix("_temp")
+        entries: list[ComfortEntry] = []
+        for entry in sched["schedule"]:
             hours = entry["hours"]
-            comfort[room].append(ComfortEntry(
+            entries.append(ComfortEntry(
                 start_hour=hours[0],
                 end_hour=hours[1],
                 min_temp=float(entry["min"]),
@@ -503,8 +580,16 @@ def _parse_config(data: dict) -> WeatherstatConfig:
                 cold_penalty=float(entry.get("cold_penalty", 2.0)),
                 hot_penalty=float(entry.get("hot_penalty", 1.0)),
             ))
+        constraint_list.append(ConstraintSchedule(
+            sensor=sensor, zone=zone, label=label, entries=tuple(entries),
+        ))
 
-    # Energy costs
+    # ── Zones ────────────────────────────────────────────────────────
+    zones: dict[str, ZoneConfig] = {}
+    for name, zcfg in data.get("zones", {}).items():
+        zones[name] = ZoneConfig(name=name, thermostat=zcfg["thermostat"])
+
+    # ── Energy costs ─────────────────────────────────────────────────
     ec = data["energy_costs"]
     energy_costs = EnergyCostConfig(
         gas_zone=float(ec["gas_zone"]),
@@ -512,21 +597,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         blower={str(k): float(v) for k, v in ec["blower"].items()},
     )
 
-    # Extra temp sensors (optional)
-    extra_temp_sensors: dict[str, ExtraTempSensorConfig] = {}
-    for name, sensor in data.get("extra_temp_sensors", {}).items():
-        extra_temp_sensors[name] = ExtraTempSensorConfig(name=name, entity_id=sensor["entity_id"])
-
-    # Thermal config (optional, with defaults)
-    thermal_data = data.get("thermal", {})
-    thermal_config = ThermalConfig(
-        tau_sealed={str(k): float(v) for k, v in thermal_data.get("tau_sealed", {}).items()},
-        tau_ventilated={str(k): float(v) for k, v in thermal_data.get("tau_ventilated", {}).items()},
-        default_tau_sealed=float(thermal_data.get("default_tau_sealed", 45.0)),
-        default_tau_ventilated=float(thermal_data.get("default_tau_ventilated", 20.0)),
-    )
-
-    # Advisory config (optional, with defaults)
+    # ── Advisory config ──────────────────────────────────────────────
     adv_data = data.get("advisory", {})
     adv_quiet = adv_data.get("quiet_hours", [22, 7])
     advisory_config = AdvisoryConfig(
@@ -535,17 +606,15 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
     )
 
-    # Safety config (optional)
+    # ── Safety config (just cooldowns — device health is on effectors) ─
     safety_data = data.get("safety", {})
-    navien_data = safety_data.get("navien", {})
     safety_config = SafetyConfig(
-        navien=NavienSafetyConfig(
-            return_temp_entity=str(navien_data.get("return_temp_entity", "")),
-            outlet_temp_entity=str(navien_data.get("outlet_temp_entity", "")),
-            disconnected_threshold=float(navien_data.get("disconnected_threshold", 33.0)),
-        ),
         cooldowns={str(k): int(v) for k, v in safety_data.get("cooldowns", {}).items()},
     )
+
+    # ── Defaults ─────────────────────────────────────────────────────
+    defaults = data.get("defaults", {})
+    default_tau = float(defaults.get("tau", 45.0))
 
     return WeatherstatConfig(
         location=location,
@@ -557,12 +626,11 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         boiler=boiler,
         windows=windows,
         weather_entity=data["weather"]["entity_id"],
-        rooms=rooms,
-        comfort=comfort,
+        constraints=constraint_list,
+        zones=zones,
         notification_target=data["notifications"]["target"],
         energy_costs=energy_costs,
-        extra_temp_sensors=extra_temp_sensors,
-        thermal=thermal_config,
+        default_tau=default_tau,
         advisory=advisory_config,
         safety=safety_config,
         window_open_offset=window_open_offset,

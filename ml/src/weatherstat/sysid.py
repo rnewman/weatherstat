@@ -179,7 +179,7 @@ def _enumerate_effectors() -> list[EffectorSpec]:
 
     effectors.append(EffectorSpec(
         name=_CFG.boiler.name,
-        state_column=f"{_CFG.boiler.name}_heating_mode",
+        state_column=f"boiler_{_CFG.boiler.name}_mode",
         encoding={str(k): float(v) for k, v in _CFG.boiler.mode_encoding.items()},
         max_lag_minutes=90,
         device_type="boiler",
@@ -189,48 +189,28 @@ def _enumerate_effectors() -> list[EffectorSpec]:
 
 
 def _enumerate_sensors() -> list[SensorSpec]:
-    """Build sensor list from YAML config."""
-    # Build room -> window columns mapping
-    room_windows: dict[str, list[str]] = {}
-    for win_name, win_cfg in _CFG.windows.items():
-        col = f"window_{win_name}_open"
-        for room in win_cfg.rooms:
-            room_windows.setdefault(room, []).append(col)
+    """Build sensor list from YAML config.
 
-    thermal = _CFG.thermal
+    Window columns and initial tau values are derived from the config:
+    - Window mapping uses naming convention (Phase 1) — e.g., bedroom_temp
+      gets window_bedroom_open if a bedroom window exists.
+    - Tau uses defaults.tau as the initial guess for curve_fit. Sysid fits
+      the actual value from data.
+    """
     sensors: list[SensorSpec] = []
 
     for col_name in _CFG.temp_sensors:
         if col_name == "outdoor_temp":
             continue
 
-        # Try to find a room name for this sensor (for tau and window lookup)
-        room_name = None
-        for rname, rcfg in _CFG.rooms.items():
-            if rcfg.temp_column == col_name:
-                room_name = rname
-                break
-        # Also check if the column name itself matches a room key pattern
-        if room_name is None:
-            # e.g., "bedroom_temp" -> "bedroom"
-            candidate = col_name.removesuffix("_temp")
-            if candidate in _CFG.rooms:
-                room_name = candidate
-
-        window_cols = room_windows.get(room_name, []) if room_name else []
-        if room_name:
-            tau_s = thermal.tau_sealed.get(room_name, thermal.default_tau_sealed)
-            tau_v = thermal.tau_ventilated.get(room_name, thermal.default_tau_ventilated)
-        else:
-            tau_s = thermal.default_tau_sealed
-            tau_v = thermal.default_tau_ventilated
+        window_cols = _CFG.window_columns_for_sensor(col_name)
 
         sensors.append(SensorSpec(
             name=col_name,
             temp_column=col_name,
             window_columns=window_cols,
-            yaml_tau_sealed=tau_s,
-            yaml_tau_ventilated=tau_v,
+            yaml_tau_sealed=_CFG.default_tau,
+            yaml_tau_ventilated=_CFG.default_tau * 0.45,
         ))
 
     return sensors

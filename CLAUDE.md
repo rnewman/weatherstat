@@ -8,21 +8,23 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 ## Architecture
 
 - HA interface is abstracted behind `HAClient` (types.ts). WebSocket is one implementation; add-on/integration would use HA internal API.
-- Collector writes 5-min snapshots to SQLite (`data/snapshots/snapshots.db`). Sysid reads this for parameter fitting. Control output goes to JSON in `data/predictions/`.
+- Collector writes 5-min snapshots to SQLite (`data/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Legacy wide `snapshots` table is also written (dual-write transition). Python reader uses `readings` table and pivots to wide DataFrame. Sysid reads this for parameter fitting. Control output goes to JSON in `data/predictions/`.
 - Weather forecasts come from HA's `weather.forecast_home` entity (met.no). The collector stores hourly forecast snapshots; the simulator uses live forecasts for piecewise outdoor temp integration.
 - Entity IDs are real and live in `ha-client/src/entities.ts`. Full reference in `docs/entities.md`.
-- Collector SQLite schema matches the Parquet snapshot schema (same columns, snake_case). Only difference: `any_window_open` is INTEGER in SQLite vs bool in Parquet (normalized at load time).
+- Collector SQLite uses EAV format (`readings` table with `timestamp, name, value` columns). Adding a sensor requires no schema change. The Python reader pivots to wide DataFrame at load time, applying types from config. Legacy wide `snapshots` table is maintained during transition.
 
 ## Development Stages
 
 1. **Pipeline & data** (done) — Collector running, LightGBM training on collector data, evaluation framework.
 2. **Control loop** (done) — Setpoint sweep, comfort schedules, safety rails, dry-run + live execution.
-3. **Data accumulation** (in progress) — Collector running since Feb 2026. Retrain weekly. All data is winter so far.
+3. **Data accumulation** (in progress) — Collector running since Feb 2026. All data is winter so far.
 4. **System identification** (done) — `sysid.py` fits tau, effector×sensor gains, and solar profiles from collector data.
 5. **Per-room models & blower control** (done) — 8 rooms × 5 horizons, blower fan speed in control sweep.
 6. **Forecast training + HVAC features** (done) — Training uses stored met.no forecasts (no train/serve skew), retrospective HVAC duty cycle features.
 7. **Effector inertia planning** (done) — Trajectory search for slow effectors, physics-only control (ML removed).
 8. **Virtual effectors Phase 1** (done) — Physics-based window advisories integrated into control loop.
+9. **Generalized architecture Phase 1** (done) — Sensor/effector/constraint model replaces room-centric config. Generic device health checks. Boiler column generalization. Humidity sensor expansion.
+10. **Narrow storage Phase 2** (done) — EAV `readings` table replaces wide `snapshots` schema. Dual-write transition. No schema changes needed to add sensors.
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 

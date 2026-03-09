@@ -411,8 +411,8 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
             result[col_name] = np.nan
             continue
 
-        if col_name == "navien_heating_mode":
-            # String sensor — handle separately
+        if col_name.endswith("_mode"):
+            # String sensor (boiler mode) — keep as text
             series = _history_to_series(records, value_fn=lambda s: s)
         else:
             series = _history_to_series(records)
@@ -511,8 +511,32 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
 # ── Collector SQLite reader ───────────────────────────────────────────────
 
 
+def _load_from_readings(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Load from the EAV readings table and pivot to wide format."""
+    df_long = pd.read_sql(
+        "SELECT timestamp, name, value FROM readings ORDER BY timestamp", conn
+    )
+    if df_long.empty:
+        return pd.DataFrame()
+
+    df = df_long.pivot(index="timestamp", columns="name", values="value")
+    df.columns.name = None  # remove "name" label from columns axis
+
+    # Apply types from config
+    col_types = _CFG.column_types
+    for col in df.columns:
+        sql_type = col_types.get(col)
+        if sql_type in ("REAL", "INTEGER"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.reset_index()
+
+
 def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
     """Load all collector snapshots from the SQLite database.
+
+    Reads from the EAV ``readings`` table if it exists and has data,
+    otherwise falls back to the legacy wide ``snapshots`` table.
 
     Args:
         db_path: Path to snapshots.db. Defaults to SNAPSHOTS_DB.
@@ -526,6 +550,25 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
         sys.exit(1)
 
     conn = sqlite3.connect(str(path))
+
+    # Check if readings table exists and has data
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "readings" in tables:
+        count = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        if count > 0:
+            df = _load_from_readings(conn)
+            conn.close()
+            for col in _CFG.window_bool_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(bool)
+            return df
+
+    # Fallback to legacy wide table
     df = pd.read_sql("SELECT * FROM snapshots ORDER BY timestamp", conn)
     conn.close()
 
@@ -571,7 +614,7 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
         if not records:
             result[col_name] = np.nan
             continue
-        if col_name == "navien_heating_mode":
+        if col_name.endswith("_mode"):
             series = _history_to_series(records, value_fn=lambda s: s)
         else:
             series = _history_to_series(records)

@@ -12,11 +12,15 @@ The primary challenge is hydronic floor heating with 2-4 hour thermal lag, compo
 
 2. **Causality over correlation.** The system must answer counterfactual questions: "what happens if I turn on the heat now vs. in 2 hours?" This requires a model that understands cause and effect, not one trained on observational data where actions and conditions are confounded.
 
-3. **Configuration-driven.** Adding a sensor, room, or device should be a YAML edit, not a code change. The system discovers its own shape from configuration.
+3. **Configuration-driven.** Adding a sensor, effector, or constraint should be a YAML edit, not a code change. The system discovers its own shape from configuration.
 
-4. **Safe by default.** Dry-run before live. Override detection. Hold times. Setpoint clamps. The system should be hard to misconfigure into damaging equipment or freezing pipes.
+4. **Sensors and effectors, not rooms.** The system optimizes sensor values by actuating effectors. Rooms are display labels, not structural entities. Constraints target sensors directly. Zones are a property of effectors (which thermostat controls which heating circuit), not of sensors.
 
-5. **Observable.** Every decision is logged with its inputs, alternatives considered, and reasoning. Predictions are saved for later comparison with reality.
+5. **Learned over configured.** Sysid discovers physics (tau, gains, window effects) from data. Configuration declares what exists, not how things interact. Command/state pairs: every effector has intent (command) and reality (measured state). Sysid trains on state; control sets commands.
+
+6. **Safe by default.** Dry-run before live. Override detection. Hold times. Setpoint clamps. Generic device health checks. The system should be hard to misconfigure into damaging equipment or freezing pipes.
+
+7. **Observable.** Every decision is logged with its inputs, alternatives considered, and reasoning. Predictions are saved for later comparison with reality.
 
 ---
 
@@ -71,18 +75,26 @@ The primary challenge is hydronic floor heating with 2-4 hour thermal lag, compo
 
 ### 1. Configuration (`weatherstat.yaml`)
 
-Single source of truth for all entity IDs, device definitions, room topology, comfort schedules, energy costs, and thermal parameters.
+Single source of truth for all entity IDs, effector definitions, comfort constraints, energy costs, and safety thresholds.
+
+The system is organized around five fundamental concepts:
+- **Sensors** — observable quantities (temperature, humidity) with entity IDs and types
+- **Effectors** — actuatable devices (thermostats, mini splits, blowers, boiler) with command/state encodings and optional health checks
+- **Constraints** — scoring objectives on sensor values, with time-of-day bounds and asymmetric penalty weights, referencing sensors directly (not rooms)
+- **Windows** — environmental modifiers with binary state; their effect on sensor dynamics is derived from naming convention (Phase 1) or learned by sysid (Phase 3)
+- **Zones** — topological grouping of effectors (which thermostat controls which heating circuit)
 
 **Contents:**
 - `location` — lat/lon/elevation/timezone (for solar position)
-- `sensors` — every monitored temperature and humidity entity, with column names
-- `devices` — thermostats, mini splits, blowers, boiler, with mode encodings
-- `windows` — window/door sensors with room associations
-- `rooms` — room definitions mapping to temperature columns and heating zones
-- `comfort` — per-room, time-of-day comfort bands with asymmetric penalty weights
-- `thermal` — fitted tau values (sealed and ventilated) per room
+- `sensors` — temperature and humidity entities (10+ humidity sensors)
+- `effectors` — thermostats, mini splits, blowers, boiler with mode encodings and health check thresholds
+- `windows` — window/door sensors (no configured room associations — effects derived)
+- `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights
+- `zones` — thermostat-to-circuit mapping
 - `energy_costs` — per-device energy cost for the optimizer
 - `advisory` — effort costs, quiet hours, cooldown timers
+- `safety` — cooldown timers for infrastructure alerts
+- `defaults` — fallback values (e.g., `tau: 45.0` before sysid has run)
 
 **Read by:** every other component (TS via `yaml-config.ts`, Python via `yaml_config.py`). Both loaders produce typed configuration objects. Adding a sensor or device to the YAML automatically propagates to collection, prediction, and control.
 
@@ -100,10 +112,11 @@ Periodically sample the full state of the house and persist it for training and 
 - Extracts values using config-driven column definitions (temperature attributes, HVAC actions/modes/targets, window states, weather conditions).
 - Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`) from HA's met.no integration for use by the simulator.
 - Deduplicates by rounding timestamps to the snapshot interval.
-- Writes rows to SQLite (`data/snapshots/snapshots.db`).
-- Schema generated dynamically from YAML — adding a sensor automatically adds a column.
+- Writes to SQLite (`data/snapshots/snapshots.db`) in two formats (dual-write transition):
+  - **`readings` table** (EAV): `(timestamp, name, value)` triples. No schema changes needed to add sensors.
+  - **`snapshots` table** (wide, legacy): one column per sensor. Kept during transition.
 
-**Output:** SQLite database, one row per 5-minute interval, each row a complete house state snapshot.
+**Output:** SQLite database with 5-minute resolution. The `readings` table stores `(timestamp, name, value)` triples (~74 readings per snapshot). The Python reader pivots this to a wide DataFrame at load time, applying types from config.
 
 **Operational:** `just collect-durable` runs with auto-restart and health monitoring. `just health` checks data freshness.
 
@@ -136,7 +149,7 @@ Where:
 
 Fits all thermal model parameters from observed collector data using a two-stage approach.
 
-**Stage 1 — Tau fitting (scipy `curve_fit`):** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off. Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via nonlinear least squares on each contiguous segment, separated by window state. Multiple segments → weighted median → tighter estimate than single-night fitting. Produces `tau_sealed` and `tau_ventilated` per sensor.
+**Stage 1 — Tau fitting (scipy `curve_fit`):** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off. Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via nonlinear least squares on each contiguous segment, separated by window state. Multiple segments → weighted median → tighter estimate than single-night fitting. Produces `tau_sealed` and `tau_ventilated` per sensor. Window-sensor associations are derived by naming convention (e.g., `bedroom_temp` ↔ `window_bedroom_open`).
 
 **Stage 2 — Effector gains and solar profiles (numpy linear regression):** With tau fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on lagged effector activity (coarse time bins capturing delay) and hour-of-day indicators (capturing solar gain). One regression per sensor; coefficients across all sensors form the full coupling matrix.
 
@@ -187,12 +200,12 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 **Scoring:**
 
 ```
-score = sum over (rooms, horizons) of:
-    comfort_violation(T_predicted, comfort_band, penalty_weights)
+score = sum over (sensors, horizons) of:
+    comfort_violation(T_predicted, constraint_band, penalty_weights)
   + energy_cost(actions, duration)
 ```
 
-Comfort violations are asymmetric: being too cold incurs a higher penalty than being too warm (configurable per room and time of day via YAML). Window-open states widen the comfort band to avoid fighting ventilation.
+Comfort violations are asymmetric: being too cold incurs a higher penalty than being too warm (configurable per sensor and time of day via YAML constraints). Window-open states widen the comfort band to avoid fighting ventilation.
 
 **Horizon weighting:** Closer predictions weighted higher (more accurate, more actionable).
 
@@ -234,7 +247,7 @@ Generates human-actionable recommendations for things the system can't do electr
 - **Free cooling:** "Open [window] — outdoor temp is lower, room cools toward comfort range."
 - **Close windows:** "Close [window] — heating efficiency improves with window sealed."
 
-**Evaluation:** After the trajectory sweep commits to an electronic plan, the advisory system re-runs `predict()` for each window with modeled rooms, toggling its state. If toggling improves comfort cost (measured against original, non-adjusted schedules) by more than the effort threshold (from YAML `advisory.effort_cost`), an advisory is generated.
+**Evaluation:** After the trajectory sweep commits to an electronic plan, the advisory system re-runs `predict()` for each window, toggling its state. If toggling improves comfort cost (measured against original, non-adjusted constraint schedules) by more than the effort threshold (from YAML `advisory.effort_cost`), an advisory is generated. Advisory messages identify the most-affected constrained sensor (data-driven from the constraint list and temperature deltas).
 
 **Key design constraint:** The electronic plan does NOT change based on advisories. The controller commits to the best electronic trajectory given current window states. Advisories are a separate, post-sweep evaluation. If the human acts on the advisory (e.g., opens a window), the next 15-minute cycle re-evaluates with the new state and naturally adjusts.
 
@@ -245,7 +258,21 @@ Generates human-actionable recommendations for things the system can't do electr
 
 ---
 
-### 7. Decision Log (`ml/src/weatherstat/decision_log.py`)
+### 7. Safety System (`ml/src/weatherstat/safety.py`)
+
+Detects infrastructure problems that prevent the control loop from working.
+
+**Check types:**
+- **Thermostat mode check:** Detects when a thermostat's `hvac_mode` is "off" while the controller wants to heat — setting the target has no effect in this state.
+- **Generic device health:** Iterates health check definitions from effector configs (e.g., `effectors.boiler.navien.health`). Fetches each entity's current state from HA and compares against configured min/max thresholds.
+
+**Dispatch:** Safety alerts bypass quiet hours (these are urgent). Cooldown tracking prevents notification fatigue. Alerts reuse the advisory notification infrastructure.
+
+**Configuration-driven:** Health checks are defined per-effector in YAML with entity ID, min/max thresholds, severity, and message. Adding a health check = YAML edit.
+
+---
+
+### 8. Decision Log (`ml/src/weatherstat/decision_log.py`)
 
 Records every control decision with full context.
 
@@ -269,9 +296,10 @@ Records every control decision with full context.
 ### Collector -> Thermal Model
 
 **Interface:** SQLite database (`data/snapshots/snapshots.db`).
-- Schema driven by YAML config.
-- One row per 5-minute interval.
-- Columns: timestamp, all temperature sensors, HVAC states (action, mode, target per device), window states, weather, humidity, forecast snapshots.
+- EAV `readings` table: `(timestamp, name, value)` triples, driven by YAML config.
+- One snapshot per 5-minute interval (~74 readings per snapshot).
+- Names include: temperature sensors, HVAC states (action, mode, target per effector), window states, weather, humidity sensors, forecast snapshots.
+- Python reader pivots to wide DataFrame at load time, applying SQL types from config.
 
 The collector is language-agnostic from the model's perspective.
 
