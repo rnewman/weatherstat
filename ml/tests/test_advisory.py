@@ -140,7 +140,7 @@ class TestEvaluateWindowAdvisories:
         )
         # Tight comfort band that the warm room violates
         schedules = _make_schedules(
-            bedroom=[ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 73.0, 2.0, 2.0))],
+            bedroom=[ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 71.5, 70.0, 73.0, 2.0, 2.0))],
         )
         advisories = evaluate_window_advisories(
             state, _all_off(), sim_params, schedules, base_hour=14,
@@ -160,7 +160,7 @@ class TestEvaluateWindowAdvisories:
         )
         # Wide comfort band that current temps satisfy
         schedules = _make_schedules(
-            bedroom=[ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 60.0, 80.0, 1.0, 1.0))],
+            bedroom=[ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 60.0, 80.0, 1.0, 1.0))],
         )
         advisories = evaluate_window_advisories(
             state, _all_off(), sim_params, schedules, base_hour=2,

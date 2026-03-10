@@ -27,6 +27,7 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 10. **Narrow storage Phase 2** (done) — EAV `readings` table is canonical storage. Legacy wide `snapshots` table and dual-write removed. No schema changes needed to add sensors.
 11. **Learned window effects Phase 3** (done) — `TauModel` with per-window `window_betas` replaces binary sealed/ventilated tau. Sysid learns window cooling rate coefficients and cross-breeze interactions from regression.
 12. **Derived zone mapping** (done) — Sensor-to-zone mapping derived from sysid coupling matrix (highest thermostat gain per sensor). Zone removed from constraints YAML and `ConstraintSchedule`. Legacy wide table dropped from collector.
+13. **Mini split target temperature control** (done) — Mini splits treated as regulating effectors: sweep target temperatures (from comfort schedule `preferred`) instead of modes. Proportional activity model in simulator (activity ramps 0→1 as room deviates from target within `proportional_band`). Mode hold windows prevent noisy mode changes during quiet hours. Two-layer comfort cost: continuous quadratic from `preferred` + 10× steep penalty outside hard rails (min/max). Asymmetric cold/hot penalties.
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 

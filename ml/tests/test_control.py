@@ -14,7 +14,9 @@ from weatherstat.control import (
     CONTROL_HORIZONS,
     HORIZON_WEIGHTS,
     _cautious_setpoint,
+    _in_hold_window,
     _in_quiet_hours,
+    _mini_split_sweep_options,
     adjust_schedules_for_windows,
     compute_comfort_cost,
     compute_energy_cost,
@@ -24,6 +26,7 @@ from weatherstat.types import (
     BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
+    ControlState,
     MiniSplitDecision,
     RoomComfort,
     ThermostatTrajectory,
@@ -37,7 +40,7 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
     """Return default_comfort_schedules() with optional room overrides.
 
     Usage:
-        make_schedules(upstairs=[ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 70, 74))])
+        make_schedules(upstairs=[ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72, 70, 74))])
     """
     from weatherstat.control import default_comfort_schedules
 
@@ -53,22 +56,33 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
 class TestComfortCost:
     """Test comfort cost computation."""
 
-    def test_comfort_cost_quadratic_penalty(self) -> None:
-        """Room at 76F, max 74F, hot_penalty 2.0 -> cost = (76-74)^2 * 2.0 * weight."""
+    def test_comfort_cost_continuous_plus_rail(self) -> None:
+        """Room at 76F, preferred 72F, max 74F, hot_penalty 2.0.
+
+        Cost = continuous(76-72)^2*2.0*weight + rail(76-74)^2*2.0*10*weight.
+        """
         schedules = [
             ComfortSchedule(
                 room="upstairs",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 70.0, 74.0, hot_penalty=2.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72.0, 70.0, 74.0, hot_penalty=2.0)),),
             ),
         ]
         predictions = {"upstairs_temp_t+12": 76.0}
         cost = compute_comfort_cost(predictions, schedules, base_hour=12)
 
-        expected = (76.0 - 74.0) ** 2 * 2.0 * HORIZON_WEIGHTS[12]
+        w = HORIZON_WEIGHTS[12]
+        continuous = (76.0 - 72.0) ** 2 * 2.0 * w  # deviation from preferred
+        rail = (76.0 - 74.0) ** 2 * 2.0 * 10.0 * w  # exceeds hard max
+        expected = continuous + rail
         assert abs(cost - expected) < 0.001
 
     def test_comfort_cost_respects_schedule_hour(self) -> None:
-        """Bedroom at hour 22 (night: max 72F) vs hour 10 (day: max 75F) -> different costs at 74F."""
+        """Bedroom at hour 22 (night: preferred 69F) vs hour 10 (day: preferred 70F).
+
+        At 74F: night schedule has higher cold_penalty AND 74 exceeds night max (72),
+        so night cost should be much higher than day cost. Day cost is non-zero
+        (74 > preferred 70) but has no hard rail penalty (74 < max 75).
+        """
         from weatherstat.control import default_comfort_schedules
 
         schedules = default_comfort_schedules()
@@ -76,14 +90,38 @@ class TestComfortCost:
 
         predictions = {"bedroom_temp_t+12": 74.0}
 
-        # Hour 22 (night schedule: max 72F) -> 74 > 72, penalized
+        # Hour 22 (night: preferred 69, max 72) -> 74 > max, big penalty
         cost_night = compute_comfort_cost(predictions, bedroom_schedules, base_hour=22)
 
-        # Hour 10 (day schedule: max 75F) -> 74 < 75, no penalty
+        # Hour 10 (day: preferred 70, max 75) -> 74 > preferred but < max, small penalty
         cost_day = compute_comfort_cost(predictions, bedroom_schedules, base_hour=10)
 
         assert cost_night > cost_day
-        assert cost_day == 0.0
+        assert cost_day > 0.0  # continuous cost: 74 is above preferred (70)
+
+    def test_comfort_cost_zero_at_preferred(self) -> None:
+        """Room exactly at preferred temperature -> zero cost."""
+        schedules = [
+            ComfortSchedule(
+                room="upstairs",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 69.0, 74.0)),),
+            ),
+        ]
+        predictions = {"upstairs_temp_t+12": 71.0}
+        cost = compute_comfort_cost(predictions, schedules, base_hour=12)
+        assert cost == 0.0
+
+    def test_comfort_cost_within_band_nonzero(self) -> None:
+        """Room within [min, max] but not at preferred -> non-zero continuous cost."""
+        schedules = [
+            ComfortSchedule(
+                room="upstairs",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 69.0, 74.0)),),
+            ),
+        ]
+        predictions = {"upstairs_temp_t+12": 73.0}  # in band but above preferred
+        cost = compute_comfort_cost(predictions, schedules, base_hour=12)
+        assert cost > 0.0  # continuous deviation cost
 
     def test_energy_cost_tiebreaker(self) -> None:
         """Two scenarios with identical comfort cost -> lower energy wins."""
@@ -168,7 +206,7 @@ class TestAdjustSchedulesForWindows:
         cfg = load_config()
         schedules = make_schedules(
             bedroom=[
-                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 74.0, 2.0, 1.0)),
+                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0, 2.0, 1.0)),
             ],
         )
         window_states = {name: False for name in cfg.windows}
@@ -207,7 +245,7 @@ class TestAdjustSchedulesForWindows:
         cfg = load_config()
         schedules = make_schedules(
             bedroom=[
-                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 74.0, 3.0, 0.5)),
+                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0, 3.0, 0.5)),
             ],
         )
         window_states = {name: False for name in cfg.windows}
@@ -373,3 +411,202 @@ class TestTrajectoryEnergyCost:
         )
         from weatherstat.config import ENERGY_COST_GAS_ZONE
         assert compute_energy_cost(traj) == ENERGY_COST_GAS_ZONE
+
+
+# ── Target grid sweep tests ──────────────────────────────────────────
+
+
+class TestMiniSplitSweepOptions:
+    """Test target-based mini split sweep option generation."""
+
+    def _bedroom_schedule(self, min_t: float = 68.0, max_t: float = 72.0) -> list[ComfortSchedule]:
+        preferred = (min_t + max_t) / 2.0
+        return [ComfortSchedule(
+            room="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", preferred, min_t, max_t)),),
+        )]
+
+    def test_sweep_options_include_off(self) -> None:
+        """Off should always be an option."""
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 42.0)
+        assert any(o.mode == "off" for o in options)
+
+    def test_sweep_options_preferred_target(self) -> None:
+        """Should generate off + preferred target."""
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 42.0)
+        assert len(options) == 2  # off + preferred
+        active = [o for o in options if o.mode != "off"]
+        assert len(active) == 1
+        assert active[0].target == 70.0  # preferred = midpoint of 68-72
+
+    def test_sweep_mode_heat_when_cold(self) -> None:
+        """Mode should be 'heat' when outdoor temp is below preferred."""
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 42.0)
+        active = [o for o in options if o.mode != "off"]
+        assert all(o.mode == "heat" for o in active)
+
+    def test_sweep_mode_cool_when_hot(self) -> None:
+        """Mode should be 'cool' when outdoor temp is above preferred."""
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 85.0)
+        active = [o for o in options if o.mode != "off"]
+        assert all(o.mode == "cool" for o in active)
+
+    def test_sweep_no_schedule_returns_off_only(self) -> None:
+        """No matching schedule -> only off option."""
+        options = _mini_split_sweep_options("bedroom", [], 12, 42.0)
+        assert len(options) == 1
+        assert options[0].mode == "off"
+
+
+# ── Mode hold window tests ──────────────────────────────────────────
+
+
+class TestModeHoldWindow:
+    """Test mode hold window constraints (quiet hours only)."""
+
+    def _bedroom_schedule(self) -> list[ComfortSchedule]:
+        return [ComfortSchedule(
+            room="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
+        )]
+
+    def test_in_hold_window_wraps_midnight(self) -> None:
+        """22:00-07:00 window wraps midnight correctly."""
+        assert _in_hold_window(23, (22, 7)) is True
+        assert _in_hold_window(0, (22, 7)) is True
+        assert _in_hold_window(6, (22, 7)) is True
+        assert _in_hold_window(7, (22, 7)) is False
+        assert _in_hold_window(12, (22, 7)) is False
+
+    def test_mode_locked_during_hold_window(self) -> None:
+        """During hold window, options are filtered to current mode."""
+        from datetime import UTC, datetime
+
+        prev_state = ControlState(
+            last_decision_time=datetime.now(UTC).isoformat(),
+            upstairs_setpoint=70.0,
+            downstairs_setpoint=70.0,
+            mini_split_modes={"bedroom": "heat"},
+            mini_split_targets={"bedroom": 70.0},
+            mini_split_mode_times={"bedroom": datetime.now(UTC).isoformat()},
+        )
+        # Hour 23 is inside bedroom's hold window [22, 7]
+        options = _mini_split_sweep_options(
+            "bedroom", self._bedroom_schedule(), 23, 42.0, prev_state,
+        )
+        # All options should be "heat" (current mode)
+        assert all(o.mode == "heat" for o in options)
+        assert len(options) >= 1
+
+    def test_mode_not_locked_outside_hold_window(self) -> None:
+        """Outside hold window, mode can change freely."""
+        from datetime import UTC, datetime
+
+        prev_state = ControlState(
+            last_decision_time=datetime.now(UTC).isoformat(),
+            upstairs_setpoint=70.0,
+            downstairs_setpoint=70.0,
+            mini_split_modes={"bedroom": "heat"},
+            mini_split_targets={"bedroom": 70.0},
+            mini_split_mode_times={"bedroom": datetime.now(UTC).isoformat()},
+        )
+        # Hour 12 is outside hold window — mode should be unlocked
+        options = _mini_split_sweep_options(
+            "bedroom", self._bedroom_schedule(), 12, 42.0, prev_state,
+        )
+        assert any(o.mode == "off" for o in options)
+
+    def test_idle_split_skipped_when_room_above_target(self) -> None:
+        """Heat option skipped when room is well above preferred (split would be idle)."""
+        options = _mini_split_sweep_options(
+            "bedroom", self._bedroom_schedule(), 12, 42.0,
+            current_temps={"bedroom": 73.0},  # 3°F above preferred 70
+        )
+        # Only off should remain — room is above preferred + proportional_band
+        assert all(o.mode == "off" for o in options)
+
+    def test_split_offered_when_room_near_target(self) -> None:
+        """Heat option available when room is near preferred."""
+        options = _mini_split_sweep_options(
+            "bedroom", self._bedroom_schedule(), 12, 42.0,
+            current_temps={"bedroom": 70.5},  # within proportional_band of preferred 70
+        )
+        assert any(o.mode == "heat" for o in options)
+
+
+# ── Proportional energy cost tests ──────────────────────────────────
+
+
+class TestProportionalEnergyCost:
+    """Test proportional energy cost for mini splits."""
+
+    def test_higher_target_more_energy_when_heating(self) -> None:
+        """Higher target vs outdoor -> more expected activity -> higher cost.
+
+        With proportional_band=1.0: target 68.5 @ outdoor 68 -> activity=0.5,
+        target 69 @ outdoor 68 -> activity=1.0.
+        """
+        low_target = TrajectoryScenario(
+            ThermostatTrajectory(heating=False),
+            ThermostatTrajectory(heating=False),
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "heat", 68.5), MiniSplitDecision("living_room", "off", 0.0)),
+        )
+        high_target = TrajectoryScenario(
+            ThermostatTrajectory(heating=False),
+            ThermostatTrajectory(heating=False),
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "heat", 69.0), MiniSplitDecision("living_room", "off", 0.0)),
+        )
+        assert compute_energy_cost(low_target, outdoor_temp=68.0) < compute_energy_cost(high_target, outdoor_temp=68.0)
+
+    def test_off_mini_split_no_energy_cost(self) -> None:
+        """Off mini split should have zero energy cost."""
+        off = TrajectoryScenario(
+            ThermostatTrajectory(heating=False),
+            ThermostatTrajectory(heating=False),
+            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+            (MiniSplitDecision("bedroom", "off", 0.0), MiniSplitDecision("living_room", "off", 0.0)),
+        )
+        assert compute_energy_cost(off, outdoor_temp=42.0) == 0.0
+
+
+# ── Trajectory scenario generation with schedules ──────────────────
+
+
+class TestTrajectoryWithSchedules:
+    """Test trajectory generation with comfort schedule integration."""
+
+    def test_scenario_count_with_schedules(self) -> None:
+        """With schedules, should have 2 options per split (off + preferred)."""
+        schedules = [
+            ComfortSchedule(
+                room="bedroom",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
+            ),
+            ComfortSchedule(
+                room="living_room",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 69.0, 74.0)),),
+            ),
+        ]
+        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, outdoor_temp=42.0)
+        # 4 mini split combos (2×2): off + preferred per split
+        split_combos = {tuple((sd.name, sd.mode, sd.target) for sd in s.mini_splits) for s in scenarios}
+        assert len(split_combos) == 4
+
+    def test_all_off_still_present(self) -> None:
+        """All-off baseline should still be in scenario set."""
+        schedules = [
+            ComfortSchedule(
+                room="bedroom",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
+            ),
+        ]
+        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, outdoor_temp=42.0)
+        all_off = [
+            s for s in scenarios
+            if not s.upstairs.heating and not s.downstairs.heating
+            and all(b.mode == "off" for b in s.blowers)
+            and all(sp.mode == "off" for sp in s.mini_splits)
+        ]
+        assert len(all_off) == 1

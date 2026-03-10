@@ -371,3 +371,58 @@ def test_trajectory_performance(sim_params: SimParams) -> None:
     predict(state, scenarios, sim_params, [12, 24, 48, 72])
     elapsed_ms = (time.monotonic() - t0) * 1000
     assert elapsed_ms < 5000, f"Trajectory sweep took {elapsed_ms:.0f}ms (should be <5000ms)"
+
+
+# ── Regulating effector tests ────────────────────────────────────────
+
+
+def _bedroom_heat_target(target: float) -> TrajectoryScenario:
+    """Mini split bedroom heat at a specific target temperature."""
+    return TrajectoryScenario(
+        ThermostatTrajectory(heating=False),
+        ThermostatTrajectory(heating=False),
+        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        (MiniSplitDecision("bedroom", "heat", target), MiniSplitDecision("living_room", "off", 0.0)),
+    )
+
+
+def test_regulating_different_targets_different_predictions(sim_params: SimParams) -> None:
+    """Different target temperatures should produce different predictions."""
+    scenarios = [_all_off(), _bedroom_heat_target(68.0), _bedroom_heat_target(72.0)]
+    targets, preds = predict(_make_state(), scenarios, sim_params, [72])
+
+    bed_idx = next(j for j, t in enumerate(targets) if t == "bedroom_temp_t+72")
+    # Higher target should produce warmer prediction
+    assert preds[2, bed_idx] > preds[1, bed_idx], "Higher target should produce warmer bedroom"
+    # Both should be warmer than all-off
+    assert preds[1, bed_idx] > preds[0, bed_idx], "Heat@68 should be warmer than off"
+
+
+def test_regulating_temperature_approaches_target(sim_params: SimParams) -> None:
+    """With a regulating effector, temperature should approach but not wildly overshoot target."""
+    target = 72.0
+    scenarios = [_bedroom_heat_target(target)]
+    # Start bedroom cold so there's room to heat
+    cold_temps = dict(_CURRENT_TEMPS, bedroom=65.0)
+    state = _make_state(outdoor=42.0, hour=2.0, temps=cold_temps)
+    targets, preds = predict(state, scenarios, sim_params, [72])
+
+    bed_idx = next(j for j, t in enumerate(targets) if t == "bedroom_temp_t+72")
+    pred_6h = preds[0, bed_idx]
+    # Should be closer to target than starting temp (heated toward it)
+    assert pred_6h > 65.0, f"Should have warmed from 65, got {pred_6h:.1f}"
+    # Should not overshoot by more than a few degrees (proportional control stabilizes)
+    assert pred_6h < target + 3.0, f"Should not overshoot {target} by >3°F, got {pred_6h:.1f}"
+
+
+def test_regulating_off_same_as_all_off(sim_params: SimParams) -> None:
+    """Mini split off with target 0 should produce same results as all-off baseline."""
+    off_split = TrajectoryScenario(
+        ThermostatTrajectory(heating=False),
+        ThermostatTrajectory(heating=False),
+        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        (MiniSplitDecision("bedroom", "off", 0.0), MiniSplitDecision("living_room", "off", 0.0)),
+    )
+    targets, preds = predict(_make_state(), [_all_off(), off_split], sim_params, [12, 72])
+    # All predictions should be identical
+    np.testing.assert_allclose(preds[0], preds[1], atol=0.01)

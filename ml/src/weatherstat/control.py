@@ -32,8 +32,6 @@ from weatherstat.config import (
     ENERGY_COST_BLOWER,
     ENERGY_COST_GAS_ZONE,
     ENERGY_COST_MINI_SPLIT,
-    MINI_SPLIT_SWEEP_MODES,
-    MINI_SPLIT_SWEEP_TARGET,
     MINI_SPLITS,
     PREDICTION_ROOMS,
     PREDICTIONS_DIR,
@@ -127,7 +125,7 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
             ComfortScheduleEntry(
                 e.start_hour,
                 e.end_hour,
-                RoomComfort(room, e.min_temp, e.max_temp, e.cold_penalty, e.hot_penalty),
+                RoomComfort(room, e.preferred, e.min_temp, e.max_temp, e.cold_penalty, e.hot_penalty),
             )
             for e in entries
         )
@@ -179,6 +177,7 @@ def adjust_schedules_for_windows(
                 e.end_hour,
                 RoomComfort(
                     e.comfort.room,
+                    e.comfort.preferred,  # preferred unchanged — window doesn't change ideal
                     e.comfort.min_temp + min_offset,
                     e.comfort.max_temp + max_offset,
                     e.comfort.cold_penalty,
@@ -202,12 +201,25 @@ def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
 # ── Cost function ─────────────────────────────────────────────────────────
 
 
+# Hard rail multiplier: additional penalty for exceeding min/max bounds.
+# Applied on top of the continuous preferred-based cost.
+_HARD_RAIL_MULTIPLIER = 10.0
+
+
 def compute_comfort_cost(
     predictions: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
 ) -> float:
     """Compute total comfort cost across all rooms and horizons.
+
+    Two-layer cost model:
+    1. Continuous: quadratic penalty for any deviation from `preferred`,
+       weighted asymmetrically by cold_penalty (below) and hot_penalty (above).
+    2. Hard rails: steep additional penalty (10×) for exceeding min/max bounds.
+
+    This gives the optimizer a gradient everywhere — it always prefers
+    temperatures closer to preferred, not just "anywhere in the band".
 
     Args:
         predictions: Model predictions keyed like "upstairs_temp_t+12".
@@ -235,20 +247,27 @@ def compute_comfort_cost(
             if pred_temp is None:
                 continue
 
-            # Quadratic penalty for being outside comfort bounds
+            # Continuous cost: quadratic deviation from preferred
+            if pred_temp < comfort.preferred:
+                cost += (comfort.preferred - pred_temp) ** 2 * comfort.cold_penalty * weight
+            elif pred_temp > comfort.preferred:
+                cost += (pred_temp - comfort.preferred) ** 2 * comfort.hot_penalty * weight
+
+            # Hard rails: steep additional penalty outside min/max
             if pred_temp < comfort.min_temp:
-                cost += (comfort.min_temp - pred_temp) ** 2 * comfort.cold_penalty * weight
+                cost += (comfort.min_temp - pred_temp) ** 2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
             elif pred_temp > comfort.max_temp:
-                cost += (pred_temp - comfort.max_temp) ** 2 * comfort.hot_penalty * weight
+                cost += (pred_temp - comfort.max_temp) ** 2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
 
     return cost
 
 
-def compute_energy_cost(scenario: TrajectoryScenario) -> float:
+def compute_energy_cost(scenario: TrajectoryScenario, outdoor_temp: float = 50.0) -> float:
     """Tiered energy penalty: gas zones > mini-splits > blower fans.
 
     Used as tiebreaker when comfort cost is equal — prefer less energy usage.
     Gas zone cost is proportional to heating duration within the horizon.
+    Mini-split cost is proportional to expected activity (target vs outdoor).
     """
     cost = 0.0
     # Gas zones (Navien boiler via thermostat)
@@ -257,10 +276,15 @@ def compute_energy_cost(scenario: TrajectoryScenario) -> float:
         if traj.heating:
             dur = traj.duration_steps if traj.duration_steps is not None else (max_h - traj.delay_steps)
             cost += ENERGY_COST_GAS_ZONE * dur / max_h
-    # Mini-splits (heat pump — efficient but uses electricity)
+    # Mini-splits: proportional to expected activity
     for sd in scenario.mini_splits:
-        if sd.mode != "off":
-            cost += ENERGY_COST_MINI_SPLIT
+        if sd.mode == "off":
+            continue
+        split_cfg = _CFG.mini_splits.get(sd.name)
+        p_band = split_cfg.proportional_band if split_cfg else 3.0
+        avg_delta = max(0.0, sd.target - outdoor_temp) if sd.mode == "heat" else max(0.0, outdoor_temp - sd.target)
+        avg_activity = min(1.0, avg_delta / p_band)
+        cost += ENERGY_COST_MINI_SPLIT * avg_activity
     # Blower fans (negligible)
     for bd in scenario.blowers:
         cost += ENERGY_COST_BLOWER.get(bd.mode, 0.0)
@@ -327,11 +351,86 @@ def _cautious_setpoint(current_temp: float, heating: bool, comfort_min: float = 
 # ── Scenario generation & sweep ──────────────────────────────────────────
 
 
-def generate_trajectory_scenarios() -> list[TrajectoryScenario]:
+def _mini_split_sweep_options(
+    split_name: str,
+    schedules: list[ComfortSchedule],
+    base_hour: int,
+    outdoor_temp: float,
+    prev_state: ControlState | None = None,
+    current_temps: dict[str, float] | None = None,
+) -> list[MiniSplitDecision]:
+    """Generate sweep options for a regulating mini split: off + preferred target.
+
+    Target is the preferred temperature from the comfort schedule.
+    Mode is derived from season context (outdoor temp vs preferred).
+    During mode hold windows, mode is locked to current.
+    If the room is already above target (heating) or below target (cooling),
+    the split would be idle — skip the on option and let receding horizon
+    re-evaluate when the room actually needs it.
+    """
+    split_cfg = _CFG.mini_splits.get(split_name)
+    options: list[MiniSplitDecision] = [MiniSplitDecision(split_name, "off", 0.0)]
+
+    # Find preferred temperature for this split's sensor
+    preferred: float | None = None
+    for sched in schedules:
+        if sched.room == split_name:
+            comfort = sched.comfort_at(base_hour)
+            if comfort is not None:
+                preferred = comfort.preferred
+            break
+
+    if preferred is None:
+        return options
+
+    # Derive mode from outdoor temp vs preferred
+    mode = "heat" if outdoor_temp < preferred else "cool"
+
+    # Skip on-option if the split would be idle: room already past target
+    # in the direction the split can't help.  Receding horizon (15-min
+    # re-evaluation) will add it back when the room actually needs it.
+    room_temp = (current_temps or {}).get(split_name)
+    p_band = split_cfg.proportional_band if split_cfg else 1.0
+    if room_temp is not None:
+        if mode == "heat" and room_temp > preferred + p_band:
+            return options  # room well above target — split would be idle
+        if mode == "cool" and room_temp < preferred - p_band:
+            return options  # room well below target — split would be idle
+
+    options.append(MiniSplitDecision(split_name, mode, round(preferred, 1)))
+
+    # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
+    hold_window = split_cfg.mode_hold_window if split_cfg else None
+    if prev_state and hold_window and _in_hold_window(base_hour, hold_window):
+        prev_mode = prev_state.mini_split_modes.get(split_name, "off")
+        options = [o for o in options if o.mode == prev_mode]
+        if not options:
+            prev_target = prev_state.mini_split_targets.get(split_name, 0.0)
+            options = [MiniSplitDecision(split_name, prev_mode, prev_target)]
+
+    return options
+
+
+def _in_hold_window(hour: int, window: tuple[int, int]) -> bool:
+    """Check if hour falls within [start, end) window, wrapping midnight."""
+    start, end = window
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def generate_trajectory_scenarios(
+    schedules: list[ComfortSchedule] | None = None,
+    base_hour: int = 12,
+    outdoor_temp: float = 50.0,
+    prev_state: ControlState | None = None,
+    current_temps: dict[str, float] | None = None,
+) -> list[TrajectoryScenario]:
     """Generate trajectory scenarios for physics sweep.
 
     Slow effectors (thermostats) get a delay × duration grid.
-    Fast effectors (blowers, mini-splits) use constant modes.
+    Fast effectors (blowers) use constant modes.
+    Mini splits use comfort-derived target grid (off + 3 targets per split).
     Blower constraint: only active when zone thermostat is heating.
     """
     from itertools import product
@@ -352,19 +451,25 @@ def generate_trajectory_scenarios() -> list[TrajectoryScenario]:
                 duration_steps=effective_duration,
             ))
 
-    # Deduplicate (capping creates duplicates, e.g. delay=48 duration=48 and duration=72 both cap to 24)
+    # Deduplicate (capping creates duplicates)
     traj_options = list(dict.fromkeys(traj_options))
 
-    # Mini-split combinations (same as constant sweep)
-    split_mode_lists = [MINI_SPLIT_SWEEP_MODES for _ in MINI_SPLITS]
-    split_combos: list[tuple[MiniSplitDecision, ...]] = []
-    for modes in product(*split_mode_lists):
-        split_combos.append(
-            tuple(
-                MiniSplitDecision(s.name, mode, MINI_SPLIT_SWEEP_TARGET)
-                for s, mode in zip(MINI_SPLITS, modes, strict=True)
-            )
-        )
+    # Mini-split combinations: target grid from comfort schedule
+    if schedules is not None:
+        per_split_options = [
+            _mini_split_sweep_options(s.name, schedules, base_hour, outdoor_temp, prev_state, current_temps)
+            for s in MINI_SPLITS
+        ]
+    else:
+        # Fallback for backward compat (e.g., scenario counting without schedules)
+        per_split_options = [
+            [MiniSplitDecision(s.name, "off", 0.0), MiniSplitDecision(s.name, "heat", 70.0)]
+            for s in MINI_SPLITS
+        ]
+
+    split_combos: list[tuple[MiniSplitDecision, ...]] = [
+        combo for combo in product(*per_split_options)
+    ]
 
     # Full cartesian product with blower constraint
     scenarios: list[TrajectoryScenario] = []
@@ -403,6 +508,7 @@ def sweep_scenarios_physics(
     current_split_temps: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
+    prev_state: ControlState | None = None,
 ) -> tuple[ControlDecision, TrajectoryScenario]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -414,7 +520,7 @@ def sweep_scenarios_physics(
     assert isinstance(sim_params, SimParams)
 
     sensor_zones = _derive_sensor_zones(sim_params.gains)
-    scenarios = generate_trajectory_scenarios()
+    scenarios = generate_trajectory_scenarios(schedules, base_hour, outdoor_temp, prev_state, current_temps)
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
 
@@ -433,27 +539,10 @@ def sweep_scenarios_physics(
         if not dn_allow:
             blocked_reasons.append(f"downstairs at/above max ({dn_current:.1f}°F >= {dn_max:.0f}°F)")
 
-    # Thermal direction constraint
-    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
-    any_room_cold = False
-    for schedule in schedules:
-        room = schedule.room
-        temp = current_temps.get(room)
-        if temp is None:
-            continue
-        for h in CONTROL_HORIZONS:
-            hours_ahead = horizon_hours.get(h, h // 12)
-            future_hour = (base_hour + hours_ahead) % 24
-            comfort = schedule.comfort_at(future_hour)
-            if comfort is not None and temp < comfort.min_temp:
-                any_room_cold = True
-                break
-        if any_room_cold:
-            break
-
-    if not any_room_cold and (up_allow or dn_allow):
-        scenarios = [s for s in scenarios if not s.upstairs.heating and not s.downstairs.heating]
-        blocked_reasons.append("no room below comfort min")
+    # Note: no "thermal direction" pruning — the trajectory sweep and cost
+    # function decide whether heating is justified.  Pre-emptive heating for
+    # slow effectors (hydronic slab: 45-75 min lag) requires evaluating
+    # futures, not checking current temps against comfort min.
 
     if blocked_reasons:
         print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
@@ -488,7 +577,7 @@ def sweep_scenarios_physics(
     for i, scenario in enumerate(scenarios):
         predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
         comfort = compute_comfort_cost(predictions, schedules, base_hour)
-        energy = compute_energy_cost(scenario)
+        energy = compute_energy_cost(scenario, outdoor_temp)
         total = comfort + energy
 
         if _is_all_off(scenario):
@@ -546,7 +635,7 @@ def sweep_scenarios_physics(
                     continue
                 predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
                 c = compute_comfort_cost(predictions, schedules, base_hour)
-                e = compute_energy_cost(scenario)
+                e = compute_energy_cost(scenario, outdoor_temp)
                 if c + e < constrained_cost:
                     constrained_cost = c + e
                     constrained_best = i
@@ -558,7 +647,7 @@ def sweep_scenarios_physics(
     scenario = scenarios[best_idx]
     predictions = {t: float(pred_matrix[best_idx, j]) for t, j in target_idx.items()}
     comfort = compute_comfort_cost(predictions, schedules, base_hour)
-    energy = compute_energy_cost(scenario)
+    energy = compute_energy_cost(scenario, outdoor_temp)
     total = comfort + energy
 
     # Immediate action: heating only if trajectory starts now (delay=0)
@@ -589,21 +678,6 @@ def sweep_scenarios_physics(
         if rpred:
             room_preds[room] = rpred
 
-    # Mini-split command targets from comfort schedule
-    final_splits: list[MiniSplitDecision] = []
-    for sd in scenario.mini_splits:
-        if sd.mode == "off":
-            final_splits.append(sd)
-        else:
-            target_temp = MINI_SPLIT_SWEEP_TARGET
-            for sched in schedules:
-                if sched.room == sd.name:
-                    comfort_entry = sched.comfort_at(base_hour)
-                    if comfort_entry is not None:
-                        target_temp = (comfort_entry.min_temp + comfort_entry.max_temp) / 2
-                    break
-            final_splits.append(MiniSplitDecision(sd.name, sd.mode, target_temp))
-
     decision = ControlDecision(
         timestamp=datetime.now(UTC).isoformat(),
         upstairs_heating=up_heating_now,
@@ -619,7 +693,7 @@ def sweep_scenarios_physics(
             comfort_min=_zone_comfort_min("downstairs", schedules, base_hour),
         ),
         blowers=scenario.blowers,
-        mini_splits=tuple(final_splits),
+        mini_splits=scenario.mini_splits,
         total_cost=round(total, 4),
         comfort_cost=round(comfort, 4),
         energy_cost=round(energy, 4),
@@ -648,20 +722,35 @@ def load_control_state() -> ControlState | None:
             blower_modes=data.get("blower_modes", {}),
             mini_split_modes=data.get("mini_split_modes", {}),
             mini_split_targets=data.get("mini_split_targets", {}),
+            mini_split_mode_times=data.get("mini_split_mode_times", {}),
         )
     except (json.JSONDecodeError, KeyError):
         return None
 
 
-def save_control_state(decision: ControlDecision) -> None:
-    """Persist control state to prevent rapid cycling."""
+def save_control_state(decision: ControlDecision, prev_state: ControlState | None = None) -> None:
+    """Persist control state to prevent rapid cycling.
+
+    Tracks mini-split mode change timestamps: only updated when mode actually changes.
+    """
+    now_iso = decision.timestamp
+    new_modes = {sd.name: sd.mode for sd in decision.mini_splits}
+    prev_modes = prev_state.mini_split_modes if prev_state else {}
+    prev_mode_times = dict(prev_state.mini_split_mode_times) if prev_state else {}
+
+    # Update mode-change timestamps only when mode actually changes
+    for name, mode in new_modes.items():
+        if mode != prev_modes.get(name, ""):
+            prev_mode_times[name] = now_iso
+
     state: dict[str, object] = {
-        "last_decision_time": decision.timestamp,
+        "last_decision_time": now_iso,
         "upstairs_setpoint": decision.upstairs_setpoint,
         "downstairs_setpoint": decision.downstairs_setpoint,
         "blower_modes": {bd.name: bd.mode for bd in decision.blowers},
-        "mini_split_modes": {sd.name: sd.mode for sd in decision.mini_splits},
+        "mini_split_modes": new_modes,
         "mini_split_targets": {sd.name: sd.target for sd in decision.mini_splits},
+        "mini_split_mode_times": prev_mode_times,
     }
     CONTROL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONTROL_STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -901,12 +990,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     fractional_hour = base_hour + local_now.minute / 60.0
 
-    n_scenarios = len(generate_trajectory_scenarios())
-    print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
-    t0 = time.monotonic()
+    # Load previous state for mode hold enforcement
+    prev_state = load_control_state()
+
     outdoor = float(out_temp) if out_temp is not None and not (
         isinstance(out_temp, float) and np.isnan(out_temp)
     ) else 50.0
+    n_scenarios = len(generate_trajectory_scenarios(schedules, base_hour, outdoor, prev_state, current_temps))
+    print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
+    t0 = time.monotonic()
     decision, winning_scenario = sweep_scenarios_physics(
         current_temps,
         outdoor,
@@ -920,6 +1012,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         current_split_temps,
         schedules,
         base_hour,
+        prev_state,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
@@ -958,7 +1051,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         ThermostatTrajectory(heating=False),
         ThermostatTrajectory(heating=False),
         tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-        tuple(MiniSplitDecision(s.name, "off", MINI_SPLIT_SWEEP_TARGET) for s in MINI_SPLITS),
+        tuple(MiniSplitDecision(s.name, "off", 0.0) for s in MINI_SPLITS),
     )
 
     from weatherstat.simulator import HouseState as _HS
@@ -1052,7 +1145,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             print("  SKIPPED: prediction sanity check failed")
             return decision
         # Save state to prevent rapid cycling
-        save_control_state(decision)
+        save_control_state(decision, prev_state)
         print("  Mode: LIVE — command written for executor")
     else:
         print("  Mode: DRY-RUN — command written but not executed")

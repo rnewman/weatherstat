@@ -111,19 +111,8 @@ MINI_SPLITS: tuple[MiniSplitConfig, ...] = tuple(
     for name, cfg in _CFG.mini_splits.items()
 )
 
-# Mini-split modes swept during control (from YAML)
-MINI_SPLIT_SWEEP_MODES: tuple[str, ...] = next(iter(_CFG.mini_splits.values())).sweep_modes
-
-# Representative target for model override during sweep.
-# The actual command target is derived post-sweep from the comfort schedule midpoint.
-MINI_SPLIT_SWEEP_TARGET = 72.0
-
-# Mini-split mode encoding (from YAML, filtered to sweep modes for control)
-MINI_SPLIT_MODE_ENC: dict[str, float] = {
-    mode: enc
-    for mode, enc in next(iter(_CFG.mini_splits.values())).command_encoding.items()
-    if mode in MINI_SPLIT_SWEEP_MODES
-}
+# Mini-split mode encoding (from YAML — all modes for sysid/history encoding)
+MINI_SPLIT_MODE_ENC: dict[str, float] = next(iter(_CFG.mini_splits.values())).command_encoding
 
 # Blower mode encoding (from YAML)
 BLOWER_MODE_ENC: dict[str, float] = next(iter(_CFG.blowers.values())).level_encoding

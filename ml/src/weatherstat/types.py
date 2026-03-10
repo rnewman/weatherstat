@@ -86,13 +86,19 @@ class WeatherState:
 
 @dataclass(frozen=True)
 class RoomComfort:
-    """Comfort bounds and penalty weights for a single room."""
+    """Comfort profile for a single room.
+
+    preferred: ideal temperature — continuous cost in both directions.
+    min_temp/max_temp: hard rails with steep additional penalty (10×).
+    cold_penalty/hot_penalty: asymmetric weights for deviation from preferred.
+    """
 
     room: str  # "bedroom", "office", "upstairs", "downstairs"
-    min_temp: float  # lower comfort bound (°F)
-    max_temp: float  # upper comfort bound (°F)
-    cold_penalty: float = 2.0  # weight for being below min
-    hot_penalty: float = 1.0  # weight for being above max
+    preferred: float  # ideal temperature (°F)
+    min_temp: float  # hard lower bound (°F)
+    max_temp: float  # hard upper bound (°F)
+    cold_penalty: float = 2.0  # weight for being below preferred
+    hot_penalty: float = 1.0  # weight for being above preferred
 
 
 @dataclass(frozen=True)
@@ -199,6 +205,7 @@ class ControlState:
     blower_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
     mini_split_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
     mini_split_targets: dict[str, float] = field(default_factory=dict)  # name -> target
+    mini_split_mode_times: dict[str, str] = field(default_factory=dict)  # name -> ISO timestamp of last mode change
 
 
 # ── Unified action types ─────────────────────────────────────────────────

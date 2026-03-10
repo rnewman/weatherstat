@@ -76,7 +76,8 @@
       "mcp__Home_Assistant__ha_get_logbook",
       "Bash(just sysid:*)",
       "Bash(curl:*)",
-      "Bash(just test:*)"
+      "Bash(just test:*)",
+      "Bash(python:*)"
     ]
   }
 }

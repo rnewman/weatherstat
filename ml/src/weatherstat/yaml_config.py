@@ -53,6 +53,9 @@ class MiniSplitYamlConfig:
     sweep_modes: tuple[str, ...]
     command_encoding: dict[str, float]  # command: what we set (for control)
     state_encoding: dict[str, float] | None = None  # state: what it's doing (for sysid)
+    control_type: str = "binary"  # "regulating" for target-based control
+    proportional_band: float = 1.0  # °F — full activity when room is this far from target
+    mode_hold_window: tuple[int, int] | None = None  # (start_hour, end_hour) — no mode changes
 
     @property
     def mode_encoding(self) -> dict[str, float]:
@@ -104,8 +107,9 @@ class WindowConfig:
 class ComfortEntry:
     start_hour: int
     end_hour: int
-    min_temp: float
-    max_temp: float
+    preferred: float  # ideal temperature — continuous cost in both directions
+    min_temp: float  # hard rail — steep additional penalty below this
+    max_temp: float  # hard rail — steep additional penalty above this
     cold_penalty: float = 2.0
     hot_penalty: float = 1.0
 
@@ -474,12 +478,17 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     for name, dev in eff["mini_splits"].items():
         state_enc_raw = dev.get("state_encoding")
         state_enc = {str(k): float(v) for k, v in state_enc_raw.items()} if state_enc_raw else None
+        mhw_raw = dev.get("mode_hold_window")
+        mode_hold_window = (int(mhw_raw[0]), int(mhw_raw[1])) if mhw_raw else None
         mini_splits[name] = MiniSplitYamlConfig(
             name=name,
             entity_id=dev["entity_id"],
             sweep_modes=tuple(str(m) for m in dev["sweep_modes"]),
             command_encoding={str(k): float(v) for k, v in dev["command_encoding"].items()},
             state_encoding=state_enc,
+            control_type=str(dev.get("control_type", "binary")),
+            proportional_band=float(dev.get("proportional_band", 3.0)),
+            mode_hold_window=mode_hold_window,
         )
 
     blowers: dict[str, BlowerYamlConfig] = {}
@@ -528,11 +537,16 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         entries: list[ComfortEntry] = []
         for entry in sched["schedule"]:
             hours = entry["hours"]
+            min_t = float(entry["min"])
+            max_t = float(entry["max"])
+            # Default preferred to midpoint if not specified (backward compat)
+            preferred = float(entry.get("preferred", (min_t + max_t) / 2))
             entries.append(ComfortEntry(
                 start_hour=hours[0],
                 end_hour=hours[1],
-                min_temp=float(entry["min"]),
-                max_temp=float(entry["max"]),
+                preferred=preferred,
+                min_temp=min_t,
+                max_temp=max_t,
                 cold_penalty=float(entry.get("cold_penalty", 2.0)),
                 hot_penalty=float(entry.get("hot_penalty", 1.0)),
             ))

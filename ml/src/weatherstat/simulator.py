@@ -280,22 +280,37 @@ def _outdoor_at(current: float, forecast: list[float], hours_ahead: float) -> fl
 # ── Vectorized batch prediction ──────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class _RegulatingEffector:
+    """Info for a regulating (target-based) effector, used in Euler loop."""
+
+    effector_name: str
+    split_name: str
+    proportional_band: float
+    targets: np.ndarray  # (n_scenarios,) — target temp per scenario
+    modes: np.ndarray  # (n_scenarios,) — +1 for heat, -1 for cool, 0 for off
+
+
 def _build_activity_matrices(
     scenarios: list[TrajectoryScenario],
     params: SimParams,
     recent_history: dict[str, list[float]],
     n_future: int,
-) -> dict[str, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], list[_RegulatingEffector]]:
     """Build per-effector activity matrices for all scenarios.
 
-    Uses numpy broadcasting to construct (n_scenarios, n_total_steps) matrices
-    for each effector, replacing the per-scenario Python loop.
+    Regulating effectors (mini splits with control_type="regulating") are excluded
+    from activity matrices and returned separately for dynamic Euler-loop computation.
 
     Returns:
-        effector_name -> np.ndarray of shape (n_scenarios, _HISTORY_STEPS + n_future).
+        (matrices, regulating_effectors) where matrices maps
+        effector_name -> np.ndarray of shape (n_scenarios, _HISTORY_STEPS + n_future),
+        and regulating_effectors contains info for target-based effectors.
     """
     from weatherstat.config import BLOWERS as _BLOWERS
+    from weatherstat.yaml_config import load_config
 
+    cfg = load_config()
     n = len(scenarios)
     n_total = _HISTORY_STEPS + n_future
     steps = np.arange(n_future)  # [0, 1, ..., n_future-1]
@@ -317,7 +332,6 @@ def _build_activity_matrices(
     ])
 
     # Thermostat active masks: (n, n_future) boolean
-    # Broadcasting: (n, 1) op (1, n_future) -> (n, n_future)
     up_active = (
         up_heating[:, None]
         & (steps[None, :] >= up_delay[:, None])
@@ -331,11 +345,10 @@ def _build_activity_matrices(
 
     blower_zones = {b.name: b.zone for b in _BLOWERS}
     matrices: dict[str, np.ndarray] = {}
+    regulating: list[_RegulatingEffector] = []
 
     for eff in params.effectors:
         name = eff["name"]
-        # For future scenarios, use command encoding (what we intend to set).
-        # For history, encoding (measured state) was already applied above.
         encoding = eff.get("command_encoding") or eff["encoding"]
         dtype = eff["device_type"]
 
@@ -366,11 +379,35 @@ def _build_activity_matrices(
 
         elif dtype == "mini_split":
             split_name = name.removeprefix("mini_split_")
-            enc_vals = np.array([
-                encoding.get(sd.mode, 0.0) if (sd := _find_split(s.mini_splits, split_name)) else 0.0
-                for s in scenarios
-            ])
-            future = np.broadcast_to(enc_vals[:, None], (n, n_future))
+            split_cfg = cfg.mini_splits.get(split_name)
+
+            if split_cfg and split_cfg.control_type == "regulating":
+                # Regulating: extract targets/modes per scenario for Euler loop
+                targets = np.array([
+                    sd.target if (sd := _find_split(s.mini_splits, split_name)) and sd.mode != "off" else 0.0
+                    for s in scenarios
+                ])
+                modes = np.array([
+                    (1.0 if sd.mode == "heat" else (-1.0 if sd.mode == "cool" else 0.0))
+                    if (sd := _find_split(s.mini_splits, split_name)) else 0.0
+                    for s in scenarios
+                ])
+                regulating.append(_RegulatingEffector(
+                    effector_name=name,
+                    split_name=split_name,
+                    proportional_band=split_cfg.proportional_band,
+                    targets=targets,
+                    modes=modes,
+                ))
+                # Still need history in the matrix for lag lookback
+                future = np.zeros((n, n_future))
+            else:
+                # Binary mini split (original behavior)
+                enc_vals = np.array([
+                    encoding.get(sd.mode, 0.0) if (sd := _find_split(s.mini_splits, split_name)) else 0.0
+                    for s in scenarios
+                ])
+                future = np.broadcast_to(enc_vals[:, None], (n, n_future))
 
         else:
             future = np.zeros((n, n_future))
@@ -381,7 +418,7 @@ def _build_activity_matrices(
         matrix[:, _HISTORY_STEPS:] = future
         matrices[name] = matrix
 
-    return matrices
+    return matrices, regulating
 
 
 def predict(
@@ -429,7 +466,9 @@ def predict(
     result = np.empty((n_scenarios, n_targets))
 
     # Build activity matrices for all effectors: (n_scenarios, n_total) each
-    activity_matrices = _build_activity_matrices(scenarios, params, state.recent_history, n_future)
+    activity_matrices, regulating_effectors = _build_activity_matrices(
+        scenarios, params, state.recent_history, n_future,
+    )
 
     # Group targets by sensor for efficient per-sensor simulation
     sensor_targets: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -498,6 +537,16 @@ def predict(
             if dst_start < dst_end:
                 total_eff[:, dst_start:dst_end] += gain * mat[:, src_start:src_end]
 
+        # Collect regulating effector info for this sensor
+        sensor_reg: list[tuple[float, int, float, np.ndarray, np.ndarray]] = []
+        for reg in regulating_effectors:
+            gain_info = sensor_gains.get(reg.effector_name)
+            if gain_info is None:
+                continue
+            gain, lag_min = gain_info
+            lag_steps = int(round(lag_min / 5.0))
+            sensor_reg.append((abs(gain), lag_steps, reg.proportional_band, reg.targets, reg.modes))
+
         # Euler integration: loop over timesteps, vectorized over scenarios
         T = np.full(n_scenarios, cur_temp)
         horizon_results: dict[int, np.ndarray] = {}
@@ -505,6 +554,32 @@ def predict(
         for step_idx in range(max_horizon):
             step = step_idx + 1
             dTdt = (outdoor_vec[step_idx] - T) / tau + total_eff[:, step] + solar_vec[step_idx]
+
+            # Regulating effector contributions (proportional to target - current temp)
+            for abs_gain, lag_s, p_band, targets, modes in sensor_reg:
+                if step - lag_s < 1:
+                    continue
+                # Heating: activity = clip((target - T) / band, 0, 1)
+                # Cooling: activity = clip((T - target) / band, 0, 1)
+                heat_mask = modes > 0  # (n_scenarios,)
+                cool_mask = modes < 0
+                activity = np.zeros(n_scenarios)
+                if heat_mask.any():
+                    activity = np.where(
+                        heat_mask,
+                        np.clip((targets - T) / p_band, 0.0, 1.0),
+                        activity,
+                    )
+                if cool_mask.any():
+                    activity = np.where(
+                        cool_mask,
+                        np.clip((T - targets) / p_band, 0.0, 1.0),
+                        activity,
+                    )
+                # Sign: heating adds heat (+gain), cooling removes heat (-gain)
+                signed_activity = np.where(heat_mask, activity, np.where(cool_mask, -activity, 0.0))
+                dTdt += abs_gain * signed_activity
+
             T = T + _DT_HOURS * dTdt
             if step in horizon_set:
                 horizon_results[step] = T.copy()
