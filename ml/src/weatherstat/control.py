@@ -475,11 +475,16 @@ def generate_trajectory_scenarios(
     scenarios: list[TrajectoryScenario] = []
     for up_traj in traj_options:
         for dn_traj in traj_options:
-            heating = {"upstairs": up_traj.heating, "downstairs": dn_traj.heating}
-
+            # Blower constraint: only sweep blower levels when zone thermostat
+            # starts immediately (delay=0).  Delayed trajectories start heating
+            # later — receding horizon will add blower when heat actually begins.
+            immediate_heat = {
+                "upstairs": up_traj.heating and up_traj.delay_steps == 0,
+                "downstairs": dn_traj.heating and dn_traj.delay_steps == 0,
+            }
             per_blower_levels = []
             for b in BLOWERS:
-                if heating.get(b.zone, False):
+                if immediate_heat.get(b.zone, False):
                     per_blower_levels.append(b.levels)
                 else:
                     per_blower_levels.append(("off",))
