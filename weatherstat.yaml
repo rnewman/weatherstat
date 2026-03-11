@@ -168,7 +168,7 @@ weather:
 # (which thermostat has the highest gain for each sensor).
 
 constraints:
-  window_open_offset: { min: -2, max: 2 }
+  window_open_offset: { min: -1, max: 1 }
   schedules:
     - sensor: thermostat_upstairs_temp
       schedule:
