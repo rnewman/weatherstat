@@ -176,8 +176,8 @@ class WeatherstatConfig:
     # ── Derived properties (primary) ─────────────────────────────────
 
     @property
-    def prediction_rooms(self) -> list[str]:
-        """Ordered list of constraint labels (room-like names) for prediction."""
+    def prediction_labels(self) -> list[str]:
+        """Ordered list of constraint labels for prediction."""
         return [c.label for c in self.constraints]
 
     @property

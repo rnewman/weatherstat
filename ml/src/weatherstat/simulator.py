@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from weatherstat.config import DATA_DIR, PREDICTION_ROOMS
+from weatherstat.config import DATA_DIR, PREDICTION_LABELS
 from weatherstat.types import BlowerDecision, MiniSplitDecision, TrajectoryScenario
 
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
@@ -77,6 +77,10 @@ class HouseState:
     hour_of_day: float  # fractional hour of day (0-23.99)
     recent_history: dict[str, list[float]] = field(default_factory=dict)
     # effector_name -> recent activity values (oldest first)
+    solar_fractions: list[float] = field(default_factory=list)
+    # Per-hour solar fractions [now, h+1, h+2, ...] from weather conditions.
+    # Index 0 = current hour, index 1 = next hour, etc.
+    # Empty list → default to 1.0 (backward compat with old params).
 
 
 def load_sim_params(path: Path | None = None) -> SimParams:
@@ -193,6 +197,7 @@ def simulate_sensor(
     solar_profile: dict[int, float],
     start_hour: float,
     n_steps: int,
+    solar_fractions: list[float] | None = None,
 ) -> list[float]:
     """Euler-integrate temperature for one sensor under one scenario.
 
@@ -209,6 +214,8 @@ def simulate_sensor(
         solar_profile: hour_of_day -> gain_f_per_hour for this sensor.
         start_hour: Fractional hour of day at t=0.
         n_steps: Number of 5-min steps to simulate.
+        solar_fractions: Per-hour solar fractions [now, h+1, h+2, ...].
+            Index 0 = current hour. None or empty → 1.0 (full sun).
 
     Returns:
         Temperature at each step [t+1, t+2, ..., t+n_steps].
@@ -247,9 +254,12 @@ def simulate_sensor(
                 activity = timeline[-1]  # clamp to last known
             dTdt += gain * activity
 
-        # Solar gain
+        # Solar gain (modulated by weather-condition solar fraction)
         current_hour = int((start_hour + hours_from_start) % 24)
         solar_gain = solar_profile.get(current_hour, 0.0)
+        if solar_gain != 0.0 and solar_fractions:
+            hour_idx = min(int(hours_from_start), len(solar_fractions) - 1)
+            solar_gain *= solar_fractions[max(0, hour_idx)]
         dTdt += solar_gain
 
         # Euler step
@@ -450,16 +460,16 @@ def predict(
     n_total = _HISTORY_STEPS + n_future
     horizon_set = set(horizons)
 
-    # Build target names: room_temp_t+horizon for each room in PREDICTION_ROOMS
-    room_to_sensor = _room_to_sensor_map(params.sensors)
+    # Build target names: label_temp_t+horizon for each label in PREDICTION_LABELS
+    label_to_sensor = _label_to_sensor_map(params.sensors)
     target_names: list[str] = []
     target_info: list[tuple[str, int]] = []
-    for room in PREDICTION_ROOMS:
-        sensor_col = room_to_sensor.get(room)
+    for label in PREDICTION_LABELS:
+        sensor_col = label_to_sensor.get(label)
         if sensor_col is None:
             continue
         for h in horizons:
-            target_names.append(f"{room}_temp_t+{h}")
+            target_names.append(f"{label}_temp_t+{h}")
             target_info.append((sensor_col, h))
 
     n_targets = len(target_names)
@@ -500,17 +510,27 @@ def predict(
             if sens == sensor_col:
                 solar[hour] = gain
 
-        solar_vec = np.array([
+        base_solar = np.array([
             solar.get(int((state.hour_of_day + step * _DT_HOURS) % 24), 0.0)
             for step in range(1, max_horizon + 1)
         ])
+        # Modulate by weather-condition solar fractions (if provided)
+        if state.solar_fractions:
+            sf = state.solar_fractions
+            sf_vec = np.array([
+                sf[min(int(step * _DT_HOURS), len(sf) - 1)]
+                for step in range(1, max_horizon + 1)
+            ])
+            solar_vec = base_solar * sf_vec
+        else:
+            solar_vec = base_solar
 
-        # Current temp (try sensor col name, then room name)
+        # Current temp (try sensor col name, then label name)
         cur_temp = state.current_temps.get(sensor_col)
         if cur_temp is None:
-            for room, sc in room_to_sensor.items():
+            for lbl, sc in label_to_sensor.items():
                 if sc == sensor_col:
-                    cur_temp = state.current_temps.get(room)
+                    cur_temp = state.current_temps.get(lbl)
                     break
         if cur_temp is None:
             cur_temp = 70.0
@@ -591,31 +611,31 @@ def predict(
     return target_names, result
 
 
-# ── Room name mapping ────────────────────────────────────────────────────
+# ── Label-to-sensor mapping ──────────────────────────────────────────────
 
 
-def _room_to_sensor_map(sensor_names: list[str]) -> dict[str, str]:
-    """Map PREDICTION_ROOMS names to sensor column names from sysid.
+def _label_to_sensor_map(sensor_names: list[str]) -> dict[str, str]:
+    """Map PREDICTION_LABELS to sensor column names from sysid.
 
-    PREDICTION_ROOMS uses names like "bedroom", "upstairs".
+    Labels are like "bedroom", "upstairs".
     Sensor columns are like "bedroom_temp", "thermostat_upstairs_temp".
     """
     mapping: dict[str, str] = {}
-    for room in PREDICTION_ROOMS:
+    for label in PREDICTION_LABELS:
         # Direct: "bedroom" -> "bedroom_temp"
-        candidate = f"{room}_temp"
+        candidate = f"{label}_temp"
         if candidate in sensor_names:
-            mapping[room] = candidate
+            mapping[label] = candidate
             continue
         # Thermostat zone: "upstairs" -> "thermostat_upstairs_temp"
-        candidate = f"thermostat_{room}_temp"
+        candidate = f"thermostat_{label}_temp"
         if candidate in sensor_names:
-            mapping[room] = candidate
+            mapping[label] = candidate
             continue
         # Aggregate: "upstairs" -> "upstairs_aggregate_temp"
-        candidate = f"{room}_aggregate_temp"
+        candidate = f"{label}_aggregate_temp"
         if candidate in sensor_names:
-            mapping[room] = candidate
+            mapping[label] = candidate
     return mapping
 
 

@@ -96,9 +96,9 @@ def _make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSche
     """Comfort schedules with optional room overrides."""
     from weatherstat.control import default_comfort_schedules
 
-    defaults = {s.room: s for s in default_comfort_schedules()}
-    for room, entries in overrides.items():
-        defaults[room] = ComfortSchedule(room=room, entries=tuple(entries))
+    defaults = {s.label: s for s in default_comfort_schedules()}
+    for label, entries in overrides.items():
+        defaults[label] = ComfortSchedule(label=label, entries=tuple(entries))
     return list(defaults.values())
 
 

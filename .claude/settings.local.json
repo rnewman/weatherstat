@@ -77,7 +77,8 @@
       "Bash(just sysid:*)",
       "Bash(curl:*)",
       "Bash(just test:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(uv run:*)"
     ]
   }
 }

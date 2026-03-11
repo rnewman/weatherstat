@@ -442,9 +442,19 @@ def _preprocess(
                 count += 1
             df[f"_lag_{eff.name}_{label}"] = lagged_sum / max(count, 1)
 
-    # Hour-of-day indicators for solar (hours 7-17)
+    # Weather-conditioned solar features (hours 7-17).
+    # Each feature = (is_hour_H) × solar_fraction, so the regression learns
+    # the gain per unit of clear sky at each hour. On a cloudy day the feature
+    # is 0.15 instead of 1.0; on a sunny day it's 1.0.
+    from weatherstat.weather import condition_to_solar_fraction
+
+    if "weather_condition" in df.columns:
+        solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3)
+    else:
+        solar_frac = pd.Series(0.3, index=df.index)
+
     for h in range(7, 18):
-        df[f"_solar_h{h}"] = (df["_local_hour"] == h).astype(float)
+        df[f"_solar_h{h}"] = ((df["_local_hour"] == h).astype(float) * solar_frac)
 
     return df
 

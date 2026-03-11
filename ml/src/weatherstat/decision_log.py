@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from weatherstat.config import DECISION_LOG_DB, PREDICTION_ROOMS, SNAPSHOTS_DB
+from weatherstat.config import DECISION_LOG_DB, PREDICTION_LABELS, SNAPSHOTS_DB
 
-# Horizon durations in minutes, keyed by the label used in room_predictions
+# Horizon durations in minutes, keyed by the label used in predictions
 HORIZON_MINUTES: dict[str, int] = {"1h": 60, "2h": 120, "4h": 240, "6h": 360}
 
 # Extra margin (minutes) before we consider a horizon checkable —
@@ -95,8 +95,8 @@ def log_decision(
         [{"name": sd.name, "mode": sd.mode, "target": sd.target} for sd in decision.mini_splits]
     )
 
-    # Serialize predictions (room -> {horizon -> temp})
-    predictions_json = json.dumps(decision.room_predictions)
+    # Serialize predictions (label -> {horizon -> temp})
+    predictions_json = json.dumps(decision.predictions)
 
     # Serialize comfort bounds at decision time
     comfort_bounds: dict[str, dict[str, float]] = {}
@@ -104,7 +104,7 @@ def log_decision(
         if isinstance(sched, ComfortSchedule):
             c = sched.comfort_at(base_hour)
             if c is not None:
-                comfort_bounds[sched.room] = {"min": c.min_temp, "max": c.max_temp}
+                comfort_bounds[sched.label] = {"min": c.min_temp, "max": c.max_temp}
     comfort_bounds_json = json.dumps(comfort_bounds)
 
     # Serialize trajectory info (if present)
@@ -226,13 +226,13 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
 
             snap_row = snap_df.iloc[closest_idx]
 
-            for room in PREDICTION_ROOMS:
-                room_preds = predictions.get(room, {})
-                predicted = room_preds.get(horizon_label)
+            for label in PREDICTION_LABELS:
+                label_preds = predictions.get(label, {})
+                predicted = label_preds.get(horizon_label)
                 if predicted is None:
                     continue
 
-                temp_col = room_temp_cols.get(room)
+                temp_col = room_temp_cols.get(label)
                 if temp_col is None:
                     continue
 
@@ -243,9 +243,9 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
                 actual = float(actual)
                 error = round(predicted - actual, 3)
 
-                if room not in outcomes:
-                    outcomes[room] = {}
-                outcomes[room][horizon_label] = {
+                if label not in outcomes:
+                    outcomes[label] = {}
+                outcomes[label][horizon_label] = {
                     "predicted": round(predicted, 2),
                     "actual": round(actual, 2),
                     "error": error,

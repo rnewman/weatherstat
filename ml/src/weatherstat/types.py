@@ -86,14 +86,14 @@ class WeatherState:
 
 @dataclass(frozen=True)
 class RoomComfort:
-    """Comfort profile for a single room.
+    """Comfort profile for a single constraint label (sensor).
 
     preferred: ideal temperature — continuous cost in both directions.
     min_temp/max_temp: hard rails with steep additional penalty (10×).
     cold_penalty/hot_penalty: asymmetric weights for deviation from preferred.
     """
 
-    room: str  # "bedroom", "office", "upstairs", "downstairs"
+    label: str  # "bedroom", "office", "upstairs", "downstairs"
     preferred: float  # ideal temperature (°F)
     min_temp: float  # hard lower bound (°F)
     max_temp: float  # hard upper bound (°F)
@@ -112,9 +112,9 @@ class ComfortScheduleEntry:
 
 @dataclass(frozen=True)
 class ComfortSchedule:
-    """Time-of-day comfort profile for a room."""
+    """Time-of-day comfort schedule for a constraint label (sensor)."""
 
-    room: str
+    label: str
     entries: tuple[ComfortScheduleEntry, ...] = field(default_factory=tuple)
 
     def comfort_at(self, hour: int) -> RoomComfort | None:
@@ -189,7 +189,7 @@ class ControlDecision:
     total_cost: float = 0.0
     comfort_cost: float = 0.0
     energy_cost: float = 0.0
-    room_predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # room -> {horizon -> temp}
+    predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # label -> {horizon -> temp}
     # zone -> {delay_steps, duration_steps}
     trajectory_info: dict[str, dict[str, int | None]] = field(default_factory=dict)
     dry_run: bool = True

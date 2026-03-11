@@ -44,9 +44,9 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
     """
     from weatherstat.control import default_comfort_schedules
 
-    defaults = {s.room: s for s in default_comfort_schedules()}
-    for room, entries in overrides.items():
-        defaults[room] = ComfortSchedule(room=room, entries=tuple(entries))
+    defaults = {s.label: s for s in default_comfort_schedules()}
+    for label, entries in overrides.items():
+        defaults[label] = ComfortSchedule(label=label, entries=tuple(entries))
     return list(defaults.values())
 
 
@@ -63,7 +63,7 @@ class TestComfortCost:
         """
         schedules = [
             ComfortSchedule(
-                room="upstairs",
+                label="upstairs",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72.0, 70.0, 74.0, hot_penalty=2.0)),),
             ),
         ]
@@ -86,7 +86,7 @@ class TestComfortCost:
         from weatherstat.control import default_comfort_schedules
 
         schedules = default_comfort_schedules()
-        bedroom_schedules = [s for s in schedules if s.room == "bedroom"]
+        bedroom_schedules = [s for s in schedules if s.label == "bedroom"]
 
         predictions = {"bedroom_temp_t+12": 74.0}
 
@@ -103,7 +103,7 @@ class TestComfortCost:
         """Room exactly at preferred temperature -> zero cost."""
         schedules = [
             ComfortSchedule(
-                room="upstairs",
+                label="upstairs",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 69.0, 74.0)),),
             ),
         ]
@@ -115,7 +115,7 @@ class TestComfortCost:
         """Room within [min, max] but not at preferred -> non-zero continuous cost."""
         schedules = [
             ComfortSchedule(
-                room="upstairs",
+                label="upstairs",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 69.0, 74.0)),),
             ),
         ]
@@ -216,7 +216,7 @@ class TestAdjustSchedulesForWindows:
             schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
-        bedroom_sched = next(s for s in adjusted if s.room == "bedroom")
+        bedroom_sched = next(s for s in adjusted if s.label == "bedroom")
         entry = bedroom_sched.entries[0]
         assert entry.comfort.min_temp == 67.0  # 70 + (-3)
         assert entry.comfort.max_temp == 76.0  # 74 + 2
@@ -234,8 +234,8 @@ class TestAdjustSchedulesForWindows:
             schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
-        upstairs_orig = next(s for s in schedules if s.room == "upstairs")
-        upstairs_adj = next(s for s in adjusted if s.room == "upstairs")
+        upstairs_orig = next(s for s in schedules if s.label == "upstairs")
+        upstairs_adj = next(s for s in adjusted if s.label == "upstairs")
         assert upstairs_orig is upstairs_adj  # unchanged
 
     def test_penalties_preserved(self) -> None:
@@ -255,7 +255,7 @@ class TestAdjustSchedulesForWindows:
             schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
         )
 
-        bedroom_sched = next(s for s in adjusted if s.room == "bedroom")
+        bedroom_sched = next(s for s in adjusted if s.label == "bedroom")
         entry = bedroom_sched.entries[0]
         assert entry.comfort.cold_penalty == 3.0
         assert entry.comfort.hot_penalty == 0.5
@@ -422,7 +422,7 @@ class TestMiniSplitSweepOptions:
     def _bedroom_schedule(self, min_t: float = 68.0, max_t: float = 72.0) -> list[ComfortSchedule]:
         preferred = (min_t + max_t) / 2.0
         return [ComfortSchedule(
-            room="bedroom",
+            label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", preferred, min_t, max_t)),),
         )]
 
@@ -466,7 +466,7 @@ class TestModeHoldWindow:
 
     def _bedroom_schedule(self) -> list[ComfortSchedule]:
         return [ComfortSchedule(
-            room="bedroom",
+            label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
         )]
 
@@ -581,11 +581,11 @@ class TestTrajectoryWithSchedules:
         """With schedules, should have 2 options per split (off + preferred)."""
         schedules = [
             ComfortSchedule(
-                room="bedroom",
+                label="bedroom",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
             ),
             ComfortSchedule(
-                room="living_room",
+                label="living_room",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 69.0, 74.0)),),
             ),
         ]
@@ -598,7 +598,7 @@ class TestTrajectoryWithSchedules:
         """All-off baseline should still be in scenario set."""
         schedules = [
             ComfortSchedule(
-                room="bedroom",
+                label="bedroom",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
             ),
         ]

@@ -33,7 +33,7 @@ from weatherstat.config import (
     ENERGY_COST_GAS_ZONE,
     ENERGY_COST_MINI_SPLIT,
     MINI_SPLITS,
-    PREDICTION_ROOMS,
+    PREDICTION_LABELS,
     PREDICTIONS_DIR,
 )
 from weatherstat.extract import fetch_recent_history
@@ -120,16 +120,16 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
     the thermostats can do for them.
     """
     schedules: list[ComfortSchedule] = []
-    for room, entries in _CFG.comfort.items():
+    for label, entries in _CFG.comfort.items():
         schedule_entries = tuple(
             ComfortScheduleEntry(
                 e.start_hour,
                 e.end_hour,
-                RoomComfort(room, e.preferred, e.min_temp, e.max_temp, e.cold_penalty, e.hot_penalty),
+                RoomComfort(label, e.preferred, e.min_temp, e.max_temp, e.cold_penalty, e.hot_penalty),
             )
             for e in entries
         )
-        schedules.append(ComfortSchedule(room=room, entries=schedule_entries))
+        schedules.append(ComfortSchedule(label=label, entries=schedule_entries))
     return schedules
 
 
@@ -168,7 +168,7 @@ def adjust_schedules_for_windows(
 
     adjusted: list[ComfortSchedule] = []
     for schedule in schedules:
-        if schedule.room not in labels_with_open_windows:
+        if schedule.label not in labels_with_open_windows:
             adjusted.append(schedule)
             continue
         new_entries = tuple(
@@ -176,7 +176,7 @@ def adjust_schedules_for_windows(
                 e.start_hour,
                 e.end_hour,
                 RoomComfort(
-                    e.comfort.room,
+                    e.comfort.label,
                     e.comfort.preferred,  # preferred unchanged — window doesn't change ideal
                     e.comfort.min_temp + min_offset,
                     e.comfort.max_temp + max_offset,
@@ -186,7 +186,7 @@ def adjust_schedules_for_windows(
             )
             for e in schedule.entries
         )
-        adjusted.append(ComfortSchedule(room=schedule.room, entries=new_entries))
+        adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
     return adjusted
 
 
@@ -233,7 +233,7 @@ def compute_comfort_cost(
     horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
 
     for schedule in schedules:
-        room = schedule.room
+        label = schedule.label
         for h in CONTROL_HORIZONS:
             weight = HORIZON_WEIGHTS.get(h, 0.5)
             hours_ahead = horizon_hours.get(h, h // 12)
@@ -243,7 +243,7 @@ def compute_comfort_cost(
             if comfort is None:
                 continue
 
-            pred_temp = predictions.get(f"{room}_temp_t+{h}")
+            pred_temp = predictions.get(f"{label}_temp_t+{h}")
             if pred_temp is None:
                 continue
 
@@ -314,20 +314,20 @@ def _derive_sensor_zones(gains: dict[tuple[str, str], tuple[float, float]]) -> d
     return {label: zone for label, (zone, _) in best.items()}
 
 
-def _zone_comfort_max(zone: str, schedules: list[ComfortSchedule], hour: int) -> float:
-    """Get the comfort max for a zone's primary thermostat at the given hour."""
+def _zone_comfort_max(label: str, schedules: list[ComfortSchedule], hour: int) -> float:
+    """Get the comfort max for a constraint label at the given hour."""
     for s in schedules:
-        if s.room == zone:
+        if s.label == label:
             c = s.comfort_at(hour)
             if c is not None:
                 return c.max_temp
     return ABSOLUTE_MAX
 
 
-def _zone_comfort_min(zone: str, schedules: list[ComfortSchedule], hour: int) -> float:
-    """Get the comfort min for a zone's primary thermostat at the given hour."""
+def _zone_comfort_min(label: str, schedules: list[ComfortSchedule], hour: int) -> float:
+    """Get the comfort min for a constraint label at the given hour."""
     for s in schedules:
-        if s.room == zone:
+        if s.label == label:
             c = s.comfort_at(hour)
             if c is not None:
                 return c.min_temp
@@ -374,7 +374,7 @@ def _mini_split_sweep_options(
     # Find preferred temperature for this split's sensor
     preferred: float | None = None
     for sched in schedules:
-        if sched.room == split_name:
+        if sched.label == split_name:
             comfort = sched.comfort_at(base_hour)
             if comfort is not None:
                 preferred = comfort.preferred
@@ -514,6 +514,7 @@ def sweep_scenarios_physics(
     schedules: list[ComfortSchedule],
     base_hour: int,
     prev_state: ControlState | None = None,
+    solar_fractions: list[float] | None = None,
 ) -> tuple[ControlDecision, TrajectoryScenario]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -569,6 +570,7 @@ def sweep_scenarios_physics(
         window_states=window_states,
         hour_of_day=hour_of_day,
         recent_history=recent_history,
+        solar_fractions=solar_fractions or [],
     )
     target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
     target_idx = {t: j for j, t in enumerate(target_names)}
@@ -603,24 +605,24 @@ def sweep_scenarios_physics(
             print(f"  Reverting to all-off: improvement {improvement:.3f} < threshold {MIN_IMPROVEMENT:.1f}")
             best_idx = off_idx
 
-    # ── Cold-room safety override ──
-    # Force immediate heating (delay=0) when room is significantly below comfort min
+    # ── Cold-sensor safety override ──
+    # Force immediate heating (delay=0) when a sensor is significantly below comfort min
     if _is_all_off(scenarios[best_idx]):
         cold_zones: set[str] = set()
-        cold_rooms_info: list[str] = []
+        cold_info: list[str] = []
         for schedule in schedules:
-            room = schedule.room
-            temp = current_temps.get(room)
+            label = schedule.label
+            temp = current_temps.get(label)
             if temp is None:
                 continue
             comfort = schedule.comfort_at(base_hour)
             if comfort is None:
                 continue
             if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
-                zone = sensor_zones.get(room)
+                zone = sensor_zones.get(label)
                 if zone:
                     cold_zones.add(zone)
-                    cold_rooms_info.append(f"{room} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
+                    cold_info.append(f"{label} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
 
         if not up_allow:
             cold_zones.discard("upstairs")
@@ -645,7 +647,7 @@ def sweep_scenarios_physics(
                     constrained_cost = c + e
                     constrained_best = i
             if constrained_best >= 0:
-                print(f"  Cold room override: {', '.join(cold_rooms_info)}")
+                print(f"  Cold sensor override: {', '.join(cold_info)}")
                 best_idx = constrained_best
 
     # ── Build ControlDecision ──
@@ -672,16 +674,16 @@ def sweep_scenarios_physics(
             "duration_steps": scenario.downstairs.duration_steps,
         }
 
-    room_preds: dict[str, dict[str, float]] = {}
-    for room in PREDICTION_ROOMS:
+    label_preds: dict[str, dict[str, float]] = {}
+    for label in PREDICTION_LABELS:
         rpred: dict[str, float] = {}
         for h in CONTROL_HORIZONS:
-            key = f"{room}_temp_t+{h}"
+            key = f"{label}_temp_t+{h}"
             val = predictions.get(key)
             if val is not None:
                 rpred[HORIZON_LABELS[h]] = round(val, 2)
         if rpred:
-            room_preds[room] = rpred
+            label_preds[label] = rpred
 
     decision = ControlDecision(
         timestamp=datetime.now(UTC).isoformat(),
@@ -702,7 +704,7 @@ def sweep_scenarios_physics(
         total_cost=round(total, 4),
         comfort_cost=round(comfort, 4),
         energy_cost=round(energy, 4),
-        room_predictions=room_preds,
+        predictions=label_preds,
         trajectory_info=trajectory_info,
     )
     return decision, scenario
@@ -795,15 +797,15 @@ def check_prediction_sanity(
     decision: ControlDecision,
     current_temps: dict[str, float],
 ) -> bool:
-    """Return True if 1h predictions look reasonable for all rooms."""
+    """Return True if 1h predictions look reasonable for all labels."""
     safe = True
-    for room, preds in decision.room_predictions.items():
+    for label, preds in decision.predictions.items():
         pred_1h = preds.get("1h")
-        current = current_temps.get(room)
+        current = current_temps.get(label)
         if pred_1h is None or current is None:
             continue
         if abs(pred_1h - current) > MAX_1H_CHANGE:
-            print(f"  WARNING: {room} 1h prediction {pred_1h:.1f}°F is >{MAX_1H_CHANGE}°F from current {current:.1f}°F")
+            print(f"  WARNING: {label} 1h pred {pred_1h:.1f}°F >{MAX_1H_CHANGE}°F from current {current:.1f}°F")
             safe = False
     return safe
 
@@ -916,11 +918,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         print(f"  Windows:     {', '.join(open_windows)} open")
     else:
         print("  Windows:     all closed")
-    other_rooms = [r for r in PREDICTION_ROOMS if r not in ("upstairs", "downstairs")]
-    for room in other_rooms:
-        t = current_temps.get(room)
+    other_labels = [la for la in PREDICTION_LABELS if la not in ("upstairs", "downstairs")]
+    for la in other_labels:
+        t = current_temps.get(la)
         if t is not None:
-            print(f"  {room:<14} {t:.1f}°F")
+            print(f"  {la:<14} {t:.1f}°F")
     # Show current blower/mini-split state
     for cfg in BLOWERS:
         mode = str(latest.get(f"blower_{cfg.name}_mode", "?"))
@@ -947,6 +949,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             print(f"  Forecast:    {', '.join(parts)}")
     else:
         print("  Forecast:    unavailable")
+
+    # Current weather condition for solar fraction
+    _current_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
+    from weatherstat.weather import condition_to_solar_fraction as _c2sf
+
+    print(f"  Weather:     {_current_cond} (solar fraction: {_c2sf(_current_cond):.0%})")
 
     # Current local hour for comfort schedule lookup
     from zoneinfo import ZoneInfo
@@ -976,8 +984,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     sim_params = load_sim_params()
     recent_hist = extract_recent_history(df_raw, sim_params)
 
-    # Build forecast temp list for simulator
+    # Build forecast temp list and solar fractions for simulator
+    from weatherstat.weather import condition_to_solar_fraction
+
     forecast_temp_list: list[float] = []
+    solar_fractions: list[float] = []
+    # Index 0 = current hour's solar fraction (from latest snapshot condition)
+    current_condition = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
+    solar_fractions.append(condition_to_solar_fraction(current_condition))
+
     if forecast:
         from weatherstat.forecast import forecast_at_horizons as _fah
 
@@ -988,10 +1003,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             entry = at_h.get(f"{h}h")
             if entry is not None:
                 forecast_temp_list.append(entry.temperature)
+                solar_fractions.append(condition_to_solar_fraction(entry.condition))
             elif forecast_temp_list:
                 forecast_temp_list.append(forecast_temp_list[-1])
+                solar_fractions.append(solar_fractions[-1])
             else:
                 forecast_temp_list.append(float(out_temp) if out_temp is not None else 50.0)
+                solar_fractions.append(solar_fractions[-1])
 
     fractional_hour = base_hour + local_now.minute / 60.0
 
@@ -1018,6 +1036,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         schedules,
         base_hour,
         prev_state,
+        solar_fractions,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
@@ -1069,6 +1088,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         window_states=window_states_dict,
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
+        solar_fractions=solar_fractions,
     )
     off_targets, off_matrix = _predict(off_state, [all_off], sim_params, CONTROL_HORIZONS)
     off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
@@ -1076,17 +1096,17 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     print(f"\n  All-off baseline: comfort={off_comfort:.4f}")
 
-    header = f"  {'Room':<14}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
+    header = f"  {'Sensor':<14}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
     print("\n  Predicted temperatures (decision vs all-off):")
     print(header)
     print(f"  {'-' * (14 + 18 * len(horizons))}")
-    for room in PREDICTION_ROOMS:
-        dec_vals = decision.room_predictions.get(room, {})
-        row = f"  {room:<14}"
+    for label in PREDICTION_LABELS:
+        dec_vals = decision.predictions.get(label, {})
+        row = f"  {label:<14}"
         has_any = False
         for h_step, h_label in zip(CONTROL_HORIZONS, horizons, strict=True):
             dec_t = dec_vals.get(h_label)
-            off_key = f"{room}_temp_t+{h_step}"
+            off_key = f"{label}_temp_t+{h_step}"
             off_t = off_preds.get(off_key)
             if dec_t is not None:
                 has_any = True
@@ -1111,6 +1131,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         window_states=window_states_dict,
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
+        solar_fractions=solar_fractions,
     )
     window_advisories = evaluate_window_advisories(
         adv_state, winning_scenario, sim_params, original_schedules, base_hour,
