@@ -36,7 +36,6 @@ See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 ```bash
 just                  # List available tasks
 just init             # Initialize ~/.weatherstat data directory
-just migrate          # Migrate data from repo data/ to ~/.weatherstat
 just collect          # Run HA state collector (5-min loop)
 just collect-once     # Collect a single snapshot
 just collect-durable  # Auto-restart collector + health monitoring
@@ -88,4 +87,3 @@ Runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR` en
 ```
 
 First-time setup: `just init` creates the directory and copies `weatherstat.yaml.example`.
-Migration from repo `data/`: `just migrate`.

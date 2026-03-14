@@ -134,10 +134,6 @@ init:
     fi
     echo "Ready: $DATA_DIR"
 
-# Migrate data from repo data/ to ~/.weatherstat
-migrate:
-    bash scripts/migrate-data.sh
-
 # Install all dependencies
 install:
     cd ha-client && pnpm install

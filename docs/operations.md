@@ -211,7 +211,6 @@ Source code in the repo:
 ```
 scripts/
   plot_comfort.py              # comfort performance dashboard
-  migrate-data.sh              # migrate from repo data/ to ~/.weatherstat
 logs/
   collector.log                # collector + health check output
 ```
