@@ -44,7 +44,7 @@ when data goes stale.
 ### Inspecting the database
 
 ```bash
-sqlite3 data/snapshots/snapshots.db "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM snapshots;"
+sqlite3 data/snapshots/snapshots.db "SELECT COUNT(DISTINCT timestamp), MIN(timestamp), MAX(timestamp) FROM readings;"
 ```
 
 ## 2. System Identification
@@ -59,7 +59,7 @@ just sysid --output custom_path.json  # custom output path
 ```
 
 **What it produces** (`data/thermal_params.json`):
-- `tau_sealed` and `tau_ventilated` per sensor — envelope heat loss time constants
+- `TauModel` per sensor — `tau_base` (sealed envelope time constant) plus per-window `window_betas` (additional cooling rate when open) and cross-breeze `interaction_betas`
 - Effector × sensor gain matrix — heating rate (°F/hr) and delay (minutes) for each (device, sensor) pair
 - Solar gain profiles — per-sensor, per-hour-of-day gain coefficients
 
@@ -74,9 +74,10 @@ Sysid uses all available collector data. More data = tighter parameter estimates
 ## 3. Control Loop
 
 The controller runs a physics-based trajectory sweep: for each combination of
-thermostat trajectories (delay × duration × on/off), blower modes, and mini-split
-modes (~7,400 scenarios), it forward-simulates room temperatures over a 6-hour
-horizon and selects the trajectory that minimizes comfort cost + energy cost.
+thermostat trajectories (delay × duration × on/off), blower modes (off/low/high),
+and mini-split target temperatures (off + comfort-derived targets), it
+forward-simulates sensor temperatures over a 6-hour horizon and selects the
+trajectory that minimizes comfort cost + energy cost (~5,000–15,000 scenarios).
 
 Re-evaluated every 15 minutes (receding horizon — only the immediate action
 is executed, then re-planned with fresh data).
@@ -106,17 +107,20 @@ The executor reads the latest `command_*.json` and applies it via HA services.
 
 ### Safety rails
 
-- Setpoints clamped to [65, 78]°F
-- 30-minute minimum hold time between setpoint changes
+- Setpoints clamped to [62, 78]°F (absolute bounds)
+- 10-minute minimum hold time between thermostat setpoint changes
+- 2-hour minimum hold time between mini-split mode changes
+- Per-device mode hold window (e.g., 10pm–7am): no mini-split mode changes during quiet hours, only target temperature adjustments
 - Refuses to execute if data is >15 minutes stale
-- Warns (and skips in live mode) if 1h prediction shows >5°F change
-- Cold-room override: forces immediate heating when a room is >1°F below comfort min
+- Cold-sensor override: forces immediate heating when any sensor is significantly below comfort minimum
 - Dry-run is always the default
 
 ### Comfort profiles
 
-Defined in `weatherstat.yaml` under the `comfort` section. Per-room, per-time-of-day
-comfort bands with asymmetric penalty weights (too-cold penalized more than too-hot).
+Defined in `weatherstat.yaml` under `constraints.schedules`. Per-sensor, per-time-of-day
+comfort profiles with `preferred` temperature, hard `min`/`max` rails, and asymmetric
+`cold_penalty`/`hot_penalty` weights. The optimizer uses a two-layer cost: continuous
+quadratic from preferred + 10× steep penalty outside min/max.
 
 ### Decision logging
 
@@ -128,6 +132,30 @@ snapshots.
 ```bash
 sqlite3 data/decision_log.db "SELECT timestamp, comfort_cost, energy_cost, trajectory FROM decisions ORDER BY timestamp DESC LIMIT 10;"
 ```
+
+## 4. Comfort Dashboard
+
+Visualize how well the system is maintaining comfort. Answers "is it working?"
+at a glance.
+
+```bash
+just comfort                     # last 7 days, save PNG to data/comfort_7d.png
+just comfort --days 3            # last 3 days
+just comfort --predictions       # include prediction accuracy histogram
+just comfort --show              # interactive matplotlib window
+just comfort -o report.png       # custom output path
+```
+
+**Summary bar:** Per-sensor stacked bar showing % in comfort band, % too cold
+(capacity exceeded vs control opportunity), % too hot (same breakdown).
+
+**Capacity analysis:** Violations are classified by whether the sensor's
+dedicated effectors (zone thermostat + name-matched mini split/blower) were
+already at maximum. "Capacity exceeded" = building physics limitation.
+"Control opportunity" = the system had headroom it didn't use.
+
+**Console output:** Summary table with per-sensor breakdown and dedicated
+effector list.
 
 ## Typical Workflow
 
@@ -155,13 +183,17 @@ just sysid
 ```
 data/
   snapshots/
-    snapshots.db               # collector output (SQLite, ongoing)
+    snapshots.db               # collector output (SQLite EAV, ongoing)
   predictions/
     command_*.json             # control decisions (executor reads these)
-  thermal_params.json          # sysid output (effector gains, tau, solar)
+  thermal_params.json          # sysid output (TauModel, gains, solar)
   decision_log.db              # control decision history + outcome tracking
-  control_state.json           # last decision state (anti-cycling)
+  control_state.json           # last decision state (anti-cycling, mode hold times)
   executor_state.json          # executor override tracking
+  advisory_state.json          # per-window advisory cooldown timestamps
+  comfort_*.png                # comfort dashboard output
+scripts/
+  plot_comfort.py              # comfort performance dashboard
 logs/
   collector.log                # collector + health check output
 ```

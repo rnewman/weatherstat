@@ -139,6 +139,7 @@ def evaluate_window_advisories(
             window_states=toggled_windows,
             hour_of_day=state.hour_of_day,
             recent_history=state.recent_history,
+            solar_fractions=state.solar_fractions,
         )
 
         _, toggled_preds = predict(toggled_state, [winning_scenario], sim_params, CONTROL_HORIZONS)
@@ -200,7 +201,12 @@ def evaluate_window_advisories(
 # ── HA notification dispatch ─────────────────────────────────────────────
 
 
-def send_ha_notification(advisory: Advisory, target: str = "persistent_notification") -> bool:
+def send_ha_notification(
+    title: str,
+    message: str,
+    tag: str,
+    target: str = "persistent_notification",
+) -> bool:
     """Send a notification to Home Assistant.
 
     Dispatches to the appropriate HA service based on the target:
@@ -211,21 +217,19 @@ def send_ha_notification(advisory: Advisory, target: str = "persistent_notificat
     Uses notification_id/tag so new notifications replace old ones (no stacking).
     Returns True on success, False on failure (logged but not raised).
     """
-    tag = f"weatherstat_{_cooldown_key(advisory)}"
-
     if target == "persistent_notification":
         service = "persistent_notification/create"
         payload: dict[str, object] = {
-            "title": advisory.title,
-            "message": advisory.message,
+            "title": title,
+            "message": message,
             "notification_id": tag,
         }
     else:
         # notify.mobile_app_foo → notify/mobile_app_foo
         service = target.replace(".", "/", 1)
         payload = {
-            "title": advisory.title,
-            "message": advisory.message,
+            "title": title,
+            "message": message,
             "data": {"tag": tag},
         }
 
@@ -291,11 +295,17 @@ def process_advisories(
         print(f"  {advisory.title}: {advisory.message}")
         dispatched.append(advisory)
 
-        if live and send_ha_notification(advisory, target=notification_target):
-            state[key] = time.time()
+    # Send a single combined notification for all dispatched advisories
+    if live and dispatched:
+        now = time.time()
+        lines = [a.message for a in dispatched]
+        combined_message = "\n".join(lines)
+        title = f"Window advisory ({len(dispatched)})" if len(dispatched) > 1 else dispatched[0].title
+        if send_ha_notification(title, combined_message, "weatherstat_advisory", notification_target):
+            for advisory in dispatched:
+                state[_cooldown_key(advisory)] = now
             print(f"  → Sent to HA ({notification_target})")
 
-    if live:
         save_advisory_state(state)
 
     return dispatched

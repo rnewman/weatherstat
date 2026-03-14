@@ -98,6 +98,10 @@ execute-force:
 sysid *ARGS:
     cd ml && uv run python -m weatherstat.sysid {{ARGS}}
 
+# Comfort performance dashboard (last 7 days by default)
+comfort *ARGS:
+    cd ml && uv run python ../scripts/plot_comfort.py {{ARGS}}
+
 # ── Setup ────────────────────────────────────────────────────────────────
 
 # Install all dependencies

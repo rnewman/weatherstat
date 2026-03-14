@@ -131,13 +131,18 @@ Forward-simulates room temperatures by Euler-integrating the thermal dynamics of
 ```
 dT/dt = (T_outdoor - T) / tau
         + Σ gain_e * activity_e(t - lag_e)     # effector heating, delayed
-        + solar(hour_of_day)                    # solar gain profile
+        + solar(hour_of_day) * solar_fraction   # solar gain, weather-modulated
 ```
 
 Where:
 - `tau` is the effective envelope time constant, computed from `TauModel`: `1/tau_eff = 1/tau_base + Σ β_w × open_w + Σ β_{ww'} × open_w × open_w'`
 - Each effector `e` contributes a gain (°F/hr per activity unit) delayed by its fitted lag
-- Solar gain is a per-sensor, per-hour profile from sysid
+- Solar gain is a per-sensor, per-hour profile from sysid, modulated by a weather-conditioned solar fraction (sunny=1.0, cloudy=0.15, clear-night=0.0, etc.)
+
+**Effector types:**
+- **Trajectory (thermostats):** Pre-computed binary activity from delay/duration parameters.
+- **Discrete (blowers):** Constant activity from mode (off=0, low=0.5, high=1.0).
+- **Regulating (mini splits):** Proportional activity computed inside the Euler loop: `activity = clip((target - T) / proportional_band, 0, 1)`. Activity drops to zero as the room reaches the target, modeling the mini split's PID controller.
 
 **Integration:** Euler steps at 5-minute resolution, chaining hourly weather forecast segments for the outdoor temperature trajectory.
 
@@ -187,34 +192,40 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 **Each control cycle:**
 1. Read current house state (temperatures, HVAC states, window states, weather).
 2. Fetch weather forecast for the prediction horizon.
-3. Enumerate candidate trajectories: each thermostat gets a delay × duration grid (e.g., "delay 1h, heat for 2h, coast"), crossed with blower modes and mini-split modes (~7,400 scenarios).
-4. For each candidate: forward-simulate all room temperatures. Score the resulting trajectories against comfort schedules and energy costs.
+3. Enumerate candidate trajectories: each thermostat gets a delay × duration grid (e.g., "delay 1h, heat for 2h, coast"), crossed with blower modes and mini-split target temperatures (~5,000–15,000 scenarios depending on config).
+4. For each candidate: forward-simulate all sensor temperatures. Score the resulting trajectories against comfort schedules and energy costs.
 5. Select the trajectory with the best score.
 6. Emit electronic commands for the executor.
 
-**Trajectory search:** Slow effectors (thermostats, 45-75 min lag) are parameterized as `[OFF × delay] → [ON × duration] → [OFF × remainder]`. Fast effectors (blowers, mini-splits) use constant modes. The boiler timeline is derived as the OR of both thermostat timelines. Blowers follow their zone thermostat (no heat to redistribute when the slab isn't active).
+**Trajectory search:** Slow effectors (thermostats, 45-75 min lag) are parameterized as `[OFF × delay] → [ON × duration] → [OFF × remainder]`. Blowers use constant modes (off/low/high). Mini splits are treated as regulating effectors: the sweep generates target temperatures derived from the comfort schedule (off + preferred), not mode permutations. The boiler timeline is derived as the OR of both thermostat timelines. Blowers follow their zone thermostat (no heat to redistribute when the slab/radiators aren't active).
 
 **Receding horizon:** Only the immediate action matters. A trajectory of "delay 2h then heat" means "stay off now." At the next 15-minute cycle, the controller re-evaluates with fresh data and may choose differently.
 
 **Scoring:**
 
+Two-layer comfort cost model:
+1. **Continuous:** Quadratic penalty for any deviation from `preferred` temperature, weighted asymmetrically by `cold_penalty` (below preferred) and `hot_penalty` (above preferred). This gives the optimizer a gradient everywhere — it always prefers temperatures closer to preferred, not just "anywhere in the band."
+2. **Hard rails:** Steep additional penalty (10×) for exceeding `min`/`max` bounds.
+
 ```
 score = sum over (sensors, horizons) of:
-    comfort_violation(T_predicted, constraint_band, penalty_weights)
+    (T_predicted - preferred)^2 * penalty_weight        # continuous
+  + hard_rail_penalty(T_predicted, min, max)             # steep outside bounds
   + energy_cost(actions, duration)
 ```
 
-Comfort violations are asymmetric: being too cold incurs a higher penalty than being too warm (configurable per sensor and time of day via YAML constraints). Window-open states widen the comfort band to avoid fighting ventilation.
+Window-open states widen the comfort band to avoid fighting ventilation.
 
 **Horizon weighting:** Closer predictions weighted higher (more accurate, more actionable).
 
-**Energy cost scaling:** For trajectory scenarios, gas zone cost is proportional to `duration / max_horizon` — a 2h heating plan costs less than a 6h plan.
+**Energy cost scaling:** Gas zone cost is proportional to `duration / max_horizon`. Mini-split cost is proportional to expected activity (target vs outdoor temperature within the proportional band).
 
 **Physical constraints:**
-- Blowers forced off when their zone's thermostat is off (no cold air circulation).
-- Setpoint clamps (min/max safety bounds).
-- Hold times (minimum interval between changes to avoid short-cycling).
-- Cold-room override: force immediate zone heating (delay=0) when any room exceeds a threshold below comfort minimum.
+- Blowers forced off when their zone's thermostat is off (no cold air circulation from radiator coils).
+- Setpoint clamps (absolute safety bounds: 62–78°F).
+- Hold times: 10-minute minimum between setpoint changes; 2-hour minimum between mini-split mode changes.
+- Mode hold window: per-device configurable hours (e.g., 10pm–7am) during which mini-split mode changes are forbidden — only silent target temperature adjustments are allowed.
+- Cold-sensor override: force immediate zone heating (delay=0) when any sensor is significantly below comfort minimum.
 
 **Output:** `ControlDecision` JSON containing recommended device states, predicted outcomes, trajectory info, and decision reasoning.
 
@@ -251,9 +262,10 @@ Generates human-actionable recommendations for things the system can't do electr
 **Key design constraint:** The electronic plan does NOT change based on advisories. The controller commits to the best electronic trajectory given current window states. Advisories are a separate, post-sweep evaluation. If the human acts on the advisory (e.g., opens a window), the next 15-minute cycle re-evaluates with the new state and naturally adjusts.
 
 **Dispatch:**
+- All triggered advisories are combined into a single notification (no spam).
 - Per-window cooldown timers prevent notification fatigue.
 - Quiet hours suppress push notifications (still logged).
-- HA persistent notifications (replaces stale notification via `notification_id`).
+- Notifications use a fixed tag so each control cycle replaces the previous advisory.
 
 ---
 
@@ -287,6 +299,23 @@ Records every control decision with full context.
 **Used by:**
 - Humans debugging decisions ("why did it turn on the heat at 3 AM?").
 - Prediction error analysis: compare predicted vs actual temperatures at each logged horizon.
+- Comfort performance dashboard (`just comfort`) for capacity analysis.
+
+---
+
+### 9. Comfort Dashboard (`scripts/plot_comfort.py`)
+
+Answers "is the system working as designed?" at a glance. Run via `just comfort`.
+
+**Output:** A multi-panel PNG with:
+- **Summary bar:** Per-sensor horizontal stacked bar showing % in comfort band, % too cold (capacity-limited vs control opportunity), % too hot (capacity-limited vs control opportunity).
+- **Temperature traces:** Per-sensor time series with comfort band overlay (green fill = min/max, dashed = preferred), violation shading (red = below min, orange = above max).
+- **Outdoor + effector panel:** Outdoor temperature with heating state overlays.
+- **Prediction accuracy** (optional, `--predictions`): Error histogram by horizon with MAE and bias.
+
+**Capacity analysis:** Violations are classified as "capacity exceeded" (all dedicated effectors at max — building physics problem) vs "control opportunity" (dedicated effectors had headroom). Dedicated effectors are identified per sensor: zone thermostat (from coupling matrix) plus any name-matched mini split or blower. Cross-talk gains from effectors that primarily serve other sensors are excluded — the optimizer already balances those trade-offs.
+
+**Console output:** Summary table with per-sensor breakdown and dedicated effector list.
 
 ---
 
@@ -313,8 +342,8 @@ The controller treats the thermal model as a black box. `HouseState` bundles all
 **Interface:** `ControlDecision` JSON file in `data/predictions/`.
 
 Contains:
-- Device states: thermostat setpoints, blower modes, mini-split modes/targets.
-- Predictions: per-room, per-horizon temperatures.
+- Device states: thermostat setpoints, blower modes, mini-split modes + target temperatures.
+- Predictions: per-sensor, per-horizon temperatures.
 - Trajectory info: delay and duration per zone.
 - Timestamp and live/dry-run flag.
 
@@ -332,29 +361,13 @@ Contains:
 
 ## Future components
 
-### Virtual Effectors / Advisory-Driven Planning (Phase 1 done)
+See `docs/FUTURE.md` for the full roadmap. Key upcoming areas:
 
-Window advisories are implemented: after the electronic plan commits, the advisory system evaluates each window toggle via `predict()` and recommends actions that improve comfort. See `docs/plans/PLAN-8-virtual-effectors.md` for Phases 2-3: expanding to other virtual effectors (doors, blinds, space heaters) and combined advisory evaluation.
-
-### Online Learning
-
-Continuously improve thermal model parameters by comparing predictions to outcomes. The decision log already records predicted vs actual temperatures. The next step is automatic parameter adjustment (exponential moving averages on gain/delay/tau) when systematic prediction errors appear.
-
-### Virtual Thermostats
-
-Per-room HA climate entities for user-adjustable comfort targets from the dashboard. Each room appears as a `climate` entity with target_temp_high and target_temp_low. YAML comfort schedules become defaults.
-
-### Config Generator
-
-Auto-generate `weatherstat.yaml` from Home Assistant entity discovery.
-
-### Anomaly Detection
-
-Detect when the house behaves differently than the model predicts. Persistent prediction error above a threshold triggers investigation ("cooling rate doubled overnight — window left open?").
-
-### Shade/Cover Control
-
-Manage solar gain via motorized blinds. Solar gain model predicts which rooms will overshoot; close blinds preemptively.
+- **Online Learning:** Automatic parameter adjustment from prediction error trends. The decision log already records predicted vs actual temperatures at each horizon.
+- **Virtual Thermostats:** Per-sensor HA climate entities for user-adjustable comfort targets from the dashboard.
+- **Summer/cooling adaptation:** Currently winter-only data. Mini splits are the only cooling effectors; capacity analysis will be important.
+- **Additional blower automation:** More blowers would improve heat distribution to capacity-limited sensors like the kitchen.
+- **Anomaly Detection:** Alert when prediction errors suggest changed conditions (window left open, equipment issues).
 
 ---
 

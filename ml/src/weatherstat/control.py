@@ -919,10 +919,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     else:
         print("  Windows:     all closed")
     other_labels = [la for la in PREDICTION_LABELS if la not in ("upstairs", "downstairs")]
+    lw = max((len(la) for la in other_labels), default=14) + 2
     for la in other_labels:
         t = current_temps.get(la)
         if t is not None:
-            print(f"  {la:<14} {t:.1f}°F")
+            print(f"  {la:<{lw}} {t:.1f}°F")
     # Show current blower/mini-split state
     for cfg in BLOWERS:
         mode = str(latest.get(f"blower_{cfg.name}_mode", "?"))
@@ -1096,13 +1097,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     print(f"\n  All-off baseline: comfort={off_comfort:.4f}")
 
-    header = f"  {'Sensor':<14}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
+    col_w = max(len(lbl) for lbl in PREDICTION_LABELS) + 2
+    header = f"  {'Sensor':<{col_w}}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
     print("\n  Predicted temperatures (decision vs all-off):")
     print(header)
-    print(f"  {'-' * (14 + 18 * len(horizons))}")
+    print(f"  {'-' * (col_w + 18 * len(horizons))}")
     for label in PREDICTION_LABELS:
         dec_vals = decision.predictions.get(label, {})
-        row = f"  {label:<14}"
+        row = f"  {label:<{col_w}}"
         has_any = False
         for h_step, h_label in zip(CONTROL_HORIZONS, horizons, strict=True):
             dec_t = dec_vals.get(h_label)

@@ -4,23 +4,27 @@ Items are roughly in priority order within each section.
 
 ---
 
-## Virtual Effectors / Advisory Planning (PLAN-8, next)
+## Summer / Cooling Adaptation
 
-Model human-actionable changes (windows, blinds, space heaters, doors) as
-virtual effectors. After the electronic trajectory sweep commits to a plan,
-evaluate whether toggling virtual effectors would improve comfort and send
-advisories via HA notifications. The electronic plan never depends on human
-compliance. See `docs/plans/PLAN-8-virtual-effectors.md`.
+All current data is winter (collector running since Feb 2026). The system
+will face new challenges in summer:
+- Mini splits are the only cooling effectors — capacity analysis will be
+  important for rooms without them.
+- Auto mode (heat_cool) may be needed in shoulder seasons where the room
+  needs heating in the morning and cooling in the afternoon.
+- Solar gain profiles will change significantly — sysid needs spring/summer
+  data to fit accurate seasonal profiles.
+- Window advisory logic should recommend opening windows for free cooling
+  more aggressively when outdoor temp is below indoor but above comfort min.
 
 ---
 
-## Archive ML Pipeline
+## Additional Blower Automation
 
-The LightGBM training/inference/experiment pipeline is orphaned — the
-control loop uses the physics simulator exclusively. Move training, inference,
-evaluation, experiment, and metrics modules to `archive/ml/`. Extract
-`fetch_recent_history` to `extract.py` first (it's data plumbing used by
-the live control path). See `docs/plans/PLAN-archive-ml.md`.
+More blowers in the hydronic circuit would improve heat distribution to
+capacity-limited sensors (e.g., kitchen: three exterior walls, crawlspace,
+end of the hydronic circuit — consistently below comfort min even with zone
+thermostat at max). Physical installation, not software.
 
 ---
 
@@ -55,32 +59,36 @@ within comfort through time t) replaces point-prediction scoring.
   outcome breaches comfort is worse than one where the median is slightly
   further from optimal but the tail is safe.
 
-**How it connects to the trajectory search:**
-- Each trajectory candidate produces a different hazard curve for each sensor.
-  "Heat now for 2h then coast" front-loads hazard reduction. "Delay 2h then
-  heat" has higher near-term hazard but similar long-term reduction.
-- The scorer becomes: maximize expected comfort-survival across all sensors,
-  weighted by room importance and penalty asymmetry.
-
 **Practical approach:**
 - Estimate prediction uncertainty from historical residuals (simulator
   prediction vs actual outcome, binned by horizon and conditions).
 - At each scored horizon, compute P(T < comfort_min) and P(T > comfort_max)
   from the predicted mean and estimated variance.
 - Weight comfort cost by breach probability rather than deterministic penalty.
-- This is incremental over the deterministic scorer — same structure, but
-  penalties are expected values over the predictive distribution.
 
 **Prerequisites:** enough decision-log history to estimate prediction error
-distributions by horizon. The trajectory search (PLAN-7) should come first;
-probabilistic scoring refines it.
+distributions by horizon. The comfort dashboard (`just comfort --predictions`)
+already shows error distributions by horizon.
+
+---
+
+## Online Learning
+
+Continuously improve thermal model parameters by comparing predictions to
+outcomes. The decision log already records predicted vs actual temperatures
+at each horizon. The next step is automatic parameter adjustment (exponential
+moving averages on gain/delay/tau) when systematic prediction errors appear.
+
+The comfort dashboard shows a consistent warm bias (+0.15 to +0.30°F,
+increasing with horizon) — this likely represents underestimated heat loss
+(air infiltration, radiation) that the tau model doesn't fully capture.
 
 ---
 
 ## Sweep Scalability
 
-Batch prediction gives ~30ms per sweep (148x speedup). Further optimization
-is only needed when the device count grows significantly.
+Batch prediction gives ~30ms per sweep. Further optimization is only needed
+when the device count grows significantly.
 
 **Future approaches (in priority order):**
 - **Window decomposition** — O(N) vs O(2^N). Independent per-window toggle.
@@ -88,7 +96,7 @@ is only needed when the device count grows significantly.
 - **Greedy coordinate descent** — O(Σ levels) vs O(∏ levels). Iterative
   single-device optimization. Needed at 6+ blowers.
 - **Marginal screening** — Fast linear approximation, full eval on top-K.
-- **Spatial decomposition** — Only re-predict rooms affected by each device
+- **Spatial decomposition** — Only re-predict sensors affected by each device
   change. Composes with all above.
 
 ---
@@ -97,18 +105,17 @@ is only needed when the device count grows significantly.
 
 Approximate solar irradiance from existing + forecast data:
 - `solar_elevation` (already computed per-row)
-- `cloud_cover` (from forecast condition: sunny/partly_cloudy/cloudy)
-- `irradiance_estimate = max(0, sin(elevation)) * (1 - cloud_factor) * PEAK`
-
-Sysid already fits per-sensor, per-hour solar gain profiles. This would extend
-that to a continuous model that accounts for cloud cover variation within hours.
+- Weather-conditioned solar fractions (already implemented: sunny=1.0,
+  cloudy=0.15, etc.) modulate the per-hour solar gain profiles.
+- Future extension: continuous irradiance model from cloud cover percentage
+  (if available from met.no) rather than discrete condition codes.
 
 ---
 
 ## Virtual Thermostats
 
-Per-room HA climate entities for user-adjustable comfort targets from the
-dashboard. Each room appears as a `climate` entity with target_temp_high and
+Per-sensor HA climate entities for user-adjustable comfort targets from the
+dashboard. Each sensor appears as a `climate` entity with target_temp_high and
 target_temp_low. YAML comfort schedules become defaults.
 
 ---

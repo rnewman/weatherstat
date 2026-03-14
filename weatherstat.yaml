@@ -30,6 +30,9 @@ sensors:
     family_room_temp:
       entity_id: sensor.climate_family_room_air_temperature
       statistics: true
+    office_bookshelf_temp:
+      entity_id: sensor.office_rn_temperature
+      statistics: true
     office_temp:
       entity_id: sensor.climate_office_air_temperature
       statistics: true
@@ -70,6 +73,8 @@ sensors:
       entity_id: sensor.climate_bedroom_humidity
     office_humidity:
       entity_id: sensor.climate_office_humidity
+    office_bookshelf_humidity:
+      entity_id: sensor.office_rn_humidity
     family_room_humidity:
       entity_id: sensor.climate_family_room_humidity
     piano_humidity:
@@ -175,19 +180,25 @@ constraints:
         - { hours: [0, 24], preferred: 71, min: 70, max: 75, hot_penalty: 0.5 }
     - sensor: thermostat_downstairs_temp
       schedule:
-        - { hours: [0, 24], preferred: 72, min: 70, max: 74 }
+        - { hours: [6, 22], preferred: 71, min: 70, max: 74 }
+        - { hours: [22, 6], preferred: 70, min: 69, max: 74 }
     - sensor: bedroom_temp
       schedule:
         - { hours: [6, 9], preferred: 71, min: 70, max: 73, cold_penalty: 2.0, hot_penalty: 2.0 }
         - { hours: [9, 21], preferred: 70, min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
         - { hours: [21, 6], preferred: 70, min: 68, max: 72, cold_penalty: 2.0, hot_penalty: 0.75 }
+    - sensor: office_bookshelf_temp
+      schedule:
+        - { hours: [8, 20], preferred: 72, min: 70, max: 74, cold_penalty: 2.0, hot_penalty: 2.0 }
+        - { hours: [18, 8], preferred: 70, min: 67, max: 76, cold_penalty: 1.0, hot_penalty: 0.5 }
     - sensor: office_temp
       schedule:
         - { hours: [8, 20], preferred: 72, min: 70, max: 74, cold_penalty: 2.0, hot_penalty: 2.0 }
         - { hours: [18, 8], preferred: 70, min: 67, max: 76, cold_penalty: 1.0, hot_penalty: 0.5 }
     - sensor: family_room_temp
       schedule:
-        - { hours: [0, 24], preferred: 71, min: 70, max: 74 }
+        - { hours: [6, 21], preferred: 71, min: 70, max: 74 }
+        - { hours: [21, 6], preferred: 70, min: 69, max: 74 }
     - sensor: kitchen_temp
       schedule:
         - { hours: [0, 24], preferred: 71, min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
