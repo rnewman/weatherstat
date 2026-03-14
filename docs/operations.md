@@ -6,12 +6,17 @@ Running the weatherstat system: data collection, system identification, and phys
 
 ```bash
 just install          # pnpm + uv dependencies
-cp .env.example .env  # then fill in HA_URL and HA_TOKEN
+just init             # create ~/.weatherstat, copy example config
+# then edit ~/.weatherstat/weatherstat.yaml with your entity IDs
+# and create ~/.weatherstat/.env with HA_URL and HA_TOKEN
 ```
+
+All runtime data lives in `~/.weatherstat/` by default. Override with
+`WEATHERSTAT_DATA_DIR` env var.
 
 ## 1. Data Collection
 
-The collector writes 5-minute snapshots to `data/snapshots/snapshots.db` (SQLite).
+The collector writes 5-minute snapshots to `~/.weatherstat/snapshots/snapshots.db` (SQLite).
 Every day of missed data is unrecoverable — start this first.
 
 ### Start collecting
@@ -44,7 +49,7 @@ when data goes stale.
 ### Inspecting the database
 
 ```bash
-sqlite3 data/snapshots/snapshots.db "SELECT COUNT(DISTINCT timestamp), MIN(timestamp), MAX(timestamp) FROM readings;"
+sqlite3 ~/.weatherstat/snapshots/snapshots.db "SELECT COUNT(DISTINCT timestamp), MIN(timestamp), MAX(timestamp) FROM readings;"
 ```
 
 ## 2. System Identification
@@ -53,12 +58,12 @@ Extract thermal parameters from collector data. This fits the physics model
 that the controller uses for all predictions.
 
 ```bash
-just sysid             # fit all parameters, write data/thermal_params.json
+just sysid             # fit all parameters, write ~/.weatherstat/thermal_params.json
 just sysid -v          # verbose: show per-sensor details
 just sysid --output custom_path.json  # custom output path
 ```
 
-**What it produces** (`data/thermal_params.json`):
+**What it produces** (`~/.weatherstat/thermal_params.json`):
 - `TauModel` per sensor — `tau_base` (sealed envelope time constant) plus per-window `window_betas` (additional cooling rate when open) and cross-breeze `interaction_betas`
 - Effector × sensor gain matrix — heating rate (°F/hr) and delay (minutes) for each (device, sensor) pair
 - Solar gain profiles — per-sensor, per-hour-of-day gain coefficients
@@ -102,7 +107,7 @@ For continuous operation:
 just control-loop-live # 15-min loop: control cycle + execute via HA
 ```
 
-The control module writes `data/predictions/command_YYYYMMDD_HHMMSS.json`.
+The control module writes `~/.weatherstat/predictions/command_YYYYMMDD_HHMMSS.json`.
 The executor reads the latest `command_*.json` and applies it via HA services.
 
 ### Safety rails
@@ -124,13 +129,13 @@ quadratic from preferred + 10× steep penalty outside min/max.
 
 ### Decision logging
 
-Every control cycle logs its decision to `data/decision_log.db` (SQLite):
+Every control cycle logs its decision to `~/.weatherstat/decision_log.db` (SQLite):
 inputs, predictions, action chosen, and trajectory info. Outcomes are backfilled
 automatically by comparing predictions to actual temperatures from subsequent
 snapshots.
 
 ```bash
-sqlite3 data/decision_log.db "SELECT timestamp, comfort_cost, energy_cost, trajectory FROM decisions ORDER BY timestamp DESC LIMIT 10;"
+sqlite3 ~/.weatherstat/decision_log.db "SELECT timestamp, comfort_cost, energy_cost, trajectory FROM decisions ORDER BY timestamp DESC LIMIT 10;"
 ```
 
 ## 4. Comfort Dashboard
@@ -139,7 +144,7 @@ Visualize how well the system is maintaining comfort. Answers "is it working?"
 at a glance.
 
 ```bash
-just comfort                     # last 7 days, save PNG to data/comfort_7d.png
+just comfort                     # last 7 days, save PNG to ~/.weatherstat/comfort_7d.png
 just comfort --days 3            # last 3 days
 just comfort --predictions       # include prediction accuracy histogram
 just comfort --show              # interactive matplotlib window
@@ -160,6 +165,10 @@ effector list.
 ## Typical Workflow
 
 ```bash
+# First time: initialize data directory
+just init
+# Edit ~/.weatherstat/weatherstat.yaml and ~/.weatherstat/.env
+
 # Day 1: Start collecting
 just collect-durable &       # background, or in a tmux/screen session
 
@@ -178,10 +187,14 @@ just execute                 # apply to HA
 just sysid
 ```
 
-## File Layout
+## Data Directory Layout
+
+All runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR`):
 
 ```
-data/
+~/.weatherstat/
+  weatherstat.yaml             # house configuration (from weatherstat.yaml.example)
+  .env                         # HA credentials (HA_URL, HA_TOKEN)
   snapshots/
     snapshots.db               # collector output (SQLite EAV, ongoing)
   predictions/
@@ -192,8 +205,13 @@ data/
   executor_state.json          # executor override tracking
   advisory_state.json          # per-window advisory cooldown timestamps
   comfort_*.png                # comfort dashboard output
+```
+
+Source code in the repo:
+```
 scripts/
   plot_comfort.py              # comfort performance dashboard
+  migrate-data.sh              # migrate from repo data/ to ~/.weatherstat
 logs/
   collector.log                # collector + health check output
 ```

@@ -1,6 +1,6 @@
 """YAML config loader — single source of truth for all entity IDs, columns, and effectors.
 
-Parses weatherstat.yaml (project root) into frozen dataclasses.
+Parses weatherstat.yaml (~/.weatherstat/) into frozen dataclasses.
 Loaded once and cached. All modules import from here instead of hardcoding.
 """
 
@@ -431,8 +431,10 @@ class WeatherstatConfig:
 
 
 def _find_yaml_path() -> Path:
-    """Find weatherstat.yaml relative to this file (ml/src/weatherstat/ -> project root)."""
-    return Path(__file__).resolve().parents[3] / "weatherstat.yaml"
+    """Find weatherstat.yaml in the data directory (~/.weatherstat/)."""
+    from weatherstat._data_dir import resolve_data_dir
+
+    return resolve_data_dir() / "weatherstat.yaml"
 
 
 def _parse_config(data: dict) -> WeatherstatConfig:

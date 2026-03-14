@@ -4,12 +4,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from weatherstat._data_dir import resolve_data_dir
 from weatherstat.yaml_config import load_config as _load_config
 
-# Project root is three levels up from this file (ml/src/weatherstat/config.py)
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = resolve_data_dir()
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 SNAPSHOTS_DB = SNAPSHOTS_DIR / "snapshots.db"
 PREDICTIONS_DIR = DATA_DIR / "predictions"

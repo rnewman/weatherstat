@@ -8,7 +8,7 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 ## Architecture
 
 - HA interface is abstracted behind `HAClient` (types.ts). WebSocket is one implementation; add-on/integration would use HA internal API.
-- Collector writes 5-min snapshots to SQLite (`data/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Python reader pivots to wide DataFrame at load time, applying types from config. Sysid reads this for parameter fitting. Control output goes to JSON in `data/predictions/`.
+- Collector writes 5-min snapshots to SQLite (`~/.weatherstat/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Python reader pivots to wide DataFrame at load time, applying types from config. Sysid reads this for parameter fitting. Control output goes to JSON in `~/.weatherstat/predictions/`.
 - Weather forecasts come from HA's `weather.forecast_home` entity (met.no). The collector stores hourly forecast snapshots; the simulator uses live forecasts for piecewise outdoor temp integration.
 - Entity IDs are real and live in `ha-client/src/entities.ts`. Full reference in `docs/entities.md`.
 - Sensor-to-zone mapping is derived from the sysid coupling matrix (which thermostat has the highest gain for each sensor), not configured in YAML.
@@ -35,6 +35,8 @@ See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
 ```bash
 just                  # List available tasks
+just init             # Initialize ~/.weatherstat data directory
+just migrate          # Migrate data from repo data/ to ~/.weatherstat
 just collect          # Run HA state collector (5-min loop)
 just collect-once     # Collect a single snapshot
 just collect-durable  # Auto-restart collector + health monitoring
@@ -45,6 +47,7 @@ just control          # Single control cycle (dry-run, physics trajectory sweep)
 just control-loop     # 15-min control loop (dry-run)
 just control-live     # Single control cycle with live execution
 just execute          # Apply latest command JSON to HA
+just comfort          # Comfort performance dashboard (last 7 days)
 just lint             # Lint both packages
 just test             # Test both packages
 just typecheck        # TypeScript type-check
@@ -67,12 +70,22 @@ just typecheck        # TypeScript type-check
 - Parquet column names use snake_case (matching Python conventions)
 - TS interface properties use camelCase (matching TS conventions)
 
-## Environment
+## Data Directory
 
-HA credentials in `.env` (not committed):
+Runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR` env var):
+
 ```
-HA_URL=https://ha.example.com
-HA_TOKEN=<long-lived access token>
+~/.weatherstat/
+  weatherstat.yaml            # house config (from weatherstat.yaml.example)
+  .env                        # HA credentials (HA_URL, HA_TOKEN)
+  snapshots/snapshots.db      # collector output (SQLite EAV)
+  predictions/command_*.json  # control decisions
+  thermal_params.json         # sysid output
+  decision_log.db             # control decision history
+  control_state.json          # last decision state
+  executor_state.json         # executor override tracking
+  advisory_state.json         # window advisory cooldowns
 ```
 
-Both the TS client and Python extraction script read from these env vars.
+First-time setup: `just init` creates the directory and copies `weatherstat.yaml.example`.
+Migration from repo `data/`: `just migrate`.

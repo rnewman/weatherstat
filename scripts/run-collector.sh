@@ -38,15 +38,17 @@ trap cleanup SIGINT SIGTERM
 # Ensure log directory exists
 mkdir -p "$LOG_DIR"
 
-# Source .env
-if [[ -f "$PROJECT_ROOT/.env" ]]; then
+# Source .env from data directory
+WEATHERSTAT_DATA_DIR="${WEATHERSTAT_DATA_DIR:-$HOME/.weatherstat}"
+export WEATHERSTAT_DATA_DIR
+if [[ -f "$WEATHERSTAT_DATA_DIR/.env" ]]; then
     set -a
     # shellcheck source=/dev/null
-    source "$PROJECT_ROOT/.env"
+    source "$WEATHERSTAT_DATA_DIR/.env"
     set +a
-    echo "[run-collector] Loaded .env"
+    echo "[run-collector] Loaded $WEATHERSTAT_DATA_DIR/.env"
 else
-    echo "[run-collector] WARNING: No .env file found at $PROJECT_ROOT/.env"
+    echo "[run-collector] WARNING: No .env file found at $WEATHERSTAT_DATA_DIR/.env"
 fi
 
 # Verify credentials

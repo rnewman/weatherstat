@@ -6,9 +6,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DB_PATH="${DB_PATH:-$PROJECT_ROOT/data/snapshots/snapshots.db}"
+WEATHERSTAT_DATA_DIR="${WEATHERSTAT_DATA_DIR:-$HOME/.weatherstat}"
+DB_PATH="${DB_PATH:-$WEATHERSTAT_DATA_DIR/snapshots/snapshots.db}"
 STALE_MINUTES="${STALE_MINUTES:-10}"
 
 if [[ ! -f "$DB_PATH" ]]; then
@@ -17,7 +16,7 @@ if [[ ! -f "$DB_PATH" ]]; then
 fi
 
 # Get the latest timestamp from SQLite (-noheader -list bypasses any .sqliterc formatting)
-latest_ts=$(sqlite3 -noheader -list "$DB_PATH" "SELECT MAX(timestamp) FROM snapshots;" 2>/dev/null)
+latest_ts=$(sqlite3 -noheader -list "$DB_PATH" "SELECT MAX(timestamp) FROM readings;" 2>/dev/null)
 
 if [[ -z "$latest_ts" ]]; then
     echo "ERROR: No snapshots in database"

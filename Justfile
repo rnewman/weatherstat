@@ -70,16 +70,17 @@ control-live:
 control-loop-live:
     #!/usr/bin/env bash
     set -uo pipefail
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
     echo "[control-loop-live] Starting (15-min interval, Ctrl+C to stop)"
     while true; do
         echo ""
         echo "── Control cycle: $(date) ──"
-        if cd ml && uv run python -m weatherstat.control --live; then
-            cd ..
+        if cd "$REPO_ROOT/ml" && uv run python -m weatherstat.control --live; then
+            cd "$REPO_ROOT"
             echo "[control-loop-live] Executing command via HA..."
-            cd ha-client && npx tsx src/index.ts execute; cd ..
+            cd ha-client && npx tsx src/index.ts execute; cd "$REPO_ROOT"
         else
-            cd /Users/rnewman/repos/weatherstat
+            cd "$REPO_ROOT"
             echo "[control-loop-live] Control cycle failed (HA down?), will retry next cycle"
         fi
         echo "[control-loop-live] Next cycle in 15 minutes..."
@@ -103,6 +104,39 @@ comfort *ARGS:
     cd ml && uv run python ../scripts/plot_comfort.py {{ARGS}}
 
 # ── Setup ────────────────────────────────────────────────────────────────
+
+# Initialize ~/.weatherstat data directory
+init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DATA_DIR="${WEATHERSTAT_DATA_DIR:-$HOME/.weatherstat}"
+    echo "Initializing data directory: $DATA_DIR"
+    mkdir -p "$DATA_DIR/snapshots"
+    mkdir -p "$DATA_DIR/predictions"
+    mkdir -p "$DATA_DIR/models"
+    mkdir -p "$DATA_DIR/metrics"
+    if [[ ! -f "$DATA_DIR/weatherstat.yaml" ]]; then
+        if [[ -f "weatherstat.yaml.example" ]]; then
+            cp weatherstat.yaml.example "$DATA_DIR/weatherstat.yaml"
+            echo "Copied weatherstat.yaml.example -> $DATA_DIR/weatherstat.yaml"
+            echo "  Edit $DATA_DIR/weatherstat.yaml with your entity IDs"
+        else
+            echo "ERROR: weatherstat.yaml.example not found in repo root"
+            exit 1
+        fi
+    else
+        echo "Config exists: $DATA_DIR/weatherstat.yaml"
+    fi
+    if [[ ! -f "$DATA_DIR/.env" ]]; then
+        echo "WARNING: No .env at $DATA_DIR/.env — create with HA_URL and HA_TOKEN"
+    else
+        echo "Env exists: $DATA_DIR/.env"
+    fi
+    echo "Ready: $DATA_DIR"
+
+# Migrate data from repo data/ to ~/.weatherstat
+migrate:
+    bash scripts/migrate-data.sh
 
 # Install all dependencies
 install:

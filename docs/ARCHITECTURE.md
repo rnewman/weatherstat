@@ -112,7 +112,7 @@ Periodically sample the full state of the house and persist it for training and 
 - Extracts values using config-driven column definitions (temperature attributes, HVAC actions/modes/targets, window states, weather conditions).
 - Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`) from HA's met.no integration for use by the simulator.
 - Deduplicates by rounding timestamps to the snapshot interval.
-- Writes to SQLite (`data/snapshots/snapshots.db`) in EAV format: `readings` table with `(timestamp, name, value)` triples. No schema changes needed to add sensors.
+- Writes to SQLite (`~/.weatherstat/snapshots/snapshots.db`) in EAV format: `readings` table with `(timestamp, name, value)` triples. No schema changes needed to add sensors.
 
 **Output:** SQLite database with 5-minute resolution. The `readings` table stores `(timestamp, name, value)` triples (~74 readings per snapshot). The Python reader pivots this to a wide DataFrame at load time, applying types from config.
 
@@ -166,7 +166,7 @@ The regression uses `np.linalg.lstsq` (OLS) with automatic fallback to ridge reg
 
 **Config-driven:** Effectors and sensors enumerated from `weatherstat.yaml`. Adding a device or sensor = YAML edit + rerun.
 
-**Output:** `data/thermal_params.json` — the full coupling matrix, tau fits, and solar profiles. Run via `just sysid`.
+**Output:** `~/.weatherstat/thermal_params.json` — the full coupling matrix, tau fits, and solar profiles. Run via `just sysid`.
 
 **Dependencies:** numpy, scipy (curve_fit), pandas. No ML frameworks required.
 
@@ -323,7 +323,7 @@ Answers "is the system working as designed?" at a glance. Run via `just comfort`
 
 ### Collector -> Thermal Model
 
-**Interface:** SQLite database (`data/snapshots/snapshots.db`).
+**Interface:** SQLite database (`~/.weatherstat/snapshots/snapshots.db`).
 - EAV `readings` table: `(timestamp, name, value)` triples, driven by YAML config.
 - One snapshot per 5-minute interval (~74 readings per snapshot).
 - Names include: temperature sensors, HVAC states (action, mode, target per effector), window states, weather, humidity sensors, forecast snapshots.
@@ -339,7 +339,7 @@ The controller treats the thermal model as a black box. `HouseState` bundles all
 
 ### Controller -> Executor
 
-**Interface:** `ControlDecision` JSON file in `data/predictions/`.
+**Interface:** `ControlDecision` JSON file in `~/.weatherstat/predictions/`.
 
 Contains:
 - Device states: thermostat setpoints, blower modes, mini-split modes + target temperatures.

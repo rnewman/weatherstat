@@ -33,9 +33,6 @@ import pandas as pd
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SNAPSHOTS_DB = PROJECT_ROOT / "data" / "snapshots" / "snapshots.db"
-DECISION_LOG_DB = PROJECT_ROOT / "data" / "decision_log.db"
-
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 # ── Data loading ───────────────────────────────────────────────────────────
@@ -50,10 +47,30 @@ def _init_weatherstat():
     return load_config(), load_sim_params()
 
 
+def _resolve_paths() -> tuple[Path, Path, Path]:
+    """Resolve data paths from weatherstat config module."""
+    import sys
+    sys.path.insert(0, str(PROJECT_ROOT / "ml" / "src"))
+    from weatherstat.config import DATA_DIR, DECISION_LOG_DB, SNAPSHOTS_DB
+    return SNAPSHOTS_DB, DECISION_LOG_DB, DATA_DIR
+
+
+# Resolved lazily on first use
+_PATHS: tuple[Path, Path, Path] | None = None
+
+
+def _paths() -> tuple[Path, Path, Path]:
+    global _PATHS  # noqa: PLW0603
+    if _PATHS is None:
+        _PATHS = _resolve_paths()
+    return _PATHS
+
+
 def load_sensor_data(days: int) -> pd.DataFrame:
     """Load 5-min sensor readings for the last N days from the EAV table."""
+    snapshots_db = _paths()[0]
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(str(SNAPSHOTS_DB))
+    conn = sqlite3.connect(str(snapshots_db))
     df_long = pd.read_sql(
         "SELECT timestamp, name, value FROM readings WHERE timestamp >= ? ORDER BY timestamp",
         conn,
@@ -74,10 +91,11 @@ def load_sensor_data(days: int) -> pd.DataFrame:
 
 def load_decisions(days: int) -> pd.DataFrame:
     """Load decision log entries for the last N days."""
-    if not DECISION_LOG_DB.exists():
+    decision_log_db = _paths()[1]
+    if not decision_log_db.exists():
         return pd.DataFrame()
     cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(str(DECISION_LOG_DB))
+    conn = sqlite3.connect(str(decision_log_db))
     df = pd.read_sql(
         "SELECT * FROM decisions WHERE timestamp >= ? ORDER BY timestamp",
         conn,
@@ -526,7 +544,7 @@ def plot_comfort(
         current += timedelta(days=1)
 
     if output_path is None:
-        output_path = PROJECT_ROOT / "data" / f"comfort_{days}d.png"
+        output_path = _paths()[2] / f"comfort_{days}d.png"
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"Saved to {output_path}")
 

@@ -21,15 +21,17 @@ log() {
     echo "[retrain $(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"
 }
 
-# Source .env
-if [[ -f "$PROJECT_ROOT/.env" ]]; then
+# Source .env from data directory
+WEATHERSTAT_DATA_DIR="${WEATHERSTAT_DATA_DIR:-$HOME/.weatherstat}"
+export WEATHERSTAT_DATA_DIR
+if [[ -f "$WEATHERSTAT_DATA_DIR/.env" ]]; then
     set -a
     # shellcheck source=/dev/null
-    source "$PROJECT_ROOT/.env"
+    source "$WEATHERSTAT_DATA_DIR/.env"
     set +a
-    log "Loaded .env"
+    log "Loaded $WEATHERSTAT_DATA_DIR/.env"
 else
-    log "WARNING: No .env file found at $PROJECT_ROOT/.env"
+    log "WARNING: No .env file found at $WEATHERSTAT_DATA_DIR/.env"
 fi
 
 # Verify credentials
@@ -52,4 +54,4 @@ else
     exit $exit_code
 fi
 
-log "Done. Metrics saved to data/metrics/"
+log "Done. Metrics saved to $WEATHERSTAT_DATA_DIR/metrics/"

@@ -1,20 +1,19 @@
 /**
  * YAML configuration loader for the TS client.
  *
- * Reads weatherstat.yaml (shared with Python) and derives entity IDs,
+ * Reads weatherstat.yaml (~/.weatherstat/) and derives entity IDs,
  * snapshot column definitions, SQL schema, and monitored entity lists.
  * Adding a sensor: just add to weatherstat.yaml — SnapshotRow is dynamic.
  */
 
 import { readFileSync } from "node:fs";
-import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { parse } from "yaml";
 
 import type { HAEntityState } from "./types.ts";
+import { dataDir } from "./data-dir.ts";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const YAML_PATH = resolve(__dirname, "../../weatherstat.yaml");
+const YAML_PATH = resolve(dataDir, "weatherstat.yaml");
 
 // ---- Raw YAML types (match the YAML file structure) ----
 

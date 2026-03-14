@@ -1,7 +1,6 @@
-import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { dataDir } from "./data-dir.ts";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -22,11 +21,6 @@ export interface Config {
 }
 
 export function loadConfig(): Config {
-  const dataDir = resolve(
-    __dirname,
-    process.env["DATA_DIR"] ?? "../../data",
-  );
-
   const snapshotsDir = resolve(dataDir, "snapshots");
 
   return {
