@@ -554,7 +554,9 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
 
     for col in _CFG.window_bool_columns:
         if col in df.columns:
-            df[col] = df[col].astype(bool)
+            # Use nullable boolean to preserve NaN (sensor didn't exist yet)
+            # so downstream code can distinguish "closed" from "unknown".
+            df[col] = df[col].astype("boolean")
 
     return df
 

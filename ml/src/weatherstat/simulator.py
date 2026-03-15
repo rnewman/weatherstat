@@ -19,6 +19,12 @@ import numpy as np
 from weatherstat.config import DATA_DIR, PREDICTION_LABELS
 from weatherstat.types import BlowerDecision, MiniSplitDecision, TrajectoryScenario
 
+# Minimum |t-statistic| for an effector→sensor gain to be used in simulation.
+# Gains below this threshold are likely confounded (e.g., bedroom split runs
+# when the house is warming for other reasons → OLS attributes warming to split).
+# At 1.0, keeps gains that are at least weakly significant.
+_MIN_T_STATISTIC = 1.0
+
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
 
@@ -105,12 +111,20 @@ def load_sim_params(path: Path | None = None) -> SimParams:
             tau_s = ft["tau_sealed"]
             taus[sensor] = TauModel(tau_base=tau_s)
 
-    # Gain lookup (only non-negligible gains)
+    # Gain lookup: filter by negligible flag and t-statistic significance.
+    # Low |t| gains are likely confounded (e.g., bedroom split runs when the
+    # house is warming for other reasons → OLS attributes warming to split).
     gains: dict[tuple[str, str], tuple[float, float]] = {}
+    n_pruned = 0
     for g in data["effector_sensor_gains"]:
         if g["negligible"]:
             continue
+        if abs(g.get("t_statistic", 999)) < _MIN_T_STATISTIC:
+            n_pruned += 1
+            continue
         gains[(g["effector"], g["sensor"])] = (g["gain_f_per_hour"], g["best_lag_minutes"])
+    if n_pruned:
+        print(f"  [sim] Pruned {n_pruned} gains with |t| < {_MIN_T_STATISTIC:.1f}")
 
     # Solar lookup
     solar: dict[tuple[str, int], float] = {}
@@ -598,7 +612,13 @@ def predict(
                     )
                 # Sign: heating adds heat (+gain), cooling removes heat (-gain)
                 signed_activity = np.where(heat_mask, activity, np.where(cool_mask, -activity, 0.0))
-                dTdt += abs_gain * signed_activity
+                contribution = abs_gain * signed_activity
+                # Mode-direction clamp: heating can't cool, cooling can't warm.
+                # Gains fitted from heating data may be confounded; inverting
+                # them for cooling can produce nonsense cross-coupling effects.
+                contribution = np.where(heat_mask, np.maximum(contribution, 0.0), contribution)
+                contribution = np.where(cool_mask, np.minimum(contribution, 0.0), contribution)
+                dTdt += contribution
 
             T = T + _DT_HOURS * dTdt
             if step in horizon_set:

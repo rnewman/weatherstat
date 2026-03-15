@@ -78,7 +78,9 @@
       "Bash(curl:*)",
       "Bash(just test:*)",
       "Bash(python:*)",
-      "Bash(uv run:*)"
+      "Bash(uv run:*)",
+      "Read(//Users/rnewman/.claude/**)",
+      "Read(//Users/rnewman/**)"
     ]
   }
 }

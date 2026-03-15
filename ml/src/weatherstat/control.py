@@ -262,12 +262,57 @@ def compute_comfort_cost(
     return cost
 
 
-def compute_energy_cost(scenario: TrajectoryScenario, outdoor_temp: float = 50.0) -> float:
+def compute_comfort_cost_by_sensor(
+    predictions: dict[str, float],
+    schedules: list[ComfortSchedule],
+    base_hour: int,
+) -> dict[str, float]:
+    """Compute comfort cost per sensor for decision rationale.
+
+    Same model as compute_comfort_cost, but returns per-sensor breakdown
+    so we can identify which sensors drive the decision.
+    """
+    costs: dict[str, float] = {}
+    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
+
+    for schedule in schedules:
+        label = schedule.label
+        sensor_cost = 0.0
+        for h in CONTROL_HORIZONS:
+            weight = HORIZON_WEIGHTS.get(h, 0.5)
+            hours_ahead = horizon_hours.get(h, h // 12)
+            future_hour = (base_hour + hours_ahead) % 24
+
+            comfort = schedule.comfort_at(future_hour)
+            if comfort is None:
+                continue
+
+            pred_temp = predictions.get(f"{label}_temp_t+{h}")
+            if pred_temp is None:
+                continue
+
+            if pred_temp < comfort.preferred:
+                sensor_cost += (comfort.preferred - pred_temp) ** 2 * comfort.cold_penalty * weight
+            elif pred_temp > comfort.preferred:
+                sensor_cost += (pred_temp - comfort.preferred) ** 2 * comfort.hot_penalty * weight
+
+            if pred_temp < comfort.min_temp:
+                sensor_cost += (comfort.min_temp - pred_temp) ** 2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
+            elif pred_temp > comfort.max_temp:
+                sensor_cost += (pred_temp - comfort.max_temp) ** 2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
+        costs[label] = sensor_cost
+    return costs
+
+
+def compute_energy_cost(
+    scenario: TrajectoryScenario,
+    current_temps: dict[str, float] | None = None,
+) -> float:
     """Tiered energy penalty: gas zones > mini-splits > blower fans.
 
     Used as tiebreaker when comfort cost is equal — prefer less energy usage.
     Gas zone cost is proportional to heating duration within the horizon.
-    Mini-split cost is proportional to expected activity (target vs outdoor).
+    Mini-split cost is proportional to expected activity (target vs room temp).
     """
     cost = 0.0
     # Gas zones (Navien boiler via thermostat)
@@ -276,14 +321,19 @@ def compute_energy_cost(scenario: TrajectoryScenario, outdoor_temp: float = 50.0
         if traj.heating:
             dur = traj.duration_steps if traj.duration_steps is not None else (max_h - traj.delay_steps)
             cost += ENERGY_COST_GAS_ZONE * dur / max_h
-    # Mini-splits: proportional to expected activity
+    # Mini-splits: proportional to expected activity based on room temp
+    temps = current_temps or {}
     for sd in scenario.mini_splits:
         if sd.mode == "off":
             continue
         split_cfg = _CFG.mini_splits.get(sd.name)
-        p_band = split_cfg.proportional_band if split_cfg else 3.0
-        avg_delta = max(0.0, sd.target - outdoor_temp) if sd.mode == "heat" else max(0.0, outdoor_temp - sd.target)
-        avg_activity = min(1.0, avg_delta / p_band)
+        p_band = split_cfg.proportional_band if split_cfg else 1.0
+        room_temp = temps.get(sd.name)
+        if room_temp is not None:
+            delta = max(0.0, sd.target - room_temp) if sd.mode == "heat" else max(0.0, room_temp - sd.target)
+            avg_activity = min(1.0, delta / p_band)
+        else:
+            avg_activity = 0.5  # unknown room temp — assume moderate activity
         cost += ENERGY_COST_MINI_SPLIT * avg_activity
     # Blower fans (negligible)
     for bd in scenario.blowers:
@@ -355,16 +405,17 @@ def _mini_split_sweep_options(
     split_name: str,
     schedules: list[ComfortSchedule],
     base_hour: int,
-    outdoor_temp: float,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
 ) -> list[MiniSplitDecision]:
     """Generate sweep options for a regulating mini split: off + preferred target.
 
     Target is the preferred temperature from the comfort schedule.
-    Mode is derived from season context (outdoor temp vs preferred).
+    Mode is derived from room temp vs preferred: if the room is above
+    preferred, cool; if below, heat.  Outdoor temp does not enter — it
+    influences trajectories via the simulator, not mode intent.
     During mode hold windows, mode is locked to current.
-    If the room is already above target (heating) or below target (cooling),
+    If the room is already past target by more than the proportional band,
     the split would be idle — skip the on option and let receding horizon
     re-evaluate when the room actually needs it.
     """
@@ -383,13 +434,17 @@ def _mini_split_sweep_options(
     if preferred is None:
         return options
 
-    # Derive mode from outdoor temp vs preferred
-    mode = "heat" if outdoor_temp < preferred else "cool"
+    # Derive mode from room temp vs preferred
+    room_temp = (current_temps or {}).get(split_name)
+    if room_temp is not None:
+        mode = "cool" if room_temp > preferred else "heat"
+    else:
+        # No room temp available — default to heat (safer in winter)
+        mode = "heat"
 
     # Skip on-option if the split would be idle: room already past target
-    # in the direction the split can't help.  Receding horizon (15-min
+    # by more than the proportional band.  Receding horizon (15-min
     # re-evaluation) will add it back when the room actually needs it.
-    room_temp = (current_temps or {}).get(split_name)
     p_band = split_cfg.proportional_band if split_cfg else 1.0
     if room_temp is not None:
         if mode == "heat" and room_temp > preferred + p_band:
@@ -422,7 +477,6 @@ def _in_hold_window(hour: int, window: tuple[int, int]) -> bool:
 def generate_trajectory_scenarios(
     schedules: list[ComfortSchedule] | None = None,
     base_hour: int = 12,
-    outdoor_temp: float = 50.0,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
 ) -> list[TrajectoryScenario]:
@@ -457,7 +511,7 @@ def generate_trajectory_scenarios(
     # Mini-split combinations: target grid from comfort schedule
     if schedules is not None:
         per_split_options = [
-            _mini_split_sweep_options(s.name, schedules, base_hour, outdoor_temp, prev_state, current_temps)
+            _mini_split_sweep_options(s.name, schedules, base_hour, prev_state, current_temps)
             for s in MINI_SPLITS
         ]
     else:
@@ -526,7 +580,7 @@ def sweep_scenarios_physics(
     assert isinstance(sim_params, SimParams)
 
     sensor_zones = _derive_sensor_zones(sim_params.gains)
-    scenarios = generate_trajectory_scenarios(schedules, base_hour, outdoor_temp, prev_state, current_temps)
+    scenarios = generate_trajectory_scenarios(schedules, base_hour, prev_state, current_temps)
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
 
@@ -584,7 +638,7 @@ def sweep_scenarios_physics(
     for i, scenario in enumerate(scenarios):
         predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
         comfort = compute_comfort_cost(predictions, schedules, base_hour)
-        energy = compute_energy_cost(scenario, outdoor_temp)
+        energy = compute_energy_cost(scenario, current_temps)
         total = comfort + energy
 
         if _is_all_off(scenario):
@@ -642,7 +696,7 @@ def sweep_scenarios_physics(
                     continue
                 predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
                 c = compute_comfort_cost(predictions, schedules, base_hour)
-                e = compute_energy_cost(scenario, outdoor_temp)
+                e = compute_energy_cost(scenario, current_temps)
                 if c + e < constrained_cost:
                     constrained_cost = c + e
                     constrained_best = i
@@ -654,7 +708,7 @@ def sweep_scenarios_physics(
     scenario = scenarios[best_idx]
     predictions = {t: float(pred_matrix[best_idx, j]) for t, j in target_idx.items()}
     comfort = compute_comfort_cost(predictions, schedules, base_hour)
-    energy = compute_energy_cost(scenario, outdoor_temp)
+    energy = compute_energy_cost(scenario, current_temps)
     total = comfort + energy
 
     # Immediate action: heating only if trajectory starts now (delay=0)
@@ -911,7 +965,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     print(f"  Upstairs:    {up_current:.1f}°F (setpoint: {up_target}°F)")
     print(f"  Downstairs:  {dn_current:.1f}°F (setpoint: {dn_target}°F)")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
-        print(f"  Outdoor:     {float(out_temp):.1f}°F")
+        print(f"  Outdoor:     {float(out_temp):.1f}°F (sensor)")
     window_cols = _CFG.window_display_map
     open_windows = [label for col, label in window_cols.items() if bool(latest.get(col, False))]
     if open_windows:
@@ -1017,10 +1071,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Load previous state for mode hold enforcement
     prev_state = load_control_state()
 
-    outdoor = float(out_temp) if out_temp is not None and not (
-        isinstance(out_temp, float) and np.isnan(out_temp)
-    ) else 50.0
-    n_scenarios = len(generate_trajectory_scenarios(schedules, base_hour, outdoor, prev_state, current_temps))
+    # Outdoor temp for simulator: prefer first forecast temp (met.no, accurate)
+    # over the side sensor (solar-heated, unreliable during daytime).
+    if forecast_temp_list:
+        outdoor = forecast_temp_list[0]
+    elif out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
+        outdoor = float(out_temp)
+    else:
+        outdoor = 50.0
+    n_scenarios = len(generate_trajectory_scenarios(schedules, base_hour, prev_state, current_temps))
     print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
     t0 = time.monotonic()
     decision, winning_scenario = sweep_scenarios_physics(
@@ -1042,20 +1101,180 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
 
+    # ── Compute baselines for rationale ──
+    horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
+
+    from weatherstat.simulator import HouseState as _HS
+    from weatherstat.simulator import predict as _predict
+
+    sim_state = _HS(
+        current_temps=current_temps,
+        outdoor_temp=outdoor,
+        forecast_temps=forecast_temp_list,
+        window_states=window_states_dict,
+        hour_of_day=fractional_hour,
+        recent_history=recent_hist,
+        solar_fractions=solar_fractions,
+    )
+
+    # All-off baseline
+    all_off = TrajectoryScenario(
+        ThermostatTrajectory(heating=False),
+        ThermostatTrajectory(heating=False),
+        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
+        tuple(MiniSplitDecision(s.name, "off", 0.0) for s in MINI_SPLITS),
+    )
+    off_targets, off_matrix = _predict(sim_state, [all_off], sim_params, CONTROL_HORIZONS)
+    off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
+    off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
+
+    # Per-device counterfactuals: winning scenario with each active device removed.
+    # This gives true per-device attribution (what does THIS device contribute?).
+    counterfactuals: list[TrajectoryScenario] = []
+    cf_device_keys: list[str] = []
+
+    if winning_scenario.upstairs.heating:
+        cf = TrajectoryScenario(
+            ThermostatTrajectory(heating=False),
+            winning_scenario.downstairs, winning_scenario.blowers, winning_scenario.mini_splits,
+        )
+        counterfactuals.append(cf)
+        cf_device_keys.append("upstairs_heating")
+    if winning_scenario.downstairs.heating:
+        cf = TrajectoryScenario(
+            winning_scenario.upstairs, ThermostatTrajectory(heating=False),
+            winning_scenario.blowers, winning_scenario.mini_splits,
+        )
+        counterfactuals.append(cf)
+        cf_device_keys.append("downstairs_heating")
+    for i, bd in enumerate(winning_scenario.blowers):
+        if bd.mode != "off":
+            new_blowers = tuple(
+                BlowerDecision(b.name, "off") if j == i else b
+                for j, b in enumerate(winning_scenario.blowers)
+            )
+            cf = TrajectoryScenario(
+                winning_scenario.upstairs, winning_scenario.downstairs,
+                new_blowers, winning_scenario.mini_splits,
+            )
+            counterfactuals.append(cf)
+            cf_device_keys.append(f"blower_{bd.name}")
+    for i, sd in enumerate(winning_scenario.mini_splits):
+        if sd.mode != "off":
+            new_splits = tuple(
+                MiniSplitDecision(s.name, "off", 0.0) if j == i else s
+                for j, s in enumerate(winning_scenario.mini_splits)
+            )
+            cf = TrajectoryScenario(
+                winning_scenario.upstairs, winning_scenario.downstairs,
+                winning_scenario.blowers, new_splits,
+            )
+            counterfactuals.append(cf)
+            cf_device_keys.append(f"split_{sd.name}")
+
+    # Simulate all counterfactuals in one batch
+    cf_preds: dict[str, dict[str, float]] = {}
+    cf_comfort_costs: dict[str, float] = {}
+    if counterfactuals:
+        cf_targets, cf_matrix = _predict(sim_state, counterfactuals, sim_params, CONTROL_HORIZONS)
+        for idx, key in enumerate(cf_device_keys):
+            preds = {t: float(cf_matrix[idx, j]) for j, t in enumerate(cf_targets)}
+            cf_preds[key] = preds
+            cf_comfort_costs[key] = compute_comfort_cost(preds, schedules, base_hour)
+
+    # Decision predictions in flat format for per-sensor breakdown
+    dec_flat: dict[str, float] = {}
+    for label, preds in decision.predictions.items():
+        for h in CONTROL_HORIZONS:
+            h_label = HORIZON_LABELS[h]
+            if h_label in preds:
+                dec_flat[f"{label}_temp_t+{h}"] = preds[h_label]
+    dec_sensor_costs = compute_comfort_cost_by_sensor(dec_flat, schedules, base_hour)
+    off_sensor_costs = compute_comfort_cost_by_sensor(off_preds, schedules, base_hour)
+
     up_label = "ON" if decision.upstairs_heating else "OFF"
     dn_label = "ON" if decision.downstairs_heating else "OFF"
 
-    # Print decision
+    # ── Print decision with counterfactual rationale ──
     print("\n[control] Decision:")
+
+    def _counterfactual_rationale(device_key: str) -> str:
+        """Build rationale: what does removing this device change?
+
+        Compares winning scenario vs counterfactual (same scenario minus this device).
+        Uses per-sensor comfort cost to find the biggest cost driver, then shows
+        the trajectory at the horizon with the biggest delta for that sensor.
+        """
+        without = cf_preds.get(device_key)
+        if without is None:
+            return ""
+
+        # Per-sensor comfort costs for counterfactual
+        cf_sensor = compute_comfort_cost_by_sensor(without, schedules, base_hour)
+
+        # Total comfort saving from this device
+        total_saving = cf_comfort_costs.get(device_key, decision.comfort_cost) - decision.comfort_cost
+
+        if abs(total_saving) < 0.1:
+            return "  → no significant effect"
+
+        # Find sensor with biggest per-sensor cost saving from this device
+        best_sensor = ""
+        best_sensor_saving = 0.0
+        for s in set(dec_sensor_costs) | set(cf_sensor):
+            s_saving = cf_sensor.get(s, 0) - dec_sensor_costs.get(s, 0)
+            if abs(s_saving) > abs(best_sensor_saving):
+                best_sensor_saving = s_saving
+                best_sensor = s
+
+        # Find the biggest trajectory delta for that sensor
+        best_h_label = ""
+        best_dec_t = 0.0
+        best_cf_t = 0.0
+        best_delta = 0.0
+        if best_sensor:
+            for h_step, h_lbl in zip(CONTROL_HORIZONS, horizons, strict=True):
+                dec_t = decision.predictions.get(best_sensor, {}).get(h_lbl)
+                cf_t = without.get(f"{best_sensor}_temp_t+{h_step}")
+                if dec_t is not None and cf_t is not None:
+                    delta = abs(dec_t - cf_t)
+                    if delta > best_delta:
+                        best_delta = delta
+                        best_h_label = h_lbl
+                        best_dec_t = dec_t
+                        best_cf_t = cf_t
+
+        if best_delta < 0.05:
+            return f"  → comfort {total_saving:+.2f} (diffuse effects across sensors)"
+
+        parts = [
+            f"  → {best_sensor} at {best_h_label}: {best_dec_t:.1f}° vs {best_cf_t:.1f}° without",
+            f" ({best_sensor} {best_sensor_saving:+.2f}",
+        ]
+        # Show total if it differs significantly from the top sensor
+        if abs(total_saving - best_sensor_saving) > 0.5:
+            parts.append(f", total {total_saving:+.2f}")
+        parts.append(")")
+        return "".join(parts)
+
     print(f"  Upstairs heating:   {up_label} → setpoint {decision.upstairs_setpoint:.0f}°F")
+    if decision.upstairs_heating:
+        print(_counterfactual_rationale("upstairs_heating"))
     print(f"  Downstairs heating: {dn_label} → setpoint {decision.downstairs_setpoint:.0f}°F")
+    if decision.downstairs_heating:
+        print(_counterfactual_rationale("downstairs_heating"))
     for bd in decision.blowers:
-        print(f"  Blower {bd.name:<14} {bd.mode}")
+        if bd.mode == "off":
+            print(f"  Blower {bd.name:<14} {bd.mode}")
+        else:
+            print(f"  Blower {bd.name:<14} {bd.mode}")
+            print(_counterfactual_rationale(f"blower_{bd.name}"))
     for sd in decision.mini_splits:
         if sd.mode == "off":
             print(f"  Split {sd.name:<15} off")
         else:
             print(f"  Split {sd.name:<15} {sd.mode} @ {sd.target:.0f}°F")
+            print(_counterfactual_rationale(f"split_{sd.name}"))
     if decision.trajectory_info:
         for zone, info in decision.trajectory_info.items():
             delay_h = info["delay_steps"] * 5 / 60
@@ -1067,36 +1286,24 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         f"  Total cost: {decision.total_cost:.4f}"
         f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
     )
+    print(f"  All-off baseline: comfort={off_comfort:.4f}")
 
-    # Per-room prediction table (decision vs all-off baseline)
-    horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
-
-    # Compute all-off baseline prediction for comparison
-    all_off = TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-        tuple(MiniSplitDecision(s.name, "off", 0.0) for s in MINI_SPLITS),
+    # ── Per-sensor cost breakdown ──
+    sensors_with_cost = sorted(
+        s for s in set(dec_sensor_costs) | set(off_sensor_costs)
+        if dec_sensor_costs.get(s, 0) > 0.001 or off_sensor_costs.get(s, 0) > 0.001
     )
+    if sensors_with_cost:
+        col_w2 = max(len(s) for s in sensors_with_cost) + 2
+        print(f"\n  {'Sensor':<{col_w2}} {'Decision':>10} {'All-off':>10} {'Saving':>10}")
+        print(f"  {'-' * (col_w2 + 32)}")
+        for s in sensors_with_cost:
+            dc = dec_sensor_costs.get(s, 0)
+            oc = off_sensor_costs.get(s, 0)
+            saving = oc - dc
+            print(f"  {s:<{col_w2}} {dc:>10.3f} {oc:>10.3f} {saving:>+10.3f}")
 
-    from weatherstat.simulator import HouseState as _HS
-    from weatherstat.simulator import predict as _predict
-
-    off_state = _HS(
-        current_temps=current_temps,
-        outdoor_temp=float(out_temp) if out_temp is not None else 50.0,
-        forecast_temps=forecast_temp_list,
-        window_states=window_states_dict,
-        hour_of_day=fractional_hour,
-        recent_history=recent_hist,
-        solar_fractions=solar_fractions,
-    )
-    off_targets, off_matrix = _predict(off_state, [all_off], sim_params, CONTROL_HORIZONS)
-    off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
-    off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
-
-    print(f"\n  All-off baseline: comfort={off_comfort:.4f}")
-
+    # ── Predicted temperatures (decision vs all-off) ──
     col_w = max(len(lbl) for lbl in PREDICTION_LABELS) + 2
     header = f"  {'Sensor':<{col_w}}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
     print("\n  Predicted temperatures (decision vs all-off):")

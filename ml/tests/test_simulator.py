@@ -22,15 +22,26 @@ from weatherstat.types import BlowerDecision, MiniSplitDecision, ThermostatTraje
 
 @pytest.fixture
 def sim_params() -> SimParams:
+    """Load from the test sandbox's synthetic thermal_params.json (see conftest.py)."""
     return load_sim_params()
+
+
+_BLOWERS_OFF = (
+    BlowerDecision("family_room", "off"),
+    BlowerDecision("office", "off"),
+    BlowerDecision("gym", "off"),
+)
+_SPLITS_OFF = (
+    MiniSplitDecision("bedroom", "off", 72),
+    MiniSplitDecision("living_room", "off", 72),
+)
 
 
 def _all_off() -> TrajectoryScenario:
     return TrajectoryScenario(
         ThermostatTrajectory(heating=False),
         ThermostatTrajectory(heating=False),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+        _BLOWERS_OFF, _SPLITS_OFF,
     )
 
 
@@ -39,8 +50,7 @@ def _both_on() -> TrajectoryScenario:
     return TrajectoryScenario(
         ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
         ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
+        _BLOWERS_OFF, _SPLITS_OFF,
     )
 
 
@@ -49,15 +59,15 @@ def _bedroom_heat() -> TrajectoryScenario:
     return TrajectoryScenario(
         ThermostatTrajectory(heating=False),
         ThermostatTrajectory(heating=False),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        _BLOWERS_OFF,
         (MiniSplitDecision("bedroom", "heat", 72), MiniSplitDecision("living_room", "off", 72)),
     )
 
 
 _CURRENT_TEMPS = {
     "upstairs": 70.0, "downstairs": 69.0, "bedroom": 68.5,
-    "office": 67.0, "family_room": 69.5, "kitchen": 68.0,
-    "piano": 67.5, "bathroom": 68.0, "living_room": 69.0,
+    "office": 67.0, "office_bookshelf": 67.0, "family_room": 69.5,
+    "kitchen": 68.0, "piano": 67.5, "bathroom": 68.0, "living_room": 69.0,
 }
 
 
@@ -78,7 +88,7 @@ def _make_state(
 # ── load_sim_params ─────────────────────────────────────────────────────
 
 
-def test_load_sim_params(sim_params: SimParams) -> None:
+def test_synthetic_params_well_formed(sim_params: SimParams) -> None:
     assert len(sim_params.sensors) > 0
     assert len(sim_params.effectors) > 0
     assert len(sim_params.taus) > 0
@@ -92,6 +102,25 @@ def test_tau_values_reasonable(sim_params: SimParams) -> None:
         # Window betas should be non-negative (physical constraint)
         for win, beta in tau_model.window_betas.items():
             assert beta >= 0, f"{sensor} window {win} beta must be >= 0"
+
+
+# ── Integration tests (require live thermal_params.json) ─────────────
+
+
+def test_load_sim_params_from_sandbox() -> None:
+    """Verify load_sim_params reads from the test sandbox data dir."""
+    sp = load_sim_params()
+    assert len(sp.sensors) > 0
+    assert len(sp.gains) > 0
+    # Gains should be filtered by t-statistic threshold
+    for (eff, _), _ in sp.gains.items():
+        if "mini_split" in eff:
+            # No confounded cross-coupling should survive
+            assert any(
+                eff.removeprefix("mini_split_") in sen
+                for (e, sen), _ in sp.gains.items()
+                if e == eff
+            )
 
 
 # ── _outdoor_at ──────────────────────────────────────────────────────────
@@ -249,11 +278,10 @@ def test_heating_warms_vs_all_off(sim_params: SimParams) -> None:
 
 
 def test_mini_split_heats_bedroom_only(sim_params: SimParams) -> None:
-    """Mini split bedroom heat should warm bedroom much more than office."""
+    """Mini split bedroom heat should warm bedroom, not office (no cross-coupling gain)."""
     targets, preds = predict(
         _make_state(), [_all_off(), _bedroom_heat()], sim_params, [72],
     )
-    # Find bedroom and office 6h predictions
     bed_idx = next(j for j, t in enumerate(targets) if t == "bedroom_temp_t+72")
     off_idx = next(j for j, t in enumerate(targets) if t == "office_temp_t+72")
 
@@ -261,6 +289,7 @@ def test_mini_split_heats_bedroom_only(sim_params: SimParams) -> None:
     off_delta = preds[1, off_idx] - preds[0, off_idx]  # office: heat vs off
 
     assert bed_delta > off_delta, "Bedroom should warm more than office from bedroom split"
+    assert off_delta == 0.0, "Office should not be affected (no cross-coupling gain)"
     assert bed_delta > 1.0, "Bedroom should warm significantly from mini split"
 
 
@@ -298,7 +327,7 @@ def _traj_heat_2h() -> TrajectoryScenario:
     return TrajectoryScenario(
         ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
         ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        _BLOWERS_OFF,
         (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
     )
 
@@ -308,7 +337,7 @@ def _traj_delayed_heat() -> TrajectoryScenario:
     return TrajectoryScenario(
         ThermostatTrajectory(heating=True, delay_steps=12, duration_steps=24),
         ThermostatTrajectory(heating=False),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        _BLOWERS_OFF,
         (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
     )
 
@@ -329,7 +358,7 @@ def test_trajectory_2h_cooler_than_6h(sim_params: SimParams) -> None:
     traj_6h = TrajectoryScenario(
         ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
         ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        _BLOWERS_OFF,
         (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
     )
     targets, preds = predict(
@@ -381,7 +410,7 @@ def _bedroom_heat_target(target: float) -> TrajectoryScenario:
     return TrajectoryScenario(
         ThermostatTrajectory(heating=False),
         ThermostatTrajectory(heating=False),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        _BLOWERS_OFF,
         (MiniSplitDecision("bedroom", "heat", target), MiniSplitDecision("living_room", "off", 0.0)),
     )
 
@@ -420,7 +449,7 @@ def test_regulating_off_same_as_all_off(sim_params: SimParams) -> None:
     off_split = TrajectoryScenario(
         ThermostatTrajectory(heating=False),
         ThermostatTrajectory(heating=False),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
+        _BLOWERS_OFF,
         (MiniSplitDecision("bedroom", "off", 0.0), MiniSplitDecision("living_room", "off", 0.0)),
     )
     targets, preds = predict(_make_state(), [_all_off(), off_split], sim_params, [12, 72])

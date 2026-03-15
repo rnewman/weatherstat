@@ -236,15 +236,21 @@ def _fit_tau_curve(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> 
         return None
 
 
-def _find_nighttime_sealed_segments(
+def _find_uncontrolled_segments(
     df: pd.DataFrame,
     effectors: list[EffectorSpec],
     sensor: SensorSpec,
 ) -> list[pd.DataFrame]:
-    """Find contiguous nighttime HVAC-off, all-windows-closed segments.
+    """Find contiguous nighttime segments with no active HVAC control.
 
-    Only returns fully sealed segments (all windows closed) for tau_base
-    fitting. Window effects are learned separately in Stage 2 regression.
+    These segments show passive convergence toward outdoor temperature —
+    cooling when indoors is warmer, warming when outdoors is warmer.
+    The exponential time constant (tau) is symmetric either way.
+
+    Requires all HVAC effectors to be off. Window/door states must be
+    constant within each segment (no transitions) but need not all be closed.
+    The fitted tau includes whatever window effects are present; Stage 2
+    regression decomposes them via window×ΔT features.
     """
     # Identify nighttime rows
     local_hour = df["_local_hour"]
@@ -261,12 +267,6 @@ def _find_nighttime_sealed_segments(
 
     mask = is_night & all_off
 
-    # All windows closed
-    all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
-    existing_win_cols = [c for c in all_win_cols if c in df.columns]
-    if existing_win_cols:
-        mask &= ~df[existing_win_cols].any(axis=1)
-
     # Drop rows where this sensor's temp is NaN
     temp_col = sensor.temp_column
     if temp_col not in df.columns:
@@ -282,11 +282,26 @@ def _find_nighttime_sealed_segments(
     breaks = dt > pd.Timedelta(minutes=10)
     seg_ids = breaks.cumsum()
 
+    # Only keep segments where all window/door states are constant
+    # (no transitions mid-segment). NaN (sensor didn't exist) is treated
+    # as a constant unknown state and does not disqualify the segment.
+    all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
+    existing_win_cols = [c for c in all_win_cols if c in df.columns]
+
     segments: list[pd.DataFrame] = []
     for _, seg_df in qualifying.groupby(seg_ids):
         if len(seg_df) < _MIN_SEGMENT_STEPS:
             continue
-        segments.append(seg_df)
+        # Check window stability: each column must have at most 1 unique
+        # non-null value within the segment
+        stable = True
+        for wc in existing_win_cols:
+            n_unique = seg_df[wc].dropna().nunique()
+            if n_unique > 1:
+                stable = False
+                break
+        if stable:
+            segments.append(seg_df)
 
     return segments
 
@@ -297,18 +312,18 @@ def _fit_tau(
     sensors: list[SensorSpec],
     verbose: bool = False,
 ) -> list[FittedTau]:
-    """Stage 1: Fit tau_base per sensor from sealed overnight cooling data.
+    """Stage 1: Fit tau per sensor from uncontrolled overnight segments.
 
-    Only uses all-windows-closed segments. Window effects on tau are
-    learned separately in Stage 2 via regression on window × ΔT features.
+    Uses segments with stable window state (no transitions). The fitted
+    tau includes any window effects present; Stage 2 decomposes them.
     """
     results: list[FittedTau] = []
 
     for sensor in sensors:
-        segments = _find_nighttime_sealed_segments(df, effectors, sensor)
+        segments = _find_uncontrolled_segments(df, effectors, sensor)
         if not segments:
             if verbose:
-                print(f"  {sensor.name}: no qualifying sealed overnight segments")
+                print(f"  {sensor.name}: no qualifying uncontrolled overnight segments")
             results.append(FittedTau(
                 sensor=sensor.name,
                 tau_base=sensor.yaml_tau_base,
@@ -539,7 +554,7 @@ def _fit_sensor_model(
     for wc in existing_win_cols:
         win_name = wc.removeprefix("window_").removesuffix("_open")
         feature_names.append(f"_win_{win_name}")
-        feature_cols.append(df[wc].values.astype(float) * delta_t)
+        feature_cols.append(df[wc].fillna(False).values.astype(float) * delta_t)
         window_feature_names.append(win_name)
 
     # Window interaction features: pairs with enough co-open data
@@ -547,7 +562,7 @@ def _fit_sensor_model(
     interaction_feature_names: list[str] = []  # "w1+w2" in order
     for i, wc1 in enumerate(existing_win_cols):
         for wc2 in existing_win_cols[i + 1:]:
-            co_open = df[wc1].values.astype(bool) & df[wc2].values.astype(bool)
+            co_open = df[wc1].fillna(False).values.astype(bool) & df[wc2].fillna(False).values.astype(bool)
             if co_open.sum() >= _MIN_INTERACTION_ROWS:
                 w1 = wc1.removeprefix("window_").removesuffix("_open")
                 w2 = wc2.removeprefix("window_").removesuffix("_open")

@@ -428,32 +428,32 @@ class TestMiniSplitSweepOptions:
 
     def test_sweep_options_include_off(self) -> None:
         """Off should always be an option."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 42.0)
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
         assert any(o.mode == "off" for o in options)
 
     def test_sweep_options_preferred_target(self) -> None:
         """Should generate off + preferred target."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 42.0)
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
         assert len(options) == 2  # off + preferred
         active = [o for o in options if o.mode != "off"]
         assert len(active) == 1
         assert active[0].target == 70.0  # preferred = midpoint of 68-72
 
     def test_sweep_mode_heat_when_cold(self) -> None:
-        """Mode should be 'heat' when outdoor temp is below preferred."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 42.0)
+        """Mode should be 'heat' when room temp is below preferred."""
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
         active = [o for o in options if o.mode != "off"]
         assert all(o.mode == "heat" for o in active)
 
     def test_sweep_mode_cool_when_hot(self) -> None:
-        """Mode should be 'cool' when outdoor temp is above preferred."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, 85.0)
+        """Mode should be 'cool' when room temp is above preferred."""
+        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 72.0})
         active = [o for o in options if o.mode != "off"]
         assert all(o.mode == "cool" for o in active)
 
     def test_sweep_no_schedule_returns_off_only(self) -> None:
         """No matching schedule -> only off option."""
-        options = _mini_split_sweep_options("bedroom", [], 12, 42.0)
+        options = _mini_split_sweep_options("bedroom", [], 12)
         assert len(options) == 1
         assert options[0].mode == "off"
 
@@ -492,7 +492,7 @@ class TestModeHoldWindow:
         )
         # Hour 23 is inside bedroom's hold window [22, 7]
         options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 23, 42.0, prev_state,
+            "bedroom", self._bedroom_schedule(), 23, prev_state, current_temps={"bedroom": 68.0},
         )
         # All options should be "heat" (current mode)
         assert all(o.mode == "heat" for o in options)
@@ -512,26 +512,27 @@ class TestModeHoldWindow:
         )
         # Hour 12 is outside hold window — mode should be unlocked
         options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 12, 42.0, prev_state,
+            "bedroom", self._bedroom_schedule(), 12, prev_state, current_temps={"bedroom": 68.0},
         )
         assert any(o.mode == "off" for o in options)
 
-    def test_idle_split_skipped_when_room_above_target(self) -> None:
-        """Heat option skipped when room is well above preferred (split would be idle)."""
+    def test_cool_offered_when_room_above_target(self) -> None:
+        """Cool option offered when room is above preferred."""
         options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 12, 42.0,
+            "bedroom", self._bedroom_schedule(), 12,
             current_temps={"bedroom": 73.0},  # 3°F above preferred 70
         )
-        # Only off should remain — room is above preferred + proportional_band
-        assert all(o.mode == "off" for o in options)
+        # Room is above preferred — cool mode should be offered
+        assert any(o.mode == "cool" for o in options)
 
     def test_split_offered_when_room_near_target(self) -> None:
-        """Heat option available when room is near preferred."""
+        """Cool option available when room is slightly above preferred."""
         options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 12, 42.0,
+            "bedroom", self._bedroom_schedule(), 12,
             current_temps={"bedroom": 70.5},  # within proportional_band of preferred 70
         )
-        assert any(o.mode == "heat" for o in options)
+        # Room is 0.5°F above preferred — should get cool option
+        assert any(o.mode == "cool" for o in options)
 
 
 # ── Proportional energy cost tests ──────────────────────────────────
@@ -541,10 +542,11 @@ class TestProportionalEnergyCost:
     """Test proportional energy cost for mini splits."""
 
     def test_higher_target_more_energy_when_heating(self) -> None:
-        """Higher target vs outdoor -> more expected activity -> higher cost.
+        """Higher target vs room temp -> more expected activity -> higher cost.
 
-        With proportional_band=1.0: target 68.5 @ outdoor 68 -> activity=0.5,
-        target 69 @ outdoor 68 -> activity=1.0.
+        With proportional_band=1.0 and room at 68°F:
+        target 68.5 -> delta=0.5 -> activity=0.5,
+        target 69.0 -> delta=1.0 -> activity=1.0.
         """
         low_target = TrajectoryScenario(
             ThermostatTrajectory(heating=False),
@@ -558,7 +560,8 @@ class TestProportionalEnergyCost:
             (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
             (MiniSplitDecision("bedroom", "heat", 69.0), MiniSplitDecision("living_room", "off", 0.0)),
         )
-        assert compute_energy_cost(low_target, outdoor_temp=68.0) < compute_energy_cost(high_target, outdoor_temp=68.0)
+        temps = {"bedroom": 68.0}
+        assert compute_energy_cost(low_target, temps) < compute_energy_cost(high_target, temps)
 
     def test_off_mini_split_no_energy_cost(self) -> None:
         """Off mini split should have zero energy cost."""
@@ -568,7 +571,7 @@ class TestProportionalEnergyCost:
             (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
             (MiniSplitDecision("bedroom", "off", 0.0), MiniSplitDecision("living_room", "off", 0.0)),
         )
-        assert compute_energy_cost(off, outdoor_temp=42.0) == 0.0
+        assert compute_energy_cost(off) == 0.0
 
 
 # ── Trajectory scenario generation with schedules ──────────────────
@@ -589,7 +592,9 @@ class TestTrajectoryWithSchedules:
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 69.0, 74.0)),),
             ),
         ]
-        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, outdoor_temp=42.0)
+        # Room temps below preferred → heat mode for both splits
+        current_temps = {"bedroom": 68.0, "living_room": 69.0}
+        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
         # 4 mini split combos (2×2): off + preferred per split
         split_combos = {tuple((sd.name, sd.mode, sd.target) for sd in s.mini_splits) for s in scenarios}
         assert len(split_combos) == 4
@@ -602,7 +607,8 @@ class TestTrajectoryWithSchedules:
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
             ),
         ]
-        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, outdoor_temp=42.0)
+        current_temps = {"bedroom": 68.0}
+        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
         all_off = [
             s for s in scenarios
             if not s.upstairs.heating and not s.downstairs.heating
