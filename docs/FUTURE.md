@@ -101,6 +101,38 @@ when the device count grows significantly.
 
 ---
 
+## Causal Gain Identification
+
+The current sysid OLS regression fits effector→sensor gains from observational
+data, which produces confounded estimates. Examples observed (Mar 2026):
+
+- **Bedroom mini split → every sensor in the house** had positive gains (t<1.0).
+  The split runs when the house is warming for other reasons (solar, thermostats),
+  so OLS attributes the warming to the split. When the optimizer sets the split to
+  cool, it inverts all these gains and thinks cooling the bedroom also cools the
+  bathroom, kitchen, etc.
+- **Office bookshelf sensor** had gains of 4-6°F/hr from thermostats — physically
+  implausible. Likely caused by unobserved heat sources (occupant body heat, space
+  heater) correlated with HVAC activity.
+- **Negative downstairs→living room coupling** (-2.5°F/hr): downstairs heating
+  only activates in genuinely cold weather, which is also when the living room
+  cools fastest. Simpson's paradox, not a real causal effect.
+
+**Current mitigations** (guard rails, not root fixes):
+- t-statistic threshold (|t| ≥ 1.5) prunes statistically insignificant gains
+- Gain magnitude cap (≤ 3.0°F/hr) catches physically implausible outliers
+- Mode-direction clamp prevents cooling from warming or heating from cooling
+
+**Future approaches:**
+- Include outdoor temperature as a control variable in the gain regression
+  (partial out weather effects before fitting effector gains)
+- Asymmetric gain fitting: train heating and cooling gains separately (hot air
+  and cold air flow differently — convection patterns differ)
+- Instrumental variable approaches if sufficient data accumulates
+- Per-sensor data quality flags (short history, known unobserved heat sources)
+
+---
+
 ## Solar Irradiance Estimation
 
 Approximate solar irradiance from existing + forecast data:

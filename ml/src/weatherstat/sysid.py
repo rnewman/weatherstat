@@ -271,7 +271,7 @@ def _find_uncontrolled_segments(
     temp_col = sensor.temp_column
     if temp_col not in df.columns:
         return []
-    mask &= df[temp_col].notna() & df["outdoor_temp"].notna()
+    mask &= df[temp_col].notna() & df["_outdoor_best"].notna()
 
     qualifying = df[mask].copy()
     if len(qualifying) < _MIN_SEGMENT_STEPS:
@@ -336,7 +336,7 @@ def _fit_tau(
         for seg_df in segments:
             t_hours = (seg_df["_ts"] - seg_df["_ts"].iloc[0]).dt.total_seconds().values / 3600.0
             temps = seg_df[sensor.temp_column].values
-            t_outdoor = seg_df["outdoor_temp"].mean()
+            t_outdoor = seg_df["_outdoor_best"].mean()
             tau = _fit_tau_curve(t_hours, temps, t_outdoor)
             if tau is not None:
                 fitted_taus.append((tau, len(seg_df)))
@@ -385,6 +385,35 @@ def _preprocess(
     # Local hour for nighttime detection and solar features
     tz = _CFG.location.timezone
     df["_local_hour"] = df["_ts"].dt.tz_convert(tz).dt.hour
+
+    # Best outdoor temp: use met.no (ERA5/NWP) exclusively when available.
+    # The house-mounted side sensor reads ~3°F warm at all hours (house heat
+    # radiation through the wall) plus solar spikes of +10-12°F in the
+    # afternoon. Met.no data has no such biases.
+    # Backfill data is hourly; interpolate to fill 5-min gaps.
+    # Fall back to side sensor only for rows with no met coverage at all.
+    if "met_outdoor_temp" in df.columns and df["met_outdoor_temp"].notna().sum() > 100:
+        met = pd.to_numeric(df["met_outdoor_temp"], errors="coerce")
+        met = met.interpolate(method="linear", limit=24)  # fill up to 2h gaps
+        n_met = met.notna().sum()
+        n_fallback = met.isna().sum()
+        df["_outdoor_best"] = met.fillna(pd.to_numeric(df["outdoor_temp"], errors="coerce"))
+        if n_fallback > 0:
+            print(f"  Outdoor temp: met.no for {n_met}/{len(df)} rows, side sensor fallback for {n_fallback}")
+        else:
+            print(f"  Outdoor temp: met.no for all {n_met} rows")
+    else:
+        df["_outdoor_best"] = pd.to_numeric(df["outdoor_temp"], errors="coerce")
+
+    # Outdoor temp rate-of-change (°F/hr, for weather control feature)
+    dt_hours = 5.0 / 60.0
+    out_vals = df["_outdoor_best"].values.astype(float)
+    dT_out = np.full_like(out_vals, np.nan)
+    if len(out_vals) > 2:
+        dT_out[1:-1] = (out_vals[2:] - out_vals[:-2]) / (2 * dt_hours)
+        dT_out[0] = (out_vals[1] - out_vals[0]) / dt_hours
+        dT_out[-1] = (out_vals[-1] - out_vals[-2]) / dt_hours
+    df["_dTdt_outdoor"] = dT_out
 
     # Encode effector states to numeric.
     # Each effector has a state column (measured action) and optionally a
@@ -519,11 +548,14 @@ def _fit_sensor_model(
 
     if temp_col not in df.columns or dTdt_col not in df.columns:
         return [], [], {}, {}
-    if "outdoor_temp" not in df.columns:
+    if "_outdoor_best" not in df.columns:
         return [], [], {}, {}
 
+    outdoor = df["_outdoor_best"].values
+    sensor_temp = df[temp_col].values
+
     # Newton residual using tau_base (all rows, not split by window state)
-    newton_dTdt = (df["outdoor_temp"].values - df[temp_col].values) / tau_base
+    newton_dTdt = (outdoor - sensor_temp) / tau_base
     residual = df[dTdt_col].values - newton_dTdt
 
     # Build feature matrix
@@ -543,11 +575,33 @@ def _fit_sensor_model(
         if end > start:
             effector_feature_ranges[eff.name] = (start, end)
 
+    # Weather control features — absorb weather-driven variance that would
+    # otherwise be attributed to correlated HVAC activity.
+    delta_t = outdoor - sensor_temp
+
+    # ΔT² — captures nonlinear heat loss (stack effect, radiation increase
+    # at large indoor-outdoor difference). The Newton model assumes linear
+    # heat loss; this term lets the regression correct for the nonlinearity.
+    feature_names.append("_weather_dt2")
+    feature_cols.append(delta_t ** 2 * np.sign(delta_t))
+
+    # wind × ΔT — wind-driven convective heat loss. A windy cold night
+    # causes more heat loss than a calm one at the same ΔT.
+    if "wind_speed" in df.columns:
+        wind = pd.to_numeric(df["wind_speed"], errors="coerce").fillna(0.0).values
+        feature_names.append("_weather_wind_dt")
+        feature_cols.append(wind * delta_t)
+
+    # dT_outdoor/dt — rapid outdoor temp drops cause more heat loss than
+    # the instantaneous ΔT suggests (interior mass hasn't equilibrated).
+    if "_dTdt_outdoor" in df.columns:
+        feature_names.append("_weather_dTout_dt")
+        feature_cols.append(df["_dTdt_outdoor"].values.astype(float))
+
     # Window × ΔT features: window_state × (T_outdoor - T_sensor)
     # The coefficient β_w gives the additional cooling rate when the window is open.
     all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
     existing_win_cols = [c for c in all_win_cols if c in df.columns]
-    delta_t = df["outdoor_temp"].values - df[temp_col].values
 
     window_feature_start = len(feature_names)
     window_feature_names: list[str] = []  # bare window names in order
@@ -628,6 +682,13 @@ def _fit_sensor_model(
             se = np.full(len(beta), np.nan)
 
     t_stats = np.where(se > 0, beta / se, 0.0)
+
+    # Report weather control feature coefficients (diagnostic, not stored)
+    if verbose:
+        for i, fname in enumerate(feature_names):
+            if fname.startswith("_weather_"):
+                label = fname.removeprefix("_weather_")
+                print(f"    weather {label}: β={beta[i]:.6f}, t={t_stats[i]:.1f}")
 
     # Extract effector gains
     gains: list[EffectorSensorGain] = []

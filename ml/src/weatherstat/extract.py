@@ -337,6 +337,7 @@ def _weather_to_series(
     """Extract weather entity state and attributes."""
     times: list[pd.Timestamp] = []
     conditions: list[str] = []
+    temperatures: list[float | None] = []
     humidities: list[float | None] = []
     wind_speeds: list[float | None] = []
 
@@ -357,6 +358,9 @@ def _weather_to_series(
         times.append(ts)
         conditions.append(state)
 
+        t = attrs.get("temperature")
+        temperatures.append(float(t) if t is not None else None)
+
         h = attrs.get("humidity")
         humidities.append(float(h) if h is not None else None)
 
@@ -366,6 +370,7 @@ def _weather_to_series(
     idx = pd.DatetimeIndex(times)
     return {
         "condition": pd.Series(conditions, index=idx, dtype=str),
+        "temperature": pd.Series(temperatures, index=idx, dtype=float),
         "humidity": pd.Series(humidities, index=idx, dtype=float),
         "wind_speed": pd.Series(wind_speeds, index=idx, dtype=float),
     }
@@ -462,8 +467,9 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
     weather_records = attr_history.get(WEATHER_ENTITY, [])
     if weather_records:
         weather_dict = _weather_to_series(weather_records)
+        _weather_col_map = {"condition": "weather_condition", "temperature": "met_outdoor_temp"}
         for suffix, series in weather_dict.items():
-            col = f"outdoor_{suffix}" if suffix != "condition" else "weather_condition"
+            col = _weather_col_map.get(suffix, f"outdoor_{suffix}")
             s = series[~series.index.duplicated(keep="last")]
             result[col] = s.reindex(time_index, method="ffill")
 
@@ -636,8 +642,9 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
     weather_records = attr_history.get(WEATHER_ENTITY, [])
     if weather_records:
         weather_dict = _weather_to_series(weather_records)
+        _weather_col_map = {"condition": "weather_condition", "temperature": "met_outdoor_temp"}
         for suffix, series in weather_dict.items():
-            col = f"outdoor_{suffix}" if suffix != "condition" else "weather_condition"
+            col = _weather_col_map.get(suffix, f"outdoor_{suffix}")
             s = series[~series.index.duplicated(keep="last")]
             result[col] = s.reindex(time_index, method="ffill")
 

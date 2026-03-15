@@ -219,6 +219,15 @@ function loadYamlConfig() {
   // 6. Weather-derived columns
   const weatherId = raw.weather.entity_id;
   columnDefs.push({
+    snake: "met_outdoor_temp",
+    camel: "metOutdoorTemp",
+    sqlType: "REAL",
+    extract: (stateMap) => {
+      const w = stateMap.get(weatherId);
+      return w ? ((w.attributes["temperature"] as number) ?? 0) : 0;
+    },
+  });
+  columnDefs.push({
     snake: "outdoor_humidity",
     camel: "outdoorHumidity",
     sqlType: "REAL",

@@ -944,7 +944,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     dn_current = float(latest.get("thermostat_downstairs_temp", 70))
     up_target = latest.get("thermostat_upstairs_target", "?")
     dn_target = latest.get("thermostat_downstairs_target", "?")
-    out_temp = latest.get("outdoor_temp")
+    # Prefer met.no outdoor temp (no house heat bias) over side sensor
+    out_temp = latest.get("met_outdoor_temp") or latest.get("outdoor_temp")
     now_str = df_raw["timestamp"].iloc[-1]
 
     # Build current temperature dict for all rooms (for sanity checks and display)
@@ -1005,12 +1006,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     else:
         print("  Forecast:    unavailable")
 
-    # Current weather condition for solar fraction
-    _current_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
-    from weatherstat.weather import condition_to_solar_fraction as _c2sf
-
-    print(f"  Weather:     {_current_cond} (solar fraction: {_c2sf(_current_cond):.0%})")
-
     # Current local hour for comfort schedule lookup
     from zoneinfo import ZoneInfo
 
@@ -1018,6 +1013,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     local_now = datetime.now(ZoneInfo(TIMEZONE))
     base_hour = local_now.hour
+
+    # Current weather condition for solar fraction
+    _current_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
+    from weatherstat.weather import condition_to_solar_fraction as _c2sf
+
+    _sf = _c2sf(_current_cond)
+    _is_night = base_hour < 7 or base_hour >= 19
+    _sf_note = "night, no solar gain" if _is_night else f"solar fraction: {_sf:.0%}"
+    print(f"  Weather:     {_current_cond} ({_sf_note})")
 
     # Comfort schedules + window adjustments
     schedules = default_comfort_schedules()

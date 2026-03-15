@@ -22,8 +22,12 @@ from weatherstat.types import BlowerDecision, MiniSplitDecision, TrajectoryScena
 # Minimum |t-statistic| for an effector→sensor gain to be used in simulation.
 # Gains below this threshold are likely confounded (e.g., bedroom split runs
 # when the house is warming for other reasons → OLS attributes warming to split).
-# At 1.0, keeps gains that are at least weakly significant.
-_MIN_T_STATISTIC = 1.0
+_MIN_T_STATISTIC = 1.5
+
+# Maximum plausible gain magnitude (°F/hr). Gains larger than this are almost
+# certainly confounded or from a sensor near a vent/register. Typical real
+# gains: thermostats 0.3-1.0, mini splits 1.0-1.5, blowers <0.5.
+_MAX_GAIN_MAGNITUDE = 3.0
 
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
@@ -111,20 +115,28 @@ def load_sim_params(path: Path | None = None) -> SimParams:
             tau_s = ft["tau_sealed"]
             taus[sensor] = TauModel(tau_base=tau_s)
 
-    # Gain lookup: filter by negligible flag and t-statistic significance.
-    # Low |t| gains are likely confounded (e.g., bedroom split runs when the
-    # house is warming for other reasons → OLS attributes warming to split).
+    # Gain lookup: filter by negligible flag, t-statistic significance,
+    # and physical plausibility (gain magnitude).
     gains: dict[tuple[str, str], tuple[float, float]] = {}
-    n_pruned = 0
+    n_pruned_t = 0
+    n_pruned_mag = 0
     for g in data["effector_sensor_gains"]:
         if g["negligible"]:
             continue
         if abs(g.get("t_statistic", 999)) < _MIN_T_STATISTIC:
-            n_pruned += 1
+            n_pruned_t += 1
+            continue
+        if abs(g["gain_f_per_hour"]) > _MAX_GAIN_MAGNITUDE:
+            n_pruned_mag += 1
             continue
         gains[(g["effector"], g["sensor"])] = (g["gain_f_per_hour"], g["best_lag_minutes"])
-    if n_pruned:
-        print(f"  [sim] Pruned {n_pruned} gains with |t| < {_MIN_T_STATISTIC:.1f}")
+    pruned_parts: list[str] = []
+    if n_pruned_t:
+        pruned_parts.append(f"{n_pruned_t} by |t| < {_MIN_T_STATISTIC:.1f}")
+    if n_pruned_mag:
+        pruned_parts.append(f"{n_pruned_mag} by |gain| > {_MAX_GAIN_MAGNITUDE:.1f}°F/hr")
+    if pruned_parts:
+        print(f"  [sim] Pruned gains: {', '.join(pruned_parts)}")
 
     # Solar lookup
     solar: dict[tuple[str, int], float] = {}

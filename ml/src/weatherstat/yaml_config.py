@@ -317,7 +317,7 @@ class WeatherstatConfig:
             cols.append(f"blower_{name}_mode")
         bname = self.boiler.name
         cols.extend([f"boiler_{bname}_mode", f"boiler_{bname}_capacity"])
-        cols.extend(["weather_condition", "wind_speed", "outdoor_humidity"])
+        cols.extend(["weather_condition", "wind_speed", "outdoor_humidity", "met_outdoor_temp"])
         for name in self.windows:
             cols.append(f"window_{name}_open")
         cols.append("any_window_open")
@@ -330,7 +330,7 @@ class WeatherstatConfig:
         for col in self.humidity_sensors:
             cols.append(col)
         cols.append(f"boiler_{self.boiler.name}_capacity")
-        cols.extend(["outdoor_humidity", "outdoor_wind_speed"])
+        cols.extend(["outdoor_humidity", "outdoor_wind_speed", "met_outdoor_temp"])
         for name in self.thermostats:
             cols.append(f"thermostat_{name}_target")
         for name in self.mini_splits:
@@ -410,6 +410,7 @@ class WeatherstatConfig:
         # Environment
         defs.extend([
             ("outdoor_temp", "REAL"),
+            ("met_outdoor_temp", "REAL"),
             ("outdoor_humidity", "REAL"),
             ("wind_speed", "REAL"),
             ("weather_condition", "TEXT"),

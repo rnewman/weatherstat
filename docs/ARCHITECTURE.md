@@ -158,6 +158,13 @@ Fits all thermal model parameters from observed collector data using a two-stage
 
 The regression uses `np.linalg.lstsq` (OLS) with automatic fallback to ridge regression (`np.linalg.solve` with L2 penalty) when the condition number indicates collinear effectors. T-statistics flag negligible gains (|gain| < 0.05°F/hr AND |t-stat| < 2.0).
 
+**Gain filtering at load time:** The simulator applies additional filters when loading gains from `thermal_params.json`:
+- **t-statistic threshold** (|t| ≥ 1.5): prunes gains that are likely confounded (e.g., bedroom split correlates with other warming sources but doesn't cause it). Without this, OLS attributes correlated warming to whichever effector happens to be active.
+- **Magnitude cap** (≤ 3.0°F/hr): catches physically implausible gains from sensors near vents, unobserved heat sources, or short data histories.
+- **Mode-direction clamp**: in the Euler loop, heating contributions are clamped ≥ 0 and cooling contributions ≤ 0, preventing confounded gains from producing physically impossible effects (e.g., cooling a room making it warmer).
+
+These are guard rails, not root fixes. The fundamental issue is that OLS on observational data produces confounded gains when effector activity correlates with unobserved variables (outdoor conditions, occupant behavior). See `docs/FUTURE.md` § "Causal Gain Identification" for planned improvements.
+
 **What it extracts:**
 - **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.
 - **Solar gain profiles**: per-sensor, per-hour-of-day gain coefficients.
@@ -226,6 +233,8 @@ Window-open states widen the comfort band to avoid fighting ventilation.
 - Hold times: 10-minute minimum between setpoint changes; 2-hour minimum between mini-split mode changes.
 - Mode hold window: per-device configurable hours (e.g., 10pm–7am) during which mini-split mode changes are forbidden — only silent target temperature adjustments are allowed.
 - Cold-sensor override: force immediate zone heating (delay=0) when any sensor is significantly below comfort minimum.
+
+**Decision rationale:** After selecting the best scenario, the controller runs counterfactual simulations — the winning scenario with each active device individually removed. This gives true per-device attribution: "what does THIS device contribute?" rather than conflating multi-device effects. Each active device's rationale shows the sensor most affected, the trajectory difference, and the per-sensor comfort cost impact. A per-sensor cost breakdown table (decision vs all-off) shows which sensors drive the overall decision.
 
 **Output:** `ControlDecision` JSON containing recommended device states, predicted outcomes, trajectory info, and decision reasoning.
 
