@@ -35,6 +35,9 @@ lint-ts:
 lint-py:
     cd ml && uv run ruff check src/
 
+lint-fix:
+    cd ml && uv run ruff check src/ --fix
+
 # Format Python
 fmt:
     cd ml && uv run ruff format src/ tests/
