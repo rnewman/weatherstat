@@ -99,8 +99,8 @@ def check_thermostat_modes(latest: object, decision: object) -> list[SafetyAlert
 def check_device_health() -> list[SafetyAlert]:
     """Run health checks for all devices with configured thresholds.
 
-    Reads health check definitions from effector configs (e.g.,
-    effectors.boiler.navien.health). For each check, fetches the
+    Reads health check definitions from the health section in
+    weatherstat.yaml. For each check, fetches the
     entity's current state from HA and compares against min/max thresholds.
     """
     from weatherstat.yaml_config import load_config

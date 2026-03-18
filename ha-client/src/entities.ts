@@ -31,8 +31,5 @@ export const WINDOW_SENSORS = config.windowSensorEntityIds;
 // Weather entity (met.no integration)
 export const WEATHER_ENTITY = config.weatherEntity;
 
-// Boiler entities (from effectors config)
-export const BOILER_ENTITIES = config.boiler;
-
 /** All entity IDs we subscribe to for snapshots. */
 export const ALL_MONITORED_ENTITIES = config.allMonitoredEntities;

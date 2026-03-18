@@ -55,15 +55,20 @@ _THERMAL_PARAMS: dict = {
     "data_end": "2026-03-14T00:00:00Z",
     "n_snapshots": 10000,
     "effectors": [
-        {"name": "thermostat_upstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat"},
-        {"name": "thermostat_downstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat"},
-        {"name": "navien", "encoding": {"Space Heating": 1.0}, "device_type": "boiler"},
+        {"name": "thermostat_upstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat", "state_gate": "navien_heating"},
+        {"name": "thermostat_downstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat", "state_gate": "navien_heating"},
         {"name": "blower_family_room", "encoding": {"off": 0, "low": 1, "high": 2}, "device_type": "blower"},
         {"name": "blower_office", "encoding": {"off": 0, "low": 1, "high": 2}, "device_type": "blower"},
         {"name": "blower_gym", "encoding": {"off": 0, "low": 1, "high": 2}, "device_type": "blower"},
         {"name": "mini_split_bedroom", "encoding": {"off": 0, "heat": 1, "cool": -1}, "device_type": "mini_split"},
         {"name": "mini_split_living_room", "encoding": {"off": 0, "heat": 1, "cool": -1}, "device_type": "mini_split"},
     ],
+    "state_gates": {
+        "navien_heating": {
+            "column": "navien_heating",
+            "encoding": {"Space Heating": 1.0, "Idle": 0.0, "Domestic Hot Water": 0.0, "DHW Recirculating": 0.0},
+        },
+    },
     "sensors": [{"name": s} for s in _SENSOR_COLS],
     "fitted_taus": [{"sensor": s, "tau_base": 45.0} for s in _SENSOR_COLS],
     "effector_sensor_gains": [
@@ -79,9 +84,6 @@ _THERMAL_PARAMS: dict = {
         {"effector": "thermostat_downstairs", "sensor": "kitchen_temp", "gain_f_per_hour": 0.4, "best_lag_minutes": 50, "t_statistic": 2.0, "negligible": False},
         {"effector": "thermostat_downstairs", "sensor": "office_temp", "gain_f_per_hour": 0.3, "best_lag_minutes": 55, "t_statistic": 1.5, "negligible": False},
         {"effector": "thermostat_downstairs", "sensor": "office_bookshelf_temp", "gain_f_per_hour": 0.3, "best_lag_minutes": 55, "t_statistic": 1.5, "negligible": False},
-        # Navien boiler
-        {"effector": "navien", "sensor": "thermostat_upstairs_temp", "gain_f_per_hour": 0.3, "best_lag_minutes": 30, "t_statistic": 1.5, "negligible": False},
-        {"effector": "navien", "sensor": "thermostat_downstairs_temp", "gain_f_per_hour": 0.4, "best_lag_minutes": 30, "t_statistic": 2.0, "negligible": False},
         # Mini splits → own room only (high t-stat, no cross-coupling)
         {"effector": "mini_split_bedroom", "sensor": "bedroom_temp", "gain_f_per_hour": 1.3, "best_lag_minutes": 10, "t_statistic": 4.5, "negligible": False},
         {"effector": "mini_split_bedroom", "sensor": "bedroom_aggregate_temp", "gain_f_per_hour": 1.3, "best_lag_minutes": 10, "t_statistic": 4.9, "negligible": False},

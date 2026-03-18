@@ -89,12 +89,20 @@ class HealthCheck:
 
 
 @dataclass(frozen=True)
-class BoilerConfig:
-    name: str  # "navien"
-    mode_entity: str
-    capacity_entity: str
-    mode_encoding: dict[str, float]
-    health: tuple[HealthCheck, ...] = ()
+class StateSensorConfig:
+    """A categorical sensor with an encoding (e.g., boiler heating mode)."""
+
+    column_name: str  # "navien_heating"
+    entity_id: str
+    encoding: dict[str, float]
+
+
+@dataclass(frozen=True)
+class PowerSensorConfig:
+    """A numeric power/energy sensor."""
+
+    column_name: str  # "navien_gas_usage"
+    entity_id: str
 
 
 @dataclass(frozen=True)
@@ -161,7 +169,9 @@ class WeatherstatConfig:
     thermostats: dict[str, ThermostatConfig]  # name -> config
     mini_splits: dict[str, MiniSplitYamlConfig]
     blowers: dict[str, BlowerYamlConfig]
-    boiler: BoilerConfig
+    state_sensors: dict[str, StateSensorConfig]
+    power_sensors: dict[str, PowerSensorConfig]
+    health_checks: list[HealthCheck]
     windows: dict[str, WindowConfig]
     weather_entity: str
     constraints: list[ConstraintSchedule]
@@ -219,12 +229,13 @@ class WeatherstatConfig:
 
     @property
     def sensor_entities(self) -> dict[str, str]:
-        """column_name -> entity_id for boiler sensors."""
-        name = self.boiler.name
-        return {
-            f"boiler_{name}_mode": self.boiler.mode_entity,
-            f"boiler_{name}_capacity": self.boiler.capacity_entity,
-        }
+        """column_name -> entity_id for state and power sensors."""
+        result: dict[str, str] = {}
+        for col, cfg in self.state_sensors.items():
+            result[col] = cfg.entity_id
+        for col, cfg in self.power_sensors.items():
+            result[col] = cfg.entity_id
+        return result
 
     @property
     def window_sensors(self) -> list[str]:
@@ -257,8 +268,10 @@ class WeatherstatConfig:
     def device_health_checks(self) -> dict[str, list[HealthCheck]]:
         """device_name -> health checks, for generic safety monitoring."""
         result: dict[str, list[HealthCheck]] = {}
-        if self.boiler.health:
-            result[self.boiler.name] = list(self.boiler.health)
+        for hc in self.health_checks:
+            # Group by entity prefix for display purposes
+            key = hc.entity_id.split(".")[-1].split("_")[0] if hc.entity_id else "unknown"
+            result.setdefault(key, []).append(hc)
         return result
 
     def window_columns_for_sensor(self, sensor_name: str) -> list[str]:
@@ -279,11 +292,6 @@ class WeatherstatConfig:
         """label -> comfort entries. Backward compat for control.py."""
         return {c.label: list(c.entries) for c in self.constraints}
 
-    @property
-    def safety_navien(self) -> None:
-        """Removed — use device_health_checks instead."""
-        return None
-
     # ── Snapshot schema ──────────────────────────────────────────────
 
     @property
@@ -300,7 +308,8 @@ class WeatherstatConfig:
             cols.add(f"mini_split_{name}_mode")
         for name in self.blowers:
             cols.add(f"blower_{name}_mode")
-        cols.add(f"boiler_{self.boiler.name}_mode")
+        for col in self.state_sensors:
+            cols.add(col)
         cols.add("weather_condition")
         cols.add("any_window_open")
         return cols
@@ -315,8 +324,10 @@ class WeatherstatConfig:
             cols.extend([f"mini_split_{name}_temp", f"mini_split_{name}_target", f"mini_split_{name}_mode"])
         for name in self.blowers:
             cols.append(f"blower_{name}_mode")
-        bname = self.boiler.name
-        cols.extend([f"boiler_{bname}_mode", f"boiler_{bname}_capacity"])
+        for col in self.state_sensors:
+            cols.append(col)
+        for col in self.power_sensors:
+            cols.append(col)
         cols.extend(["weather_condition", "wind_speed", "outdoor_humidity", "met_outdoor_temp"])
         for name in self.windows:
             cols.append(f"window_{name}_open")
@@ -329,7 +340,8 @@ class WeatherstatConfig:
         cols: list[str] = list(self.temp_sensors.keys())
         for col in self.humidity_sensors:
             cols.append(col)
-        cols.append(f"boiler_{self.boiler.name}_capacity")
+        for col in self.power_sensors:
+            cols.append(col)
         cols.extend(["outdoor_humidity", "outdoor_wind_speed", "met_outdoor_temp"])
         for name in self.thermostats:
             cols.append(f"thermostat_{name}_target")
@@ -404,9 +416,12 @@ class WeatherstatConfig:
         # Blowers
         for name in self.blowers:
             defs.append((f"blower_{name}_mode", "TEXT"))
-        # Boiler
-        bname = self.boiler.name
-        defs.extend([(f"boiler_{bname}_mode", "TEXT"), (f"boiler_{bname}_capacity", "REAL")])
+        # State sensors (categorical — stored as TEXT, encoded when used)
+        for col in self.state_sensors:
+            defs.append((col, "TEXT"))
+        # Power sensors (numeric)
+        for col in self.power_sensors:
+            defs.append((col, "REAL"))
         # Environment
         defs.extend([
             ("outdoor_temp", "REAL"),
@@ -504,10 +519,26 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             level_encoding={str(k): float(v) for k, v in dev["level_encoding"].items()},
         )
 
-    boiler_items = list(eff["boiler"].items())
-    boiler_name, boiler_data = boiler_items[0]
+    # ── State sensors (categorical with encoding) ─────────────────────
+    state_sensors: dict[str, StateSensorConfig] = {}
+    for col_name, sensor in data.get("sensors", {}).get("state", {}).items():
+        state_sensors[col_name] = StateSensorConfig(
+            column_name=col_name,
+            entity_id=sensor["entity_id"],
+            encoding={str(k): float(v) for k, v in sensor["encoding"].items()},
+        )
+
+    # ── Power sensors (numeric) ──────────────────────────────────────
+    power_sensors: dict[str, PowerSensorConfig] = {}
+    for col_name, sensor in data.get("sensors", {}).get("power", {}).items():
+        power_sensors[col_name] = PowerSensorConfig(
+            column_name=col_name,
+            entity_id=sensor["entity_id"],
+        )
+
+    # ── Health checks (standalone section) ────────────────────────────
     health_checks: list[HealthCheck] = []
-    for hc in boiler_data.get("health", []):
+    for _name, hc in data.get("health", {}).items():
         health_checks.append(HealthCheck(
             entity_id=hc["entity"],
             min_value=float(hc["min_value"]) if "min_value" in hc else None,
@@ -515,13 +546,32 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             severity=hc.get("severity", "warning"),
             message=hc.get("message", ""),
         ))
-    boiler = BoilerConfig(
-        name=boiler_name,
-        mode_entity=boiler_data["mode_entity"],
-        capacity_entity=boiler_data["capacity_entity"],
-        mode_encoding={str(k): float(v) for k, v in boiler_data["mode_encoding"].items()},
-        health=tuple(health_checks),
-    )
+
+    # ── Backward compat: synthesize state sensor from effectors.boiler ──
+    if not state_sensors and "boiler" in eff:
+        boiler_items = list(eff["boiler"].items())
+        boiler_name, boiler_data = boiler_items[0]
+        state_sensors[f"{boiler_name}_heating"] = StateSensorConfig(
+            column_name=f"{boiler_name}_heating",
+            entity_id=boiler_data["mode_entity"],
+            encoding={str(k): float(v) for k, v in boiler_data["mode_encoding"].items()},
+        )
+        # Migrate health checks from boiler config
+        for hc_data in boiler_data.get("health", []):
+            health_checks.append(HealthCheck(
+                entity_id=hc_data["entity"],
+                min_value=float(hc_data["min_value"]) if "min_value" in hc_data else None,
+                max_value=float(hc_data["max_value"]) if "max_value" in hc_data else None,
+                severity=hc_data.get("severity", "warning"),
+                message=hc_data.get("message", ""),
+            ))
+        # Rewrite thermostat state_device refs from old boiler name to new sensor name
+        for name, tcfg in thermostats.items():
+            if tcfg.state_device == boiler_name:
+                thermostats[name] = ThermostatConfig(
+                    name=name, entity_id=tcfg.entity_id, zone=tcfg.zone,
+                    state_device=f"{boiler_name}_heating",
+                )
 
     # ── Windows ──────────────────────────────────────────────────────
     windows: dict[str, WindowConfig] = {}
@@ -596,7 +646,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         thermostats=thermostats,
         mini_splits=mini_splits,
         blowers=blowers,
-        boiler=boiler,
+        state_sensors=state_sensors,
+        power_sensors=power_sensors,
+        health_checks=health_checks,
         windows=windows,
         weather_entity=data["weather"]["entity_id"],
         constraints=constraint_list,

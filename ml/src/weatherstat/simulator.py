@@ -61,6 +61,14 @@ class TauModel:
 
 
 @dataclass(frozen=True)
+class StateGateInfo:
+    """A state sensor gate for confirming effector delivery."""
+
+    column: str
+    encoding: dict[str, float]
+
+
+@dataclass(frozen=True)
 class SimParams:
     """Lookup structures for fast simulation from sysid output."""
 
@@ -69,6 +77,7 @@ class SimParams:
     solar: dict[tuple[str, int], float]  # (sensor, hour) -> gain_f/hr
     sensors: list[str]  # sensor names with params
     effectors: list[dict]  # raw effector dicts (name, encoding, device_type)
+    state_gates: dict[str, StateGateInfo] = field(default_factory=dict)  # gate_name -> info
 
 
 @dataclass(frozen=True)
@@ -145,12 +154,21 @@ def load_sim_params(path: Path | None = None) -> SimParams:
 
     sensors = [s["name"] for s in data["sensors"]]
 
+    # State gates (for confirming effector delivery from history)
+    state_gates: dict[str, StateGateInfo] = {}
+    for gate_name, gate_data in data.get("state_gates", {}).items():
+        state_gates[gate_name] = StateGateInfo(
+            column=gate_data["column"],
+            encoding={str(k): float(v) for k, v in gate_data["encoding"].items()},
+        )
+
     return SimParams(
         taus=taus,
         gains=gains,
         solar=solar,
         sensors=sensors,
         effectors=data["effectors"],
+        state_gates=state_gates,
     )
 
 
@@ -398,10 +416,6 @@ def _build_activity_matrices(
             zone = name.removeprefix("thermostat_")
             active = up_active if zone == "upstairs" else dn_active
             future = active.astype(np.float64) * encoding.get("heating", 1.0)
-
-        elif dtype == "boiler":
-            boiler_on = encoding.get("Space Heating", 1.0)
-            future = (up_active | dn_active).astype(np.float64) * boiler_on
 
         elif dtype == "blower":
             blower_name = name.removeprefix("blower_")
@@ -704,14 +718,17 @@ def extract_recent_history(df_raw: dict | object, params: SimParams) -> dict[str
 
     # Apply state confirmation — matches sysid preprocessing.
     # Intent-only signals (e.g., thermostat calling) are confirmed by a
-    # paired device (e.g., boiler responding) to reflect actual delivery.
+    # state sensor gate (e.g., boiler firing) to reflect actual delivery.
     for eff in params.effectors:
-        state_eff = eff.get("state_effector")
-        if state_eff:
-            state_hist = history.get(state_eff, [])
+        gate_name = eff.get("state_gate")
+        if gate_name and gate_name in params.state_gates:
+            gate_info = params.state_gates[gate_name]
+            gate_col = gate_info.column
+            gate_enc = gate_info.encoding
             eff_name = eff["name"]
             eff_hist = history.get(eff_name, [])
-            if state_hist and eff_hist:
-                history[eff_name] = [a * s for a, s in zip(eff_hist, state_hist, strict=True)]
+            if gate_col in tail.columns and eff_hist:
+                gate_vals = [gate_enc.get(str(v), 0.0) for v in tail[gate_col]]
+                history[eff_name] = [a * g for a, g in zip(eff_hist, gate_vals, strict=True)]
 
     return history

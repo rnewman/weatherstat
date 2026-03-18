@@ -297,9 +297,11 @@ def compute_comfort_cost_by_sensor(
                 sensor_cost += (pred_temp - comfort.preferred) ** 2 * comfort.hot_penalty * weight
 
             if pred_temp < comfort.min_temp:
-                sensor_cost += (comfort.min_temp - pred_temp) ** 2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
+                delta = comfort.min_temp - pred_temp
+                sensor_cost += delta**2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
             elif pred_temp > comfort.max_temp:
-                sensor_cost += (pred_temp - comfort.max_temp) ** 2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
+                delta = pred_temp - comfort.max_temp
+                sensor_cost += delta**2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
         costs[label] = sensor_cost
     return costs
 
@@ -434,13 +436,9 @@ def _mini_split_sweep_options(
     if preferred is None:
         return options
 
-    # Derive mode from room temp vs preferred
+    # Derive mode from room temp vs preferred (default heat — safer in winter)
     room_temp = (current_temps or {}).get(split_name)
-    if room_temp is not None:
-        mode = "cool" if room_temp > preferred else "heat"
-    else:
-        # No room temp available — default to heat (safer in winter)
-        mode = "heat"
+    mode = ("cool" if room_temp > preferred else "heat") if room_temp is not None else "heat"
 
     # Skip on-option if the split would be idle: room already past target
     # by more than the proportional band.  Receding horizon (15-min

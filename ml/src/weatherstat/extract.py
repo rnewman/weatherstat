@@ -416,8 +416,8 @@ def extract_history(days_back: int = 10) -> pd.DataFrame:
             result[col_name] = np.nan
             continue
 
-        if col_name.endswith("_mode"):
-            # String sensor (boiler mode) — keep as text
+        if col_name.endswith("_mode") or col_name in _CFG.state_sensors:
+            # String/state sensor — keep as text
             series = _history_to_series(records, value_fn=lambda s: s)
         else:
             series = _history_to_series(records)
@@ -602,7 +602,7 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
         if not records:
             result[col_name] = np.nan
             continue
-        if col_name.endswith("_mode"):
+        if col_name.endswith("_mode") or col_name in _CFG.state_sensors:
             series = _history_to_series(records, value_fn=lambda s: s)
         else:
             series = _history_to_series(records)

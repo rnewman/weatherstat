@@ -46,8 +46,8 @@ class EffectorSpec:
     - command_column + command_encoding: what we told it to do (for control scenarios)
 
     When command_column is None, state_column serves both roles.
-    When state_effector is set, effective activity = self × state_effector
-    (e.g., thermostat calling × boiler responding = actual heat delivery).
+    When state_gate is set, effective activity = self × encoded(state_gate_column)
+    (e.g., thermostat calling × boiler firing = actual heat delivery).
     """
 
     name: str
@@ -55,7 +55,7 @@ class EffectorSpec:
     encoding: dict[str, float]  # encoding for state_column
     max_lag_minutes: int
     device_type: str
-    state_effector: str | None = None  # another effector confirming delivery
+    state_gate: str | None = None  # state sensor column that gates this effector
     command_column: str | None = None  # column for command (what we told it)
     command_encoding: dict[str, float] | None = None  # encoding for command_column
 
@@ -108,6 +108,14 @@ class SolarGainProfile:
 
 
 @dataclass(frozen=True)
+class StateGate:
+    """A state sensor gate referenced by effectors for delivery confirmation."""
+
+    column: str
+    encoding: dict[str, float]
+
+
+@dataclass(frozen=True)
 class SysIdResult:
     timestamp: str
     data_start: str
@@ -118,22 +126,17 @@ class SysIdResult:
     fitted_taus: list[FittedTau]
     effector_sensor_gains: list[EffectorSensorGain]
     solar_gains: list[SolarGainProfile]
+    state_gates: dict[str, StateGate] = field(default_factory=dict)
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
 
 
-def _resolve_gate(device_name: str) -> str:
-    """Resolve a YAML device name to its sysid effector name."""
-    if device_name == _CFG.boiler.name:
+def _resolve_gate(device_name: str) -> str | None:
+    """Resolve a state_device name to the state sensor column, or None."""
+    if device_name in _CFG.state_sensors:
         return device_name
-    if device_name in _CFG.thermostats:
-        return f"thermostat_{device_name}"
-    if device_name in _CFG.mini_splits:
-        return f"mini_split_{device_name}"
-    if device_name in _CFG.blowers:
-        return f"blower_{device_name}"
-    return device_name  # assume already an effector name
+    return None
 
 
 def _enumerate_effectors() -> list[EffectorSpec]:
@@ -141,14 +144,14 @@ def _enumerate_effectors() -> list[EffectorSpec]:
     effectors: list[EffectorSpec] = []
 
     for name, therm_cfg in _CFG.thermostats.items():
-        state_eff = _resolve_gate(therm_cfg.state_device) if therm_cfg.state_device else None
+        state_gate = _resolve_gate(therm_cfg.state_device) if therm_cfg.state_device else None
         effectors.append(EffectorSpec(
             name=f"thermostat_{name}",
             state_column=f"thermostat_{name}_action",
             encoding={"heating": 1.0, "idle": 0.0, "off": 0.0},
             max_lag_minutes=90,
             device_type="thermostat",
-            state_effector=state_eff,
+            state_gate=state_gate,
         ))
 
     for name, cfg in _CFG.mini_splits.items():
@@ -180,14 +183,6 @@ def _enumerate_effectors() -> list[EffectorSpec]:
             max_lag_minutes=5,
             device_type="blower",
         ))
-
-    effectors.append(EffectorSpec(
-        name=_CFG.boiler.name,
-        state_column=f"boiler_{_CFG.boiler.name}_mode",
-        encoding={str(k): float(v) for k, v in _CFG.boiler.mode_encoding.items()},
-        max_lag_minutes=90,
-        device_type="boiler",
-    ))
 
     return effectors
 
@@ -435,15 +430,20 @@ def _preprocess(
         else:
             df[f"_eff_{eff.name}"] = 0.0
 
-    # Apply state confirmation: effective activity requires paired device to confirm.
+    # Encode state sensor columns (categorical → numeric via encoding).
+    for col, scfg in _CFG.state_sensors.items():
+        if col in df.columns:
+            df[f"_state_{col}"] = df[col].map(scfg.encoding).fillna(0.0).astype(float)
+
+    # Apply state confirmation: effective activity requires state sensor gate.
     # E.g., a thermostat "calling for heat" only delivers heat when the boiler
     # confirms it's responding. Without this, fault periods show intent-on
     # with no temperature rise, diluting fitted gains.
     for eff in effectors:
-        if eff.state_effector:
-            state_col = f"_eff_{eff.state_effector}"
-            if state_col in df.columns:
-                df[f"_eff_{eff.name}"] *= df[state_col]
+        if eff.state_gate:
+            gate_col = f"_state_{eff.state_gate}"
+            if gate_col in df.columns:
+                df[f"_eff_{eff.name}"] *= df[gate_col]
 
     # Compute dT/dt for each sensor (°F/hr, central differences)
     dt_hours = 5.0 / 60.0  # 5-minute intervals
@@ -463,7 +463,7 @@ def _preprocess(
     # Generate lagged effector features in coarse bins
     for eff in effectors:
         eff_col = f"_eff_{eff.name}"
-        if eff.device_type == "thermostat" or eff.device_type == "boiler":
+        if eff.device_type == "thermostat":
             # Floor heat: 0-15min, 15-30min, 30-60min, 60-90min
             bins = [(0, 3), (3, 6), (6, 12), (12, 18)]  # in 5-min steps
             bin_labels = ["0_15", "15_30", "30_60", "60_90"]
@@ -510,10 +510,9 @@ _T_STAT_THRESHOLD = 2.0
 _MIN_REGRESSION_ROWS = 500  # need substantial data for reliable regression
 _MIN_INTERACTION_ROWS = 100  # min co-open rows for window interaction terms
 
-
 def _get_lag_columns(eff: EffectorSpec) -> list[str]:
     """Get lag column names for an effector."""
-    if eff.device_type in ("thermostat", "boiler"):
+    if eff.device_type == "thermostat":
         return [f"_lag_{eff.name}_{b}" for b in ("0_15", "15_30", "30_60", "60_90")]
     elif eff.device_type == "mini_split":
         return [f"_lag_{eff.name}_{b}" for b in ("0_5", "5_15")]
@@ -844,6 +843,11 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
                 interaction_betas=int_b,
             )
 
+    # Build state_gates from config
+    state_gates: dict[str, StateGate] = {}
+    for col, scfg in _CFG.state_sensors.items():
+        state_gates[col] = StateGate(column=col, encoding=scfg.encoding)
+
     result = SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
         data_start=data_start,
@@ -854,6 +858,7 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
         fitted_taus=fitted_taus,
         effector_sensor_gains=all_gains,
         solar_gains=all_solar,
+        state_gates=state_gates,
     )
 
     # Save output

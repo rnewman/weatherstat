@@ -21,6 +21,8 @@ interface RawConfig {
   sensors: {
     temperature: Record<string, { entity_id: string; statistics?: boolean; role?: string }>;
     humidity: Record<string, { entity_id: string; statistics?: boolean }>;
+    state?: Record<string, { entity_id: string; encoding: Record<string, number> }>;
+    power?: Record<string, { entity_id: string }>;
   };
   effectors: {
     thermostats: Record<string, { entity_id: string; zone: string; state_device?: string }>;
@@ -37,7 +39,7 @@ interface RawConfig {
       string,
       { entity_id: string; zone: string; levels: string[]; level_encoding: Record<string, number> }
     >;
-    boiler: Record<
+    boiler?: Record<
       string,
       {
         mode_entity: string;
@@ -189,19 +191,23 @@ function loadYamlConfig() {
     });
   }
 
-  // 4. Boiler (2 cols each: mode, capacity)
-  for (const [name, boiler] of Object.entries(raw.effectors.boiler)) {
+  // 4. State sensors (categorical — stored as TEXT)
+  for (const [col, sensor] of Object.entries(raw.sensors.state ?? {})) {
     columnDefs.push({
-      snake: `boiler_${name}_mode`,
-      camel: snakeToCamel(`boiler_${name}_mode`),
+      snake: col,
+      camel: snakeToCamel(col),
       sqlType: "TEXT",
-      extract: entityState(boiler.mode_entity, "Idle"),
+      extract: entityState(sensor.entity_id, ""),
     });
+  }
+
+  // 4b. Power sensors (numeric)
+  for (const [col, sensor] of Object.entries(raw.sensors.power ?? {})) {
     columnDefs.push({
-      snake: `boiler_${name}_capacity`,
-      camel: snakeToCamel(`boiler_${name}_capacity`),
+      snake: col,
+      camel: snakeToCamel(col),
       sqlType: "REAL",
-      extract: sensorNum(boiler.capacity_entity, 0),
+      extract: sensorNum(sensor.entity_id, 0),
     });
   }
 
@@ -341,9 +347,10 @@ function loadYamlConfig() {
       ...Object.values(raw.effectors.thermostats).map((t) => t.entity_id),
       ...Object.values(raw.effectors.mini_splits).map((s) => s.entity_id),
       ...Object.values(raw.effectors.blowers).map((b) => b.entity_id),
-      ...Object.values(raw.effectors.boiler).flatMap((b) => [b.mode_entity, b.capacity_entity]),
       ...Object.values(raw.sensors.temperature).map((s) => s.entity_id),
       ...Object.values(raw.sensors.humidity).map((s) => s.entity_id),
+      ...Object.values(raw.sensors.state ?? {}).map((s) => s.entity_id),
+      ...Object.values(raw.sensors.power ?? {}).map((s) => s.entity_id),
       ...Object.values(raw.windows).map((w) => w.entity_id),
       raw.weather.entity_id,
     ]),
@@ -381,13 +388,6 @@ function loadYamlConfig() {
         { entityId: b.entity_id, zone: b.zone, levels: b.levels, levelEncoding: b.level_encoding },
       ]),
     ),
-    boiler: Object.fromEntries(
-      Object.entries(raw.effectors.boiler).map(([name, b]) => [
-        name,
-        { modeEntity: b.mode_entity, capacityEntity: b.capacity_entity },
-      ]),
-    ),
-
     // Sensor entity IDs
     outdoorTempEntity: raw.sensors.temperature["outdoor_temp"]?.entity_id ?? "",
     weatherEntity: raw.weather.entity_id,
