@@ -48,7 +48,7 @@ from weatherstat.types import (
     ThermostatTrajectory,
     TrajectoryScenario,
 )
-from weatherstat.yaml_config import load_config
+from weatherstat.yaml_config import ComfortProfile, load_config
 
 _CFG = load_config()
 
@@ -180,6 +180,68 @@ def adjust_schedules_for_windows(
                     e.comfort.preferred,  # preferred unchanged — window doesn't change ideal
                     e.comfort.min_temp + min_offset,
                     e.comfort.max_temp + max_offset,
+                    e.comfort.cold_penalty,
+                    e.comfort.hot_penalty,
+                ),
+            )
+            for e in schedule.entries
+        )
+        adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
+    return adjusted
+
+
+def fetch_active_comfort_profile() -> ComfortProfile | None:
+    """Fetch the active comfort profile from Home Assistant.
+
+    Reads the state of the configured comfort_entity (input_select) and
+    looks up the corresponding profile from config. Returns None if
+    unconfigured, unreachable, or the entity state doesn't match a profile.
+    """
+    if _CFG.comfort_entity is None:
+        return None
+
+    import requests
+
+    from weatherstat.config import HA_TOKEN, HA_URL
+
+    try:
+        resp = requests.get(
+            f"{HA_URL}/api/states/{_CFG.comfort_entity}",
+            headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        state = resp.json().get("state", "")
+        return _CFG.comfort_profiles.get(state)
+    except Exception:
+        return None
+
+
+def apply_comfort_profile(
+    schedules: list[ComfortSchedule],
+    profile: ComfortProfile | None,
+) -> list[ComfortSchedule]:
+    """Apply comfort profile offsets to all schedules.
+
+    If profile is None or has all-zero offsets, returns schedules unchanged.
+    """
+    if profile is None:
+        return schedules
+    if profile.preferred_offset == 0.0 and profile.min_offset == 0.0 and profile.max_offset == 0.0:
+        return schedules
+
+    adjusted: list[ComfortSchedule] = []
+    for schedule in schedules:
+        new_entries = tuple(
+            ComfortScheduleEntry(
+                e.start_hour,
+                e.end_hour,
+                RoomComfort(
+                    e.comfort.label,
+                    e.comfort.preferred + profile.preferred_offset,
+                    e.comfort.min_temp + profile.min_offset,
+                    e.comfort.max_temp + profile.max_offset,
                     e.comfort.cold_penalty,
                     e.comfort.hot_penalty,
                 ),
@@ -1021,8 +1083,21 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     _sf_note = "night, no solar gain" if _is_night else f"solar fraction: {_sf:.0%}"
     print(f"  Weather:     {_current_cond} ({_sf_note})")
 
-    # Comfort schedules + window adjustments
+    # Comfort schedules: base → profile offsets → window adjustments
     schedules = default_comfort_schedules()
+    active_profile = fetch_active_comfort_profile()
+    schedules = apply_comfort_profile(schedules, active_profile)
+    if active_profile is not None:
+        parts = [f"{active_profile.name} profile"]
+        offset_items = [
+            ("pref", active_profile.preferred_offset),
+            ("min", active_profile.min_offset),
+            ("max", active_profile.max_offset),
+        ]
+        offsets = [f"{lbl} {v:+.0f}" for lbl, v in offset_items if v]
+        if offsets:
+            parts.append(f"({', '.join(offsets)})")
+        print(f"  Comfort:     {' '.join(parts)}")
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     constraint_labels = {c.label for c in _CFG.constraints}
     schedules = adjust_schedules_for_windows(

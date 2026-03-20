@@ -84,6 +84,7 @@ class HealthCheck:
     entity_id: str
     min_value: float | None = None  # alert if reading <= this
     max_value: float | None = None  # alert if reading >= this
+    expected_state: str | None = None  # alert if state != this (for binary/enum entities)
     severity: str = "warning"
     message: str = ""
 
@@ -120,6 +121,20 @@ class ComfortEntry:
     max_temp: float  # hard rail — steep additional penalty above this
     cold_penalty: float = 2.0
     hot_penalty: float = 1.0
+
+
+@dataclass(frozen=True)
+class ComfortProfile:
+    """Offset-based comfort profile applied on top of base schedules.
+
+    When active, offsets are added to every schedule entry's preferred/min/max temps.
+    An empty profile (all zeros) means "use base schedules unchanged".
+    """
+
+    name: str
+    preferred_offset: float = 0.0
+    min_offset: float = 0.0
+    max_offset: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -179,6 +194,8 @@ class WeatherstatConfig:
     notification_target: str
     energy_costs: EnergyCostConfig
     default_tau: float = 45.0
+    comfort_entity: str | None = None  # HA input_select controlling active comfort profile
+    comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     window_open_offset: tuple[float, float] = (-3.0, 2.0)
@@ -543,6 +560,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             entity_id=hc["entity"],
             min_value=float(hc["min_value"]) if "min_value" in hc else None,
             max_value=float(hc["max_value"]) if "max_value" in hc else None,
+            expected_state=str(hc["expected_state"]) if "expected_state" in hc else None,
             severity=hc.get("severity", "warning"),
             message=hc.get("message", ""),
         ))
@@ -562,6 +580,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
                 entity_id=hc_data["entity"],
                 min_value=float(hc_data["min_value"]) if "min_value" in hc_data else None,
                 max_value=float(hc_data["max_value"]) if "max_value" in hc_data else None,
+                expected_state=str(hc_data["expected_state"]) if "expected_state" in hc_data else None,
                 severity=hc_data.get("severity", "warning"),
                 message=hc_data.get("message", ""),
             ))
@@ -582,6 +601,18 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     constraints_data = data.get("constraints", {})
     wo_offset = constraints_data.get("window_open_offset", {"min": -3, "max": 2})
     window_open_offset = (float(wo_offset["min"]), float(wo_offset["max"]))
+
+    # Comfort profiles (home/away mode)
+    comfort_entity: str | None = constraints_data.get("comfort_entity")
+    comfort_profiles: dict[str, ComfortProfile] = {}
+    for prof_name, prof_data in constraints_data.get("profiles", {}).items():
+        prof_data = prof_data or {}  # "Home: {}" parses as None in YAML
+        comfort_profiles[prof_name] = ComfortProfile(
+            name=prof_name,
+            preferred_offset=float(prof_data.get("preferred_offset", 0.0)),
+            min_offset=float(prof_data.get("min_offset", 0.0)),
+            max_offset=float(prof_data.get("max_offset", 0.0)),
+        )
 
     constraint_list: list[ConstraintSchedule] = []
     for sched in constraints_data.get("schedules", []):
@@ -656,6 +687,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         notification_target=data["notifications"]["target"],
         energy_costs=energy_costs,
         default_tau=default_tau,
+        comfort_entity=comfort_entity,
+        comfort_profiles=comfort_profiles,
         advisory=advisory_config,
         safety=safety_config,
         window_open_offset=window_open_offset,

@@ -78,33 +78,66 @@ class TestCheckThermostatModes:
 
 class TestCheckDeviceHealth:
 
-    def _mock_ha_response(self, state_val: str, status_code: int = 200) -> MagicMock:
+    @staticmethod
+    def _mock_ha_response(state_val: str, status_code: int = 200) -> MagicMock:
         resp = MagicMock()
         resp.status_code = status_code
         resp.json.return_value = {"state": state_val}
         return resp
 
+    @staticmethod
+    def _mock_by_entity(entity_states: dict[str, str]) -> callable:
+        """Return a side_effect function that returns different states per entity."""
+        def _get(url: str, **_kwargs: object) -> MagicMock:
+            entity_id = url.rsplit("/", 1)[-1]
+            state = entity_states.get(entity_id, "unknown")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"state": state}
+            return resp
+        return _get
+
     def test_no_alert_when_healthy(self) -> None:
-        """Sensor value above min_value threshold → no alert."""
-        with patch("weatherstat.safety.requests.get", return_value=self._mock_ha_response("120.0")):
+        """All checks pass → no alert."""
+        states = {
+            "binary_sensor.navien_navien_connection_status": "on",
+            "sensor.navien_navien_sh_return_temp": "120.0",
+        }
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 0
 
     def test_alert_when_below_min(self) -> None:
         """Sensor value at or below min_value → critical alert."""
-        with patch("weatherstat.safety.requests.get", return_value=self._mock_ha_response("32.0")):
+        states = {
+            "binary_sensor.navien_navien_connection_status": "on",
+            "sensor.navien_navien_sh_return_temp": "32.0",
+        }
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 1
         assert alerts[0].key == "navien_fault"
         assert alerts[0].severity == "critical"
 
+    def test_alert_when_connection_lost(self) -> None:
+        """Connection status off → critical alert."""
+        states = {
+            "binary_sensor.navien_navien_connection_status": "off",
+            "sensor.navien_navien_sh_return_temp": "120.0",
+        }
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
+            alerts = check_device_health()
+        assert len(alerts) == 1
+        assert alerts[0].severity == "critical"
+        assert "connection" in alerts[0].message.lower()
+
     def test_alert_when_unavailable(self) -> None:
         """Sensor state 'unavailable' → warning alert."""
         with patch("weatherstat.safety.requests.get", return_value=self._mock_ha_response("unavailable")):
             alerts = check_device_health()
-        assert len(alerts) == 1
-        assert alerts[0].key == "navien_unavailable"
-        assert alerts[0].severity == "warning"
+        # Both checks see 'unavailable'
+        assert len(alerts) == 2
+        assert all(a.severity == "warning" for a in alerts)
 
     def test_ha_failure_does_not_crash(self) -> None:
         """HTTP error → no alert, no crash."""

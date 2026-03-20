@@ -146,6 +146,18 @@ def _check_health_threshold(device_name: str, check: HealthCheck) -> SafetyAlert
             severity="warning",
         )
 
+    # String state check (for binary/enum entities like connection status)
+    if check.expected_state is not None:
+        if state_val != check.expected_state:
+            return SafetyAlert(
+                key=f"{device_name}_fault",
+                title=f"{device_name} health check failed",
+                message=check.message or f"{check.entity_id} is '{state_val}' (expected '{check.expected_state}')",
+                severity=check.severity,
+            )
+        return None
+
+    # Numeric threshold checks
     try:
         value = float(state_val)
     except (ValueError, TypeError):
