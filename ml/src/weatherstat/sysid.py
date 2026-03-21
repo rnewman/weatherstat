@@ -656,30 +656,28 @@ def _fit_sensor_model(
         ]
         return gains, [], {}, {}
 
-    # Check condition number for collinearity
+    # Always-on ridge regularization.
+    # OLS on observational HVAC data produces confounded gains: heating
+    # correlates with cold weather, inflating gain estimates. Ridge shrinks
+    # poorly-identified coefficients toward zero, improving t-statistics
+    # for genuine effects and reducing false large gains.
+    # λ = 0.01 × n is mild enough to preserve well-identified gains while
+    # penalizing coefficients that rely on few observations or collinear
+    # features. For high collinearity (cond > 1e6), λ is increased.
     cond = np.linalg.cond(X)
-    use_ridge = cond > 1e6
+    lam = 0.01 * len(y)
+    if cond > 1e6:
+        lam *= 10  # stronger regularization for ill-conditioned problems
 
-    if use_ridge:
-        lam = 0.01 * len(y)
-        XtX = X.T @ X + lam * np.eye(X.shape[1])
-        beta = np.linalg.solve(XtX, X.T @ y)
-        resid = y - X @ beta
-        s2 = np.sum(resid**2) / max(len(y) - X.shape[1], 1)
-        try:
-            cov = s2 * np.linalg.inv(XtX)
-            se = np.sqrt(np.abs(np.diag(cov)))
-        except np.linalg.LinAlgError:
-            se = np.full(len(beta), np.nan)
-    else:
-        beta, residuals_sum, rank, sv = np.linalg.lstsq(X, y, rcond=None)
-        resid = y - X @ beta
-        s2 = np.sum(resid**2) / max(len(y) - X.shape[1], 1)
-        try:
-            cov = s2 * np.linalg.inv(X.T @ X)
-            se = np.sqrt(np.abs(np.diag(cov)))
-        except np.linalg.LinAlgError:
-            se = np.full(len(beta), np.nan)
+    XtX = X.T @ X + lam * np.eye(X.shape[1])
+    beta = np.linalg.solve(XtX, X.T @ y)
+    resid = y - X @ beta
+    s2 = np.sum(resid**2) / max(len(y) - X.shape[1], 1)
+    try:
+        cov = s2 * np.linalg.inv(XtX)
+        se = np.sqrt(np.abs(np.diag(cov)))
+    except np.linalg.LinAlgError:
+        se = np.full(len(beta), np.nan)
 
     t_stats = np.where(se > 0, beta / se, 0.0)
 

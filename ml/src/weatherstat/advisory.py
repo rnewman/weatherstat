@@ -243,6 +243,7 @@ def evaluate_window_opportunities(
     """
     from weatherstat.control import (
         CONTROL_HORIZONS,
+        HORIZON_WEIGHTS,
         compute_comfort_cost,
         sweep_scenarios_physics,
     )
@@ -253,6 +254,13 @@ def evaluate_window_opportunities(
 
     cfg = load_config()
     threshold = ADVISORY_OPPORTUNITY_THRESHOLD
+
+    # Normalization factor: total horizon weight × number of schedules.
+    # Converts raw cost difference to per-room per-weighted-horizon average,
+    # so thresholds (0.3 = track, 1.5 = notify) are stable regardless of
+    # system size (number of rooms/horizons).
+    total_hw = sum(HORIZON_WEIGHTS.get(h, 0.5) for h in CONTROL_HORIZONS)
+    cost_norm = len(schedules) * total_hw if schedules else 1.0
 
     # Baseline comfort cost with current window states
     target_names, baseline_preds = predict(state, [winning_scenario], sim_params, CONTROL_HORIZONS)
@@ -280,9 +288,9 @@ def evaluate_window_opportunities(
         _, toggled_preds = predict(toggled_state, [winning_scenario], sim_params, CONTROL_HORIZONS)
         toggled_dict = {t: float(toggled_preds[0, j]) for j, t in enumerate(target_names)}
         quick_comfort = compute_comfort_cost(toggled_dict, schedules, base_hour)
-        quick_improvement = baseline_comfort - quick_comfort
+        quick_benefit = (baseline_comfort - quick_comfort) / cost_norm
 
-        if quick_improvement <= threshold:
+        if quick_benefit <= threshold:
             continue
 
         # Re-sweep: find best HVAC plan with toggled window
@@ -314,7 +322,7 @@ def evaluate_window_opportunities(
             solar_fractions=state.solar_fractions,
         )
 
-        comfort_improvement = winning_comfort_cost - resweep_decision.comfort_cost
+        comfort_improvement = (winning_comfort_cost - resweep_decision.comfort_cost) / cost_norm
         energy_saving = winning_energy_cost - resweep_decision.energy_cost
         total_benefit = comfort_improvement + energy_saving
 
@@ -327,9 +335,9 @@ def evaluate_window_opportunities(
         if not is_open:
             parts.append(f"({state.outdoor_temp:.0f}°F outside)")
         if comfort_improvement > 0.01:
-            parts.append(f"comfort +{comfort_improvement:.1f}")
+            parts.append(f"comfort +{comfort_improvement:.2f}")
         if energy_saving > 0.01:
-            parts.append(f"energy saving +{energy_saving:.2f}")
+            parts.append(f"energy saving +{energy_saving:.3f}")
         message = " — ".join(parts)
 
         opportunities.append(WindowOpportunity(
