@@ -48,7 +48,7 @@ from weatherstat.types import (
     ThermostatTrajectory,
     TrajectoryScenario,
 )
-from weatherstat.yaml_config import ComfortProfile, load_config
+from weatherstat.yaml_config import ComfortProfile, MrtCorrectionConfig, load_config
 
 _CFG = load_config()
 
@@ -250,6 +250,55 @@ def apply_comfort_profile(
         )
         adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
     return adjusted
+
+
+def apply_mrt_correction(
+    schedules: list[ComfortSchedule],
+    outdoor_temp: float,
+    mrt_config: MrtCorrectionConfig | None,
+) -> tuple[list[ComfortSchedule], float]:
+    """Adjust comfort targets for mean radiant temperature effects.
+
+    Cold exterior surfaces (walls, windows) lower operative temperature below
+    the air temperature reading. This shifts comfort targets up when it's cold
+    outside to compensate, and down when warm walls make the air feel warmer.
+
+    Args:
+        schedules: Comfort schedules for all constrained sensors.
+        outdoor_temp: Current outdoor temperature (°F).
+        mrt_config: Correction parameters, or None to skip.
+
+    Returns:
+        (adjusted_schedules, offset_applied). Offset is 0.0 if no correction.
+    """
+    if mrt_config is None:
+        return schedules, 0.0
+
+    raw_offset = mrt_config.alpha * (mrt_config.reference_temp - outdoor_temp)
+    offset = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_offset))
+
+    if abs(offset) < 0.05:
+        return schedules, 0.0
+
+    adjusted: list[ComfortSchedule] = []
+    for schedule in schedules:
+        new_entries = tuple(
+            ComfortScheduleEntry(
+                e.start_hour,
+                e.end_hour,
+                RoomComfort(
+                    e.comfort.label,
+                    e.comfort.preferred + offset,
+                    e.comfort.min_temp + offset,
+                    e.comfort.max_temp + offset,
+                    e.comfort.cold_penalty,
+                    e.comfort.hot_penalty,
+                ),
+            )
+            for e in schedule.entries
+        )
+        adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
+    return adjusted, offset
 
 
 def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
@@ -1083,7 +1132,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     _sf_note = "night, no solar gain" if _is_night else f"solar fraction: {_sf:.0%}"
     print(f"  Weather:     {_current_cond} ({_sf_note})")
 
-    # Comfort schedules: base → profile offsets → window adjustments
+    # Comfort schedules: base → profile offsets → MRT correction → window adjustments
     schedules = default_comfort_schedules()
     active_profile = fetch_active_comfort_profile()
     schedules = apply_comfort_profile(schedules, active_profile)
@@ -1098,6 +1147,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if offsets:
             parts.append(f"({', '.join(offsets)})")
         print(f"  Comfort:     {' '.join(parts)}")
+    # MRT correction: adjust targets for cold/warm wall surface effects
+    _out_valid = out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
+    _mrt_outdoor = float(out_temp) if _out_valid else 50.0
+    schedules, mrt_offset = apply_mrt_correction(schedules, _mrt_outdoor, _CFG.mrt_correction)
+    if abs(mrt_offset) >= 0.05:
+        print(f"  MRT:         {mrt_offset:+.1f}°F (outdoor {_mrt_outdoor:.0f}°F)")
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     constraint_labels = {c.label for c in _CFG.constraints}
     schedules = adjust_schedules_for_windows(

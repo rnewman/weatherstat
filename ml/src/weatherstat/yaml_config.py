@@ -138,6 +138,22 @@ class ComfortProfile:
 
 
 @dataclass(frozen=True)
+class MrtCorrectionConfig:
+    """Outdoor-temp-based correction for mean radiant temperature effects.
+
+    Cold exterior walls and windows lower the mean radiant temperature (MRT),
+    making a room feel colder than the air temperature reads. This correction
+    raises comfort targets when it's cold outside and lowers them when warm.
+
+    offset = clamp(alpha * (reference_temp - outdoor_temp), -max_offset, +max_offset)
+    """
+
+    alpha: float  # °F comfort shift per °F outdoor deviation from reference
+    reference_temp: float  # outdoor temp at which current comfort targets feel right (°F)
+    max_offset: float  # cap on correction magnitude (°F)
+
+
+@dataclass(frozen=True)
 class ConstraintSchedule:
     """Comfort constraint on a sensor's value over time."""
 
@@ -196,6 +212,7 @@ class WeatherstatConfig:
     default_tau: float = 45.0
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
+    mrt_correction: MrtCorrectionConfig | None = None
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     window_open_offset: tuple[float, float] = (-3.0, 2.0)
@@ -614,6 +631,14 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             max_offset=float(prof_data.get("max_offset", 0.0)),
         )
 
+    # MRT correction (operative temperature adjustment for wall surface effects)
+    mrt_data = constraints_data.get("mrt_correction")
+    mrt_correction: MrtCorrectionConfig | None = MrtCorrectionConfig(
+        alpha=float(mrt_data["alpha"]),
+        reference_temp=float(mrt_data["reference_temp"]),
+        max_offset=float(mrt_data.get("max_offset", 3.0)),
+    ) if mrt_data else None
+
     constraint_list: list[ConstraintSchedule] = []
     for sched in constraints_data.get("schedules", []):
         sensor = sched["sensor"]
@@ -689,6 +714,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         default_tau=default_tau,
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
+        mrt_correction=mrt_correction,
         advisory=advisory_config,
         safety=safety_config,
         window_open_offset=window_open_offset,

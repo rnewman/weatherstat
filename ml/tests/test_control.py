@@ -18,6 +18,7 @@ from weatherstat.control import (
     _in_quiet_hours,
     _mini_split_sweep_options,
     adjust_schedules_for_windows,
+    apply_mrt_correction,
     compute_comfort_cost,
     compute_energy_cost,
     generate_trajectory_scenarios,
@@ -275,6 +276,79 @@ class TestAdjustSchedulesForWindows:
 
         for orig, adj in zip(schedules, adjusted, strict=True):
             assert orig is adj
+
+
+# ── MRT correction tests ──────────────────────────────────────────────────
+
+
+class TestMrtCorrection:
+    """Test mean radiant temperature correction for comfort targets."""
+
+    @staticmethod
+    def _cfg(alpha: float = 0.1, reference_temp: float = 50.0, max_offset: float = 3.0):
+        from weatherstat.yaml_config import MrtCorrectionConfig
+
+        return MrtCorrectionConfig(alpha=alpha, reference_temp=reference_temp, max_offset=max_offset)
+
+    def test_cold_day_raises_targets(self) -> None:
+        """35°F outside, ref=50, alpha=0.1 → +1.5°F offset."""
+        schedules = [ComfortSchedule(
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
+        )]
+        adjusted, offset = apply_mrt_correction(schedules, 35.0, self._cfg())
+        assert abs(offset - 1.5) < 0.01
+        entry = adjusted[0].entries[0]
+        assert abs(entry.comfort.preferred - 73.5) < 0.01
+        assert abs(entry.comfort.min_temp - 71.5) < 0.01
+        assert abs(entry.comfort.max_temp - 75.5) < 0.01
+
+    def test_warm_day_lowers_targets(self) -> None:
+        """80°F outside, ref=50, alpha=0.1 → clamped to -3.0°F."""
+        schedules = [ComfortSchedule(
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
+        )]
+        adjusted, offset = apply_mrt_correction(schedules, 80.0, self._cfg())
+        assert abs(offset - (-3.0)) < 0.01  # clamped
+        entry = adjusted[0].entries[0]
+        assert abs(entry.comfort.preferred - 69.0) < 0.01
+
+    def test_at_reference_no_change(self) -> None:
+        """Outdoor = reference → no correction."""
+        schedules = make_schedules()
+        adjusted, offset = apply_mrt_correction(schedules, 50.0, self._cfg())
+        assert offset == 0.0
+        assert adjusted is schedules  # exact same object
+
+    def test_clamped_at_max(self) -> None:
+        """0°F outside → raw offset 5.0, clamped to 3.0."""
+        schedules = [ComfortSchedule(
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
+        )]
+        adjusted, offset = apply_mrt_correction(schedules, 0.0, self._cfg())
+        assert abs(offset - 3.0) < 0.01
+        entry = adjusted[0].entries[0]
+        assert abs(entry.comfort.preferred - 75.0) < 0.01
+
+    def test_none_config_no_change(self) -> None:
+        """mrt_config=None → schedules returned unchanged."""
+        schedules = make_schedules()
+        adjusted, offset = apply_mrt_correction(schedules, 35.0, None)
+        assert offset == 0.0
+        assert adjusted is schedules
+
+    def test_penalties_preserved(self) -> None:
+        """MRT correction shifts temps but preserves penalty weights."""
+        schedules = [ComfortSchedule(
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0, 3.0, 0.5)),),
+        )]
+        adjusted, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
+        entry = adjusted[0].entries[0]
+        assert entry.comfort.cold_penalty == 3.0
+        assert entry.comfort.hot_penalty == 0.5
 
 
 # ── Quiet hours tests ─────────────────────────────────────────────────────
