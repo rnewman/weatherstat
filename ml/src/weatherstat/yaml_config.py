@@ -160,6 +160,7 @@ class ConstraintSchedule:
     sensor: str  # sensor column name (e.g., "bedroom_temp")
     label: str  # derived display label (e.g., "bedroom")
     entries: tuple[ComfortEntry, ...] = ()
+    mrt_weight: float = 1.0  # multiplier on global MRT offset for this sensor
 
 
 @dataclass(frozen=True)
@@ -177,9 +178,11 @@ class EnergyCostConfig:
 
 @dataclass(frozen=True)
 class AdvisoryConfig:
-    effort_cost: float
+    effort_cost: float  # deprecated, kept for backward compat
     cooldowns: dict[str, int]
     quiet_hours: tuple[int, int] = (22, 7)
+    opportunity_threshold: float = 0.3  # minimum benefit to track
+    notification_threshold: float = 1.5  # minimum benefit to push notification
 
 
 @dataclass(frozen=True)
@@ -661,6 +664,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             ))
         constraint_list.append(ConstraintSchedule(
             sensor=sensor, label=label, entries=tuple(entries),
+            mrt_weight=float(sched.get("mrt_weight", 1.0)),
         ))
 
     # ── Zones ────────────────────────────────────────────────────────
@@ -683,6 +687,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         effort_cost=float(adv_data.get("effort_cost", 0.5)),
         cooldowns={str(k): int(v) for k, v in adv_data.get("cooldowns", {}).items()},
         quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
+        opportunity_threshold=float(adv_data.get("opportunity_threshold", 0.3)),
+        notification_threshold=float(adv_data.get("notification_threshold", 1.5)),
     )
 
     # ── Safety config (just cooldowns — device health is on effectors) ─

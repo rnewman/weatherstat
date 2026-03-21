@@ -256,6 +256,7 @@ def apply_mrt_correction(
     schedules: list[ComfortSchedule],
     outdoor_temp: float,
     mrt_config: MrtCorrectionConfig | None,
+    mrt_weights: dict[str, float] | None = None,
 ) -> tuple[list[ComfortSchedule], float]:
     """Adjust comfort targets for mean radiant temperature effects.
 
@@ -263,13 +264,18 @@ def apply_mrt_correction(
     the air temperature reading. This shifts comfort targets up when it's cold
     outside to compensate, and down when warm walls make the air feel warmer.
 
+    Per-sensor weights modulate the global offset: a weight of 0.5 halves the
+    correction (e.g., sun-facing room where solar gain warms surfaces), while
+    a weight of 2.0 doubles it (e.g., north-facing room with cold walls).
+
     Args:
         schedules: Comfort schedules for all constrained sensors.
         outdoor_temp: Current outdoor temperature (°F).
         mrt_config: Correction parameters, or None to skip.
+        mrt_weights: Per-sensor label → weight multiplier (default 1.0).
 
     Returns:
-        (adjusted_schedules, offset_applied). Offset is 0.0 if no correction.
+        (adjusted_schedules, base_offset). Base offset before per-sensor weighting.
     """
     if mrt_config is None:
         return schedules, 0.0
@@ -282,15 +288,17 @@ def apply_mrt_correction(
 
     adjusted: list[ComfortSchedule] = []
     for schedule in schedules:
+        weight = (mrt_weights or {}).get(schedule.label, 1.0)
+        sensor_offset = offset * weight
         new_entries = tuple(
             ComfortScheduleEntry(
                 e.start_hour,
                 e.end_hour,
                 RoomComfort(
                     e.comfort.label,
-                    e.comfort.preferred + offset,
-                    e.comfort.min_temp + offset,
-                    e.comfort.max_temp + offset,
+                    e.comfort.preferred + sensor_offset,
+                    e.comfort.min_temp + sensor_offset,
+                    e.comfort.max_temp + sensor_offset,
                     e.comfort.cold_penalty,
                     e.comfort.hot_penalty,
                 ),
@@ -976,7 +984,10 @@ def check_prediction_sanity(
 # ── Command JSON output ───────────────────────────────────────────────────
 
 
-def write_command_json(decision: ControlDecision) -> Path:
+def write_command_json(
+    decision: ControlDecision,
+    opportunities: list | None = None,
+) -> Path:
     """Write executor-compatible command JSON.
 
     Uses camelCase keys matching the TS Prediction interface.
@@ -999,6 +1010,18 @@ def write_command_json(decision: ControlDecision) -> Path:
         cfg = next(s for s in MINI_SPLITS if s.name == sd.name)
         command[cfg.command_mode_key] = sd.mode
         command[cfg.command_target_key] = sd.target
+
+    # Active window opportunities (informational)
+    if opportunities:
+        command["opportunities"] = [
+            {
+                "window": o.window,
+                "action": o.action,
+                "benefit": o.total_benefit,
+                "message": o.message,
+            }
+            for o in opportunities
+        ]
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -1147,12 +1170,30 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if offsets:
             parts.append(f"({', '.join(offsets)})")
         print(f"  Comfort:     {' '.join(parts)}")
+    # Load physics parameters (needed for derived MRT weights and sweep)
+    from weatherstat.simulator import extract_recent_history, load_sim_params
+
+    sim_params = load_sim_params()
+
     # MRT correction: adjust targets for cold/warm wall surface effects
+    # Merge configured weights (from YAML) with derived weights (from sysid solar profiles).
+    # Configured weight takes priority if explicitly set (!= 1.0).
     _out_valid = out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
     _mrt_outdoor = float(out_temp) if _out_valid else 50.0
-    schedules, mrt_offset = apply_mrt_correction(schedules, _mrt_outdoor, _CFG.mrt_correction)
+    _sensor_to_label = {c.sensor: c.label for c in _CFG.constraints}
+    _derived_by_label = {_sensor_to_label[s]: w for s, w in sim_params.mrt_weights.items() if s in _sensor_to_label}
+    _mrt_weights = {
+        c.label: (c.mrt_weight if c.mrt_weight != 1.0 else _derived_by_label.get(c.label, 1.0))
+        for c in _CFG.constraints
+    }
+    schedules, mrt_offset = apply_mrt_correction(schedules, _mrt_outdoor, _CFG.mrt_correction, _mrt_weights)
     if abs(mrt_offset) >= 0.05:
-        print(f"  MRT:         {mrt_offset:+.1f}°F (outdoor {_mrt_outdoor:.0f}°F)")
+        _varying = {lbl: w for lbl, w in _mrt_weights.items() if w != 1.0}
+        if _varying:
+            _wparts = ", ".join(f"{lbl}={w:.1f}" for lbl, w in _varying.items())
+            print(f"  MRT:         {mrt_offset:+.1f}°F base (outdoor {_mrt_outdoor:.0f}°F), weights: {_wparts}")
+        else:
+            print(f"  MRT:         {mrt_offset:+.1f}°F (outdoor {_mrt_outdoor:.0f}°F)")
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     constraint_labels = {c.label for c in _CFG.constraints}
     schedules = adjust_schedules_for_windows(
@@ -1164,11 +1205,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     labels_with_open = {wn for wn, ws in window_states_dict.items() if ws and wn in constraint_labels}
     if labels_with_open:
         print(f"  Comfort adjusted for open windows: {', '.join(sorted(labels_with_open))}")
-
-    # Physics-based sweep using forward simulator
-    from weatherstat.simulator import extract_recent_history, load_sim_params
-
-    sim_params = load_sim_params()
     recent_hist = extract_recent_history(df_raw, sim_params)
 
     # Build forecast temp list and solar fractions for simulator
@@ -1461,11 +1497,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if has_any:
             print(row)
 
-    # ── Window advisories (physics-based) ──
-    from weatherstat.advisory import evaluate_window_advisories, process_advisories
+    # ── Window opportunities (persistent, energy-aware) ──
+    from weatherstat.advisory import evaluate_window_opportunities, process_opportunities
 
     original_schedules = default_comfort_schedules()
-    adv_state = _HS(
+    opp_state = _HS(
         current_temps=current_temps,
         outdoor_temp=outdoor,
         forecast_temps=forecast_temp_list,
@@ -1474,11 +1510,19 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
     )
-    window_advisories = evaluate_window_advisories(
-        adv_state, winning_scenario, sim_params, original_schedules, base_hour,
+    window_opportunities = evaluate_window_opportunities(
+        opp_state,
+        winning_scenario,
+        winning_comfort_cost=decision.comfort_cost,
+        winning_energy_cost=decision.energy_cost,
+        sim_params=sim_params,
+        schedules=original_schedules,
+        base_hour=base_hour,
+        prev_state=prev_state,
+        current_temps=current_temps,
     )
-    process_advisories(
-        window_advisories,
+    active_opps, dismissed_windows = process_opportunities(
+        window_opportunities,
         live=live,
         notification_target=_CFG.notification_target,
         current_hour=base_hour,
@@ -1498,7 +1542,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     sane = check_prediction_sanity(decision, current_temps)
 
     # Write command JSON
-    cmd_path = write_command_json(decision)
+    cmd_path = write_command_json(decision, opportunities=active_opps)
     print(f"\n  Command JSON: {cmd_path}")
 
     # Log decision for outcome tracking

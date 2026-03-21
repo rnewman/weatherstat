@@ -78,6 +78,7 @@ class SimParams:
     sensors: list[str]  # sensor names with params
     effectors: list[dict]  # raw effector dicts (name, encoding, device_type)
     state_gates: dict[str, StateGateInfo] = field(default_factory=dict)  # gate_name -> info
+    mrt_weights: dict[str, float] = field(default_factory=dict)  # sensor -> derived MRT weight
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,9 @@ def load_sim_params(path: Path | None = None) -> SimParams:
             encoding={str(k): float(v) for k, v in gate_data["encoding"].items()},
         )
 
+    # MRT weights (derived from solar gain profiles by sysid)
+    mrt_weights = {str(k): float(v) for k, v in data.get("mrt_weights", {}).items()}
+
     return SimParams(
         taus=taus,
         gains=gains,
@@ -169,6 +173,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         sensors=sensors,
         effectors=data["effectors"],
         state_gates=state_gates,
+        mrt_weights=mrt_weights,
     )
 
 

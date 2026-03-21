@@ -92,10 +92,20 @@ _THERMAL_PARAMS: dict = {
         {"effector": "mini_split_living_room", "sensor": "piano_temp", "gain_f_per_hour": 1.2, "best_lag_minutes": 5, "t_statistic": 1.6, "negligible": False},
     ],
     "solar_gains": [
-        {"sensor": s, "hour_of_day": h, "gain_f_per_hour": 0.1}
+        {"sensor": s, "hour_of_day": h, "gain_f_per_hour": 0.1, "std_error": 0.05, "t_statistic": 2.0}
         for s in _SENSOR_COLS
         for h in range(8, 18)
+        if s != "bathroom_temp"  # bathroom: no solar gain (north-facing)
+    ] + [
+        # Piano gets high solar gains (south-facing)
+        {"sensor": "piano_temp", "hour_of_day": h, "gain_f_per_hour": 0.5, "std_error": 0.1, "t_statistic": 5.0}
+        for h in range(9, 16)
+    ] + [
+        # Bathroom: zero solar gains
+        {"sensor": "bathroom_temp", "hour_of_day": h, "gain_f_per_hour": 0.0, "std_error": 0.1, "t_statistic": 0.0}
+        for h in range(8, 18)
     ],
+    "mrt_weights": {},  # populated by sysid; left empty in sandbox for backward compat testing
 }
 
 (_TEST_DATA_DIR / "thermal_params.json").write_text(json.dumps(_THERMAL_PARAMS, indent=2))

@@ -131,6 +131,20 @@ class ComfortSchedule:
 
 
 @dataclass(frozen=True)
+class WindowOpportunity:
+    """A persistent opportunity to improve comfort/energy by toggling a window."""
+
+    window: str  # window name
+    action: str  # "open" or "close"
+    comfort_improvement: float  # comfort cost reduction
+    energy_saving: float  # energy cost reduction from HVAC changes
+    total_benefit: float  # comfort_improvement + energy_saving
+    message: str  # human-readable description
+    first_seen: str = ""  # ISO timestamp when first detected
+    notified: bool = False  # whether push notification was sent
+
+
+@dataclass(frozen=True)
 class BlowerDecision:
     """Control decision for a single blower fan."""
 

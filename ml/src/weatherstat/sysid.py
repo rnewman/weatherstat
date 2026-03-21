@@ -127,6 +127,7 @@ class SysIdResult:
     effector_sensor_gains: list[EffectorSensorGain]
     solar_gains: list[SolarGainProfile]
     state_gates: dict[str, StateGate] = field(default_factory=dict)
+    mrt_weights: dict[str, float] = field(default_factory=dict)
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
@@ -763,6 +764,50 @@ def _fit_sensor_model(
     return gains, solar_profiles, window_betas, interaction_betas
 
 
+# ── Derived MRT weights ──────────────────────────────────────────────────
+
+
+def _compute_mrt_weights(
+    solar_gains: list[SolarGainProfile],
+    constrained_sensors: list[str],
+) -> dict[str, float]:
+    """Derive per-sensor MRT weights from solar gain profiles.
+
+    Sensors with high total daily solar gain get weight < 1 (less MRT correction
+    needed because sun warms surfaces). Sensors with zero solar gain get weight > 1
+    (cold surfaces dominate, more MRT correction needed).
+
+    Weight is centered around 1.0: sensor at mean solar → 1.0.
+    Clamped to [0.3, 2.0].
+    """
+    # Sum significant solar gains per sensor (hours 7-17)
+    totals: dict[str, float] = {}
+    for sg in solar_gains:
+        if sg.sensor not in constrained_sensors:
+            continue
+        if abs(sg.t_statistic) < _T_STAT_THRESHOLD:
+            continue
+        if sg.gain_f_per_hour > 0:  # only positive (warming) solar gains
+            totals[sg.sensor] = totals.get(sg.sensor, 0.0) + sg.gain_f_per_hour
+
+    # Mean across sensors with nonzero gain
+    nonzero = [v for v in totals.values() if v > 0]
+    if not nonzero:
+        return {}  # no solar data → no derived weights
+
+    mean_solar = sum(nonzero) / len(nonzero)
+
+    weights: dict[str, float] = {}
+    for sensor in constrained_sensors:
+        total = totals.get(sensor, 0.0)
+        ratio = total / mean_solar if mean_solar > 0 else 0.0
+        # Invert: high solar → low weight, zero solar → high weight
+        raw_weight = 2.0 - ratio
+        weights[sensor] = max(0.3, min(2.0, raw_weight))
+
+    return weights
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────
 
 
@@ -848,6 +893,10 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
     for col, scfg in _CFG.state_sensors.items():
         state_gates[col] = StateGate(column=col, encoding=scfg.encoding)
 
+    # Derive per-sensor MRT weights from solar gain profiles
+    constrained_sensors = [c.sensor for c in _CFG.constraints]
+    mrt_weights = _compute_mrt_weights(all_solar, constrained_sensors)
+
     result = SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
         data_start=data_start,
@@ -859,6 +908,7 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
         effector_sensor_gains=all_gains,
         solar_gains=all_solar,
         state_gates=state_gates,
+        mrt_weights=mrt_weights,
     )
 
     # Save output
@@ -967,6 +1017,14 @@ def print_report(result: SysIdResult) -> None:
                 f"    {p.hour_of_day:2d}:00  {p.gain_f_per_hour:+.3f} ±{p.std_error:.3f}"
                 f"  t={p.t_statistic:5.1f} {marker} {bar}"
             )
+
+    # MRT weights (derived from solar profiles)
+    if result.mrt_weights:
+        print("\n── Derived MRT Weights (per-sensor, from solar gain) ──")
+        for sensor_name, weight in sorted(result.mrt_weights.items()):
+            label = sensor_name.removeprefix("thermostat_").removesuffix("_temp")
+            bar = "◀" if weight < 1.0 else ("▶" if weight > 1.0 else "=")
+            print(f"  {label:<25s}  {weight:.2f}  {bar}")
 
     # Effector activity summary
     print("\n── Effector Activity Summary ──")

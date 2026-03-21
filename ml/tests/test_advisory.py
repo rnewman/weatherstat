@@ -6,6 +6,7 @@ dispatch (cooldowns, quiet hours).
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -272,3 +273,166 @@ class TestProcessAdvisories:
         advs = [self._make_advisory("bedroom"), self._make_advisory("kitchen")]
         result = process_advisories(advs, live=False, current_hour=12)
         assert len(result) == 2
+
+
+# ── Opportunity state tests ──────────────────────────────────────────────
+
+
+class TestOpportunityState:
+    """Test persistent opportunity state management."""
+
+    def test_load_empty(self, tmp_path, monkeypatch) -> None:
+        """Empty state file → empty active and cooldowns."""
+        from weatherstat.advisory import OpportunityState
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        state = OpportunityState.load()
+        assert state.active == {}
+        assert state.cooldowns == {}
+
+    def test_load_new_format(self, tmp_path, monkeypatch) -> None:
+        """New format with active + cooldowns loads correctly."""
+        from weatherstat.advisory import OpportunityState
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "active": {"bedroom": {"action": "open", "total_benefit": 2.0}},
+            "cooldowns": {"opportunity_bedroom": 1000.0},
+        }))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        state = OpportunityState.load()
+        assert "bedroom" in state.active
+        assert state.cooldowns["opportunity_bedroom"] == 1000.0
+
+    def test_load_old_format_backward_compat(self, tmp_path, monkeypatch) -> None:
+        """Old flat dict format treated as cooldowns-only."""
+        from weatherstat.advisory import OpportunityState
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"free_cooling_bedroom": 1234.0}))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        state = OpportunityState.load()
+        assert state.active == {}
+        assert state.cooldowns["free_cooling_bedroom"] == 1234.0
+
+    def test_save_and_reload(self, tmp_path, monkeypatch) -> None:
+        """Round-trip save and load."""
+        from weatherstat.advisory import OpportunityState
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        state = OpportunityState(
+            active={"piano": {"action": "open", "total_benefit": 1.5}},
+            cooldowns={"opportunity_piano": 5000.0},
+        )
+        state.save()
+        loaded = OpportunityState.load()
+        assert loaded.active == state.active
+        assert loaded.cooldowns == state.cooldowns
+
+
+# ── Opportunity lifecycle tests ──────────────────────────────────────────
+
+
+class TestProcessOpportunities:
+    """Test opportunity lifecycle: new, persist, expire."""
+
+    @staticmethod
+    def _make_opp(window: str, benefit: float = 2.0):
+        from weatherstat.types import WindowOpportunity
+
+        return WindowOpportunity(
+            window=window,
+            action="open",
+            comfort_improvement=benefit * 0.7,
+            energy_saving=benefit * 0.3,
+            total_benefit=benefit,
+            message=f"Open {window} — test",
+        )
+
+    def test_new_opportunity_tracked(self, tmp_path, monkeypatch, capsys) -> None:
+        """New opportunity is added to active set."""
+        from weatherstat.advisory import process_opportunities
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        opp = self._make_opp("bedroom", 1.0)
+        active, dismissed = process_opportunities([opp], live=False, current_hour=12)
+        assert len(active) == 1
+        assert active[0].window == "bedroom"
+        assert len(dismissed) == 0
+        assert "new" in capsys.readouterr().out.lower()
+
+    def test_opportunity_persists_across_cycles(self, tmp_path, monkeypatch) -> None:
+        """Opportunity stays active across multiple cycles."""
+        from weatherstat.advisory import process_opportunities
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        opp = self._make_opp("bedroom", 1.0)
+
+        # Cycle 1: new
+        active1, _ = process_opportunities([opp], live=True, current_hour=12)
+        assert len(active1) == 1
+
+        # Cycle 2: still valid
+        active2, _ = process_opportunities([opp], live=True, current_hour=12)
+        assert len(active2) == 1
+        assert active2[0].first_seen == active1[0].first_seen  # preserved
+
+    def test_expired_opportunity_dismissed(self, tmp_path, monkeypatch, capsys) -> None:
+        """Opportunity removed when no longer in candidates."""
+        from weatherstat.advisory import process_opportunities
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        opp = self._make_opp("bedroom", 1.0)
+
+        # Cycle 1: active
+        process_opportunities([opp], live=True, current_hour=12)
+
+        # Cycle 2: no longer a candidate → dismissed
+        active, dismissed = process_opportunities([], live=True, current_hour=12)
+        assert len(active) == 0
+        assert "bedroom" in dismissed
+
+    def test_below_notification_threshold_not_notified(self, tmp_path, monkeypatch) -> None:
+        """Opportunity below notification threshold is tracked but not notified."""
+        from weatherstat.advisory import process_opportunities
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        # benefit=0.5, notification_threshold=1.5 → tracked, not notified
+        opp = self._make_opp("bedroom", 0.5)
+        active, _ = process_opportunities([opp], live=False, current_hour=12)
+        assert len(active) == 1
+        assert not active[0].notified
+
+    def test_above_notification_threshold_notified(self, tmp_path, monkeypatch) -> None:
+        """Opportunity above notification threshold is marked as notified."""
+        from weatherstat.advisory import process_opportunities
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        # benefit=2.0 > notification_threshold=1.5 → notified
+        opp = self._make_opp("bedroom", 2.0)
+        active, _ = process_opportunities([opp], live=False, current_hour=12)
+        assert len(active) == 1
+        assert active[0].notified
+
+    def test_quiet_hours_suppress_notification_not_tracking(self, tmp_path, monkeypatch) -> None:
+        """During quiet hours: tracked but not notified, even above threshold."""
+        from weatherstat.advisory import process_opportunities
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        opp = self._make_opp("bedroom", 5.0)
+        active, _ = process_opportunities([opp], live=False, current_hour=23)
+        assert len(active) == 1
+        assert not active[0].notified  # quiet hours suppress notification
+
+    def test_empty_opportunities(self, tmp_path, monkeypatch, capsys) -> None:
+        """No opportunities → empty result."""
+        from weatherstat.advisory import process_opportunities
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        active, dismissed = process_opportunities([], live=False, current_hour=12)
+        assert active == []
+        assert dismissed == []
+        assert "No opportunities" in capsys.readouterr().out

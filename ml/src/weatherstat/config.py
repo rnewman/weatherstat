@@ -124,6 +124,8 @@ ENERGY_COST_BLOWER: dict[str, float] = _CFG.energy_costs.blower
 ADVISORY_EFFORT_COST: float = _CFG.advisory.effort_cost
 ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
 ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
+ADVISORY_OPPORTUNITY_THRESHOLD: float = _CFG.advisory.opportunity_threshold
+ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
 
 
 # LightGBM training parameters — conservative for small datasets

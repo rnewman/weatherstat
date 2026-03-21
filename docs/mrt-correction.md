@@ -99,10 +99,18 @@ Even if the forecast says it'll warm from 35°F to 55°F in 6 hours, the
 walls won't catch up for much longer. The current outdoor temp is more
 representative of current wall state than any forecast.
 
-**Why global, not per-room?** Different rooms have different window
-ratios, orientations, and insulation. Per-room alpha would be more
-accurate but adds complexity without clear calibration data. A single
-alpha is a good starting point.
+**Why not per-room?** Actually, it is per-room now. Each sensor gets a
+`mrt_weight` multiplier that scales the global offset. Two sources:
+
+1. **Manual** (`mrt_weight` in YAML constraint schedule): explicit
+   override for rooms where you know the solar exposure. Default 1.0.
+2. **Derived** (from sysid solar gain profiles): sensors with high
+   daytime solar gains get lower weight (sun warms surfaces, reducing
+   MRT correction need), sensors with zero solar gains get higher
+   weight. Stored in `thermal_params.json` as `mrt_weights`.
+
+Priority: manual weight wins if set != 1.0, otherwise derived weight
+is used. If neither is set, weight defaults to 1.0.
 
 **Why shift all targets uniformly?** The min/max bounds are comfort
 limits, not safety limits. If 71°F feels like 69.5°F on a cold day,

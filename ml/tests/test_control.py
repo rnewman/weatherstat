@@ -350,6 +350,151 @@ class TestMrtCorrection:
         assert entry.comfort.cold_penalty == 3.0
         assert entry.comfort.hot_penalty == 0.5
 
+    def test_mrt_weight_scales_offset(self) -> None:
+        """Per-sensor weight=0.5 produces half the offset."""
+        schedules = [ComfortSchedule(
+            label="piano",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 70.0, 74.0)),),
+        )]
+        # Base offset: 0.1 * (50 - 35) = 1.5°F; weighted: 1.5 * 0.5 = 0.75°F
+        adjusted, base_offset = apply_mrt_correction(
+            schedules, 35.0, self._cfg(), mrt_weights={"piano": 0.5},
+        )
+        assert abs(base_offset - 1.5) < 0.01
+        entry = adjusted[0].entries[0]
+        assert abs(entry.comfort.preferred - 72.75) < 0.01
+        assert abs(entry.comfort.min_temp - 70.75) < 0.01
+
+    def test_mrt_weight_zero_no_adjustment(self) -> None:
+        """Per-sensor weight=0.0 suppresses MRT correction for that sensor."""
+        schedules = [ComfortSchedule(
+            label="piano",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 70.0, 74.0)),),
+        )]
+        adjusted, base_offset = apply_mrt_correction(
+            schedules, 35.0, self._cfg(), mrt_weights={"piano": 0.0},
+        )
+        assert abs(base_offset - 1.5) < 0.01
+        entry = adjusted[0].entries[0]
+        assert abs(entry.comfort.preferred - 72.0) < 0.01  # unchanged
+
+    def test_mrt_different_weights_per_sensor(self) -> None:
+        """Two sensors with different weights get different offsets."""
+        schedules = [
+            ComfortSchedule(
+                label="piano",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 70.0, 74.0)),),
+            ),
+            ComfortSchedule(
+                label="bathroom",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bathroom", 72.0, 70.0, 74.0)),),
+            ),
+        ]
+        # Base offset: 1.5°F; piano×0.5=0.75, bathroom×1.5=2.25
+        adjusted, _ = apply_mrt_correction(
+            schedules, 35.0, self._cfg(), mrt_weights={"piano": 0.5, "bathroom": 1.5},
+        )
+        piano_pref = adjusted[0].entries[0].comfort.preferred
+        bath_pref = adjusted[1].entries[0].comfort.preferred
+        assert abs(piano_pref - 72.75) < 0.01
+        assert abs(bath_pref - 74.25) < 0.01
+
+    def test_mrt_weight_default_backward_compat(self) -> None:
+        """No weights dict (None) produces same behavior as uniform weight=1.0."""
+        schedules = [ComfortSchedule(
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
+        )]
+        adj_none, off_none = apply_mrt_correction(schedules, 35.0, self._cfg())
+        adj_ones, off_ones = apply_mrt_correction(
+            schedules, 35.0, self._cfg(), mrt_weights={"bedroom": 1.0},
+        )
+        assert off_none == off_ones
+        assert adj_none[0].entries[0].comfort.preferred == adj_ones[0].entries[0].comfort.preferred
+
+
+# ── Derived MRT weight tests ─────────────────────────────────────────────
+
+
+class TestComputeMrtWeights:
+    """Test MRT weight derivation from solar gain profiles."""
+
+    @staticmethod
+    def _make_solar(sensor: str, total_gain: float, n_hours: int = 10, t_stat: float = 3.0):
+        from weatherstat.sysid import SolarGainProfile
+
+        gain_per_hour = total_gain / n_hours if n_hours > 0 else 0.0
+        return [
+            SolarGainProfile(
+                sensor=sensor,
+                hour_of_day=7 + i,
+                gain_f_per_hour=gain_per_hour,
+                std_error=0.05,
+                t_statistic=t_stat,
+            )
+            for i in range(n_hours)
+        ]
+
+    def test_high_solar_low_weight(self) -> None:
+        """Sensor with 2x mean solar gain gets low weight."""
+        from weatherstat.sysid import _compute_mrt_weights
+
+        gains = self._make_solar("piano_temp", 5.0) + self._make_solar("bedroom_temp", 1.0)
+        # mean of nonzero = (5+1)/2 = 3.0; piano ratio=5/3=1.67; weight=2-1.67=0.33
+        weights = _compute_mrt_weights(gains, ["piano_temp", "bedroom_temp"])
+        assert weights["piano_temp"] < 1.0
+        assert weights["piano_temp"] >= 0.3
+
+    def test_zero_solar_high_weight(self) -> None:
+        """Sensor with zero solar gain gets weight 2.0."""
+        from weatherstat.sysid import _compute_mrt_weights
+
+        gains = (
+            self._make_solar("piano_temp", 3.0)
+            + self._make_solar("bathroom_temp", 0.0, t_stat=0.5)  # below t-stat threshold
+        )
+        weights = _compute_mrt_weights(gains, ["piano_temp", "bathroom_temp"])
+        assert weights["bathroom_temp"] == 2.0
+        assert weights["piano_temp"] == 1.0  # only nonzero sensor → ratio=1 → weight=1
+
+    def test_average_sensor_gets_one(self) -> None:
+        """Sensor at mean solar gain gets weight 1.0."""
+        from weatherstat.sysid import _compute_mrt_weights
+
+        # All three sensors with same solar gain → mean equals each → ratio=1 → weight=1
+        gains = (
+            self._make_solar("a_temp", 2.0)
+            + self._make_solar("b_temp", 2.0)
+            + self._make_solar("c_temp", 2.0)
+        )
+        weights = _compute_mrt_weights(gains, ["a_temp", "b_temp", "c_temp"])
+        assert abs(weights["a_temp"] - 1.0) < 0.01
+
+    def test_weight_clamped_low(self) -> None:
+        """Very high solar gain clamped to 0.3 minimum."""
+        from weatherstat.sysid import _compute_mrt_weights
+
+        gains = self._make_solar("piano_temp", 10.0) + self._make_solar("bedroom_temp", 0.5)
+        weights = _compute_mrt_weights(gains, ["piano_temp", "bedroom_temp"])
+        assert weights["piano_temp"] >= 0.3
+
+    def test_no_solar_data_returns_empty(self) -> None:
+        """No significant solar gains → empty dict (no derived weights)."""
+        from weatherstat.sysid import _compute_mrt_weights
+
+        gains = self._make_solar("piano_temp", 0.0, t_stat=0.5)
+        weights = _compute_mrt_weights(gains, ["piano_temp"])
+        assert weights == {}
+
+    def test_unconstrained_sensor_ignored(self) -> None:
+        """Sensors not in constrained list are excluded."""
+        from weatherstat.sysid import _compute_mrt_weights
+
+        gains = self._make_solar("outdoor_temp", 5.0) + self._make_solar("piano_temp", 2.0)
+        weights = _compute_mrt_weights(gains, ["piano_temp"])
+        assert "outdoor_temp" not in weights
+        assert "piano_temp" in weights
+
 
 # ── Quiet hours tests ─────────────────────────────────────────────────────
 
