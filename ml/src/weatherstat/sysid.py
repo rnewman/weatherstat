@@ -656,26 +656,41 @@ def _fit_sensor_model(
         ]
         return gains, [], {}, {}
 
-    # Always-on ridge regularization.
+    # Selectively standardized ridge regularization.
     # OLS on observational HVAC data produces confounded gains: heating
     # correlates with cold weather, inflating gain estimates. Ridge shrinks
     # poorly-identified coefficients toward zero, improving t-statistics
     # for genuine effects and reducing false large gains.
-    # λ = 0.01 × n is mild enough to preserve well-identified gains while
-    # penalizing coefficients that rely on few observations or collinear
-    # features. For high collinearity (cond > 1e6), λ is increased.
-    cond = np.linalg.cond(X)
+    #
+    # Solar and window features are selectively standardized: divided by
+    # their std so the penalty falls proportionally. Without this, solar
+    # indicators (active ~1/24 of the time, low variance) are over-penalized,
+    # suppressing legitimate solar gain estimates. Effector and weather
+    # features are left in raw scale to maintain full regularization against
+    # confounded gains (they have high variance from frequent HVAC cycling).
+    scale = np.ones(X.shape[1])
+    for j, name in enumerate(feature_names):
+        if name.startswith("_solar_") or name.startswith("_win_") or name.startswith("_winx_"):
+            s = np.std(X[:, j])
+            if s > 0:
+                scale[j] = s
+    X_s = X / scale
+
+    cond = np.linalg.cond(X_s)
     lam = 0.01 * len(y)
     if cond > 1e6:
         lam *= 10  # stronger regularization for ill-conditioned problems
 
-    XtX = X.T @ X + lam * np.eye(X.shape[1])
-    beta = np.linalg.solve(XtX, X.T @ y)
+    XsXs = X_s.T @ X_s + lam * np.eye(X_s.shape[1])
+    beta_s = np.linalg.solve(XsXs, X_s.T @ y)
+
+    # Transform back to original feature scale
+    beta = beta_s / scale
     resid = y - X @ beta
     s2 = np.sum(resid**2) / max(len(y) - X.shape[1], 1)
     try:
-        cov = s2 * np.linalg.inv(XtX)
-        se = np.sqrt(np.abs(np.diag(cov)))
+        cov_s = s2 * np.linalg.inv(XsXs)
+        se = np.sqrt(np.abs(np.diag(cov_s))) / scale
     except np.linalg.LinAlgError:
         se = np.full(len(beta), np.nan)
 

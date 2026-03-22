@@ -81,42 +81,44 @@ a window on a cold night.
 ### What changed
 
 Sysid gain regression switched from OLS (with ridge fallback for
-high condition numbers) to always-on ridge with λ = 0.01 × n_rows.
+high condition numbers) to selectively standardized ridge (λ = 0.01 × n).
 
-### Observed effects
+Three approaches were evaluated; selective standardization won:
 
-**Positive:**
-- Confounded thermostat_downstairs gains shrunk 6-217× across sensors
-  (these were all spurious — caused by heating↔cold-weather correlation)
-- office_bookshelf thermostat_downstairs: -10.978 → -1.293 (8.5× shrink)
-- bedroom_temp → mini_split_bedroom t-stat improved 1.22 → 1.52
-  (now passes simulator's |t| ≥ 1.5 filter — was previously filtered out!)
-- bedroom_aggregate → mini_split_bedroom: t improved 5.69 → 7.54
-- bedroom_aggregate → blower_family_room: t improved 1.65 → 1.80
+| Metric             | OLS   | Naive ridge | Full std | **Selective** |
+|--------------------|-------|-------------|----------|---------------|
+| Gains passing filter | 6   | 6           | 3        | **3**         |
+| bedroom→mini_split | –     | t=1.52      | –        | **t=1.51**    |
+| bedroom_agg→m.s.   | t=5.69| t=7.54      | t=5.73   | **t=7.05**    |
+| piano→mini_split_lr| t=1.85| t=1.94      | t=1.79   | **t=1.83**    |
+| Significant solar  | 0     | 0           | 9        | **9**         |
+| MRT weights        | empty | empty       | populated| **populated** |
+| Confounded gains   | wild  | shrunk      | exploded | **shrunk**    |
 
-**Negative / trade-off:**
-- Solar gain estimates also shrunk (~5-8× for piano). No solar gains
-  are now statistically significant. This means MRT weights are all
-  empty (no differentiation between sun-facing and north-facing rooms).
-- Root cause: binary solar indicators have low variance (~1/24 active),
-  so their coefficients need to be large to fit the data. Ridge penalizes
-  large coefficients regardless of feature scale.
+**Selective standardization**: only solar (`_solar_*`) and window
+(`_win_*`, `_winx_*`) features are divided by their std before
+regression. Effector and weather features stay in raw scale. This
+protects sparse low-variance features (solar indicators) from
+over-penalization while maintaining full regularization on confounded
+effector gains. Coefficients are transformed back to original units
+after the solve.
 
-### Potential improvement: standardized ridge
+### Known issue: living_room_climate solar spikes
 
-Scale each feature column to mean=0, std=1 before regression, then
-un-standardize coefficients afterward. This would penalize all features
-equally regardless of their natural scale, preserving solar gains while
-still shrinking confounded effector gains.
+`living_room_climate_temp` shows ±17°F/hr solar gains (h=8, h=10).
+Root cause: only 3 tau segments, tau_base=500h cap. The solar
+coefficients are fitting noise in sparse data. Solar gains are NOT
+filtered by the simulator's magnitude cap (only effector gains are).
+Guard rail: add a solar gain magnitude cap in the simulator, or
+filter at sysid time for sensors with < N tau segments.
 
 ### Tuning notes
 
-- Current λ = 0.01 × n_rows. For n ≈ 10000, λ = 100.
-- Reducing to 0.001 × n would preserve more signal but less shrinkage.
-- Per-feature-group λ (different for effectors vs solar vs windows)
-  is more principled but more complex.
-- Cross-validation for λ selection is the textbook approach but adds
-  compute time to sysid.
+- λ = 0.01 × n_rows. For n ≈ 10000, λ = 100.
+- High collinearity (cond > 1e6) uses 10× λ.
+- Standardization applies only to solar/window features.
+- Pre-ridge backups saved as `.pre-ridge`, `.naive-ridge`, `.std-ridge`
+  in `~/.weatherstat/` for A/B comparison.
 
 ---
 
