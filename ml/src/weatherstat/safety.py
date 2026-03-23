@@ -20,8 +20,6 @@ if TYPE_CHECKING:
     from weatherstat.yaml_config import HealthCheck
 
 from weatherstat.advisory import (
-    Advisory,
-    AdvisoryType,
     load_advisory_state,
     save_advisory_state,
     send_ha_notification,
@@ -221,14 +219,8 @@ def process_safety_alerts(
         dispatched.append(alert)
 
         if live:
-            # Send as Advisory for notification compatibility
-            adv = Advisory(
-                advisory_type=AdvisoryType.CLOSE_WINDOWS,  # carrier type
-                title=f"⚠ {alert.title}",
-                message=alert.message,
-                window=f"safety_{alert.key}",
-            )
-            if send_ha_notification(adv, target=notification_target):
+            tag = f"weatherstat_safety_{alert.key}"
+            if send_ha_notification(f"⚠ {alert.title}", alert.message, tag, notification_target):
                 state[cooldown_key] = time.time()
                 print(f"    → Sent to HA ({notification_target})")
 
