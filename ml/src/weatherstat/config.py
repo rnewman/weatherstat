@@ -66,6 +66,7 @@ class EffectorConfig:
     mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
     mode_encoding: dict[str, float] = field(default_factory=dict)  # for energy cost / sysid
     temp_col: str = ""  # sensor column for current temp (climate entities)
+    energy_cost: float | dict[str, float] = 0.0  # per-effector energy cost (scalar or per-mode dict)
 
 
 def _snake_to_camel(s: str) -> str:
@@ -74,57 +75,42 @@ def _snake_to_camel(s: str) -> str:
     return parts[0] + "".join(p.capitalize() for p in parts[1:])
 
 
-# Build unified EFFECTORS from YAML
+# Build unified EFFECTORS from YAML — single loop over flat effector dict
 _effectors: list[EffectorConfig] = []
 
-for name, cfg in _CFG.thermostats.items():
-    _effectors.append(EffectorConfig(
-        name=f"thermostat_{name}",
-        entity_id=cfg.entity_id,
-        control_type="trajectory",
-        mode_control="manual",
-        supported_modes=("heat",),
-        command_keys={"target": _snake_to_camel(f"thermostat_{name}_target")},
-        state_device=cfg.state_device,
-        temp_col=f"thermostat_{name}_temp",
-    ))
+for name, cfg in _CFG.effectors.items():
+    # Derive command keys from domain and mode_control
+    if cfg.domain == "climate":
+        if cfg.mode_control == "manual":
+            command_keys = {"target": _snake_to_camel(f"{name}_target")}
+        else:
+            command_keys = {
+                "mode": _snake_to_camel(f"{name}_mode"),
+                "target": _snake_to_camel(f"{name}_target"),
+            }
+        temp_col = f"{name}_temp"
+    else:
+        command_keys = {"mode": _snake_to_camel(f"{name}_mode")}
+        temp_col = ""
 
-for name, cfg in _CFG.mini_splits.items():
     _effectors.append(EffectorConfig(
-        name=f"mini_split_{name}",
+        name=name,
         entity_id=cfg.entity_id,
         control_type=cfg.control_type,
-        mode_control="automatic",
-        supported_modes=cfg.sweep_modes,
-        command_keys={
-            "mode": _snake_to_camel(f"mini_split_{name}_mode"),
-            "target": _snake_to_camel(f"mini_split_{name}_target"),
-        },
+        mode_control=cfg.mode_control,
+        supported_modes=cfg.supported_modes,
+        command_keys=command_keys,
+        depends_on=cfg.depends_on,
+        state_device=cfg.state_device,
         proportional_band=cfg.proportional_band,
         mode_hold_window=cfg.mode_hold_window,
-        mode_encoding=cfg.command_encoding,
-        temp_col=f"mini_split_{name}_temp",
-    ))
-
-for name, cfg in _CFG.blowers.items():
-    _effectors.append(EffectorConfig(
-        name=f"blower_{name}",
-        entity_id=cfg.entity_id,
-        control_type="binary",
-        mode_control="automatic",
-        supported_modes=cfg.levels,
-        command_keys={"mode": _snake_to_camel(f"blower_{name}_mode")},
-        depends_on=f"thermostat_{cfg.zone}",
-        mode_encoding=cfg.level_encoding,
+        mode_encoding=cfg.command_encoding or cfg.state_encoding,
+        temp_col=temp_col,
+        energy_cost=cfg.energy_cost,
     ))
 
 EFFECTORS: tuple[EffectorConfig, ...] = tuple(_effectors)
 EFFECTOR_MAP: dict[str, EffectorConfig] = {e.name: e for e in EFFECTORS}
-
-# Energy cost per device-state (from YAML, tiebreaker when comfort is equal)
-ENERGY_COST_GAS_ZONE = _CFG.energy_costs.gas_zone
-ENERGY_COST_MINI_SPLIT = _CFG.energy_costs.mini_split
-ENERGY_COST_BLOWER: dict[str, float] = _CFG.energy_costs.blower
 
 # Advisory configuration (from YAML)
 ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns

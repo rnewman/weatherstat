@@ -80,7 +80,9 @@
       "Bash(python:*)",
       "Bash(uv run:*)",
       "Read(//Users/rnewman/.claude/**)",
-      "Read(//Users/rnewman/**)"
+      "Read(//Users/rnewman/**)",
+      "Bash(wc:*)",
+      "Bash(cut -d'\\(' -f1)"
     ]
   }
 }

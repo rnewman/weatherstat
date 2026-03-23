@@ -141,49 +141,66 @@ def _resolve_gate(device_name: str) -> str | None:
 
 
 def _enumerate_effectors() -> list[EffectorSpec]:
-    """Build effector list from YAML config."""
+    """Build effector list from YAML config.
+
+    Single loop over the flat effectors dict. All sysid-relevant properties
+    (encoding, max_lag_minutes, state_gate) come from YAML config.
+
+    Column naming convention (determined by HA entity domain):
+    - climate + mode_control=manual: state from {name}_action (hvac_action attribute)
+    - climate + mode_control=automatic: state from {name}_action if state_encoding,
+      else {name}_mode; command from {name}_mode
+    - fan: state from {name}_mode (preset_mode attribute)
+
+    device_type for simulator compatibility:
+    - trajectory → "thermostat", regulating → "mini_split", binary → "blower"
+    """
+    device_type_map = {"trajectory": "thermostat", "regulating": "mini_split", "binary": "blower"}
     effectors: list[EffectorSpec] = []
 
-    for name, therm_cfg in _CFG.thermostats.items():
-        state_gate = _resolve_gate(therm_cfg.state_device) if therm_cfg.state_device else None
-        effectors.append(EffectorSpec(
-            name=f"thermostat_{name}",
-            state_column=f"thermostat_{name}_action",
-            encoding={"heating": 1.0, "idle": 0.0, "off": 0.0},
-            max_lag_minutes=90,
-            device_type="thermostat",
-            state_gate=state_gate,
-        ))
+    for name, cfg in _CFG.effectors.items():
+        dtype = device_type_map.get(cfg.control_type, cfg.control_type)
 
-    for name, cfg in _CFG.mini_splits.items():
-        if cfg.state_encoding:
-            # Prefer measured state (hvac_action) over command (hvac_mode)
+        if cfg.domain == "climate" and cfg.mode_control == "manual":
+            # Manual-mode climate (thermostat): state = hvac_action attribute
             effectors.append(EffectorSpec(
-                name=f"mini_split_{name}",
-                state_column=f"mini_split_{name}_action",
+                name=name,
+                state_column=f"{name}_action",
                 encoding=cfg.state_encoding,
-                max_lag_minutes=15,
-                device_type="mini_split",
-                command_column=f"mini_split_{name}_mode",
-                command_encoding=cfg.command_encoding,
+                max_lag_minutes=cfg.max_lag_minutes,
+                device_type=dtype,
+                state_gate=_resolve_gate(cfg.state_device) if cfg.state_device else None,
             ))
+        elif cfg.domain == "climate":
+            # Automatic-mode climate (mini-split): separate command/state
+            if cfg.command_encoding and cfg.state_encoding != cfg.command_encoding:
+                effectors.append(EffectorSpec(
+                    name=name,
+                    state_column=f"{name}_action",
+                    encoding=cfg.state_encoding,
+                    max_lag_minutes=cfg.max_lag_minutes,
+                    device_type=dtype,
+                    command_column=f"{name}_mode",
+                    command_encoding=cfg.command_encoding,
+                ))
+            else:
+                enc = cfg.command_encoding or cfg.state_encoding
+                effectors.append(EffectorSpec(
+                    name=name,
+                    state_column=f"{name}_mode",
+                    encoding=enc,
+                    max_lag_minutes=cfg.max_lag_minutes,
+                    device_type=dtype,
+                ))
         else:
+            # Fan entity (blower): state from preset_mode
             effectors.append(EffectorSpec(
-                name=f"mini_split_{name}",
-                state_column=f"mini_split_{name}_mode",
-                encoding={str(k): float(v) for k, v in cfg.command_encoding.items()},
-                max_lag_minutes=15,
-                device_type="mini_split",
+                name=name,
+                state_column=f"{name}_mode",
+                encoding=cfg.state_encoding,
+                max_lag_minutes=cfg.max_lag_minutes,
+                device_type=dtype,
             ))
-
-    for name, cfg in _CFG.blowers.items():
-        effectors.append(EffectorSpec(
-            name=f"blower_{name}",
-            state_column=f"blower_{name}_mode",
-            encoding={str(k): float(v) for k, v in cfg.level_encoding.items()},
-            max_lag_minutes=5,
-            device_type="blower",
-        ))
 
     return effectors
 
@@ -461,23 +478,10 @@ def _preprocess(
         dT[-1] = (temps[-1] - temps[-2]) / dt_hours if len(temps) > 1 else 0.0
         df[f"_dTdt_{sensor.name}"] = dT
 
-    # Generate lagged effector features in coarse bins
+    # Generate lagged effector features in coarse bins derived from max_lag_minutes
     for eff in effectors:
         eff_col = f"_eff_{eff.name}"
-        if eff.device_type == "thermostat":
-            # Floor heat: 0-15min, 15-30min, 30-60min, 60-90min
-            bins = [(0, 3), (3, 6), (6, 12), (12, 18)]  # in 5-min steps
-            bin_labels = ["0_15", "15_30", "30_60", "60_90"]
-        elif eff.device_type == "mini_split":
-            # Mini splits: 0-5min, 5-15min
-            bins = [(0, 1), (1, 3)]
-            bin_labels = ["0_5", "5_15"]
-        else:
-            # Blowers: 0-5min (immediate)
-            bins = [(0, 1)]
-            bin_labels = ["0_5"]
-
-        for (start, end), label in zip(bins, bin_labels, strict=True):
+        for (start, end), label in _lag_bins(eff.max_lag_minutes):
             # Mean activity in the lag bin [start, end) steps back
             lagged_sum = pd.Series(0.0, index=df.index)
             count = 0
@@ -511,23 +515,40 @@ _T_STAT_THRESHOLD = 2.0
 _MIN_REGRESSION_ROWS = 500  # need substantial data for reliable regression
 _MIN_INTERACTION_ROWS = 100  # min co-open rows for window interaction terms
 
-def _get_lag_columns(eff: EffectorSpec) -> list[str]:
-    """Get lag column names for an effector."""
-    if eff.device_type == "thermostat":
-        return [f"_lag_{eff.name}_{b}" for b in ("0_15", "15_30", "30_60", "60_90")]
-    elif eff.device_type == "mini_split":
-        return [f"_lag_{eff.name}_{b}" for b in ("0_5", "5_15")]
+def _lag_bins(max_lag_minutes: int) -> list[tuple[tuple[int, int], str]]:
+    """Derive lag bins from max_lag_minutes.
+
+    Returns (start_step, end_step) pairs with labels, at 5-min resolution.
+    Reproduces current behavior:
+      max_lag=5  → [(0,1)] "0_5"
+      max_lag=15 → [(0,1),(1,3)] "0_5", "5_15"
+      max_lag=90 → [(0,3),(3,6),(6,12),(12,18)] "0_15", "15_30", "30_60", "60_90"
+    """
+    steps = max(1, max_lag_minutes // 5)
+    if steps <= 1:
+        bins = [(0, 1)]
+    elif steps <= 3:
+        bins = [(0, 1), (1, steps)]
+    elif steps <= 6:
+        bins = [(0, 3), (3, steps)]
     else:
-        return [f"_lag_{eff.name}_0_5"]
+        # Logarithmic-ish bins for long-lag effectors
+        bins = [(0, 3), (3, 6), (6, 12), (12, steps)]
+    return [((s, e), f"{s * 5}_{e * 5}") for s, e in bins]
+
+
+def _get_lag_columns(eff: EffectorSpec) -> list[str]:
+    """Get lag column names for an effector, derived from max_lag_minutes."""
+    return [f"_lag_{eff.name}_{label}" for _, label in _lag_bins(eff.max_lag_minutes)]
 
 
 def _lag_label_to_minutes(label: str) -> float:
-    """Convert lag bin label to midpoint in minutes."""
-    mapping = {
-        "0_15": 7.5, "15_30": 22.5, "30_60": 45.0, "60_90": 75.0,
-        "0_5": 2.5, "5_15": 10.0,
-    }
-    return mapping.get(label, 0.0)
+    """Convert lag bin label (e.g. '0_15') to midpoint in minutes."""
+    parts = label.split("_")
+    if len(parts) == 2:
+        start, end = int(parts[0]), int(parts[1])
+        return (start + end) / 2.0
+    return 0.0
 
 
 def _fit_sensor_model(

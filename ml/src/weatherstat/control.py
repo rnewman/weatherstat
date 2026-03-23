@@ -31,9 +31,6 @@ from weatherstat.config import (
     CONTROL_STATE_FILE,
     EFFECTOR_MAP,
     EFFECTORS,
-    ENERGY_COST_BLOWER,
-    ENERGY_COST_GAS_ZONE,
-    ENERGY_COST_MINI_SPLIT,
     PREDICTION_LABELS,
     PREDICTIONS_DIR,
 )
@@ -434,11 +431,12 @@ def compute_energy_cost(
     scenario: Scenario,
     current_temps: dict[str, float] | None = None,
 ) -> float:
-    """Tiered energy penalty: gas zones > mini-splits > blower fans.
+    """Per-effector energy penalty from config.
 
     Used as tiebreaker when comfort cost is equal — prefer less energy usage.
-    Gas zone cost is proportional to heating duration within the horizon.
-    Mini-split cost is proportional to expected activity (target vs room temp).
+    Trajectory cost is proportional to heating duration within the horizon.
+    Regulating cost is proportional to expected activity (target vs room temp).
+    Binary cost is a per-mode lookup.
     """
     cost = 0.0
     max_h = max(CONTROL_HORIZONS)
@@ -449,27 +447,27 @@ def compute_energy_cost(
         if eff_cfg is None or ed.mode == "off":
             continue
 
+        ec = eff_cfg.energy_cost
         if eff_cfg.control_type == "trajectory":
-            # Gas zones (Navien boiler via thermostat)
             dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
-            cost += ENERGY_COST_GAS_ZONE * dur / max_h
+            assert isinstance(ec, (int, float))
+            cost += ec * dur / max_h
 
         elif eff_cfg.control_type == "regulating":
-            # Mini-splits: proportional to expected activity based on room temp
             p_band = eff_cfg.proportional_band
-            # Regulating effector label = name without prefix (e.g., "mini_split_bedroom" -> "bedroom")
             label = ed.name.removeprefix("mini_split_")
             room_temp = temps.get(label)
             if room_temp is not None and ed.target is not None:
                 delta = max(0.0, ed.target - room_temp) if ed.mode == "heat" else max(0.0, room_temp - ed.target)
                 avg_activity = min(1.0, delta / p_band)
             else:
-                avg_activity = 0.5  # unknown room temp — assume moderate activity
-            cost += ENERGY_COST_MINI_SPLIT * avg_activity
+                avg_activity = 0.5
+            assert isinstance(ec, (int, float))
+            cost += ec * avg_activity
 
         elif eff_cfg.control_type == "binary":
-            # Blower fans (negligible)
-            cost += ENERGY_COST_BLOWER.get(ed.mode, 0.0)
+            assert isinstance(ec, dict)
+            cost += ec.get(ed.mode, 0.0)
 
     return cost
 

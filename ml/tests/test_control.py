@@ -619,8 +619,9 @@ class TestTrajectoryEnergyCost:
         traj = Scenario(effectors={
             "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating"),
         })
-        from weatherstat.config import ENERGY_COST_GAS_ZONE
-        assert compute_energy_cost(traj) == ENERGY_COST_GAS_ZONE
+        from weatherstat.config import EFFECTOR_MAP
+        expected = EFFECTOR_MAP["thermostat_upstairs"].energy_cost
+        assert compute_energy_cost(traj) == expected
 
 
 # ── Target grid sweep tests ──────────────────────────────────────────

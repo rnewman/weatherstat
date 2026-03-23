@@ -24,31 +24,23 @@ interface RawConfig {
     state?: Record<string, { entity_id: string; encoding: Record<string, number> }>;
     power?: Record<string, { entity_id: string }>;
   };
-  effectors: {
-    thermostats: Record<string, { entity_id: string; zone: string; state_device?: string }>;
-    mini_splits: Record<
-      string,
-      {
-        entity_id: string;
-        sweep_modes: string[];
-        command_encoding: Record<string, number>;
-        state_encoding?: Record<string, number>;
-      }
-    >;
-    blowers: Record<
-      string,
-      { entity_id: string; zone: string; levels: string[]; level_encoding: Record<string, number> }
-    >;
-    boiler?: Record<
-      string,
-      {
-        mode_entity: string;
-        capacity_entity: string;
-        mode_encoding: Record<string, number>;
-        health?: Array<{ entity: string; min_value?: number; max_value?: number; severity?: string; message?: string }>;
-      }
-    >;
-  };
+  effectors: Record<
+    string,
+    {
+      entity_id: string;
+      control_type: string;
+      mode_control: string;
+      supported_modes?: string[];
+      state_encoding?: Record<string, number>;
+      command_encoding?: Record<string, number>;
+      state_device?: string;
+      depends_on?: string;
+      proportional_band?: number;
+      mode_hold_window?: [number, number];
+      max_lag_minutes?: number;
+      energy_cost?: number | Record<string, number>;
+    }
+  >;
   windows: Record<string, { entity_id: string }>;
   weather: { entity_id: string };
   notifications: { target: string };
@@ -125,70 +117,57 @@ function loadYamlConfig() {
 
   const columnDefs: ColumnDef[] = [];
 
-  // 1. Thermostats (3 cols each: temp, target, action)
-  for (const [name, therm] of Object.entries(raw.effectors.thermostats)) {
-    const prefix = `thermostat_${name}`;
-    columnDefs.push({
-      snake: `${prefix}_temp`,
-      camel: snakeToCamel(`${prefix}_temp`),
-      sqlType: "REAL",
-      extract: attrNum(therm.entity_id, "current_temperature", 0),
-    });
-    columnDefs.push({
-      snake: `${prefix}_target`,
-      camel: snakeToCamel(`${prefix}_target`),
-      sqlType: "REAL",
-      extract: attrNum(therm.entity_id, "temperature", 0),
-    });
-    columnDefs.push({
-      snake: `${prefix}_action`,
-      camel: snakeToCamel(`${prefix}_action`),
-      sqlType: "TEXT",
-      extract: attrStr(therm.entity_id, "hvac_action", "idle"),
-    });
-  }
-
-  // 2. Mini splits (3-4 cols each: temp, target, mode, action?)
-  for (const [name, split] of Object.entries(raw.effectors.mini_splits)) {
-    const prefix = `mini_split_${name}`;
-    columnDefs.push({
-      snake: `${prefix}_temp`,
-      camel: snakeToCamel(`${prefix}_temp`),
-      sqlType: "REAL",
-      extract: attrNum(split.entity_id, "current_temperature", 0),
-    });
-    columnDefs.push({
-      snake: `${prefix}_target`,
-      camel: snakeToCamel(`${prefix}_target`),
-      sqlType: "REAL",
-      extract: attrNum(split.entity_id, "temperature", 0),
-    });
-    columnDefs.push({
-      snake: `${prefix}_mode`,
-      camel: snakeToCamel(`${prefix}_mode`),
-      sqlType: "TEXT",
-      extract: entityState(split.entity_id, "off"),
-    });
-    if (split.state_encoding) {
-      // Measured state: what the device is actually doing (e.g., compressor running)
+  // 1. Effectors — column layout depends on HA entity domain
+  for (const [name, eff] of Object.entries(raw.effectors)) {
+    const domain = eff.entity_id.split(".")[0];
+    if (domain === "climate") {
+      // Climate entities: temp, target, and action/mode
       columnDefs.push({
-        snake: `${prefix}_action`,
-        camel: snakeToCamel(`${prefix}_action`),
+        snake: `${name}_temp`,
+        camel: snakeToCamel(`${name}_temp`),
+        sqlType: "REAL",
+        extract: attrNum(eff.entity_id, "current_temperature", 0),
+      });
+      columnDefs.push({
+        snake: `${name}_target`,
+        camel: snakeToCamel(`${name}_target`),
+        sqlType: "REAL",
+        extract: attrNum(eff.entity_id, "temperature", 0),
+      });
+      if (eff.mode_control === "manual") {
+        // Manual mode (thermostat): only action (hvac_action attribute)
+        columnDefs.push({
+          snake: `${name}_action`,
+          camel: snakeToCamel(`${name}_action`),
+          sqlType: "TEXT",
+          extract: attrStr(eff.entity_id, "hvac_action", "idle"),
+        });
+      } else {
+        // Automatic mode (mini-split): mode (entity state) + optional action
+        columnDefs.push({
+          snake: `${name}_mode`,
+          camel: snakeToCamel(`${name}_mode`),
+          sqlType: "TEXT",
+          extract: entityState(eff.entity_id, "off"),
+        });
+        if (eff.state_encoding && eff.command_encoding) {
+          columnDefs.push({
+            snake: `${name}_action`,
+            camel: snakeToCamel(`${name}_action`),
+            sqlType: "TEXT",
+            extract: attrStr(eff.entity_id, "hvac_action", "off"),
+          });
+        }
+      }
+    } else {
+      // Fan entities: mode from state/preset_mode
+      columnDefs.push({
+        snake: `${name}_mode`,
+        camel: snakeToCamel(`${name}_mode`),
         sqlType: "TEXT",
-        extract: attrStr(split.entity_id, "hvac_action", "off"),
+        extract: blowerModeExtract(eff.entity_id),
       });
     }
-  }
-
-  // 3. Blowers (1 col each: mode)
-  for (const [name, blw] of Object.entries(raw.effectors.blowers)) {
-    const snake = `blower_${name}_mode`;
-    columnDefs.push({
-      snake,
-      camel: snakeToCamel(snake),
-      sqlType: "TEXT",
-      extract: blowerModeExtract(blw.entity_id),
-    });
   }
 
   // 4. State sensors (categorical — stored as TEXT)
@@ -344,9 +323,7 @@ function loadYamlConfig() {
   // All monitored entities (unique set)
   const allMonitoredEntities = Array.from(
     new Set([
-      ...Object.values(raw.effectors.thermostats).map((t) => t.entity_id),
-      ...Object.values(raw.effectors.mini_splits).map((s) => s.entity_id),
-      ...Object.values(raw.effectors.blowers).map((b) => b.entity_id),
+      ...Object.values(raw.effectors).map((e) => e.entity_id),
       ...Object.values(raw.sensors.temperature).map((s) => s.entity_id),
       ...Object.values(raw.sensors.humidity).map((s) => s.entity_id),
       ...Object.values(raw.sensors.state ?? {}).map((s) => s.entity_id),
@@ -368,26 +345,21 @@ function loadYamlConfig() {
     tempSensors[key] = sensor.entity_id;
   }
 
+  // Effector configs for executor — flat dict keyed by effector name
+  const effectors = Object.fromEntries(
+    Object.entries(raw.effectors).map(([name, e]) => [
+      name,
+      {
+        entityId: e.entity_id,
+        domain: e.entity_id.split(".")[0] as "climate" | "fan",
+        controlType: e.control_type,
+        modeControl: e.mode_control,
+      },
+    ]),
+  );
+
   return {
-    // Raw effector configs
-    thermostats: Object.fromEntries(
-      Object.entries(raw.effectors.thermostats).map(([name, t]) => [
-        name,
-        { entityId: t.entity_id, zone: t.zone },
-      ]),
-    ),
-    miniSplits: Object.fromEntries(
-      Object.entries(raw.effectors.mini_splits).map(([name, s]) => [
-        name,
-        { entityId: s.entity_id, sweepModes: s.sweep_modes, commandEncoding: s.command_encoding },
-      ]),
-    ),
-    blowers: Object.fromEntries(
-      Object.entries(raw.effectors.blowers).map(([name, b]) => [
-        name,
-        { entityId: b.entity_id, zone: b.zone, levels: b.levels, levelEncoding: b.level_encoding },
-      ]),
-    ),
+    effectors,
     // Sensor entity IDs
     outdoorTempEntity: raw.sensors.temperature["outdoor_temp"]?.entity_id ?? "",
     weatherEntity: raw.weather.entity_id,

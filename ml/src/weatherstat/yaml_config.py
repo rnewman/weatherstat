@@ -39,33 +39,34 @@ class HumiditySensorConfig:
 
 
 @dataclass(frozen=True)
-class ThermostatConfig:
-    name: str  # "upstairs", "downstairs"
+class EffectorYamlConfig:
+    """Unified effector config — all device types in a single flat dict.
+
+    The effector key in YAML is the full name (e.g., 'thermostat_upstairs').
+    Properties replace categories:
+    - control_type: "trajectory" (slow-twitch), "regulating" (proportional), "binary" (discrete)
+    - mode_control: "manual" (human controls mode) or "automatic" (system controls mode)
+    - domain: HA entity domain ("climate" or "fan"), derived from entity_id
+    """
+
+    name: str  # "thermostat_upstairs", "mini_split_bedroom", "blower_office"
     entity_id: str
-    zone: str
-    state_device: str | None = None  # device that confirms actual delivery (e.g., boiler)
+    control_type: str  # "trajectory", "regulating", "binary"
+    mode_control: str  # "manual", "automatic"
+    supported_modes: tuple[str, ...]  # ("heat",), ("heat", "cool"), ("off", "low", "high")
+    state_encoding: dict[str, float]  # maps measured state to numeric (for sysid)
+    max_lag_minutes: int = 90  # thermal response lag
+    energy_cost: float | dict[str, float] = 0.0  # scalar or per-mode dict
+    command_encoding: dict[str, float] | None = None  # separate command encoding (auto-mode climate)
+    state_device: str | None = None  # state sensor confirming delivery
+    depends_on: str | None = None  # effector name this depends on
+    proportional_band: float = 1.0  # regulating: activity ramp width (°F)
+    mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
 
-
-@dataclass(frozen=True)
-class MiniSplitYamlConfig:
-    name: str  # "bedroom", "living_room"
-    entity_id: str
-    sweep_modes: tuple[str, ...]
-    command_encoding: dict[str, float]  # command: what we set (for control)
-    state_encoding: dict[str, float] | None = None  # state: what it's doing (for sysid)
-    control_type: str = "binary"  # "regulating" for target-based control
-    proportional_band: float = 1.0  # °F — full activity when room is this far from target
-    mode_hold_window: tuple[int, int] | None = None  # (start_hour, end_hour) — no mode changes
-
-
-
-@dataclass(frozen=True)
-class BlowerYamlConfig:
-    name: str  # "family_room", "office"
-    entity_id: str
-    zone: str
-    levels: tuple[str, ...]
-    level_encoding: dict[str, float]
+    @property
+    def domain(self) -> str:
+        """HA entity domain, derived from entity_id."""
+        return self.entity_id.split(".")[0]
 
 
 @dataclass(frozen=True)
@@ -156,19 +157,6 @@ class ConstraintSchedule:
 
 
 @dataclass(frozen=True)
-class ZoneConfig:
-    name: str  # "upstairs", "downstairs"
-    thermostat: str  # thermostat name within this zone
-
-
-@dataclass(frozen=True)
-class EnergyCostConfig:
-    gas_zone: float
-    mini_split: float
-    blower: dict[str, float]
-
-
-@dataclass(frozen=True)
 class AdvisoryConfig:
     cooldowns: dict[str, int]
     quiet_hours: tuple[int, int] = (22, 7)
@@ -191,18 +179,14 @@ class WeatherstatConfig:
     location: LocationConfig
     temp_sensors: dict[str, TempSensorConfig]  # col_name -> config
     humidity_sensors: dict[str, HumiditySensorConfig]
-    thermostats: dict[str, ThermostatConfig]  # name -> config
-    mini_splits: dict[str, MiniSplitYamlConfig]
-    blowers: dict[str, BlowerYamlConfig]
+    effectors: dict[str, EffectorYamlConfig]  # full_name -> config
     state_sensors: dict[str, StateSensorConfig]
     power_sensors: dict[str, PowerSensorConfig]
     health_checks: list[HealthCheck]
     windows: dict[str, WindowConfig]
     weather_entity: str
     constraints: list[ConstraintSchedule]
-    zones: dict[str, ZoneConfig]
     notification_target: str
-    energy_costs: EnergyCostConfig
     default_tau: float = 45.0
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
@@ -242,18 +226,13 @@ class WeatherstatConfig:
 
     @property
     def climate_entities(self) -> dict[str, str]:
-        """prefix -> entity_id for thermostats and mini-splits (history extraction)."""
-        result: dict[str, str] = {}
-        for name, cfg in self.thermostats.items():
-            result[f"thermostat_{name}"] = cfg.entity_id
-        for name, cfg in self.mini_splits.items():
-            result[f"mini_split_{name}"] = cfg.entity_id
-        return result
+        """name -> entity_id for climate effectors (history extraction)."""
+        return {name: cfg.entity_id for name, cfg in self.effectors.items() if cfg.domain == "climate"}
 
     @property
     def fan_entities(self) -> dict[str, str]:
-        """prefix -> entity_id for blower fans (history extraction)."""
-        return {f"blower_{name}": cfg.entity_id for name, cfg in self.blowers.items()}
+        """name -> entity_id for fan effectors (history extraction)."""
+        return {name: cfg.entity_id for name, cfg in self.effectors.items() if cfg.domain == "fan"}
 
     @property
     def sensor_entities(self) -> dict[str, str]:
@@ -317,13 +296,15 @@ class WeatherstatConfig:
         Raw categorical strings that have encoded versions.
         """
         cols: set[str] = {"timestamp"}
-        for name in self.thermostats:
-            cols.add(f"thermostat_{name}_target")
-            cols.add(f"thermostat_{name}_action")
-        for name in self.mini_splits:
-            cols.add(f"mini_split_{name}_mode")
-        for name in self.blowers:
-            cols.add(f"blower_{name}_mode")
+        for name, cfg in self.effectors.items():
+            if cfg.domain == "climate":
+                cols.add(f"{name}_target")
+                if cfg.mode_control == "manual":
+                    cols.add(f"{name}_action")
+                else:
+                    cols.add(f"{name}_mode")
+            else:
+                cols.add(f"{name}_mode")
         for col in self.state_sensors:
             cols.add(col)
         cols.add("weather_condition")
@@ -334,12 +315,14 @@ class WeatherstatConfig:
     def hvac_merge_columns(self) -> list[str]:
         """HVAC columns to merge from full-feature sources into baseline hourly data."""
         cols: list[str] = []
-        for name in self.thermostats:
-            cols.append(f"thermostat_{name}_action")
-        for name in self.mini_splits:
-            cols.extend([f"mini_split_{name}_temp", f"mini_split_{name}_target", f"mini_split_{name}_mode"])
-        for name in self.blowers:
-            cols.append(f"blower_{name}_mode")
+        for name, cfg in self.effectors.items():
+            if cfg.domain == "climate":
+                if cfg.mode_control == "manual":
+                    cols.append(f"{name}_action")
+                else:
+                    cols.extend([f"{name}_temp", f"{name}_target", f"{name}_mode"])
+            else:
+                cols.append(f"{name}_mode")
         for col in self.state_sensors:
             cols.append(col)
         for col in self.power_sensors:
@@ -359,10 +342,12 @@ class WeatherstatConfig:
         for col in self.power_sensors:
             cols.append(col)
         cols.extend(["outdoor_humidity", "outdoor_wind_speed", "met_outdoor_temp"])
-        for name in self.thermostats:
-            cols.append(f"thermostat_{name}_target")
-        for name in self.mini_splits:
-            cols.extend([f"mini_split_{name}_temp", f"mini_split_{name}_target"])
+        for name, cfg in self.effectors.items():
+            if cfg.domain == "climate":
+                if cfg.mode_control == "manual":
+                    cols.append(f"{name}_target")
+                else:
+                    cols.extend([f"{name}_temp", f"{name}_target"])
         return cols
 
     @property
@@ -374,29 +359,30 @@ class WeatherstatConfig:
 
     @property
     def thermostat_action_columns(self) -> list[str]:
-        """Thermostat action columns for HVAC encoding."""
-        return [f"thermostat_{name}_action" for name in self.thermostats]
+        """Action columns for manual-mode climate effectors."""
+        return [f"{name}_action" for name, cfg in self.effectors.items()
+                if cfg.domain == "climate" and cfg.mode_control == "manual"]
 
     @property
     def mini_split_mode_columns(self) -> list[str]:
-        """Mini-split mode columns for HVAC encoding."""
-        return [f"mini_split_{name}_mode" for name in self.mini_splits]
+        """Mode columns for automatic-mode climate effectors."""
+        return [f"{name}_mode" for name, cfg in self.effectors.items()
+                if cfg.domain == "climate" and cfg.mode_control == "automatic"]
 
     @property
     def blower_mode_columns(self) -> list[str]:
-        """Blower mode columns for HVAC encoding."""
-        return [f"blower_{name}_mode" for name in self.blowers]
+        """Mode columns for fan effectors."""
+        return [f"{name}_mode" for name, cfg in self.effectors.items() if cfg.domain == "fan"]
 
     @property
     def mini_split_delta_pairs(self) -> list[tuple[str, str, str]]:
-        """(target_col, temp_col, delta_name) for mini-split delta features."""
+        """(target_col, temp_col, delta_name) for regulating climate effectors."""
         pairs: list[tuple[str, str, str]] = []
-        for name in self.mini_splits:
-            pairs.append((
-                f"mini_split_{name}_target",
-                f"mini_split_{name}_temp",
-                f"{name}_target_delta",
-            ))
+        for name, cfg in self.effectors.items():
+            if cfg.domain == "climate" and cfg.mode_control == "automatic":
+                # Strip prefix for delta name (e.g., "mini_split_bedroom" -> "bedroom")
+                label = name.split("_", 2)[-1] if "_" in name else name
+                pairs.append((f"{name}_target", f"{name}_temp", f"{label}_target_delta"))
         return pairs
 
     @property
@@ -411,27 +397,26 @@ class WeatherstatConfig:
         """(column_name, SQL_type) for all snapshot columns.
 
         Used for CREATE TABLE and ALTER TABLE migrations.
+        Column layout depends on HA entity domain:
+        - climate (mode_control=manual): _temp, _target, _action
+        - climate (mode_control=automatic): _temp, _target, _mode, optionally _action
+        - fan: _mode
         """
         defs: list[tuple[str, str]] = []
-        # Thermostats
-        for name in self.thermostats:
-            defs.extend([
-                (f"thermostat_{name}_temp", "REAL"),
-                (f"thermostat_{name}_target", "REAL"),
-                (f"thermostat_{name}_action", "TEXT"),
-            ])
-        # Mini-splits
-        for name, cfg in self.mini_splits.items():
-            defs.extend([
-                (f"mini_split_{name}_temp", "REAL"),
-                (f"mini_split_{name}_target", "REAL"),
-                (f"mini_split_{name}_mode", "TEXT"),
-            ])
-            if cfg.state_encoding:
-                defs.append((f"mini_split_{name}_action", "TEXT"))
-        # Blowers
-        for name in self.blowers:
-            defs.append((f"blower_{name}_mode", "TEXT"))
+        for name, cfg in self.effectors.items():
+            if cfg.domain == "climate":
+                defs.extend([
+                    (f"{name}_temp", "REAL"),
+                    (f"{name}_target", "REAL"),
+                ])
+                if cfg.mode_control == "manual":
+                    defs.append((f"{name}_action", "TEXT"))
+                else:
+                    defs.append((f"{name}_mode", "TEXT"))
+                    if cfg.command_encoding and cfg.state_encoding != cfg.command_encoding:
+                        defs.append((f"{name}_action", "TEXT"))
+            else:
+                defs.append((f"{name}_mode", "TEXT"))
         # State sensors (categorical — stored as TEXT, encoded when used)
         for col in self.state_sensors:
             defs.append((col, "TEXT"))
@@ -498,41 +483,31 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             statistics=sensor.get("statistics", False),
         )
 
-    # ── Effectors ────────────────────────────────────────────────────
-    eff = data["effectors"]
-
-    thermostats: dict[str, ThermostatConfig] = {}
-    for name, dev in eff["thermostats"].items():
-        thermostats[name] = ThermostatConfig(
-            name=name, entity_id=dev["entity_id"], zone=dev["zone"],
-            state_device=dev.get("state_device"),
-        )
-
-    mini_splits: dict[str, MiniSplitYamlConfig] = {}
-    for name, dev in eff["mini_splits"].items():
-        state_enc_raw = dev.get("state_encoding")
-        state_enc = {str(k): float(v) for k, v in state_enc_raw.items()} if state_enc_raw else None
+    # ── Effectors (flat dict, each declares its own properties) ─────
+    effectors: dict[str, EffectorYamlConfig] = {}
+    for name, dev in data.get("effectors", {}).items():
+        se_raw = dev.get("state_encoding")
+        state_enc = {str(k): float(v) for k, v in se_raw.items()} if se_raw else {}
+        ce_raw = dev.get("command_encoding")
+        cmd_enc = {str(k): float(v) for k, v in ce_raw.items()} if ce_raw else None
         mhw_raw = dev.get("mode_hold_window")
         mode_hold_window = (int(mhw_raw[0]), int(mhw_raw[1])) if mhw_raw else None
-        mini_splits[name] = MiniSplitYamlConfig(
+        ec_raw = dev.get("energy_cost", 0.0)
+        energy_cost = {str(k): float(v) for k, v in ec_raw.items()} if isinstance(ec_raw, dict) else float(ec_raw)
+        effectors[name] = EffectorYamlConfig(
             name=name,
             entity_id=dev["entity_id"],
-            sweep_modes=tuple(str(m) for m in dev["sweep_modes"]),
-            command_encoding={str(k): float(v) for k, v in dev["command_encoding"].items()},
+            control_type=str(dev.get("control_type", "trajectory")),
+            mode_control=str(dev.get("mode_control", "manual")),
+            supported_modes=tuple(str(m) for m in dev.get("supported_modes", ())),
             state_encoding=state_enc,
-            control_type=str(dev.get("control_type", "binary")),
-            proportional_band=float(dev.get("proportional_band", 3.0)),
+            max_lag_minutes=int(dev.get("max_lag_minutes", 90)),
+            energy_cost=energy_cost,
+            command_encoding=cmd_enc,
+            state_device=dev.get("state_device"),
+            depends_on=dev.get("depends_on"),
+            proportional_band=float(dev.get("proportional_band", 1.0)),
             mode_hold_window=mode_hold_window,
-        )
-
-    blowers: dict[str, BlowerYamlConfig] = {}
-    for name, dev in eff["blowers"].items():
-        blowers[name] = BlowerYamlConfig(
-            name=name,
-            entity_id=dev["entity_id"],
-            zone=dev["zone"],
-            levels=tuple(str(lv) for lv in dev["levels"]),
-            level_encoding={str(k): float(v) for k, v in dev["level_encoding"].items()},
         )
 
     # ── State sensors (categorical with encoding) ─────────────────────
@@ -620,19 +595,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             mrt_weight=float(sched.get("mrt_weight", 1.0)),
         ))
 
-    # ── Zones ────────────────────────────────────────────────────────
-    zones: dict[str, ZoneConfig] = {}
-    for name, zcfg in data.get("zones", {}).items():
-        zones[name] = ZoneConfig(name=name, thermostat=zcfg["thermostat"])
-
-    # ── Energy costs ─────────────────────────────────────────────────
-    ec = data["energy_costs"]
-    energy_costs = EnergyCostConfig(
-        gas_zone=float(ec["gas_zone"]),
-        mini_split=float(ec["mini_split"]),
-        blower={str(k): float(v) for k, v in ec["blower"].items()},
-    )
-
     # ── Advisory config ──────────────────────────────────────────────
     adv_data = data.get("advisory", {})
     adv_quiet = adv_data.get("quiet_hours", [22, 7])
@@ -657,18 +619,14 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         location=location,
         temp_sensors=temp_sensors,
         humidity_sensors=humidity_sensors,
-        thermostats=thermostats,
-        mini_splits=mini_splits,
-        blowers=blowers,
+        effectors=effectors,
         state_sensors=state_sensors,
         power_sensors=power_sensors,
         health_checks=health_checks,
         windows=windows,
         weather_entity=data["weather"]["entity_id"],
         constraints=constraint_list,
-        zones=zones,
         notification_target=data["notifications"]["target"],
-        energy_costs=energy_costs,
         default_tau=default_tau,
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,

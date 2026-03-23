@@ -184,12 +184,8 @@ export async function executePrediction(
   );
   if (force) console.log("[executor] Force mode — overrides will be ignored");
 
-  // Fetch current HA states for all controlled entities (from config)
-  const controlledEntities: string[] = [
-    ...Object.values(yamlConfig.thermostats).map((t) => t.entityId),
-    ...Object.values(yamlConfig.miniSplits).map((s) => s.entityId),
-    ...Object.values(yamlConfig.blowers).map((b) => b.entityId),
-  ];
+  // Fetch current HA states for all controlled entities
+  const controlledEntities = Object.values(yamlConfig.effectors).map((e) => e.entityId);
   const states = await client.getStates(controlledEntities);
   const stateMap = new Map<string, HAEntityState>(states.map((s) => [s.entity_id, s]));
 
@@ -215,132 +211,121 @@ export async function executePrediction(
   let lazySkips = 0;
   let overrideSkips = 0;
 
-  // ── Thermostats (from config) ──────────────────────────────────────────
+  // ── Iterate all effectors from config ─────────────────────────────────
 
-  for (const [name, tcfg] of Object.entries(yamlConfig.thermostats)) {
-    const key = `thermostat_${name}`;
-    const targetKey = snakeToCamel(`thermostat_${name}_target`);
-    const desiredTarget = prediction[targetKey] as number | undefined;
+  for (const [name, ecfg] of Object.entries(yamlConfig.effectors)) {
+    if (ecfg.domain === "climate" && ecfg.modeControl === "manual") {
+      // ── Manual-mode climate (thermostat): target only ───────────────
+      const targetKey = snakeToCamel(`${name}_target`);
+      const desiredTarget = prediction[targetKey] as number | undefined;
 
-    // Ineligible: no target in command JSON (thermostat off or gate device down)
-    if (desiredTarget === undefined) {
-      console.log(`[executor] ${key}: ineligible, skipping`);
-      continue;
+      if (desiredTarget === undefined) {
+        console.log(`[executor] ${name}: ineligible, skipping`);
+        continue;
+      }
+
+      const current = readThermostat(stateMap, ecfg.entityId);
+
+      if (current.target !== undefined && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE) {
+        console.log(`[executor] ${name}: already at ${current.target}°F, skipping`);
+        lazySkips++;
+        continue;
+      }
+
+      const lastApplied = last[name];
+      if (
+        !force
+        && lastApplied?.target !== undefined
+        && current.target !== undefined
+        && Math.abs(current.target - lastApplied.target) > TARGET_TOLERANCE
+      ) {
+        console.log(
+          `[executor] ${name}: override detected`
+          + ` (current ${current.target}°F, we last set ${lastApplied.target}°F), skipping`,
+        );
+        overrideSkips++;
+        continue;
+      }
+
+      await applyThermostat(client, ecfg.entityId, desiredTarget);
+      console.log(`[executor] ${name}: set to ${desiredTarget}°F`);
+      updated[name] = { target: desiredTarget };
+      applied++;
+
+    } else if (ecfg.domain === "climate") {
+      // ── Automatic-mode climate (mini-split): mode + target ──────────
+      const modeKey = snakeToCamel(`${name}_mode`);
+      const targetKey = snakeToCamel(`${name}_target`);
+      const desiredMode = prediction[modeKey] as string | undefined;
+      const desiredTarget = prediction[targetKey] as number | undefined;
+
+      if (desiredMode === undefined) {
+        console.log(`[executor] ${name}: not in command, skipping`);
+        continue;
+      }
+
+      const current = readMiniSplit(stateMap, ecfg.entityId);
+
+      const modeMatch = current.mode === desiredMode;
+      const targetMatch = desiredMode === "off"
+        || (desiredTarget !== undefined && current.target !== undefined
+          && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE);
+      if (modeMatch && targetMatch) {
+        const desc = desiredMode === "off" ? "off" : `${desiredMode} @ ${current.target}°F`;
+        console.log(`[executor] ${name}: already ${desc}, skipping`);
+        lazySkips++;
+        continue;
+      }
+
+      const lastApplied = last[name];
+      if (!force && lastApplied?.mode !== undefined && current.mode !== lastApplied.mode) {
+        console.log(
+          `[executor] ${name}: override detected`
+          + ` (currently ${current.mode}, we last set ${lastApplied.mode}), skipping`,
+        );
+        overrideSkips++;
+        continue;
+      }
+
+      await applyMiniSplit(client, ecfg.entityId, desiredMode, desiredTarget ?? 72);
+      const desc = desiredMode === "off" ? "off" : `${desiredMode} @ ${desiredTarget}°F`;
+      console.log(`[executor] ${name}: set to ${desc}`);
+      updated[name] = { mode: desiredMode, target: desiredTarget };
+      applied++;
+
+    } else {
+      // ── Fan entity (blower): mode only ─────────────────────────────
+      const modeKey = snakeToCamel(`${name}_mode`);
+      const desiredMode = prediction[modeKey] as string | undefined;
+
+      if (desiredMode === undefined) {
+        console.log(`[executor] ${name}: not in command, skipping`);
+        continue;
+      }
+
+      const current = readBlower(stateMap, ecfg.entityId);
+
+      if (current.mode === desiredMode) {
+        console.log(`[executor] ${name}: already ${desiredMode}, skipping`);
+        lazySkips++;
+        continue;
+      }
+
+      const lastApplied = last[name];
+      if (!force && lastApplied?.mode !== undefined && current.mode !== lastApplied.mode) {
+        console.log(
+          `[executor] ${name}: override detected`
+          + ` (currently ${current.mode}, we last set ${lastApplied.mode}), skipping`,
+        );
+        overrideSkips++;
+        continue;
+      }
+
+      await applyBlower(client, ecfg.entityId, desiredMode);
+      console.log(`[executor] ${name}: set to ${desiredMode}`);
+      updated[name] = { mode: desiredMode };
+      applied++;
     }
-
-    const current = readThermostat(stateMap, tcfg.entityId);
-
-    // Lazy: already at desired target
-    if (current.target !== undefined && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE) {
-      console.log(`[executor] ${key}: already at ${current.target}°F, skipping`);
-      lazySkips++;
-      continue;
-    }
-
-    // Override: target changed from what we last set
-    const lastApplied = last[key];
-    if (
-      !force
-      && lastApplied?.target !== undefined
-      && current.target !== undefined
-      && Math.abs(current.target - lastApplied.target) > TARGET_TOLERANCE
-    ) {
-      console.log(
-        `[executor] ${key}: override detected`
-        + ` (current ${current.target}°F, we last set ${lastApplied.target}°F), skipping`,
-      );
-      overrideSkips++;
-      continue;
-    }
-
-    await applyThermostat(client, tcfg.entityId, desiredTarget);
-    console.log(`[executor] ${key}: set to ${desiredTarget}°F`);
-    updated[key] = { target: desiredTarget };
-    applied++;
-  }
-
-  // ── Mini splits (from config) ──────────────────────────────────────────
-
-  for (const [name, scfg] of Object.entries(yamlConfig.miniSplits)) {
-    const key = `mini_split_${name}`;
-    const modeKey = snakeToCamel(`mini_split_${name}_mode`);
-    const targetKey = snakeToCamel(`mini_split_${name}_target`);
-    const desiredMode = prediction[modeKey] as string | undefined;
-    const desiredTarget = prediction[targetKey] as number | undefined;
-
-    if (desiredMode === undefined) {
-      console.log(`[executor] ${key}: not in command, skipping`);
-      continue;
-    }
-
-    const current = readMiniSplit(stateMap, scfg.entityId);
-
-    // Lazy: mode and target already match
-    const modeMatch = current.mode === desiredMode;
-    const targetMatch = desiredMode === "off"
-      || (desiredTarget !== undefined && current.target !== undefined
-        && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE);
-    if (modeMatch && targetMatch) {
-      const desc = desiredMode === "off" ? "off" : `${desiredMode} @ ${current.target}°F`;
-      console.log(`[executor] ${key}: already ${desc}, skipping`);
-      lazySkips++;
-      continue;
-    }
-
-    // Override: mode changed from what we last set
-    const lastApplied = last[key];
-    if (!force && lastApplied?.mode !== undefined && current.mode !== lastApplied.mode) {
-      console.log(
-        `[executor] ${key}: override detected`
-        + ` (currently ${current.mode}, we last set ${lastApplied.mode}), skipping`,
-      );
-      overrideSkips++;
-      continue;
-    }
-
-    await applyMiniSplit(client, scfg.entityId, desiredMode, desiredTarget ?? 72);
-    const desc = desiredMode === "off" ? "off" : `${desiredMode} @ ${desiredTarget}°F`;
-    console.log(`[executor] ${key}: set to ${desc}`);
-    updated[key] = { mode: desiredMode, target: desiredTarget };
-    applied++;
-  }
-
-  // ── Blowers (from config) ──────────────────────────────────────────────
-
-  for (const [name, bcfg] of Object.entries(yamlConfig.blowers)) {
-    const key = `blower_${name}`;
-    const modeKey = snakeToCamel(`blower_${name}_mode`);
-    const desiredMode = prediction[modeKey] as string | undefined;
-
-    if (desiredMode === undefined) {
-      console.log(`[executor] ${key}: not in command, skipping`);
-      continue;
-    }
-
-    const current = readBlower(stateMap, bcfg.entityId);
-
-    // Lazy: already at desired mode
-    if (current.mode === desiredMode) {
-      console.log(`[executor] ${key}: already ${desiredMode}, skipping`);
-      lazySkips++;
-      continue;
-    }
-
-    // Override: mode changed from what we last set
-    const lastApplied = last[key];
-    if (!force && lastApplied?.mode !== undefined && current.mode !== lastApplied.mode) {
-      console.log(
-        `[executor] ${key}: override detected`
-        + ` (currently ${current.mode}, we last set ${lastApplied.mode}), skipping`,
-      );
-      overrideSkips++;
-      continue;
-    }
-
-    await applyBlower(client, bcfg.entityId, desiredMode);
-    console.log(`[executor] ${key}: set to ${desiredMode}`);
-    updated[key] = { mode: desiredMode };
-    applied++;
   }
 
   // ── Save state ─────────────────────────────────────────────────────────
