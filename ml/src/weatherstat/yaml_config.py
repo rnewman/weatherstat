@@ -57,15 +57,6 @@ class MiniSplitYamlConfig:
     proportional_band: float = 1.0  # °F — full activity when room is this far from target
     mode_hold_window: tuple[int, int] | None = None  # (start_hour, end_hour) — no mode changes
 
-    @property
-    def mode_encoding(self) -> dict[str, float]:
-        """Backward compat alias for command_encoding."""
-        return self.command_encoding
-
-    @property
-    def action_encoding(self) -> dict[str, float] | None:
-        """Backward compat alias for state_encoding."""
-        return self.state_encoding
 
 
 @dataclass(frozen=True)
@@ -179,7 +170,6 @@ class EnergyCostConfig:
 
 @dataclass(frozen=True)
 class AdvisoryConfig:
-    effort_cost: float  # deprecated, kept for backward compat
     cooldowns: dict[str, int]
     quiet_hours: tuple[int, int] = (22, 7)
     opportunity_threshold: float = 0.3  # minimum benefit to track
@@ -217,7 +207,7 @@ class WeatherstatConfig:
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
-    advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(effort_cost=0.5, cooldowns={}))
+    advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     window_open_offset: tuple[float, float] = (-3.0, 2.0)
 
@@ -317,13 +307,6 @@ class WeatherstatConfig:
         if label in self.windows:
             return [f"window_{label}_open"]
         return []
-
-    # ── Backward compat properties ───────────────────────────────────
-
-    @property
-    def comfort(self) -> dict[str, list[ComfortEntry]]:
-        """label -> comfort entries. Backward compat for control.py."""
-        return {c.label: list(c.entries) for c in self.constraints}
 
     # ── Snapshot schema ──────────────────────────────────────────────
 
@@ -582,34 +565,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             message=hc.get("message", ""),
         ))
 
-    # ── Backward compat: synthesize state sensor from effectors.boiler ──
-    if not state_sensors and "boiler" in eff:
-        boiler_items = list(eff["boiler"].items())
-        boiler_name, boiler_data = boiler_items[0]
-        state_sensors[f"{boiler_name}_heating"] = StateSensorConfig(
-            column_name=f"{boiler_name}_heating",
-            entity_id=boiler_data["mode_entity"],
-            encoding={str(k): float(v) for k, v in boiler_data["mode_encoding"].items()},
-        )
-        # Migrate health checks from boiler config
-        for i, hc_data in enumerate(boiler_data.get("health", [])):
-            health_checks.append(HealthCheck(
-                name=f"boiler_{boiler_name}_{i}",
-                entity_id=hc_data["entity"],
-                min_value=float(hc_data["min_value"]) if "min_value" in hc_data else None,
-                max_value=float(hc_data["max_value"]) if "max_value" in hc_data else None,
-                expected_state=str(hc_data["expected_state"]) if "expected_state" in hc_data else None,
-                severity=hc_data.get("severity", "warning"),
-                message=hc_data.get("message", ""),
-            ))
-        # Rewrite thermostat state_device refs from old boiler name to new sensor name
-        for name, tcfg in thermostats.items():
-            if tcfg.state_device == boiler_name:
-                thermostats[name] = ThermostatConfig(
-                    name=name, entity_id=tcfg.entity_id, zone=tcfg.zone,
-                    state_device=f"{boiler_name}_heating",
-                )
-
     # ── Windows ──────────────────────────────────────────────────────
     windows: dict[str, WindowConfig] = {}
     for name, win in data["windows"].items():
@@ -682,7 +637,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     adv_data = data.get("advisory", {})
     adv_quiet = adv_data.get("quiet_hours", [22, 7])
     advisory_config = AdvisoryConfig(
-        effort_cost=float(adv_data.get("effort_cost", 0.5)),
         cooldowns={str(k): int(v) for k, v in adv_data.get("cooldowns", {}).items()},
         quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
         opportunity_threshold=float(adv_data.get("opportunity_threshold", 0.3)),

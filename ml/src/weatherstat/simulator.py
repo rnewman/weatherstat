@@ -100,7 +100,7 @@ class HouseState:
     solar_fractions: list[float] = field(default_factory=list)
     # Per-hour solar fractions [now, h+1, h+2, ...] from weather conditions.
     # Index 0 = current hour, index 1 = next hour, etc.
-    # Empty list → default to 1.0 (backward compat with old params).
+    # Empty list → default to 1.0 (full sun).
 
 
 def load_sim_params(path: Path | None = None) -> SimParams:
@@ -113,17 +113,11 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     taus: dict[str, TauModel] = {}
     for ft in data["fitted_taus"]:
         sensor = ft["sensor"]
-        if "tau_base" in ft:
-            # New format: tau_base + window_betas + interaction_betas
-            taus[sensor] = TauModel(
-                tau_base=ft["tau_base"],
-                window_betas=ft.get("window_betas", {}),
-                interaction_betas=ft.get("interaction_betas", {}),
-            )
-        else:
-            # Legacy format: tau_sealed / tau_ventilated
-            tau_s = ft["tau_sealed"]
-            taus[sensor] = TauModel(tau_base=tau_s)
+        taus[sensor] = TauModel(
+            tau_base=ft["tau_base"],
+            window_betas=ft.get("window_betas", {}),
+            interaction_betas=ft.get("interaction_betas", {}),
+        )
 
     # Gain lookup: filter by negligible flag, t-statistic significance,
     # and physical plausibility (gain magnitude).

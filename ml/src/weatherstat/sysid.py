@@ -156,22 +156,22 @@ def _enumerate_effectors() -> list[EffectorSpec]:
         ))
 
     for name, cfg in _CFG.mini_splits.items():
-        if cfg.action_encoding:
+        if cfg.state_encoding:
             # Prefer measured state (hvac_action) over command (hvac_mode)
             effectors.append(EffectorSpec(
                 name=f"mini_split_{name}",
                 state_column=f"mini_split_{name}_action",
-                encoding=cfg.action_encoding,
+                encoding=cfg.state_encoding,
                 max_lag_minutes=15,
                 device_type="mini_split",
                 command_column=f"mini_split_{name}_mode",
-                command_encoding=cfg.mode_encoding,
+                command_encoding=cfg.command_encoding,
             ))
         else:
             effectors.append(EffectorSpec(
                 name=f"mini_split_{name}",
                 state_column=f"mini_split_{name}_mode",
-                encoding={str(k): float(v) for k, v in cfg.mode_encoding.items()},
+                encoding={str(k): float(v) for k, v in cfg.command_encoding.items()},
                 max_lag_minutes=15,
                 device_type="mini_split",
             ))

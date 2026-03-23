@@ -2,7 +2,6 @@
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 from weatherstat._data_dir import resolve_data_dir
 from weatherstat.yaml_config import load_config as _load_config
@@ -11,20 +10,9 @@ DATA_DIR = resolve_data_dir()
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 SNAPSHOTS_DB = SNAPSHOTS_DIR / "snapshots.db"
 PREDICTIONS_DIR = DATA_DIR / "predictions"
-MODELS_DIR = DATA_DIR / "models"
-METRICS_DIR = DATA_DIR / "metrics"
 CONTROL_STATE_FILE = DATA_DIR / "control_state.json"
 ADVISORY_STATE_FILE = DATA_DIR / "advisory_state.json"
 DECISION_LOG_DB = DATA_DIR / "decision_log.db"
-
-
-def experiment_models_dir(name: str) -> Path:
-    """Return the models directory for a named experiment.
-
-    Production models live in data/models/. Experiments live in data/models/{name}/.
-    The control loop always reads from MODELS_DIR (production).
-    """
-    return MODELS_DIR / name
 
 
 # Snapshot collection interval (should match HA client config)
@@ -121,20 +109,8 @@ ENERGY_COST_MINI_SPLIT = _CFG.energy_costs.mini_split
 ENERGY_COST_BLOWER: dict[str, float] = _CFG.energy_costs.blower
 
 # Advisory configuration (from YAML)
-ADVISORY_EFFORT_COST: float = _CFG.advisory.effort_cost
 ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
 ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
 ADVISORY_OPPORTUNITY_THRESHOLD: float = _CFG.advisory.opportunity_threshold
 ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
 
-
-# LightGBM training parameters — conservative for small datasets
-LGBM_PARAMS: dict[str, object] = {
-    "objective": "regression",
-    "metric": "rmse",
-    "num_leaves": 31,
-    "learning_rate": 0.05,
-    "n_estimators": 500,
-    "early_stopping_rounds": 50,
-    "verbose": -1,
-}

@@ -121,16 +121,19 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
     the thermostats can do for them.
     """
     schedules: list[ComfortSchedule] = []
-    for label, entries in _CFG.comfort.items():
+    for constraint in _CFG.constraints:
         schedule_entries = tuple(
             ComfortScheduleEntry(
                 e.start_hour,
                 e.end_hour,
-                RoomComfort(label, e.preferred, e.min_temp, e.max_temp, e.cold_penalty, e.hot_penalty),
+                RoomComfort(
+                    constraint.label, e.preferred, e.min_temp, e.max_temp,
+                    e.cold_penalty, e.hot_penalty,
+                ),
             )
-            for e in entries
+            for e in constraint.entries
         )
-        schedules.append(ComfortSchedule(label=label, entries=schedule_entries))
+        schedules.append(ComfortSchedule(label=constraint.label, entries=schedule_entries))
     return schedules
 
 
@@ -898,10 +901,7 @@ def sweep_scenarios_physics(
 
 
 def load_control_state() -> ControlState | None:
-    """Load persisted control state, or None if not found.
-
-    Backward-compatible: old state files without blower/mini-split fields load cleanly.
-    """
+    """Load persisted control state, or None if not found."""
     if not CONTROL_STATE_FILE.exists():
         return None
     try:
