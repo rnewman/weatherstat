@@ -145,66 +145,50 @@ class WindowOpportunity:
 
 
 @dataclass(frozen=True)
-class BlowerDecision:
-    """Control decision for a single blower fan."""
+class EffectorDecision:
+    """Decision for a single effector in a scenario.
 
-    name: str  # "family_room", "office"
-    mode: str  # "off", "low", "high"
-
-
-@dataclass(frozen=True)
-class MiniSplitDecision:
-    """Control decision for a single mini-split heat pump."""
-
-    name: str  # "bedroom", "living_room"
-    mode: str  # "off", "heat", "cool"
-    target: float  # command target (derived from comfort schedule after sweep)
-
-
-@dataclass(frozen=True)
-class ThermostatTrajectory:
-    """Trajectory for a slow effector: [OFF × delay] → [ON × duration] → [OFF × remainder].
-
-    Used in the physics sweep where constant-action evaluation systematically
-    mis-evaluates slow effectors (hydronic floor heat: 45-75 min lag).
+    Unified type for all effectors — thermostats (trajectory), mini-splits
+    (regulating), blowers (binary). Fields are used per control_type:
+    - trajectory: mode="heating"/"off", delay_steps, duration_steps
+    - regulating: mode="heat"/"cool"/"off", target (comfort setpoint)
+    - binary: mode="off"/"low"/"high"/etc.
     """
 
-    heating: bool
-    delay_steps: int = 0  # 5-min steps before activation (0 = start now)
-    duration_steps: int | None = None  # 5-min steps of activation (None = full horizon)
+    name: str  # "thermostat_upstairs", "blower_office", "mini_split_bedroom"
+    mode: str = "off"  # "off", "heating", "heat", "cool", "low", "high"
+    target: float | None = None  # regulating effectors: comfort setpoint (°F)
+    delay_steps: int = 0  # trajectory effectors: 5-min steps before activation
+    duration_steps: int | None = None  # trajectory effectors: steps of activation (None = full horizon)
 
 
 @dataclass(frozen=True)
-class TrajectoryScenario:
-    """HVAC scenario with trajectory parameters for slow effectors (thermostats).
+class Scenario:
+    """An HVAC plan to evaluate: one decision per effector.
 
-    Fast effectors (mini-splits, blowers) use constant activity over the full horizon.
-    Blower timelines follow their zone thermostat's on/off pattern.
-    Boiler timeline is derived as the OR of both thermostat timelines.
+    Activity timelines depend on control_type (from sysid params):
+    - trajectory: [OFF × delay] → [ON × duration] → [OFF × remainder]
+    - regulating: proportional activity based on (target - room_temp) / band
+    - binary: constant encoded mode value over full horizon
+
+    Dependent effectors (e.g., blowers depending on a thermostat) have their
+    activity multiplied by the dependency's active mask in the simulator.
     """
 
-    upstairs: ThermostatTrajectory
-    downstairs: ThermostatTrajectory
-    blowers: tuple[BlowerDecision, ...]
-    mini_splits: tuple[MiniSplitDecision, ...]
+    effectors: dict[str, EffectorDecision]  # effector_name -> decision
 
 
 @dataclass(frozen=True)
 class ControlDecision:
-    """A single control decision: all HVAC devices and derived setpoints."""
+    """A single control decision: all effectors and derived command targets."""
 
     timestamp: str
-    upstairs_heating: bool
-    downstairs_heating: bool
-    upstairs_setpoint: float  # derived: current ± CAUTIOUS_OFFSET
-    downstairs_setpoint: float
-    blowers: tuple[BlowerDecision, ...] = ()
-    mini_splits: tuple[MiniSplitDecision, ...] = ()
+    effectors: tuple[EffectorDecision, ...]
+    command_targets: dict[str, float] = field(default_factory=dict)  # effector_name -> setpoint for command JSON
     total_cost: float = 0.0
     comfort_cost: float = 0.0
     energy_cost: float = 0.0
     predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # label -> {horizon -> temp}
-    # zone -> {delay_steps, duration_steps}
     trajectory_info: dict[str, dict[str, int | None]] = field(default_factory=dict)
     dry_run: bool = True
 
@@ -214,9 +198,6 @@ class ControlState:
     """Persisted state to prevent rapid cycling."""
 
     last_decision_time: str  # ISO 8601
-    upstairs_setpoint: float
-    downstairs_setpoint: float
-    blower_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
-    mini_split_modes: dict[str, str] = field(default_factory=dict)  # name -> mode
-    mini_split_targets: dict[str, float] = field(default_factory=dict)  # name -> target
-    mini_split_mode_times: dict[str, str] = field(default_factory=dict)  # name -> ISO timestamp of last mode change
+    setpoints: dict[str, float] = field(default_factory=dict)  # effector_name -> setpoint
+    modes: dict[str, str] = field(default_factory=dict)  # effector_name -> mode
+    mode_times: dict[str, str] = field(default_factory=dict)  # effector_name -> ISO timestamp

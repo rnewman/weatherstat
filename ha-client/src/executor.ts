@@ -16,14 +16,7 @@ import { resolve, dirname } from "node:path";
 
 import type { HAClient, HAEntityState, Prediction } from "./types.ts";
 import type { Config } from "./config.ts";
-import {
-  THERMOSTAT_UPSTAIRS,
-  THERMOSTAT_DOWNSTAIRS,
-  MINI_SPLIT_BEDROOM,
-  MINI_SPLIT_LIVING_ROOM,
-  BLOWER_FAMILY_ROOM,
-  BLOWER_OFFICE,
-} from "./entities.ts";
+import { config as yamlConfig } from "./yaml-config.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -41,6 +34,12 @@ interface ExecutorState {
 
 /** Ignore temperature differences smaller than this (°F). */
 const TARGET_TOLERANCE = 0.5;
+
+/** Convert snake_case to camelCase for prediction JSON key lookup. */
+function snakeToCamel(s: string): string {
+  const parts = s.split("_");
+  return parts[0] + parts.slice(1).map((p) => (p ? p[0]!.toUpperCase() + p.slice(1) : "")).join("");
+}
 
 // ── State persistence ────────────────────────────────────────────────────
 
@@ -185,11 +184,11 @@ export async function executePrediction(
   );
   if (force) console.log("[executor] Force mode — overrides will be ignored");
 
-  // Fetch current HA states for all controlled entities
-  const controlledEntities = [
-    THERMOSTAT_UPSTAIRS, THERMOSTAT_DOWNSTAIRS,
-    MINI_SPLIT_BEDROOM, MINI_SPLIT_LIVING_ROOM,
-    BLOWER_FAMILY_ROOM, BLOWER_OFFICE,
+  // Fetch current HA states for all controlled entities (from config)
+  const controlledEntities: string[] = [
+    ...Object.values(yamlConfig.thermostats).map((t) => t.entityId),
+    ...Object.values(yamlConfig.miniSplits).map((s) => s.entityId),
+    ...Object.values(yamlConfig.blowers).map((b) => b.entityId),
   ];
   const states = await client.getStates(controlledEntities);
   const stateMap = new Map<string, HAEntityState>(states.map((s) => [s.entity_id, s]));
@@ -216,15 +215,12 @@ export async function executePrediction(
   let lazySkips = 0;
   let overrideSkips = 0;
 
-  // ── Thermostats ────────────────────────────────────────────────────────
+  // ── Thermostats (from config) ──────────────────────────────────────────
 
-  const thermostats: [string, string, number][] = [
-    ["upstairs", THERMOSTAT_UPSTAIRS, prediction.thermostatUpstairsTarget],
-    ["downstairs", THERMOSTAT_DOWNSTAIRS, prediction.thermostatDownstairsTarget],
-  ];
-
-  for (const [name, entityId, desiredTarget] of thermostats) {
+  for (const [name, tcfg] of Object.entries(yamlConfig.thermostats)) {
     const key = `thermostat_${name}`;
+    const targetKey = snakeToCamel(`thermostat_${name}_target`);
+    const desiredTarget = prediction[targetKey] as number | undefined;
 
     // Ineligible: no target in command JSON (thermostat off or gate device down)
     if (desiredTarget === undefined) {
@@ -232,7 +228,7 @@ export async function executePrediction(
       continue;
     }
 
-    const current = readThermostat(stateMap, entityId);
+    const current = readThermostat(stateMap, tcfg.entityId);
 
     // Lazy: already at desired target
     if (current.target !== undefined && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE) {
@@ -257,27 +253,33 @@ export async function executePrediction(
       continue;
     }
 
-    await applyThermostat(client, entityId, desiredTarget);
+    await applyThermostat(client, tcfg.entityId, desiredTarget);
     console.log(`[executor] ${key}: set to ${desiredTarget}°F`);
     updated[key] = { target: desiredTarget };
     applied++;
   }
 
-  // ── Mini splits ────────────────────────────────────────────────────────
+  // ── Mini splits (from config) ──────────────────────────────────────────
 
-  const miniSplits: [string, string, string, number][] = [
-    ["bedroom", MINI_SPLIT_BEDROOM, prediction.miniSplitBedroomMode, prediction.miniSplitBedroomTarget],
-    ["living_room", MINI_SPLIT_LIVING_ROOM, prediction.miniSplitLivingRoomMode, prediction.miniSplitLivingRoomTarget],
-  ];
-
-  for (const [name, entityId, desiredMode, desiredTarget] of miniSplits) {
+  for (const [name, scfg] of Object.entries(yamlConfig.miniSplits)) {
     const key = `mini_split_${name}`;
-    const current = readMiniSplit(stateMap, entityId);
+    const modeKey = snakeToCamel(`mini_split_${name}_mode`);
+    const targetKey = snakeToCamel(`mini_split_${name}_target`);
+    const desiredMode = prediction[modeKey] as string | undefined;
+    const desiredTarget = prediction[targetKey] as number | undefined;
+
+    if (desiredMode === undefined) {
+      console.log(`[executor] ${key}: not in command, skipping`);
+      continue;
+    }
+
+    const current = readMiniSplit(stateMap, scfg.entityId);
 
     // Lazy: mode and target already match
     const modeMatch = current.mode === desiredMode;
     const targetMatch = desiredMode === "off"
-      || (current.target !== undefined && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE);
+      || (desiredTarget !== undefined && current.target !== undefined
+        && Math.abs(current.target - desiredTarget) < TARGET_TOLERANCE);
     if (modeMatch && targetMatch) {
       const desc = desiredMode === "off" ? "off" : `${desiredMode} @ ${current.target}°F`;
       console.log(`[executor] ${key}: already ${desc}, skipping`);
@@ -296,23 +298,26 @@ export async function executePrediction(
       continue;
     }
 
-    await applyMiniSplit(client, entityId, desiredMode, desiredTarget);
+    await applyMiniSplit(client, scfg.entityId, desiredMode, desiredTarget ?? 72);
     const desc = desiredMode === "off" ? "off" : `${desiredMode} @ ${desiredTarget}°F`;
     console.log(`[executor] ${key}: set to ${desc}`);
     updated[key] = { mode: desiredMode, target: desiredTarget };
     applied++;
   }
 
-  // ── Blowers ────────────────────────────────────────────────────────────
+  // ── Blowers (from config) ──────────────────────────────────────────────
 
-  const blowers: [string, string, string][] = [
-    ["family_room", BLOWER_FAMILY_ROOM, prediction.blowerFamilyRoomMode],
-    ["office", BLOWER_OFFICE, prediction.blowerOfficeMode],
-  ];
-
-  for (const [name, entityId, desiredMode] of blowers) {
+  for (const [name, bcfg] of Object.entries(yamlConfig.blowers)) {
     const key = `blower_${name}`;
-    const current = readBlower(stateMap, entityId);
+    const modeKey = snakeToCamel(`blower_${name}_mode`);
+    const desiredMode = prediction[modeKey] as string | undefined;
+
+    if (desiredMode === undefined) {
+      console.log(`[executor] ${key}: not in command, skipping`);
+      continue;
+    }
+
+    const current = readBlower(stateMap, bcfg.entityId);
 
     // Lazy: already at desired mode
     if (current.mode === desiredMode) {
@@ -332,7 +337,7 @@ export async function executePrediction(
       continue;
     }
 
-    await applyBlower(client, entityId, desiredMode);
+    await applyBlower(client, bcfg.entityId, desiredMode);
     console.log(`[executor] ${key}: set to ${desiredMode}`);
     updated[key] = { mode: desiredMode };
     applied++;

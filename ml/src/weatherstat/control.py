@@ -3,9 +3,9 @@
 Receding-horizon controller: "what HVAC settings maximize comfort over the next 6 hours?"
 Re-evaluated every 15 minutes. Physics-based trajectory sweep using forward simulation.
 
-Control variables: 2 thermostats (binary on/off with delay x duration grid),
-2 blowers (off/low/high), 2 mini-splits (off/heat/cool). Config-driven device lists
-make adding blowers a single-line change.
+Config-driven effector list: thermostats (trajectory on/off with delay x duration grid),
+blowers (binary modes), mini-splits (regulating with target temperatures). Adding a device
+is a YAML edit — no code changes needed.
 
 Run:
   uv run python -m weatherstat.control            # single cycle, dry-run
@@ -28,26 +28,24 @@ import pandas as pd
 import requests
 
 from weatherstat.config import (
-    BLOWERS,
     CONTROL_STATE_FILE,
+    EFFECTOR_MAP,
+    EFFECTORS,
     ENERGY_COST_BLOWER,
     ENERGY_COST_GAS_ZONE,
     ENERGY_COST_MINI_SPLIT,
-    MINI_SPLITS,
     PREDICTION_LABELS,
     PREDICTIONS_DIR,
 )
 from weatherstat.extract import fetch_recent_history
 from weatherstat.types import (
-    BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
     ControlState,
-    MiniSplitDecision,
+    EffectorDecision,
     RoomComfort,
-    ThermostatTrajectory,
-    TrajectoryScenario,
+    Scenario,
 )
 from weatherstat.yaml_config import ComfortProfile, MrtCorrectionConfig, load_config
 
@@ -127,8 +125,12 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
                 e.start_hour,
                 e.end_hour,
                 RoomComfort(
-                    constraint.label, e.preferred, e.min_temp, e.max_temp,
-                    e.cold_penalty, e.hot_penalty,
+                    constraint.label,
+                    e.preferred,
+                    e.min_temp,
+                    e.max_temp,
+                    e.cold_penalty,
+                    e.hot_penalty,
                 ),
             )
             for e in constraint.entries
@@ -163,8 +165,7 @@ def adjust_schedules_for_windows(
     """
     # Window name matches constraint label → that window affects that sensor
     labels_with_open_windows: set[str] = {
-        wname for wname, is_open in window_states.items()
-        if is_open and wname in constraint_labels
+        wname for wname, is_open in window_states.items() if is_open and wname in constraint_labels
     }
 
     if not labels_with_open_windows:
@@ -430,7 +431,7 @@ def compute_comfort_cost_by_sensor(
 
 
 def compute_energy_cost(
-    scenario: TrajectoryScenario,
+    scenario: Scenario,
     current_temps: dict[str, float] | None = None,
 ) -> float:
     """Tiered energy penalty: gas zones > mini-splits > blower fans.
@@ -440,53 +441,58 @@ def compute_energy_cost(
     Mini-split cost is proportional to expected activity (target vs room temp).
     """
     cost = 0.0
-    # Gas zones (Navien boiler via thermostat)
     max_h = max(CONTROL_HORIZONS)
-    for traj in [scenario.upstairs, scenario.downstairs]:
-        if traj.heating:
-            dur = traj.duration_steps if traj.duration_steps is not None else (max_h - traj.delay_steps)
-            cost += ENERGY_COST_GAS_ZONE * dur / max_h
-    # Mini-splits: proportional to expected activity based on room temp
     temps = current_temps or {}
-    for sd in scenario.mini_splits:
-        if sd.mode == "off":
+
+    for ed in scenario.effectors.values():
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None or ed.mode == "off":
             continue
-        split_cfg = _CFG.mini_splits.get(sd.name)
-        p_band = split_cfg.proportional_band if split_cfg else 1.0
-        room_temp = temps.get(sd.name)
-        if room_temp is not None:
-            delta = max(0.0, sd.target - room_temp) if sd.mode == "heat" else max(0.0, room_temp - sd.target)
-            avg_activity = min(1.0, delta / p_band)
-        else:
-            avg_activity = 0.5  # unknown room temp — assume moderate activity
-        cost += ENERGY_COST_MINI_SPLIT * avg_activity
-    # Blower fans (negligible)
-    for bd in scenario.blowers:
-        cost += ENERGY_COST_BLOWER.get(bd.mode, 0.0)
+
+        if eff_cfg.control_type == "trajectory":
+            # Gas zones (Navien boiler via thermostat)
+            dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
+            cost += ENERGY_COST_GAS_ZONE * dur / max_h
+
+        elif eff_cfg.control_type == "regulating":
+            # Mini-splits: proportional to expected activity based on room temp
+            p_band = eff_cfg.proportional_band
+            # Regulating effector label = name without prefix (e.g., "mini_split_bedroom" -> "bedroom")
+            label = ed.name.removeprefix("mini_split_")
+            room_temp = temps.get(label)
+            if room_temp is not None and ed.target is not None:
+                delta = max(0.0, ed.target - room_temp) if ed.mode == "heat" else max(0.0, room_temp - ed.target)
+                avg_activity = min(1.0, delta / p_band)
+            else:
+                avg_activity = 0.5  # unknown room temp — assume moderate activity
+            cost += ENERGY_COST_MINI_SPLIT * avg_activity
+
+        elif eff_cfg.control_type == "binary":
+            # Blower fans (negligible)
+            cost += ENERGY_COST_BLOWER.get(ed.mode, 0.0)
+
     return cost
 
 
 def _derive_sensor_zones(gains: dict[tuple[str, str], tuple[float, float]]) -> dict[str, str]:
-    """Derive sensor → zone mapping from the sysid coupling matrix.
+    """Derive sensor → thermostat effector mapping from the sysid coupling matrix.
 
-    For each sensor, find the thermostat effector with the highest positive gain.
-    Returns label -> zone_name (e.g., {"bedroom": "upstairs"}).
+    For each sensor, find the trajectory effector with the highest positive gain.
+    Returns label -> effector_name (e.g., {"bedroom": "thermostat_upstairs"}).
     """
-    zones = _CFG.zones  # zone_name -> ZoneConfig(thermostat=...)
-    thermostat_to_zone = {f"thermostat_{z.thermostat}": z.name for z in zones.values()}
+    trajectory_effectors = {e.name for e in EFFECTORS if e.control_type == "trajectory"}
 
     # Accumulate best thermostat gain per sensor
-    best: dict[str, tuple[str, float]] = {}  # sensor -> (zone, gain)
+    best: dict[str, tuple[str, float]] = {}  # sensor_label -> (effector_name, gain)
     for (effector, sensor), (gain, _lag) in gains.items():
-        if effector not in thermostat_to_zone or gain <= 0:
+        if effector not in trajectory_effectors or gain <= 0:
             continue
-        zone = thermostat_to_zone[effector]
         label = sensor.removeprefix("thermostat_").removesuffix("_temp")
         prev = best.get(label)
         if prev is None or gain > prev[1]:
-            best[label] = (zone, gain)
+            best[label] = (effector, gain)
 
-    return {label: zone for label, (zone, _) in best.items()}
+    return {label: eff_name for label, (eff_name, _) in best.items()}
 
 
 def _zone_comfort_max(label: str, schedules: list[ComfortSchedule], hour: int) -> float:
@@ -526,14 +532,14 @@ def _cautious_setpoint(current_temp: float, heating: bool, comfort_min: float = 
 # ── Scenario generation & sweep ──────────────────────────────────────────
 
 
-def _mini_split_sweep_options(
-    split_name: str,
+def _regulating_sweep_options(
+    eff: object,
     schedules: list[ComfortSchedule],
     base_hour: int,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
-) -> list[MiniSplitDecision]:
-    """Generate sweep options for a regulating mini split: off + preferred target.
+) -> list[EffectorDecision]:
+    """Generate sweep options for a regulating effector: off + preferred target.
 
     Target is the preferred temperature from the comfort schedule.
     Mode is derived from room temp vs preferred: if the room is above
@@ -541,16 +547,20 @@ def _mini_split_sweep_options(
     influences trajectories via the simulator, not mode intent.
     During mode hold windows, mode is locked to current.
     If the room is already past target by more than the proportional band,
-    the split would be idle — skip the on option and let receding horizon
+    the effector would be idle — skip the on option and let receding horizon
     re-evaluate when the room actually needs it.
     """
-    split_cfg = _CFG.mini_splits.get(split_name)
-    options: list[MiniSplitDecision] = [MiniSplitDecision(split_name, "off", 0.0)]
+    from weatherstat.config import EffectorConfig
 
-    # Find preferred temperature for this split's sensor
+    assert isinstance(eff, EffectorConfig)
+    # Label for comfort schedule lookup: name without prefix (e.g., "mini_split_bedroom" -> "bedroom")
+    label = eff.name.removeprefix("mini_split_")
+    options: list[EffectorDecision] = [EffectorDecision(eff.name)]
+
+    # Find preferred temperature for this effector's sensor
     preferred: float | None = None
     for sched in schedules:
-        if sched.label == split_name:
+        if sched.label == label:
             comfort = sched.comfort_at(base_hour)
             if comfort is not None:
                 preferred = comfort.preferred
@@ -560,29 +570,28 @@ def _mini_split_sweep_options(
         return options
 
     # Derive mode from room temp vs preferred (default heat — safer in winter)
-    room_temp = (current_temps or {}).get(split_name)
+    room_temp = (current_temps or {}).get(label)
     mode = ("cool" if room_temp > preferred else "heat") if room_temp is not None else "heat"
 
-    # Skip on-option if the split would be idle: room already past target
+    # Skip on-option if the effector would be idle: room already past target
     # by more than the proportional band.  Receding horizon (15-min
     # re-evaluation) will add it back when the room actually needs it.
-    p_band = split_cfg.proportional_band if split_cfg else 1.0
+    p_band = eff.proportional_band
     if room_temp is not None:
         if mode == "heat" and room_temp > preferred + p_band:
-            return options  # room well above target — split would be idle
+            return options  # room well above target — effector would be idle
         if mode == "cool" and room_temp < preferred - p_band:
-            return options  # room well below target — split would be idle
+            return options  # room well below target — effector would be idle
 
-    options.append(MiniSplitDecision(split_name, mode, round(preferred, 1)))
+    options.append(EffectorDecision(eff.name, mode=mode, target=round(preferred, 1)))
 
     # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
-    hold_window = split_cfg.mode_hold_window if split_cfg else None
-    if prev_state and hold_window and _in_hold_window(base_hour, hold_window):
-        prev_mode = prev_state.mini_split_modes.get(split_name, "off")
+    if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
+        prev_mode = prev_state.modes.get(eff.name, "off")
         options = [o for o in options if o.mode == prev_mode]
         if not options:
-            prev_target = prev_state.mini_split_targets.get(split_name, 0.0)
-            options = [MiniSplitDecision(split_name, prev_mode, prev_target)]
+            prev_target = prev_state.setpoints.get(eff.name, 0.0)
+            options = [EffectorDecision(eff.name, mode=prev_mode, target=prev_target)]
 
     return options
 
@@ -600,80 +609,98 @@ def generate_trajectory_scenarios(
     base_hour: int = 12,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
-    ineligible_zones: set[str] | None = None,
-) -> list[TrajectoryScenario]:
+    ineligible_effectors: set[str] | None = None,
+) -> list[Scenario]:
     """Generate trajectory scenarios for physics sweep.
 
-    Slow effectors (thermostats) get a delay × duration grid.
-    Fast effectors (blowers) use constant modes.
-    Mini splits use comfort-derived target grid (off + 3 targets per split).
-    Blower constraint: only active when zone thermostat is heating.
+    Slow effectors (trajectory) get a delay x duration grid.
+    Fast effectors (binary) use constant modes.
+    Regulating effectors use comfort-derived target grid (off + preferred).
+    Dependent effectors (e.g., blowers) only active when parent is active.
     """
     from itertools import product
 
     max_horizon = max(CONTROL_HORIZONS)
+    _ineligible = ineligible_effectors or set()
 
-    # Build thermostat trajectory options: OFF + delay×duration grid
-    traj_options: list[ThermostatTrajectory] = [ThermostatTrajectory(heating=False)]
-    for delay in TRAJECTORY_DELAYS:
-        if delay >= max_horizon:
+    # Build per-effector option lists
+    per_effector_options: dict[str, list[EffectorDecision]] = {}
+
+    for eff in EFFECTORS:
+        if eff.depends_on is not None:
+            # Dependent effectors handled after their parent
             continue
-        for duration in TRAJECTORY_DURATIONS:
-            # Cap duration at remaining horizon
-            effective_duration = min(duration, max_horizon - delay)
-            traj_options.append(ThermostatTrajectory(
-                heating=True,
-                delay_steps=delay,
-                duration_steps=effective_duration,
-            ))
 
-    # Deduplicate (capping creates duplicates)
-    traj_options = list(dict.fromkeys(traj_options))
+        if eff.control_type == "trajectory":
+            if eff.name in _ineligible:
+                per_effector_options[eff.name] = [EffectorDecision(eff.name)]
+            else:
+                options: list[EffectorDecision] = [EffectorDecision(eff.name)]
+                for delay in TRAJECTORY_DELAYS:
+                    if delay >= max_horizon:
+                        continue
+                    for duration in TRAJECTORY_DURATIONS:
+                        effective_duration = min(duration, max_horizon - delay)
+                        options.append(
+                            EffectorDecision(
+                                eff.name,
+                                mode="heating",
+                                delay_steps=delay,
+                                duration_steps=effective_duration,
+                            )
+                        )
+                # Deduplicate (capping creates duplicates)
+                per_effector_options[eff.name] = list(dict.fromkeys(options))
 
-    # Mini-split combinations: target grid from comfort schedule
-    if schedules is not None:
-        per_split_options = [
-            _mini_split_sweep_options(s.name, schedules, base_hour, prev_state, current_temps)
-            for s in MINI_SPLITS
-        ]
-    else:
-        # Fallback for backward compat (e.g., scenario counting without schedules)
-        per_split_options = [
-            [MiniSplitDecision(s.name, "off", 0.0), MiniSplitDecision(s.name, "heat", 70.0)]
-            for s in MINI_SPLITS
-        ]
+        elif eff.control_type == "regulating":
+            if schedules is not None:
+                per_effector_options[eff.name] = _regulating_sweep_options(
+                    eff,
+                    schedules,
+                    base_hour,
+                    prev_state,
+                    current_temps,
+                )
+            else:
+                per_effector_options[eff.name] = [
+                    EffectorDecision(eff.name),
+                    EffectorDecision(eff.name, mode="heat", target=70.0),
+                ]
 
-    split_combos: list[tuple[MiniSplitDecision, ...]] = [
-        combo for combo in product(*per_split_options)
-    ]
+        elif eff.control_type == "binary":
+            per_effector_options[eff.name] = [EffectorDecision(eff.name, mode=m) for m in eff.supported_modes]
 
-    # Per-zone trajectory options (ineligible zones fixed to heating=False)
-    _ineligible = ineligible_zones or set()
-    up_traj_options = [ThermostatTrajectory(heating=False)] if "upstairs" in _ineligible else traj_options
-    dn_traj_options = [ThermostatTrajectory(heating=False)] if "downstairs" in _ineligible else traj_options
+    # Cartesian product of independent effectors
+    independent_names = list(per_effector_options.keys())
+    independent_options = [per_effector_options[n] for n in independent_names]
 
-    # Full cartesian product with blower constraint
-    scenarios: list[TrajectoryScenario] = []
-    for up_traj in up_traj_options:
-        for dn_traj in dn_traj_options:
-            # Blower constraint: only sweep blower levels when zone thermostat
-            # starts immediately (delay=0).  Delayed trajectories start heating
-            # later — receding horizon will add blower when heat actually begins.
-            immediate_heat = {
-                "upstairs": up_traj.heating and up_traj.delay_steps == 0,
-                "downstairs": dn_traj.heating and dn_traj.delay_steps == 0,
-            }
-            per_blower_levels = []
-            for b in BLOWERS:
-                if immediate_heat.get(b.zone, False):
-                    per_blower_levels.append(b.levels)
-                else:
-                    per_blower_levels.append(("off",))
+    # Dependent effectors: constrained by parent state
+    dependent_effectors = [e for e in EFFECTORS if e.depends_on is not None]
 
-            for levels in product(*per_blower_levels):
-                blowers = tuple(BlowerDecision(b.name, lvl) for b, lvl in zip(BLOWERS, levels, strict=True))
-                for splits in split_combos:
-                    scenarios.append(TrajectoryScenario(up_traj, dn_traj, blowers, splits))
+    scenarios: list[Scenario] = []
+    for combo in product(*independent_options):
+        base_decisions = {ed.name: ed for ed in combo}
+
+        # Build dependent options: only sweep when parent is immediately active
+        dep_option_lists: list[list[EffectorDecision]] = []
+        dep_names: list[str] = []
+        for dep in dependent_effectors:
+            parent = base_decisions.get(dep.depends_on or "")
+            parent_immediate = parent is not None and parent.mode != "off" and parent.delay_steps == 0
+            if parent_immediate:
+                dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep.supported_modes])
+            else:
+                dep_option_lists.append([EffectorDecision(dep.name)])
+            dep_names.append(dep.name)
+
+        if dep_option_lists:
+            for dep_combo in product(*dep_option_lists):
+                effectors = dict(base_decisions)
+                for dep_ed in dep_combo:
+                    effectors[dep_ed.name] = dep_ed
+                scenarios.append(Scenario(effectors))
+        else:
+            scenarios.append(Scenario(dict(base_decisions)))
 
     return scenarios
 
@@ -689,46 +716,56 @@ def sweep_scenarios_physics(
     sim_params: object,
     hour_of_day: float,
     recent_history: dict[str, list[float]],
-    up_current: float,
-    dn_current: float,
-    current_split_temps: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
     prev_state: ControlState | None = None,
     solar_fractions: list[float] | None = None,
-    ineligible_zones: set[str] | None = None,
-) -> tuple[ControlDecision, TrajectoryScenario]:
+    ineligible_effectors: set[str] | None = None,
+) -> tuple[ControlDecision, Scenario]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
-    Thermostats are evaluated over a delay × duration grid (trajectory search).
-    Fast effectors (blowers, mini-splits) use constant modes.
-    Ineligible zones are fixed to heating=False (thermostats off or Navien down).
+    Trajectory effectors are evaluated over a delay x duration grid.
+    Regulating effectors use comfort-derived targets.
+    Binary effectors sweep supported modes.
+    Ineligible effectors are fixed to off.
     """
     from weatherstat.simulator import HouseState, SimParams, predict
 
     assert isinstance(sim_params, SimParams)
 
     sensor_zones = _derive_sensor_zones(sim_params.gains)
+    _ineligible = ineligible_effectors or set()
     scenarios = generate_trajectory_scenarios(
-        schedules, base_hour, prev_state, current_temps, ineligible_zones,
+        schedules,
+        base_hour,
+        prev_state,
+        current_temps,
+        _ineligible,
     )
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
 
-    # ── Physical constraints ──
-    up_max = _zone_comfort_max("upstairs", schedules, base_hour)
-    dn_max = _zone_comfort_max("downstairs", schedules, base_hour)
-    up_allow = up_current < up_max
-    dn_allow = dn_current < dn_max
-    if not up_allow or not dn_allow:
+    # ── Physical constraints: block trajectory effectors at/above comfort max ──
+    blocked_effectors: set[str] = set()
+    for eff in EFFECTORS:
+        if eff.control_type != "trajectory":
+            continue
+        # Trajectory effector label from temp_col (e.g., "thermostat_upstairs_temp" -> "upstairs")
+        label = eff.name.removeprefix("thermostat_")
+        eff_temp = current_temps.get(label)
+        if eff_temp is None:
+            continue
+        eff_max = _zone_comfort_max(label, schedules, base_hour)
+        if eff_temp >= eff_max:
+            blocked_effectors.add(eff.name)
+            blocked_reasons.append(f"{label} at/above max ({eff_temp:.1f}°F >= {eff_max:.0f}°F)")
+
+    if blocked_effectors:
         scenarios = [
-            s for s in scenarios
-            if (up_allow or not s.upstairs.heating) and (dn_allow or not s.downstairs.heating)
+            s
+            for s in scenarios
+            if all(s.effectors[name].mode == "off" for name in blocked_effectors if name in s.effectors)
         ]
-        if not up_allow:
-            blocked_reasons.append(f"upstairs at/above max ({up_current:.1f}°F >= {up_max:.0f}°F)")
-        if not dn_allow:
-            blocked_reasons.append(f"downstairs at/above max ({dn_current:.1f}°F >= {dn_max:.0f}°F)")
 
     # Note: no "thermal direction" pruning — the trajectory sweep and cost
     # function decide whether heating is justified.  Pre-emptive heating for
@@ -739,13 +776,8 @@ def sweep_scenarios_physics(
         print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
         print(f"  Reduced scenarios: {pre_count} → {len(scenarios)}")
 
-    def _is_all_off(s: TrajectoryScenario) -> bool:
-        return (
-            not s.upstairs.heating
-            and not s.downstairs.heating
-            and all(b.mode == "off" for b in s.blowers)
-            and all(sp.mode == "off" for sp in s.mini_splits)
-        )
+    def _is_all_off(s: Scenario) -> bool:
+        return all(ed.mode == "off" for ed in s.effectors.values())
 
     # ── Batch simulate all scenarios ──
     sweep_state = HouseState(
@@ -793,7 +825,7 @@ def sweep_scenarios_physics(
     # ── Cold-sensor safety override ──
     # Force immediate heating (delay=0) when a sensor is significantly below comfort min
     if _is_all_off(scenarios[best_idx]):
-        cold_zones: set[str] = set()
+        cold_effectors: set[str] = set()
         cold_info: list[str] = []
         for schedule in schedules:
             label = schedule.label
@@ -804,27 +836,24 @@ def sweep_scenarios_physics(
             if comfort is None:
                 continue
             if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
-                zone = sensor_zones.get(label)
-                if zone:
-                    cold_zones.add(zone)
+                eff_name = sensor_zones.get(label)
+                if eff_name:
+                    cold_effectors.add(eff_name)
                     cold_info.append(f"{label} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
 
-        if not up_allow:
-            cold_zones.discard("upstairs")
-        if not dn_allow:
-            cold_zones.discard("downstairs")
-        for zone in (ineligible_zones or set()):
-            cold_zones.discard(zone)
+        # Remove blocked or ineligible effectors from cold override set
+        cold_effectors -= blocked_effectors
+        cold_effectors -= _ineligible
 
-        if cold_zones:
+        if cold_effectors:
             constrained_best = -1
             constrained_cost = float("inf")
             for i, scenario in enumerate(scenarios):
-                # Cold-room override requires immediate heating (delay=0)
-                if "upstairs" in cold_zones and not (scenario.upstairs.heating and scenario.upstairs.delay_steps == 0):
-                    continue
-                if "downstairs" in cold_zones and not (
-                    scenario.downstairs.heating and scenario.downstairs.delay_steps == 0
+                # Cold-room override requires immediate heating (delay=0) for cold effectors
+                if any(
+                    not (scenario.effectors[name].mode != "off" and scenario.effectors[name].delay_steps == 0)
+                    for name in cold_effectors
+                    if name in scenario.effectors
                 ):
                     continue
                 predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
@@ -844,22 +873,35 @@ def sweep_scenarios_physics(
     energy = compute_energy_cost(scenario, current_temps)
     total = comfort + energy
 
-    # Immediate action: heating only if trajectory starts now (delay=0)
-    up_heating_now = scenario.upstairs.heating and scenario.upstairs.delay_steps == 0
-    dn_heating_now = scenario.downstairs.heating and scenario.downstairs.delay_steps == 0
-
-    # Build trajectory info for logging/display
+    # Build effector decisions and command targets
+    effector_decisions: list[EffectorDecision] = list(scenario.effectors.values())
+    command_targets: dict[str, float] = {}
     trajectory_info: dict[str, dict[str, int | None]] = {}
-    if scenario.upstairs.heating:
-        trajectory_info["upstairs"] = {
-            "delay_steps": scenario.upstairs.delay_steps,
-            "duration_steps": scenario.upstairs.duration_steps,
-        }
-    if scenario.downstairs.heating:
-        trajectory_info["downstairs"] = {
-            "delay_steps": scenario.downstairs.delay_steps,
-            "duration_steps": scenario.downstairs.duration_steps,
-        }
+
+    for ed in effector_decisions:
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None:
+            continue
+
+        if eff_cfg.control_type == "trajectory":
+            # Trajectory effector: compute cautious setpoint
+            label = ed.name.removeprefix("thermostat_")
+            eff_temp = current_temps.get(label, 70.0)
+            heating_now = ed.mode != "off" and ed.delay_steps == 0
+            setpoint = _cautious_setpoint(
+                eff_temp,
+                heating_now,
+                comfort_min=_zone_comfort_min(label, schedules, base_hour),
+            )
+            command_targets[ed.name] = setpoint
+            if ed.mode != "off":
+                trajectory_info[ed.name] = {
+                    "delay_steps": ed.delay_steps,
+                    "duration_steps": ed.duration_steps,
+                }
+
+        elif eff_cfg.control_type == "regulating" and ed.target is not None:
+            command_targets[ed.name] = ed.target
 
     label_preds: dict[str, dict[str, float]] = {}
     for label in PREDICTION_LABELS:
@@ -874,20 +916,8 @@ def sweep_scenarios_physics(
 
     decision = ControlDecision(
         timestamp=datetime.now(UTC).isoformat(),
-        upstairs_heating=up_heating_now,
-        downstairs_heating=dn_heating_now,
-        upstairs_setpoint=_cautious_setpoint(
-            up_current,
-            up_heating_now,
-            comfort_min=_zone_comfort_min("upstairs", schedules, base_hour),
-        ),
-        downstairs_setpoint=_cautious_setpoint(
-            dn_current,
-            dn_heating_now,
-            comfort_min=_zone_comfort_min("downstairs", schedules, base_hour),
-        ),
-        blowers=scenario.blowers,
-        mini_splits=scenario.mini_splits,
+        effectors=tuple(effector_decisions),
+        command_targets=command_targets,
         total_cost=round(total, 4),
         comfort_cost=round(comfort, 4),
         energy_cost=round(energy, 4),
@@ -908,12 +938,9 @@ def load_control_state() -> ControlState | None:
         data = json.loads(CONTROL_STATE_FILE.read_text())
         return ControlState(
             last_decision_time=data["last_decision_time"],
-            upstairs_setpoint=data["upstairs_setpoint"],
-            downstairs_setpoint=data["downstairs_setpoint"],
-            blower_modes=data.get("blower_modes", {}),
-            mini_split_modes=data.get("mini_split_modes", {}),
-            mini_split_targets=data.get("mini_split_targets", {}),
-            mini_split_mode_times=data.get("mini_split_mode_times", {}),
+            setpoints=data.get("setpoints", {}),
+            modes=data.get("modes", {}),
+            mode_times=data.get("mode_times", {}),
         )
     except (json.JSONDecodeError, KeyError):
         return None
@@ -922,12 +949,13 @@ def load_control_state() -> ControlState | None:
 def save_control_state(decision: ControlDecision, prev_state: ControlState | None = None) -> None:
     """Persist control state to prevent rapid cycling.
 
-    Tracks mini-split mode change timestamps: only updated when mode actually changes.
+    Tracks mode change timestamps: only updated when mode actually changes.
     """
     now_iso = decision.timestamp
-    new_modes = {sd.name: sd.mode for sd in decision.mini_splits}
-    prev_modes = prev_state.mini_split_modes if prev_state else {}
-    prev_mode_times = dict(prev_state.mini_split_mode_times) if prev_state else {}
+    new_modes = {ed.name: ed.mode for ed in decision.effectors}
+    new_setpoints = dict(decision.command_targets)
+    prev_modes = prev_state.modes if prev_state else {}
+    prev_mode_times = dict(prev_state.mode_times) if prev_state else {}
 
     # Update mode-change timestamps only when mode actually changes
     for name, mode in new_modes.items():
@@ -936,12 +964,9 @@ def save_control_state(decision: ControlDecision, prev_state: ControlState | Non
 
     state: dict[str, object] = {
         "last_decision_time": now_iso,
-        "upstairs_setpoint": decision.upstairs_setpoint,
-        "downstairs_setpoint": decision.downstairs_setpoint,
-        "blower_modes": {bd.name: bd.mode for bd in decision.blowers},
-        "mini_split_modes": new_modes,
-        "mini_split_targets": {sd.name: sd.target for sd in decision.mini_splits},
-        "mini_split_mode_times": prev_mode_times,
+        "setpoints": new_setpoints,
+        "modes": new_modes,
+        "mode_times": prev_mode_times,
     }
     CONTROL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONTROL_STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -1015,31 +1040,34 @@ def _fetch_entity_state(entity_id: str) -> str | None:
 
 
 def check_effector_eligibility() -> dict[str, str]:
-    """Check which thermostat zones are ineligible for heating.
+    """Check which effectors are ineligible for control.
 
-    A thermostat is eligible when:
-    1. Its hvac_mode is "heat" (not "off") — it will respond to setpoint changes.
+    A manually-controlled effector is eligible when:
+    1. Its hvac_mode is not "off" — it will respond to setpoint changes.
        (The snapshot stores hvac_action, not hvac_mode, and both report "idle" when
        off — so we fetch the entity state (= hvac_mode) live from HA.)
     2. Its state_device is functional — the delivery system (e.g., boiler) is online.
 
-    Returns zone_name -> reason for each ineligible zone.
+    Returns effector_name -> reason for each ineligible effector.
     """
     ineligible: dict[str, str] = {}
 
-    for zone_name, tcfg in _CFG.thermostats.items():
+    for eff in EFFECTORS:
+        if eff.mode_control != "manual":
+            continue
+
         # 1. Check hvac_mode (entity state) — "off" means setpoint changes are ignored
-        hvac_mode = _fetch_entity_state(tcfg.entity_id)
+        hvac_mode = _fetch_entity_state(eff.entity_id)
         if hvac_mode == "off":
-            ineligible[zone_name] = "thermostat hvac_mode is off"
+            ineligible[eff.name] = "hvac_mode is off"
             continue
 
         # 2. Check state_device is functional (gate is open)
-        if tcfg.state_device and tcfg.state_device in _CFG.state_sensors:
-            entity_id = _CFG.state_sensors[tcfg.state_device].entity_id
+        if eff.state_device and eff.state_device in _CFG.state_sensors:
+            entity_id = _CFG.state_sensors[eff.state_device].entity_id
             state = _fetch_entity_state(entity_id)
             if state in ("unavailable", "unknown", None):
-                ineligible[zone_name] = f"{tcfg.state_device} is {state or 'unreachable'}"
+                ineligible[eff.name] = f"{eff.state_device} is {state or 'unreachable'}"
 
     return ineligible
 
@@ -1050,33 +1078,31 @@ def check_effector_eligibility() -> dict[str, str]:
 def write_command_json(
     decision: ControlDecision,
     opportunities: list | None = None,
-    ineligible_zones: set[str] | None = None,
+    ineligible_effectors: set[str] | None = None,
 ) -> Path:
     """Write executor-compatible command JSON.
 
     Uses camelCase keys matching the TS Prediction interface.
-    For ineligible zones, uses the current target (no-op for executor).
+    For ineligible effectors, omits their commands (no-op for executor).
     """
-    _ineligible = ineligible_zones or set()
+    _ineligible = ineligible_effectors or set()
     command: dict[str, object] = {
         "timestamp": decision.timestamp,
         "confidence": 1.0 - min(decision.total_cost / 10.0, 0.9),
     }
-    if "upstairs" not in _ineligible:
-        command["thermostatUpstairsTarget"] = decision.upstairs_setpoint
-    if "downstairs" not in _ineligible:
-        command["thermostatDownstairsTarget"] = decision.downstairs_setpoint
 
-    # Blowers
-    for bd in decision.blowers:
-        cfg = next(b for b in BLOWERS if b.name == bd.name)
-        command[cfg.command_key] = bd.mode
-
-    # Mini-splits
-    for sd in decision.mini_splits:
-        cfg = next(s for s in MINI_SPLITS if s.name == sd.name)
-        command[cfg.command_mode_key] = sd.mode
-        command[cfg.command_target_key] = sd.target
+    for ed in decision.effectors:
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None or ed.name in _ineligible:
+            continue
+        # Write each command key for this effector
+        for purpose, camel_key in eff_cfg.command_keys.items():
+            if purpose == "target":
+                target_val = decision.command_targets.get(ed.name)
+                if target_val is not None:
+                    command[camel_key] = target_val
+            elif purpose == "mode":
+                command[camel_key] = ed.mode
 
     # Active window opportunities (informational)
     if opportunities:
@@ -1139,10 +1165,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     room_temp_columns = _CFG.room_temp_columns
 
     latest = df_raw.iloc[-1]
-    up_current = float(latest.get("thermostat_upstairs_temp", 70))
-    dn_current = float(latest.get("thermostat_downstairs_temp", 70))
-    up_target = latest.get("thermostat_upstairs_target", "?")
-    dn_target = latest.get("thermostat_downstairs_target", "?")
     # Prefer met.no outdoor temp (no house heat bias) over side sensor
     out_temp = latest.get("met_outdoor_temp") or latest.get("outdoor_temp")
     now_str = df_raw["timestamp"].iloc[-1]
@@ -1154,16 +1176,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if val is not None and not (isinstance(val, float) and np.isnan(val)):
             current_temps[room] = float(val)
 
-    # Current mini-split temps for delta computation during sweep
-    current_split_temps: dict[str, float] = {}
-    for cfg in MINI_SPLITS:
-        val = latest.get(cfg.temp_col)
-        if val is not None and not (isinstance(val, float) and np.isnan(val)):
-            current_split_temps[cfg.name] = float(val)
-
     print(f"\n[control] Current state ({now_str}):")
-    print(f"  Upstairs:    {up_current:.1f}°F (setpoint: {up_target}°F)")
-    print(f"  Downstairs:  {dn_current:.1f}°F (setpoint: {dn_target}°F)")
+    # Show trajectory effector temps and setpoints
+    for eff in EFFECTORS:
+        if eff.control_type == "trajectory":
+            label = eff.name.removeprefix("thermostat_")
+            eff_temp = current_temps.get(label, 70.0)
+            eff_target = latest.get(f"{eff.name}_target", "?")
+            print(f"  {label:<14} {eff_temp:.1f}°F (setpoint: {eff_target}°F)")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         print(f"  Outdoor:     {float(out_temp):.1f}°F (sensor)")
     window_cols = _CFG.window_display_map
@@ -1172,20 +1192,25 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         print(f"  Windows:     {', '.join(open_windows)} open")
     else:
         print("  Windows:     all closed")
-    other_labels = [la for la in PREDICTION_LABELS if la not in ("upstairs", "downstairs")]
+    # Show all prediction labels that aren't trajectory effector zones
+    traj_labels = {eff.name.removeprefix("thermostat_") for eff in EFFECTORS if eff.control_type == "trajectory"}
+    other_labels = [la for la in PREDICTION_LABELS if la not in traj_labels]
     lw = max((len(la) for la in other_labels), default=14) + 2
     for la in other_labels:
         t = current_temps.get(la)
         if t is not None:
             print(f"  {la:<{lw}} {t:.1f}°F")
-    # Show current blower/mini-split state
-    for cfg in BLOWERS:
-        mode = str(latest.get(f"blower_{cfg.name}_mode", "?"))
-        print(f"  blower_{cfg.name:<10} {mode}")
-    for cfg in MINI_SPLITS:
-        mode = str(latest.get(f"mini_split_{cfg.name}_mode", "?"))
-        target = latest.get(f"mini_split_{cfg.name}_target", "?")
-        print(f"  split_{cfg.name:<12} {mode} @ {target}°F")
+    # Show current effector states
+    for eff in EFFECTORS:
+        if eff.control_type == "trajectory":
+            continue  # already shown above
+        if eff.control_type == "regulating":
+            mode = str(latest.get(f"{eff.name}_mode", "?"))
+            target = latest.get(f"{eff.name}_target", "?")
+            print(f"  {eff.name:<20} {mode} @ {target}°F")
+        elif eff.control_type == "binary":
+            mode = str(latest.get(f"{eff.name}_mode", "?"))
+            print(f"  {eff.name:<20} {mode}")
 
     # Show forecast summary
     if forecast:
@@ -1316,15 +1341,21 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         outdoor = 50.0
     # ── Effector eligibility ──
     ineligible = check_effector_eligibility()
-    ineligible_zones = set(ineligible) if ineligible else None
+    ineligible_effectors = set(ineligible) if ineligible else None
     if ineligible:
         print("\n[control] Effector eligibility:")
-        for zone, reason in ineligible.items():
-            print(f"  {zone}: INELIGIBLE — {reason}")
+        for eff_name, reason in ineligible.items():
+            print(f"  {eff_name}: INELIGIBLE — {reason}")
 
-    n_scenarios = len(generate_trajectory_scenarios(
-        schedules, base_hour, prev_state, current_temps, ineligible_zones,
-    ))
+    n_scenarios = len(
+        generate_trajectory_scenarios(
+            schedules,
+            base_hour,
+            prev_state,
+            current_temps,
+            ineligible_effectors,
+        )
+    )
     print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
     t0 = time.monotonic()
     decision, winning_scenario = sweep_scenarios_physics(
@@ -1335,14 +1366,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         sim_params,
         fractional_hour,
         recent_hist,
-        up_current,
-        dn_current,
-        current_split_temps,
         schedules,
         base_hour,
         prev_state,
         solar_fractions,
-        ineligible_zones,
+        ineligible_effectors,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
@@ -1364,59 +1392,22 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     )
 
     # All-off baseline
-    all_off = TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-        tuple(MiniSplitDecision(s.name, "off", 0.0) for s in MINI_SPLITS),
-    )
+    all_off = Scenario({e.name: EffectorDecision(e.name) for e in EFFECTORS})
     off_targets, off_matrix = _predict(sim_state, [all_off], sim_params, CONTROL_HORIZONS)
     off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
     off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
 
     # Per-device counterfactuals: winning scenario with each active device removed.
     # This gives true per-device attribution (what does THIS device contribute?).
-    counterfactuals: list[TrajectoryScenario] = []
+    counterfactuals: list[Scenario] = []
     cf_device_keys: list[str] = []
 
-    if winning_scenario.upstairs.heating:
-        cf = TrajectoryScenario(
-            ThermostatTrajectory(heating=False),
-            winning_scenario.downstairs, winning_scenario.blowers, winning_scenario.mini_splits,
-        )
-        counterfactuals.append(cf)
-        cf_device_keys.append("upstairs_heating")
-    if winning_scenario.downstairs.heating:
-        cf = TrajectoryScenario(
-            winning_scenario.upstairs, ThermostatTrajectory(heating=False),
-            winning_scenario.blowers, winning_scenario.mini_splits,
-        )
-        counterfactuals.append(cf)
-        cf_device_keys.append("downstairs_heating")
-    for i, bd in enumerate(winning_scenario.blowers):
-        if bd.mode != "off":
-            new_blowers = tuple(
-                BlowerDecision(b.name, "off") if j == i else b
-                for j, b in enumerate(winning_scenario.blowers)
-            )
-            cf = TrajectoryScenario(
-                winning_scenario.upstairs, winning_scenario.downstairs,
-                new_blowers, winning_scenario.mini_splits,
-            )
-            counterfactuals.append(cf)
-            cf_device_keys.append(f"blower_{bd.name}")
-    for i, sd in enumerate(winning_scenario.mini_splits):
-        if sd.mode != "off":
-            new_splits = tuple(
-                MiniSplitDecision(s.name, "off", 0.0) if j == i else s
-                for j, s in enumerate(winning_scenario.mini_splits)
-            )
-            cf = TrajectoryScenario(
-                winning_scenario.upstairs, winning_scenario.downstairs,
-                winning_scenario.blowers, new_splits,
-            )
-            counterfactuals.append(cf)
-            cf_device_keys.append(f"split_{sd.name}")
+    for eff_name, ed in winning_scenario.effectors.items():
+        if ed.mode != "off":
+            cf_effectors = dict(winning_scenario.effectors)
+            cf_effectors[eff_name] = EffectorDecision(eff_name)
+            counterfactuals.append(Scenario(cf_effectors))
+            cf_device_keys.append(eff_name)
 
     # Simulate all counterfactuals in one batch
     cf_preds: dict[str, dict[str, float]] = {}
@@ -1437,9 +1428,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 dec_flat[f"{label}_temp_t+{h}"] = preds[h_label]
     dec_sensor_costs = compute_comfort_cost_by_sensor(dec_flat, schedules, base_hour)
     off_sensor_costs = compute_comfort_cost_by_sensor(off_preds, schedules, base_hour)
-
-    up_label = "ON" if decision.upstairs_heating else "OFF"
-    dn_label = "ON" if decision.downstairs_heating else "OFF"
 
     # ── Print decision with counterfactual rationale ──
     print("\n[control] Decision:")
@@ -1462,7 +1450,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         total_saving = cf_comfort_costs.get(device_key, decision.comfort_cost) - decision.comfort_cost
 
         if abs(total_saving) < 0.1:
-            return "  → no significant effect"
+            return "  -> no significant effect"
 
         # Find sensor with biggest per-sensor cost saving from this device
         best_sensor = ""
@@ -1491,10 +1479,10 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                         best_cf_t = cf_t
 
         if best_delta < 0.05:
-            return f"  → comfort {total_saving:+.2f} (diffuse effects across sensors)"
+            return f"  -> comfort {total_saving:+.2f} (diffuse effects across sensors)"
 
         parts = [
-            f"  → {best_sensor} at {best_h_label}: {best_dec_t:.1f}° vs {best_cf_t:.1f}° without",
+            f"  -> {best_sensor} at {best_h_label}: {best_dec_t:.1f} vs {best_cf_t:.1f} without",
             f" ({best_sensor} {best_sensor_saving:+.2f}",
         ]
         # Show total if it differs significantly from the top sensor
@@ -1503,31 +1491,35 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         parts.append(")")
         return "".join(parts)
 
-    print(f"  Upstairs heating:   {up_label} → setpoint {decision.upstairs_setpoint:.0f}°F")
-    if decision.upstairs_heating:
-        print(_counterfactual_rationale("upstairs_heating"))
-    print(f"  Downstairs heating: {dn_label} → setpoint {decision.downstairs_setpoint:.0f}°F")
-    if decision.downstairs_heating:
-        print(_counterfactual_rationale("downstairs_heating"))
-    for bd in decision.blowers:
-        if bd.mode == "off":
-            print(f"  Blower {bd.name:<14} {bd.mode}")
-        else:
-            print(f"  Blower {bd.name:<14} {bd.mode}")
-            print(_counterfactual_rationale(f"blower_{bd.name}"))
-    for sd in decision.mini_splits:
-        if sd.mode == "off":
-            print(f"  Split {sd.name:<15} off")
-        else:
-            print(f"  Split {sd.name:<15} {sd.mode} @ {sd.target:.0f}°F")
-            print(_counterfactual_rationale(f"split_{sd.name}"))
+    for ed in decision.effectors:
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None:
+            continue
+        if eff_cfg.control_type == "trajectory":
+            label = ed.name.removeprefix("thermostat_")
+            setpoint = decision.command_targets.get(ed.name, 0)
+            on_label = "ON" if ed.mode != "off" and ed.delay_steps == 0 else "OFF"
+            print(f"  {label} heating:  {on_label} -> setpoint {setpoint:.0f}°F")
+            if ed.mode != "off":
+                print(_counterfactual_rationale(ed.name))
+        elif eff_cfg.control_type == "regulating":
+            if ed.mode == "off":
+                print(f"  {ed.name:<20} off")
+            else:
+                target_str = f" @ {ed.target:.0f}°F" if ed.target is not None else ""
+                print(f"  {ed.name:<20} {ed.mode}{target_str}")
+                print(_counterfactual_rationale(ed.name))
+        elif eff_cfg.control_type == "binary":
+            print(f"  {ed.name:<20} {ed.mode}")
+            if ed.mode != "off":
+                print(_counterfactual_rationale(ed.name))
     if decision.trajectory_info:
-        for zone, info in decision.trajectory_info.items():
+        for eff_name, info in decision.trajectory_info.items():
             delay_h = info["delay_steps"] * 5 / 60
             dur = info.get("duration_steps")
             dur_str = f"{dur * 5 / 60:.0f}h" if dur is not None else "full"
             label = "ON now" if info["delay_steps"] == 0 else f"start in {delay_h:.0f}h"
-            print(f"  Trajectory {zone}: {label}, duration {dur_str}")
+            print(f"  Trajectory {eff_name}: {label}, duration {dur_str}")
     print(
         f"  Total cost: {decision.total_cost:.4f}"
         f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
@@ -1536,7 +1528,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # ── Per-sensor cost breakdown ──
     sensors_with_cost = sorted(
-        s for s in set(dec_sensor_costs) | set(off_sensor_costs)
+        s
+        for s in set(dec_sensor_costs) | set(off_sensor_costs)
         if dec_sensor_costs.get(s, 0) > 0.001 or off_sensor_costs.get(s, 0) > 0.001
     )
     if sensors_with_cost:
@@ -1619,9 +1612,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Prediction sanity checks
     sane = check_prediction_sanity(decision, current_temps)
 
-    # Write command JSON (omit targets for ineligible zones)
+    # Write command JSON (omit targets for ineligible effectors)
     cmd_path = write_command_json(
-        decision, opportunities=active_opps, ineligible_zones=ineligible_zones,
+        decision,
+        opportunities=active_opps,
+        ineligible_effectors=ineligible_effectors,
     )
     print(f"\n  Command JSON: {cmd_path}")
 

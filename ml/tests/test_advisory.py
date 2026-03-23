@@ -7,19 +7,15 @@ lifecycle (persist, expire, dismiss), and notification dispatch.
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
-from weatherstat.simulator import HouseState, SimParams, TauModel, load_sim_params
+from weatherstat.simulator import SimParams, TauModel, load_sim_params
 from weatherstat.types import (
-    BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
-    MiniSplitDecision,
-    RoomComfort,
-    ThermostatTrajectory,
-    TrajectoryScenario,
+    EffectorDecision,
+    Scenario,
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -67,22 +63,15 @@ _CURRENT_TEMPS = {
 }
 
 
-def _all_off() -> TrajectoryScenario:
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-    )
+def _all_off() -> Scenario:
+    return Scenario(effectors={})
 
 
-def _both_on() -> TrajectoryScenario:
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
-        (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-    )
+def _both_on() -> Scenario:
+    return Scenario(effectors={
+        "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating"),
+        "thermostat_downstairs": EffectorDecision("thermostat_downstairs", mode="heating"),
+    })
 
 
 def _make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSchedule]:

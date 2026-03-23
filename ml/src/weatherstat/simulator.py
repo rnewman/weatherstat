@@ -16,8 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
-from weatherstat.config import DATA_DIR, PREDICTION_LABELS
-from weatherstat.types import BlowerDecision, MiniSplitDecision, TrajectoryScenario
+from weatherstat.config import DATA_DIR, EFFECTOR_MAP, PREDICTION_LABELS
+from weatherstat.types import EffectorDecision, Scenario
 
 # Minimum |t-statistic| for an effector→sensor gain to be used in simulation.
 # Gains below this threshold are likely confounded (e.g., bedroom split runs
@@ -169,23 +169,6 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         state_gates=state_gates,
         mrt_weights=mrt_weights,
     )
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-
-def _find_split(splits: tuple[MiniSplitDecision, ...], name: str) -> MiniSplitDecision | None:
-    for sd in splits:
-        if sd.name == name:
-            return sd
-    return None
-
-
-def _find_blower(blowers: tuple[BlowerDecision, ...], name: str) -> BlowerDecision | None:
-    for bd in blowers:
-        if bd.name == name:
-            return bd
-    return None
 
 
 # ── Activity timeline: single-scenario utility ───────────────────────────
@@ -345,7 +328,7 @@ class _RegulatingEffector:
 
 
 def _build_activity_matrices(
-    scenarios: list[TrajectoryScenario],
+    scenarios: list[Scenario],
     params: SimParams,
     recent_history: dict[str, list[float]],
     n_future: int,
@@ -360,43 +343,29 @@ def _build_activity_matrices(
         effector_name -> np.ndarray of shape (n_scenarios, _HISTORY_STEPS + n_future),
         and regulating_effectors contains info for target-based effectors.
     """
-    from weatherstat.config import BLOWERS as _BLOWERS
-    from weatherstat.yaml_config import load_config
-
-    cfg = load_config()
     n = len(scenarios)
     n_total = _HISTORY_STEPS + n_future
     steps = np.arange(n_future)  # [0, 1, ..., n_future-1]
 
-    # Pre-extract thermostat parameters as numpy arrays
-    up_heating = np.array([s.upstairs.heating for s in scenarios])
-    up_delay = np.array([s.upstairs.delay_steps for s in scenarios])
-    up_dur = np.array([
-        s.upstairs.duration_steps if s.upstairs.duration_steps is not None
-        else (n_future - s.upstairs.delay_steps)
-        for s in scenarios
-    ])
-    dn_heating = np.array([s.downstairs.heating for s in scenarios])
-    dn_delay = np.array([s.downstairs.delay_steps for s in scenarios])
-    dn_dur = np.array([
-        s.downstairs.duration_steps if s.downstairs.duration_steps is not None
-        else (n_future - s.downstairs.delay_steps)
-        for s in scenarios
-    ])
+    # Build trajectory active masks for all trajectory effectors
+    trajectory_active: dict[str, np.ndarray] = {}
+    for eff in params.effectors:
+        if eff["device_type"] != "thermostat":
+            continue
+        name = eff["name"]
+        decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
+        heating = np.array([d.mode != "off" for d in decisions])
+        delay = np.array([d.delay_steps for d in decisions])
+        dur = np.array([
+            d.duration_steps if d.duration_steps is not None else (n_future - d.delay_steps)
+            for d in decisions
+        ])
+        trajectory_active[name] = (
+            heating[:, None]
+            & (steps[None, :] >= delay[:, None])
+            & (steps[None, :] < (delay + dur)[:, None])
+        )
 
-    # Thermostat active masks: (n, n_future) boolean
-    up_active = (
-        up_heating[:, None]
-        & (steps[None, :] >= up_delay[:, None])
-        & (steps[None, :] < (up_delay + up_dur)[:, None])
-    )
-    dn_active = (
-        dn_heating[:, None]
-        & (steps[None, :] >= dn_delay[:, None])
-        & (steps[None, :] < (dn_delay + dn_dur)[:, None])
-    )
-
-    blower_zones = {b.name: b.zone for b in _BLOWERS}
     matrices: dict[str, np.ndarray] = {}
     regulating: list[_RegulatingEffector] = []
 
@@ -412,39 +381,41 @@ def _build_activity_matrices(
 
         # Future: varies by device type
         if dtype == "thermostat":
-            zone = name.removeprefix("thermostat_")
-            active = up_active if zone == "upstairs" else dn_active
+            active = trajectory_active.get(name, np.zeros((n, n_future), dtype=bool))
             future = active.astype(np.float64) * encoding.get("heating", 1.0)
 
         elif dtype == "blower":
-            blower_name = name.removeprefix("blower_")
+            eff_cfg = EFFECTOR_MAP.get(name)
+            dep_name = eff_cfg.depends_on if eff_cfg else None
+            dep_active = (
+                trajectory_active.get(dep_name, np.ones((n, n_future), dtype=bool))
+                if dep_name
+                else np.ones((n, n_future), dtype=bool)
+            )
             enc_vals = np.array([
-                encoding.get(bd.mode, 0.0) if (bd := _find_blower(s.blowers, blower_name)) else 0.0
+                encoding.get(s.effectors.get(name, EffectorDecision(name)).mode, 0.0)
                 for s in scenarios
             ])
-            zone = blower_zones.get(blower_name, "downstairs")
-            zone_active = up_active if zone == "upstairs" else dn_active
-            future = zone_active.astype(np.float64) * enc_vals[:, None]
+            future = dep_active.astype(np.float64) * enc_vals[:, None]
 
         elif dtype == "mini_split":
-            split_name = name.removeprefix("mini_split_")
-            split_cfg = cfg.mini_splits.get(split_name)
+            eff_cfg = EFFECTOR_MAP.get(name)
 
-            if split_cfg and split_cfg.control_type == "regulating":
+            if eff_cfg and eff_cfg.control_type == "regulating":
                 # Regulating: extract targets/modes per scenario for Euler loop
+                decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
                 targets = np.array([
-                    sd.target if (sd := _find_split(s.mini_splits, split_name)) and sd.mode != "off" else 0.0
-                    for s in scenarios
+                    d.target if d.mode != "off" and d.target is not None else 0.0
+                    for d in decisions
                 ])
                 modes = np.array([
-                    (1.0 if sd.mode == "heat" else (-1.0 if sd.mode == "cool" else 0.0))
-                    if (sd := _find_split(s.mini_splits, split_name)) else 0.0
-                    for s in scenarios
+                    1.0 if d.mode == "heat" else (-1.0 if d.mode == "cool" else 0.0)
+                    for d in decisions
                 ])
                 regulating.append(_RegulatingEffector(
                     effector_name=name,
-                    split_name=split_name,
-                    proportional_band=split_cfg.proportional_band,
+                    split_name=name.removeprefix("mini_split_"),
+                    proportional_band=eff_cfg.proportional_band,
                     targets=targets,
                     modes=modes,
                 ))
@@ -453,7 +424,7 @@ def _build_activity_matrices(
             else:
                 # Binary mini split (original behavior)
                 enc_vals = np.array([
-                    encoding.get(sd.mode, 0.0) if (sd := _find_split(s.mini_splits, split_name)) else 0.0
+                    encoding.get(s.effectors.get(name, EffectorDecision(name)).mode, 0.0)
                     for s in scenarios
                 ])
                 future = np.broadcast_to(enc_vals[:, None], (n, n_future))
@@ -472,7 +443,7 @@ def _build_activity_matrices(
 
 def predict(
     state: HouseState,
-    scenarios: list[TrajectoryScenario],
+    scenarios: list[Scenario],
     params: SimParams,
     horizons: list[int],
 ) -> tuple[list[str], np.ndarray]:

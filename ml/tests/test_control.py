@@ -7,7 +7,7 @@ trajectory generation, window schedule adjustment, and quiet hours.
 
 from __future__ import annotations
 
-from weatherstat.config import BLOWERS, MINI_SPLITS
+from weatherstat.config import EFFECTOR_MAP, EFFECTORS
 from weatherstat.control import (
     ABSOLUTE_MAX,
     ABSOLUTE_MIN,
@@ -16,7 +16,7 @@ from weatherstat.control import (
     _cautious_setpoint,
     _in_hold_window,
     _in_quiet_hours,
-    _mini_split_sweep_options,
+    _regulating_sweep_options,
     adjust_schedules_for_windows,
     apply_mrt_correction,
     compute_comfort_cost,
@@ -24,14 +24,12 @@ from weatherstat.control import (
     generate_trajectory_scenarios,
 )
 from weatherstat.types import (
-    BlowerDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlState,
-    MiniSplitDecision,
+    EffectorDecision,
     RoomComfort,
-    ThermostatTrajectory,
-    TrajectoryScenario,
+    Scenario,
 )
 
 # ── Test helpers ──────────────────────────────────────────────────────────
@@ -126,18 +124,13 @@ class TestComfortCost:
 
     def test_energy_cost_tiebreaker(self) -> None:
         """Two scenarios with identical comfort cost -> lower energy wins."""
-        scenario_both = TrajectoryScenario(
-            ThermostatTrajectory(heating=True),
-            ThermostatTrajectory(heating=True),
-            tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-            tuple(MiniSplitDecision(s.name, "off", 72.0) for s in MINI_SPLITS),
-        )
-        scenario_one = TrajectoryScenario(
-            ThermostatTrajectory(heating=True),
-            ThermostatTrajectory(heating=False),
-            tuple(BlowerDecision(b.name, "off") for b in BLOWERS),
-            tuple(MiniSplitDecision(s.name, "off", 72.0) for s in MINI_SPLITS),
-        )
+        scenario_both = Scenario(effectors={
+            "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating"),
+            "thermostat_downstairs": EffectorDecision("thermostat_downstairs", mode="heating"),
+        })
+        scenario_one = Scenario(effectors={
+            "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating"),
+        })
 
         cost_both = compute_energy_cost(scenario_both)
         cost_one = compute_energy_cost(scenario_one)
@@ -537,21 +530,28 @@ class TestQuietHours:
 class TestTrajectoryScenarioGeneration:
     """Test trajectory scenario generation for physics sweep."""
 
+    @staticmethod
+    def _eff(s: Scenario, name: str) -> EffectorDecision | None:
+        return s.effectors.get(name)
+
     def test_trajectory_scenarios_include_all_off(self) -> None:
         """All-off should be in the trajectory scenario set."""
         scenarios = generate_trajectory_scenarios()
         all_off = [
             s for s in scenarios
-            if not s.upstairs.heating and not s.downstairs.heating
-            and all(b.mode == "off" for b in s.blowers)
-            and all(sp.mode == "off" for sp in s.mini_splits)
+            if all(e.mode == "off" for e in s.effectors.values())
+            or len(s.effectors) == 0
         ]
         assert len(all_off) == 1
 
     def test_trajectory_scenarios_include_delayed_start(self) -> None:
         """Trajectories with delay > 0 should exist."""
         scenarios = generate_trajectory_scenarios()
-        delayed = [s for s in scenarios if s.upstairs.heating and s.upstairs.delay_steps > 0]
+        delayed = [
+            s for s in scenarios
+            if (up := self._eff(s, "thermostat_upstairs")) is not None
+            and up.mode != "off" and up.delay_steps > 0
+        ]
         assert len(delayed) > 0
 
     def test_trajectory_scenarios_include_short_duration(self) -> None:
@@ -559,7 +559,8 @@ class TestTrajectoryScenarioGeneration:
         scenarios = generate_trajectory_scenarios()
         short = [
             s for s in scenarios
-            if s.upstairs.heating and s.upstairs.duration_steps is not None and s.upstairs.duration_steps < 72
+            if (up := self._eff(s, "thermostat_upstairs")) is not None
+            and up.mode != "off" and up.duration_steps is not None and up.duration_steps < 72
         ]
         assert len(short) > 0
 
@@ -575,20 +576,24 @@ class TestTrajectoryScenarioGeneration:
         max_horizon = max(CONTROL_HORIZONS)
         scenarios = generate_trajectory_scenarios()
         for s in scenarios:
-            if s.upstairs.heating:
-                assert s.upstairs.delay_steps < max_horizon
-            if s.downstairs.heating:
-                assert s.downstairs.delay_steps < max_horizon
+            for eff in EFFECTORS:
+                if eff.control_type != "trajectory":
+                    continue
+                ed = self._eff(s, eff.name)
+                if ed is not None and ed.mode != "off":
+                    assert ed.delay_steps < max_horizon
 
     def test_trajectory_duration_capped_at_horizon(self) -> None:
         """delay + duration should not exceed max horizon."""
         max_horizon = max(CONTROL_HORIZONS)
         scenarios = generate_trajectory_scenarios()
         for s in scenarios:
-            if s.upstairs.heating and s.upstairs.duration_steps is not None:
-                assert s.upstairs.delay_steps + s.upstairs.duration_steps <= max_horizon
-            if s.downstairs.heating and s.downstairs.duration_steps is not None:
-                assert s.downstairs.delay_steps + s.downstairs.duration_steps <= max_horizon
+            for eff in EFFECTORS:
+                if eff.control_type != "trajectory":
+                    continue
+                ed = self._eff(s, eff.name)
+                if ed is not None and ed.mode != "off" and ed.duration_steps is not None:
+                    assert ed.delay_steps + ed.duration_steps <= max_horizon
 
 
 class TestTrajectoryEnergyCost:
@@ -596,38 +601,24 @@ class TestTrajectoryEnergyCost:
 
     def test_shorter_duration_lower_cost(self) -> None:
         """2h trajectory should cost less than 6h trajectory."""
-        short = TrajectoryScenario(
-            ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-        )
-        long = TrajectoryScenario(
-            ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-        )
+        short = Scenario(effectors={
+            "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating", duration_steps=24),
+        })
+        long = Scenario(effectors={
+            "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating", duration_steps=72),
+        })
         assert compute_energy_cost(short) < compute_energy_cost(long)
 
     def test_off_trajectory_no_gas_cost(self) -> None:
         """All-off trajectory should have no gas zone cost."""
-        off = TrajectoryScenario(
-            ThermostatTrajectory(heating=False),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-        )
+        off = Scenario(effectors={})
         assert compute_energy_cost(off) == 0.0
 
     def test_full_horizon_trajectory_energy_cost(self) -> None:
         """Full-horizon trajectory should cost one gas zone unit."""
-        traj = TrajectoryScenario(
-            ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-        )
+        traj = Scenario(effectors={
+            "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating"),
+        })
         from weatherstat.config import ENERGY_COST_GAS_ZONE
         assert compute_energy_cost(traj) == ENERGY_COST_GAS_ZONE
 
@@ -635,8 +626,12 @@ class TestTrajectoryEnergyCost:
 # ── Target grid sweep tests ──────────────────────────────────────────
 
 
-class TestMiniSplitSweepOptions:
-    """Test target-based mini split sweep option generation."""
+class TestRegulatingSweepOptions:
+    """Test target-based regulating effector sweep option generation."""
+
+    @staticmethod
+    def _bedroom_eff():
+        return EFFECTOR_MAP["mini_split_bedroom"]
 
     def _bedroom_schedule(self, min_t: float = 68.0, max_t: float = 72.0) -> list[ComfortSchedule]:
         preferred = (min_t + max_t) / 2.0
@@ -647,12 +642,14 @@ class TestMiniSplitSweepOptions:
 
     def test_sweep_options_include_off(self) -> None:
         """Off should always be an option."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
+        eff = self._bedroom_eff()
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
         assert any(o.mode == "off" for o in options)
 
     def test_sweep_options_preferred_target(self) -> None:
         """Should generate off + preferred target."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
+        eff = self._bedroom_eff()
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
         assert len(options) == 2  # off + preferred
         active = [o for o in options if o.mode != "off"]
         assert len(active) == 1
@@ -660,19 +657,21 @@ class TestMiniSplitSweepOptions:
 
     def test_sweep_mode_heat_when_cold(self) -> None:
         """Mode should be 'heat' when room temp is below preferred."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
+        eff = self._bedroom_eff()
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
         active = [o for o in options if o.mode != "off"]
         assert all(o.mode == "heat" for o in active)
 
     def test_sweep_mode_cool_when_hot(self) -> None:
         """Mode should be 'cool' when room temp is above preferred."""
-        options = _mini_split_sweep_options("bedroom", self._bedroom_schedule(), 12, current_temps={"bedroom": 72.0})
+        eff = self._bedroom_eff()
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 72.0})
         active = [o for o in options if o.mode != "off"]
         assert all(o.mode == "cool" for o in active)
 
     def test_sweep_no_schedule_returns_off_only(self) -> None:
         """No matching schedule -> only off option."""
-        options = _mini_split_sweep_options("bedroom", [], 12)
+        options = _regulating_sweep_options(self._bedroom_eff(), [], 12)
         assert len(options) == 1
         assert options[0].mode == "off"
 
@@ -703,15 +702,14 @@ class TestModeHoldWindow:
 
         prev_state = ControlState(
             last_decision_time=datetime.now(UTC).isoformat(),
-            upstairs_setpoint=70.0,
-            downstairs_setpoint=70.0,
-            mini_split_modes={"bedroom": "heat"},
-            mini_split_targets={"bedroom": 70.0},
-            mini_split_mode_times={"bedroom": datetime.now(UTC).isoformat()},
+            modes={"mini_split_bedroom": "heat"},
+            setpoints={"mini_split_bedroom": 70.0},
+            mode_times={"mini_split_bedroom": datetime.now(UTC).isoformat()},
         )
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
         # Hour 23 is inside bedroom's hold window [22, 7]
-        options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 23, prev_state, current_temps={"bedroom": 68.0},
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 23, prev_state, current_temps={"bedroom": 68.0},
         )
         # All options should be "heat" (current mode)
         assert all(o.mode == "heat" for o in options)
@@ -723,34 +721,35 @@ class TestModeHoldWindow:
 
         prev_state = ControlState(
             last_decision_time=datetime.now(UTC).isoformat(),
-            upstairs_setpoint=70.0,
-            downstairs_setpoint=70.0,
-            mini_split_modes={"bedroom": "heat"},
-            mini_split_targets={"bedroom": 70.0},
-            mini_split_mode_times={"bedroom": datetime.now(UTC).isoformat()},
+            modes={"mini_split_bedroom": "heat"},
+            setpoints={"mini_split_bedroom": 70.0},
+            mode_times={"mini_split_bedroom": datetime.now(UTC).isoformat()},
         )
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
         # Hour 12 is outside hold window — mode should be unlocked
-        options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 12, prev_state, current_temps={"bedroom": 68.0},
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12, prev_state, current_temps={"bedroom": 68.0},
         )
         assert any(o.mode == "off" for o in options)
 
     def test_cool_offered_when_room_above_target(self) -> None:
         """Cool option offered when room is above preferred."""
-        options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 12,
-            current_temps={"bedroom": 73.0},  # 3°F above preferred 70
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            current_temps={"bedroom": 73.0},  # 3 deg F above preferred 70
         )
         # Room is above preferred — cool mode should be offered
         assert any(o.mode == "cool" for o in options)
 
     def test_split_offered_when_room_near_target(self) -> None:
         """Cool option available when room is slightly above preferred."""
-        options = _mini_split_sweep_options(
-            "bedroom", self._bedroom_schedule(), 12,
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
             current_temps={"bedroom": 70.5},  # within proportional_band of preferred 70
         )
-        # Room is 0.5°F above preferred — should get cool option
+        # Room is 0.5 deg F above preferred — should get cool option
         assert any(o.mode == "cool" for o in options)
 
 
@@ -763,33 +762,22 @@ class TestProportionalEnergyCost:
     def test_higher_target_more_energy_when_heating(self) -> None:
         """Higher target vs room temp -> more expected activity -> higher cost.
 
-        With proportional_band=1.0 and room at 68°F:
+        With proportional_band=1.0 and room at 68F:
         target 68.5 -> delta=0.5 -> activity=0.5,
         target 69.0 -> delta=1.0 -> activity=1.0.
         """
-        low_target = TrajectoryScenario(
-            ThermostatTrajectory(heating=False),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "heat", 68.5), MiniSplitDecision("living_room", "off", 0.0)),
-        )
-        high_target = TrajectoryScenario(
-            ThermostatTrajectory(heating=False),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "heat", 69.0), MiniSplitDecision("living_room", "off", 0.0)),
-        )
+        low_target = Scenario(effectors={
+            "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=68.5),
+        })
+        high_target = Scenario(effectors={
+            "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=69.0),
+        })
         temps = {"bedroom": 68.0}
         assert compute_energy_cost(low_target, temps) < compute_energy_cost(high_target, temps)
 
     def test_off_mini_split_no_energy_cost(self) -> None:
         """Off mini split should have zero energy cost."""
-        off = TrajectoryScenario(
-            ThermostatTrajectory(heating=False),
-            ThermostatTrajectory(heating=False),
-            (BlowerDecision("family_room", "off"), BlowerDecision("office", "off")),
-            (MiniSplitDecision("bedroom", "off", 0.0), MiniSplitDecision("living_room", "off", 0.0)),
-        )
+        off = Scenario(effectors={})
         assert compute_energy_cost(off) == 0.0
 
 
@@ -811,11 +799,18 @@ class TestTrajectoryWithSchedules:
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 69.0, 74.0)),),
             ),
         ]
-        # Room temps below preferred → heat mode for both splits
+        # Room temps below preferred -> heat mode for both splits
         current_temps = {"bedroom": 68.0, "living_room": 69.0}
         scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
-        # 4 mini split combos (2×2): off + preferred per split
-        split_combos = {tuple((sd.name, sd.mode, sd.target) for sd in s.mini_splits) for s in scenarios}
+        # 4 mini split combos (2x2): off + preferred per split
+        split_combos = set()
+        for s in scenarios:
+            combo = tuple(
+                (name, ed.mode, ed.target)
+                for name, ed in sorted(s.effectors.items())
+                if EFFECTOR_MAP.get(name) and EFFECTOR_MAP[name].control_type == "regulating"
+            )
+            split_combos.add(combo)
         assert len(split_combos) == 4
 
     def test_all_off_still_present(self) -> None:
@@ -830,9 +825,8 @@ class TestTrajectoryWithSchedules:
         scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
         all_off = [
             s for s in scenarios
-            if not s.upstairs.heating and not s.downstairs.heating
-            and all(b.mode == "off" for b in s.blowers)
-            and all(sp.mode == "off" for sp in s.mini_splits)
+            if all(e.mode == "off" for e in s.effectors.values())
+            or len(s.effectors) == 0
         ]
         assert len(all_off) == 1
 
@@ -859,9 +853,9 @@ class TestEffectorEligibility:
 
         with patch("weatherstat.control._fetch_entity_state", side_effect=mock_fetch):
             result = check_effector_eligibility()
-        assert "upstairs" in result
-        assert "downstairs" not in result
-        assert "off" in result["upstairs"]
+        assert "thermostat_upstairs" in result
+        assert "thermostat_downstairs" not in result
+        assert "off" in result["thermostat_upstairs"]
 
     def test_thermostat_heat_eligible(self) -> None:
         """Thermostat with hvac_mode=heat is eligible."""
@@ -879,18 +873,18 @@ class TestEffectorEligibility:
         assert result == {}
 
     def test_both_off_both_ineligible(self) -> None:
-        """Both thermostats off → both ineligible."""
+        """Both thermostats off -> both ineligible."""
         from unittest.mock import patch
 
         from weatherstat.control import check_effector_eligibility
 
         with patch("weatherstat.control._fetch_entity_state", return_value="off"):
             result = check_effector_eligibility()
-        assert "upstairs" in result
-        assert "downstairs" in result
+        assert "thermostat_upstairs" in result
+        assert "thermostat_downstairs" in result
 
     def test_state_device_unavailable_ineligible(self) -> None:
-        """State device reporting unavailable → zone ineligible."""
+        """State device reporting unavailable -> effector ineligible."""
         from unittest.mock import patch
 
         from weatherstat.control import check_effector_eligibility
@@ -903,9 +897,9 @@ class TestEffectorEligibility:
         with patch("weatherstat.control._fetch_entity_state", side_effect=mock_fetch):
             result = check_effector_eligibility()
         # Both thermostats share the same state_device, both ineligible
-        assert "upstairs" in result
-        assert "downstairs" in result
-        assert "unavailable" in result["upstairs"]
+        assert "thermostat_upstairs" in result
+        assert "thermostat_downstairs" in result
+        assert "unavailable" in result["thermostat_upstairs"]
 
     def test_state_device_functional_eligible(self) -> None:
         """State device reporting a valid state → zone eligible."""
@@ -923,26 +917,40 @@ class TestEffectorEligibility:
         assert result == {}
 
     def test_scenarios_reduced_when_ineligible(self) -> None:
-        """Ineligible zone produces fewer scenarios with no heating for that zone."""
+        """Ineligible effector produces fewer scenarios with no heating for that effector."""
         schedules = make_schedules()
         all_scenarios = generate_trajectory_scenarios(schedules, base_hour=12)
-        reduced = generate_trajectory_scenarios(schedules, base_hour=12, ineligible_zones={"upstairs"})
+        reduced = generate_trajectory_scenarios(schedules, base_hour=12, ineligible_effectors={"thermostat_upstairs"})
 
         assert len(reduced) < len(all_scenarios)
         # No upstairs heating in any scenario
-        assert all(not s.upstairs.heating for s in reduced)
+        up_heating = [
+            s for s in reduced
+            if (ed := s.effectors.get("thermostat_upstairs")) is not None and ed.mode != "off"
+        ]
+        assert len(up_heating) == 0
         # Downstairs still has heating options
-        assert any(s.downstairs.heating for s in reduced)
+        dn_heating = [
+            s for s in reduced
+            if (ed := s.effectors.get("thermostat_downstairs")) is not None and ed.mode != "off"
+        ]
+        assert len(dn_heating) > 0
 
-    def test_scenarios_both_zones_ineligible(self) -> None:
-        """Both zones ineligible — only mini-split variations remain."""
+    def test_scenarios_both_effectors_ineligible(self) -> None:
+        """Both trajectory effectors ineligible -- only regulating/binary variations remain."""
         schedules = make_schedules()
         reduced = generate_trajectory_scenarios(
-            schedules, base_hour=12, ineligible_zones={"upstairs", "downstairs"},
+            schedules, base_hour=12, ineligible_effectors={"thermostat_upstairs", "thermostat_downstairs"},
         )
-        assert all(not s.upstairs.heating for s in reduced)
-        assert all(not s.downstairs.heating for s in reduced)
+        # No thermostat heating in any scenario
+        for s in reduced:
+            for name in ("thermostat_upstairs", "thermostat_downstairs"):
+                ed = s.effectors.get(name)
+                assert ed is None or ed.mode == "off"
         # Should still have mini-split variations
         assert len(reduced) >= 1
-        # All blowers should be off (no zone heating → blowers forced off)
-        assert all(b.mode == "off" for s in reduced for b in s.blowers)
+        # All blowers should be off (no zone heating -> blowers forced off)
+        for s in reduced:
+            for name, ed in s.effectors.items():
+                if EFFECTOR_MAP.get(name) and EFFECTOR_MAP[name].control_type == "binary":
+                    assert ed.mode == "off"

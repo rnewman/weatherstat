@@ -60,6 +60,11 @@ def init_db(db_path: Path | None = None) -> Path:
     # Schema migration: add trajectory column if upgrading from pre-PLAN-7
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE decisions ADD COLUMN trajectory TEXT")
+    # Schema migration: add unified effector columns
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN effector_decisions TEXT")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN command_targets TEXT")
     conn.commit()
     conn.close()
     return path
@@ -78,6 +83,7 @@ def log_decision(
 
     Called after the sweep completes in run_control_cycle().
     """
+    from weatherstat.config import EFFECTOR_MAP
     from weatherstat.types import ComfortSchedule, ControlDecision
 
     assert isinstance(decision, ControlDecision)
@@ -89,11 +95,33 @@ def log_decision(
     wind_speed = _safe_float(latest, "wind_speed")
     weather_condition = str(latest.get("weather_condition", "")) if hasattr(latest, "get") else ""
 
-    # Serialize blower/mini-split decisions
-    blowers_json = json.dumps([{"name": bd.name, "mode": bd.mode} for bd in decision.blowers])
-    mini_splits_json = json.dumps(
-        [{"name": sd.name, "mode": sd.mode, "target": sd.target} for sd in decision.mini_splits]
-    )
+    # Backward compat: fill old columns from new data
+    up_heating = any(e.mode != "off" for e in decision.effectors if e.name == "thermostat_upstairs")
+    dn_heating = any(e.mode != "off" for e in decision.effectors if e.name == "thermostat_downstairs")
+    up_setpoint = decision.command_targets.get("thermostat_upstairs", 0.0)
+    dn_setpoint = decision.command_targets.get("thermostat_downstairs", 0.0)
+
+    # Backward compat: serialize blower/mini-split decisions from unified effectors
+    blowers_json = json.dumps([
+        {"name": e.name.removeprefix("blower_"), "mode": e.mode}
+        for e in decision.effectors
+        if EFFECTOR_MAP.get(e.name) and EFFECTOR_MAP[e.name].control_type == "binary"
+    ])
+    mini_splits_json = json.dumps([
+        {"name": e.name.removeprefix("mini_split_"), "mode": e.mode, "target": e.target}
+        for e in decision.effectors
+        if EFFECTOR_MAP.get(e.name) and EFFECTOR_MAP[e.name].control_type == "regulating"
+    ])
+
+    # New unified effector columns
+    effector_decisions_json = json.dumps([
+        {
+            "name": e.name, "mode": e.mode, "target": e.target,
+            "delay_steps": e.delay_steps, "duration_steps": e.duration_steps,
+        }
+        for e in decision.effectors
+    ])
+    command_targets_json = json.dumps(decision.command_targets)
 
     # Serialize predictions (label -> {horizon -> temp})
     predictions_json = json.dumps(decision.predictions)
@@ -117,8 +145,8 @@ def log_decision(
             timestamp, live, outdoor_temp, outdoor_humidity, wind_speed, weather_condition,
             current_temps, upstairs_heating, downstairs_heating, upstairs_setpoint, downstairs_setpoint,
             blowers, mini_splits, predictions, comfort_cost, energy_cost, total_cost,
-            comfort_bounds, trajectory, outcome_backfilled
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            comfort_bounds, trajectory, outcome_backfilled, effector_decisions, command_targets
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """,
         (
             decision.timestamp,
@@ -128,10 +156,10 @@ def log_decision(
             wind_speed,
             weather_condition,
             json.dumps(current_temps),
-            int(decision.upstairs_heating),
-            int(decision.downstairs_heating),
-            decision.upstairs_setpoint,
-            decision.downstairs_setpoint,
+            int(up_heating),
+            int(dn_heating),
+            up_setpoint,
+            dn_setpoint,
             blowers_json,
             mini_splits_json,
             predictions_json,
@@ -140,6 +168,8 @@ def log_decision(
             decision.total_cost,
             comfort_bounds_json,
             trajectory_json,
+            effector_decisions_json,
+            command_targets_json,
         ),
     )
     conn.commit()

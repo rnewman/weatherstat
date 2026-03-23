@@ -1,23 +1,12 @@
 /**
  * Home Assistant entity ID constants.
  *
- * Thin re-exports from the YAML config (weatherstat.yaml).
- * See docs/entities.md for the full entity reference with zone associations.
+ * Re-exports from the YAML config (weatherstat.yaml).
+ * Device-specific entity IDs (thermostats, mini-splits, blowers) are accessed
+ * directly from config in the executor. Only shared/non-device constants here.
  */
 
 import { config } from "./yaml-config.ts";
-
-// Z-Wave thermostats (control hydronic floor heat zones via boiler)
-export const THERMOSTAT_UPSTAIRS = config.thermostats["upstairs"]!.entityId;
-export const THERMOSTAT_DOWNSTAIRS = config.thermostats["downstairs"]!.entityId;
-
-// Mini splits (wired via M5NanoC6 IR blasters)
-export const MINI_SPLIT_BEDROOM = config.miniSplits["bedroom"]!.entityId;
-export const MINI_SPLIT_LIVING_ROOM = config.miniSplits["living_room"]!.entityId;
-
-// In-wall blowers (Z-Wave fan entities with off/low/high presets)
-export const BLOWER_FAMILY_ROOM = config.blowers["family_room"]!.entityId;
-export const BLOWER_OFFICE = config.blowers["office"]!.entityId;
 
 // Temperature sensors (per-room)
 export const TEMP_SENSORS = config.tempSensors;

@@ -15,7 +15,7 @@ from weatherstat.simulator import (
     predict,
     simulate_sensor,
 )
-from weatherstat.types import BlowerDecision, MiniSplitDecision, ThermostatTrajectory, TrajectoryScenario
+from weatherstat.types import EffectorDecision, Scenario
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -26,42 +26,23 @@ def sim_params() -> SimParams:
     return load_sim_params()
 
 
-_BLOWERS_OFF = (
-    BlowerDecision("family_room", "off"),
-    BlowerDecision("office", "off"),
-    BlowerDecision("gym", "off"),
-)
-_SPLITS_OFF = (
-    MiniSplitDecision("bedroom", "off", 72),
-    MiniSplitDecision("living_room", "off", 72),
-)
+def _all_off() -> Scenario:
+    return Scenario(effectors={})
 
 
-def _all_off() -> TrajectoryScenario:
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        _BLOWERS_OFF, _SPLITS_OFF,
-    )
-
-
-def _both_on() -> TrajectoryScenario:
+def _both_on() -> Scenario:
     """Both thermostats on for full horizon."""
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=None),
-        _BLOWERS_OFF, _SPLITS_OFF,
-    )
+    return Scenario(effectors={
+        "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating"),
+        "thermostat_downstairs": EffectorDecision("thermostat_downstairs", mode="heating"),
+    })
 
 
-def _bedroom_heat() -> TrajectoryScenario:
+def _bedroom_heat() -> Scenario:
     """Mini split bedroom heat, thermostats off."""
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        _BLOWERS_OFF,
-        (MiniSplitDecision("bedroom", "heat", 72), MiniSplitDecision("living_room", "off", 72)),
-    )
+    return Scenario(effectors={
+        "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=72.0),
+    })
 
 
 _CURRENT_TEMPS = {
@@ -322,24 +303,18 @@ def test_performance(sim_params: SimParams) -> None:
 # ── Trajectory scenario tests ──────────────────────────────────────────
 
 
-def _traj_heat_2h() -> TrajectoryScenario:
+def _traj_heat_2h() -> Scenario:
     """Both thermostats heat for 2h starting now."""
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=24),
-        _BLOWERS_OFF,
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-    )
+    return Scenario(effectors={
+        "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating", duration_steps=24),
+        "thermostat_downstairs": EffectorDecision("thermostat_downstairs", mode="heating", duration_steps=24),
+    })
 
 
-def _traj_delayed_heat() -> TrajectoryScenario:
+def _traj_delayed_heat() -> Scenario:
     """Upstairs heats after 1h delay for 2h."""
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=True, delay_steps=12, duration_steps=24),
-        ThermostatTrajectory(heating=False),
-        _BLOWERS_OFF,
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-    )
+    up = EffectorDecision("thermostat_upstairs", mode="heating", delay_steps=12, duration_steps=24)
+    return Scenario(effectors={"thermostat_upstairs": up})
 
 
 def test_trajectory_2h_warmer_than_off(sim_params: SimParams) -> None:
@@ -355,12 +330,10 @@ def test_trajectory_2h_warmer_than_off(sim_params: SimParams) -> None:
 
 def test_trajectory_2h_cooler_than_6h(sim_params: SimParams) -> None:
     """2h heating should produce cooler 6h temps than 6h continuous heating."""
-    traj_6h = TrajectoryScenario(
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
-        ThermostatTrajectory(heating=True, delay_steps=0, duration_steps=72),
-        _BLOWERS_OFF,
-        (MiniSplitDecision("bedroom", "off", 72), MiniSplitDecision("living_room", "off", 72)),
-    )
+    traj_6h = Scenario(effectors={
+        "thermostat_upstairs": EffectorDecision("thermostat_upstairs", mode="heating", duration_steps=72),
+        "thermostat_downstairs": EffectorDecision("thermostat_downstairs", mode="heating", duration_steps=72),
+    })
     targets, preds = predict(
         _make_state(), [_traj_heat_2h(), traj_6h], sim_params, [72],
     )
@@ -405,14 +378,11 @@ def test_trajectory_performance(sim_params: SimParams) -> None:
 # ── Regulating effector tests ────────────────────────────────────────
 
 
-def _bedroom_heat_target(target: float) -> TrajectoryScenario:
+def _bedroom_heat_target(target: float) -> Scenario:
     """Mini split bedroom heat at a specific target temperature."""
-    return TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        _BLOWERS_OFF,
-        (MiniSplitDecision("bedroom", "heat", target), MiniSplitDecision("living_room", "off", 0.0)),
-    )
+    return Scenario(effectors={
+        "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=target),
+    })
 
 
 def test_regulating_different_targets_different_predictions(sim_params: SimParams) -> None:
@@ -446,12 +416,10 @@ def test_regulating_temperature_approaches_target(sim_params: SimParams) -> None
 
 def test_regulating_off_same_as_all_off(sim_params: SimParams) -> None:
     """Mini split off with target 0 should produce same results as all-off baseline."""
-    off_split = TrajectoryScenario(
-        ThermostatTrajectory(heating=False),
-        ThermostatTrajectory(heating=False),
-        _BLOWERS_OFF,
-        (MiniSplitDecision("bedroom", "off", 0.0), MiniSplitDecision("living_room", "off", 0.0)),
-    )
+    off_split = Scenario(effectors={
+        "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="off"),
+        "mini_split_living_room": EffectorDecision("mini_split_living_room", mode="off"),
+    })
     targets, preds = predict(_make_state(), [_all_off(), off_split], sim_params, [12, 72])
     # All predictions should be identical
     np.testing.assert_allclose(preds[0], preds[1], atol=0.01)

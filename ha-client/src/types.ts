@@ -120,13 +120,7 @@ export interface SnapshotRow {
 
 export interface Prediction {
   timestamp: string;
-  thermostatUpstairsTarget: number;
-  thermostatDownstairsTarget: number;
-  miniSplitBedroomTarget: number;
-  miniSplitBedroomMode: HVACMode;
-  miniSplitLivingRoomTarget: number;
-  miniSplitLivingRoomMode: HVACMode;
-  blowerFamilyRoomMode: string;
-  blowerOfficeMode: string;
   confidence: number;
+  /** Dynamic effector command keys (camelCase, from config). */
+  [key: string]: unknown;
 }

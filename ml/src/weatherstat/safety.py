@@ -67,22 +67,30 @@ def check_thermostat_modes(latest: object, decision: object) -> list[SafetyAlert
 
     Args:
         latest: Latest snapshot row (pandas Series or dict-like).
-        decision: ControlDecision with upstairs_heating/downstairs_heating.
+        decision: ControlDecision with effectors tuple.
     """
+    from weatherstat.config import EFFECTORS
+
     alerts: list[SafetyAlert] = []
 
-    for zone in ("upstairs", "downstairs"):
-        heating = getattr(decision, f"{zone}_heating", False)
-        action = str(getattr(latest, f"thermostat_{zone}_action", "")
-                      if hasattr(latest, f"thermostat_{zone}_action")
-                      else latest.get(f"thermostat_{zone}_action", ""))
+    for eff in EFFECTORS:
+        if eff.mode_control != "manual":
+            continue
+        # Find this effector's decision
+        eff_dec = next((e for e in decision.effectors if e.name == eff.name), None)
+        heating = eff_dec is not None and eff_dec.mode != "off"
+        action = str(getattr(latest, f"{eff.name}_action", "")
+                      if hasattr(latest, f"{eff.name}_action")
+                      else latest.get(f"{eff.name}_action", ""))
 
         if heating and action == "off":
+            # Strip "thermostat_" prefix for display
+            display_name = eff.name.removeprefix("thermostat_")
             alerts.append(SafetyAlert(
-                key=f"thermostat_off_{zone}",
-                title=f"{zone.title()} thermostat is off",
+                key=f"{eff.name}_off",
+                title=f"{display_name.replace('_', ' ').title()} thermostat is off",
                 message=(
-                    f"Control wants {zone} heating but the thermostat's hvac_mode is off. "
+                    f"Control wants {display_name} heating but the thermostat's hvac_mode is off. "
                     f"Setpoint changes will have no effect. Turn the thermostat on."
                 ),
                 severity="critical",

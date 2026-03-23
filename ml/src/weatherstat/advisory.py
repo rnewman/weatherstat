@@ -35,7 +35,7 @@ from weatherstat.config import (
 if TYPE_CHECKING:
     from weatherstat.control import ControlState
     from weatherstat.simulator import HouseState, SimParams
-    from weatherstat.types import ComfortSchedule, TrajectoryScenario, WindowOpportunity
+    from weatherstat.types import ComfortSchedule, Scenario, WindowOpportunity
 
 # ── Opportunity state ────────────────────────────────────────────────────
 
@@ -90,7 +90,7 @@ def save_advisory_state(cooldowns: dict[str, float]) -> None:
 
 def evaluate_window_opportunities(
     state: HouseState,
-    winning_scenario: TrajectoryScenario,
+    winning_scenario: Scenario,
     winning_comfort_cost: float,
     winning_energy_cost: float,
     sim_params: SimParams,
@@ -161,16 +161,16 @@ def evaluate_window_opportunities(
             continue
 
         # Re-sweep: find best HVAC plan with toggled window
-        # Uses the thermostat temps from current state for physical constraints
-        up_temp = current_temps.get("upstairs", 71.0) if current_temps else 71.0
-        dn_temp = current_temps.get("downstairs", 71.0) if current_temps else 71.0
-        split_temps: dict[str, float] = {}
+        # Build zone current temps from config-driven effectors
+        from weatherstat.config import EFFECTORS
+
+        zone_current_temps: dict[str, float] = {}
         if current_temps:
-            for ms in cfg.mini_splits:
-                for c in cfg.constraints:
-                    if c.label == ms:
-                        split_temps[ms] = current_temps.get(c.label, 71.0)
-                        break
+            for eff in EFFECTORS:
+                # Strip prefix to get the zone/room name used in current_temps
+                label = eff.name.removeprefix("thermostat_").removeprefix("mini_split_").removeprefix("blower_")
+                if label in current_temps:
+                    zone_current_temps[eff.name] = current_temps[label]
 
         resweep_decision, _resweep_scenario = sweep_scenarios_physics(
             current_temps=state.current_temps,
@@ -180,9 +180,7 @@ def evaluate_window_opportunities(
             sim_params=sim_params,
             hour_of_day=state.hour_of_day,
             recent_history=state.recent_history,
-            up_current=up_temp,
-            dn_current=dn_temp,
-            current_split_temps=split_temps,
+            zone_current_temps=zone_current_temps,
             schedules=schedules,
             base_hour=base_hour,
             prev_state=prev_state,

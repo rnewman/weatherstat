@@ -16,8 +16,18 @@ from weatherstat.safety import (
 
 class FakeDecision:
     def __init__(self, upstairs_heating: bool = False, downstairs_heating: bool = False):
-        self.upstairs_heating = upstairs_heating
-        self.downstairs_heating = downstairs_heating
+        from weatherstat.types import EffectorDecision
+
+        effs: list[EffectorDecision] = []
+        if upstairs_heating:
+            effs.append(EffectorDecision("thermostat_upstairs", mode="heating"))
+        else:
+            effs.append(EffectorDecision("thermostat_upstairs", mode="off"))
+        if downstairs_heating:
+            effs.append(EffectorDecision("thermostat_downstairs", mode="heating"))
+        else:
+            effs.append(EffectorDecision("thermostat_downstairs", mode="off"))
+        self.effectors = tuple(effs)
 
 
 class FakeRow:
@@ -50,7 +60,7 @@ class TestCheckThermostatModes:
         decision = FakeDecision(upstairs_heating=True, downstairs_heating=False)
         alerts = check_thermostat_modes(latest, decision)
         assert len(alerts) == 1
-        assert alerts[0].key == "thermostat_off_upstairs"
+        assert alerts[0].key == "thermostat_upstairs_off"
         assert alerts[0].severity == "critical"
 
     def test_alert_both_zones_off(self) -> None:
@@ -59,7 +69,7 @@ class TestCheckThermostatModes:
         alerts = check_thermostat_modes(latest, decision)
         assert len(alerts) == 2
         keys = {a.key for a in alerts}
-        assert keys == {"thermostat_off_upstairs", "thermostat_off_downstairs"}
+        assert keys == {"thermostat_upstairs_off", "thermostat_downstairs_off"}
 
     def test_no_alert_when_not_heating(self) -> None:
         latest = FakeRow(thermostat_upstairs_action="off", thermostat_downstairs_action="off")
@@ -163,7 +173,7 @@ class TestProcessSafetyAlerts:
 
     def test_alert_dispatched_dry_run(self, capsys) -> None:
         alert = SafetyAlert(
-            key="thermostat_off_upstairs",
+            key="thermostat_upstairs_off",
             title="Upstairs thermostat is off",
             message="Turn it on.",
             severity="critical",
@@ -176,7 +186,7 @@ class TestProcessSafetyAlerts:
 
     def test_multiple_alerts(self) -> None:
         alerts = [
-            SafetyAlert(key="thermostat_off_upstairs", title="T1", message="m1"),
+            SafetyAlert(key="thermostat_upstairs_off", title="T1", message="m1"),
             SafetyAlert(key="navien_fault", title="T2", message="m2"),
         ]
         result = process_safety_alerts(alerts, live=False)
