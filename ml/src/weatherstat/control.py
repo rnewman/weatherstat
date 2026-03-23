@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 
 from weatherstat.config import (
     BLOWERS,
@@ -596,6 +597,7 @@ def generate_trajectory_scenarios(
     base_hour: int = 12,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
+    ineligible_zones: set[str] | None = None,
 ) -> list[TrajectoryScenario]:
     """Generate trajectory scenarios for physics sweep.
 
@@ -642,10 +644,15 @@ def generate_trajectory_scenarios(
         combo for combo in product(*per_split_options)
     ]
 
+    # Per-zone trajectory options (ineligible zones fixed to heating=False)
+    _ineligible = ineligible_zones or set()
+    up_traj_options = [ThermostatTrajectory(heating=False)] if "upstairs" in _ineligible else traj_options
+    dn_traj_options = [ThermostatTrajectory(heating=False)] if "downstairs" in _ineligible else traj_options
+
     # Full cartesian product with blower constraint
     scenarios: list[TrajectoryScenario] = []
-    for up_traj in traj_options:
-        for dn_traj in traj_options:
+    for up_traj in up_traj_options:
+        for dn_traj in dn_traj_options:
             # Blower constraint: only sweep blower levels when zone thermostat
             # starts immediately (delay=0).  Delayed trajectories start heating
             # later — receding horizon will add blower when heat actually begins.
@@ -686,18 +693,22 @@ def sweep_scenarios_physics(
     base_hour: int,
     prev_state: ControlState | None = None,
     solar_fractions: list[float] | None = None,
+    ineligible_zones: set[str] | None = None,
 ) -> tuple[ControlDecision, TrajectoryScenario]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
     Thermostats are evaluated over a delay × duration grid (trajectory search).
     Fast effectors (blowers, mini-splits) use constant modes.
+    Ineligible zones are fixed to heating=False (thermostats off or Navien down).
     """
     from weatherstat.simulator import HouseState, SimParams, predict
 
     assert isinstance(sim_params, SimParams)
 
     sensor_zones = _derive_sensor_zones(sim_params.gains)
-    scenarios = generate_trajectory_scenarios(schedules, base_hour, prev_state, current_temps)
+    scenarios = generate_trajectory_scenarios(
+        schedules, base_hour, prev_state, current_temps, ineligible_zones,
+    )
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
 
@@ -799,6 +810,8 @@ def sweep_scenarios_physics(
             cold_zones.discard("upstairs")
         if not dn_allow:
             cold_zones.discard("downstairs")
+        for zone in (ineligible_zones or set()):
+            cold_zones.discard(zone)
 
         if cold_zones:
             constrained_best = -1
@@ -981,22 +994,84 @@ def check_prediction_sanity(
     return safe
 
 
+# ── Effector eligibility ──────────────────────────────────────────────────
+
+
+def _fetch_entity_state(entity_id: str) -> str | None:
+    """Fetch a single entity's state from HA. Returns None on failure."""
+    from weatherstat.config import HA_TOKEN, HA_URL
+
+    try:
+        resp = requests.get(
+            f"{HA_URL}/api/states/{entity_id}",
+            headers={"Authorization": f"Bearer {HA_TOKEN}"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("state")
+    except Exception:
+        pass
+    return None
+
+
+def check_effector_eligibility() -> dict[str, str]:
+    """Check which thermostat zones are ineligible for heating.
+
+    A thermostat is eligible when:
+    1. Its hvac_mode is "heat" (not "off") — it will respond to setpoint changes.
+       (The snapshot stores hvac_action, not hvac_mode, and both report "idle" when
+       off — so we fetch the entity state (= hvac_mode) live from HA.)
+    2. Its state_device is functional — the delivery system (e.g., boiler) is online.
+
+    Returns zone_name -> reason for each ineligible zone.
+    """
+    ineligible: dict[str, str] = {}
+
+    for zone_name, tcfg in _CFG.thermostats.items():
+        # 1. Check hvac_mode (entity state) — "off" means setpoint changes are ignored
+        hvac_mode = _fetch_entity_state(tcfg.entity_id)
+        if hvac_mode == "off":
+            ineligible[zone_name] = "thermostat hvac_mode is off"
+            continue
+
+        # 2. Check state_device is functional (gate is open)
+        if tcfg.state_device and tcfg.state_device in _CFG.state_sensors:
+            entity_id = _CFG.state_sensors[tcfg.state_device].entity_id
+            state = _fetch_entity_state(entity_id)
+            if state in ("unavailable", "unknown", None):
+                ineligible[zone_name] = f"{tcfg.state_device} is {state or 'unreachable'}"
+
+    return ineligible
+
+
 # ── Command JSON output ───────────────────────────────────────────────────
 
 
 def write_command_json(
     decision: ControlDecision,
     opportunities: list | None = None,
+    ineligible_zones: set[str] | None = None,
+    current_targets: dict[str, float] | None = None,
 ) -> Path:
     """Write executor-compatible command JSON.
 
     Uses camelCase keys matching the TS Prediction interface.
-    All device values come from the decision (no pass-through from current state).
+    For ineligible zones, uses the current target (no-op for executor).
     """
+    _ineligible = ineligible_zones or set()
+    _targets = current_targets or {}
+    up_target = (
+        _targets.get("upstairs", decision.upstairs_setpoint)
+        if "upstairs" in _ineligible else decision.upstairs_setpoint
+    )
+    dn_target = (
+        _targets.get("downstairs", decision.downstairs_setpoint)
+        if "downstairs" in _ineligible else decision.downstairs_setpoint
+    )
     command: dict[str, object] = {
         "timestamp": decision.timestamp,
-        "thermostatUpstairsTarget": decision.upstairs_setpoint,
-        "thermostatDownstairsTarget": decision.downstairs_setpoint,
+        "thermostatUpstairsTarget": up_target,
+        "thermostatDownstairsTarget": dn_target,
         "confidence": 1.0 - min(decision.total_cost / 10.0, 0.9),
     }
 
@@ -1247,7 +1322,17 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         outdoor = float(out_temp)
     else:
         outdoor = 50.0
-    n_scenarios = len(generate_trajectory_scenarios(schedules, base_hour, prev_state, current_temps))
+    # ── Effector eligibility ──
+    ineligible = check_effector_eligibility()
+    ineligible_zones = set(ineligible) if ineligible else None
+    if ineligible:
+        print("\n[control] Effector eligibility:")
+        for zone, reason in ineligible.items():
+            print(f"  {zone}: INELIGIBLE — {reason}")
+
+    n_scenarios = len(generate_trajectory_scenarios(
+        schedules, base_hour, prev_state, current_temps, ineligible_zones,
+    ))
     print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
     t0 = time.monotonic()
     decision, winning_scenario = sweep_scenarios_physics(
@@ -1265,6 +1350,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         base_hour,
         prev_state,
         solar_fractions,
+        ineligible_zones,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
@@ -1541,8 +1627,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Prediction sanity checks
     sane = check_prediction_sanity(decision, current_temps)
 
-    # Write command JSON
-    cmd_path = write_command_json(decision, opportunities=active_opps)
+    # Write command JSON (ineligible zones get current target → executor lazy-skips)
+    _current_targets = {
+        "upstairs": float(up_target) if up_target != "?" else decision.upstairs_setpoint,
+        "downstairs": float(dn_target) if dn_target != "?" else decision.downstairs_setpoint,
+    }
+    cmd_path = write_command_json(
+        decision, opportunities=active_opps,
+        ineligible_zones=ineligible_zones, current_targets=_current_targets,
+    )
     print(f"\n  Command JSON: {cmd_path}")
 
     # Log decision for outcome tracking

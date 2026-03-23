@@ -835,3 +835,114 @@ class TestTrajectoryWithSchedules:
             and all(sp.mode == "off" for sp in s.mini_splits)
         ]
         assert len(all_off) == 1
+
+
+# ── Effector eligibility tests ───────────────────────────────────────────
+
+
+class TestEffectorEligibility:
+    """Test the effector eligibility gate."""
+
+    def test_thermostat_off_ineligible(self) -> None:
+        """Thermostat with hvac_mode off is ineligible."""
+        from unittest.mock import patch
+
+        from weatherstat.control import check_effector_eligibility
+
+        # _fetch_entity_state returns hvac_mode for thermostat, then state_device state
+        def mock_fetch(entity_id: str) -> str:
+            if "upstairs" in entity_id:
+                return "off"
+            if "downstairs" in entity_id:
+                return "heat"
+            return "Idle"  # state_device
+
+        with patch("weatherstat.control._fetch_entity_state", side_effect=mock_fetch):
+            result = check_effector_eligibility()
+        assert "upstairs" in result
+        assert "downstairs" not in result
+        assert "off" in result["upstairs"]
+
+    def test_thermostat_heat_eligible(self) -> None:
+        """Thermostat with hvac_mode=heat is eligible."""
+        from unittest.mock import patch
+
+        from weatherstat.control import check_effector_eligibility
+
+        def mock_fetch(entity_id: str) -> str:
+            if "thermostat" in entity_id:
+                return "heat"
+            return "Idle"  # state_device
+
+        with patch("weatherstat.control._fetch_entity_state", side_effect=mock_fetch):
+            result = check_effector_eligibility()
+        assert result == {}
+
+    def test_both_off_both_ineligible(self) -> None:
+        """Both thermostats off → both ineligible."""
+        from unittest.mock import patch
+
+        from weatherstat.control import check_effector_eligibility
+
+        with patch("weatherstat.control._fetch_entity_state", return_value="off"):
+            result = check_effector_eligibility()
+        assert "upstairs" in result
+        assert "downstairs" in result
+
+    def test_state_device_unavailable_ineligible(self) -> None:
+        """State device reporting unavailable → zone ineligible."""
+        from unittest.mock import patch
+
+        from weatherstat.control import check_effector_eligibility
+
+        def mock_fetch(entity_id: str) -> str:
+            if "thermostat" in entity_id:
+                return "heat"
+            return "unavailable"  # state_device
+
+        with patch("weatherstat.control._fetch_entity_state", side_effect=mock_fetch):
+            result = check_effector_eligibility()
+        # Both thermostats share the same state_device, both ineligible
+        assert "upstairs" in result
+        assert "downstairs" in result
+        assert "unavailable" in result["upstairs"]
+
+    def test_state_device_functional_eligible(self) -> None:
+        """State device reporting a valid state → zone eligible."""
+        from unittest.mock import patch
+
+        from weatherstat.control import check_effector_eligibility
+
+        def mock_fetch(entity_id: str) -> str:
+            if "thermostat" in entity_id:
+                return "heat"
+            return "Idle"
+
+        with patch("weatherstat.control._fetch_entity_state", side_effect=mock_fetch):
+            result = check_effector_eligibility()
+        assert result == {}
+
+    def test_scenarios_reduced_when_ineligible(self) -> None:
+        """Ineligible zone produces fewer scenarios with no heating for that zone."""
+        schedules = make_schedules()
+        all_scenarios = generate_trajectory_scenarios(schedules, base_hour=12)
+        reduced = generate_trajectory_scenarios(schedules, base_hour=12, ineligible_zones={"upstairs"})
+
+        assert len(reduced) < len(all_scenarios)
+        # No upstairs heating in any scenario
+        assert all(not s.upstairs.heating for s in reduced)
+        # Downstairs still has heating options
+        assert any(s.downstairs.heating for s in reduced)
+
+    def test_scenarios_both_zones_ineligible(self) -> None:
+        """Both zones ineligible — only mini-split variations remain."""
+        schedules = make_schedules()
+        reduced = generate_trajectory_scenarios(
+            schedules, base_hour=12, ineligible_zones={"upstairs", "downstairs"},
+        )
+        assert all(not s.upstairs.heating for s in reduced)
+        assert all(not s.downstairs.heating for s in reduced)
+        # Should still have mini-split variations
+        assert len(reduced) >= 1
+        # All blowers should be off (no zone heating → blowers forced off)
+        assert all(b.mode == "off" for s in reduced for b in s.blowers)

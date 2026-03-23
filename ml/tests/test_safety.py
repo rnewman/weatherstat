@@ -116,7 +116,7 @@ class TestCheckDeviceHealth:
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 1
-        assert alerts[0].key == "navien_fault"
+        assert alerts[0].key == "navien_return_fault"
         assert alerts[0].severity == "critical"
 
     def test_alert_when_connection_lost(self) -> None:
@@ -128,6 +128,7 @@ class TestCheckDeviceHealth:
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 1
+        assert alerts[0].key == "navien_connection_fault"
         assert alerts[0].severity == "critical"
         assert "connection" in alerts[0].message.lower()
 

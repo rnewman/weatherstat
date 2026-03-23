@@ -81,6 +81,7 @@ class BlowerYamlConfig:
 class HealthCheck:
     """Generic device health threshold check."""
 
+    name: str  # YAML key, e.g. "navien_connection" — used as alert key
     entity_id: str
     min_value: float | None = None  # alert if reading <= this
     max_value: float | None = None  # alert if reading >= this
@@ -302,14 +303,9 @@ class WeatherstatConfig:
         return ids
 
     @property
-    def device_health_checks(self) -> dict[str, list[HealthCheck]]:
-        """device_name -> health checks, for generic safety monitoring."""
-        result: dict[str, list[HealthCheck]] = {}
-        for hc in self.health_checks:
-            # Group by entity prefix for display purposes
-            key = hc.entity_id.split(".")[-1].split("_")[0] if hc.entity_id else "unknown"
-            result.setdefault(key, []).append(hc)
-        return result
+    def device_health_checks(self) -> list[HealthCheck]:
+        """All configured health checks, for generic safety monitoring."""
+        return self.health_checks
 
     def window_columns_for_sensor(self, sensor_name: str) -> list[str]:
         """Derive window columns that might affect a sensor via naming convention.
@@ -575,8 +571,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
 
     # ── Health checks (standalone section) ────────────────────────────
     health_checks: list[HealthCheck] = []
-    for _name, hc in data.get("health", {}).items():
+    for hc_name, hc in data.get("health", {}).items():
         health_checks.append(HealthCheck(
+            name=hc_name,
             entity_id=hc["entity"],
             min_value=float(hc["min_value"]) if "min_value" in hc else None,
             max_value=float(hc["max_value"]) if "max_value" in hc else None,
@@ -595,8 +592,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             encoding={str(k): float(v) for k, v in boiler_data["mode_encoding"].items()},
         )
         # Migrate health checks from boiler config
-        for hc_data in boiler_data.get("health", []):
+        for i, hc_data in enumerate(boiler_data.get("health", [])):
             health_checks.append(HealthCheck(
+                name=f"boiler_{boiler_name}_{i}",
                 entity_id=hc_data["entity"],
                 min_value=float(hc_data["min_value"]) if "min_value" in hc_data else None,
                 max_value=float(hc_data["max_value"]) if "max_value" in hc_data else None,

@@ -106,19 +106,18 @@ def check_device_health() -> list[SafetyAlert]:
     cfg = load_config()
     alerts: list[SafetyAlert] = []
 
-    for device_name, checks in cfg.device_health_checks.items():
-        for check in checks:
-            try:
-                alert = _check_health_threshold(device_name, check)
-                if alert is not None:
-                    alerts.append(alert)
-            except Exception:
-                pass  # Don't fail the control cycle if HA fetch fails
+    for check in cfg.device_health_checks:
+        try:
+            alert = _check_health_threshold(check)
+            if alert is not None:
+                alerts.append(alert)
+        except Exception:
+            pass  # Don't fail the control cycle if HA fetch fails
 
     return alerts
 
 
-def _check_health_threshold(device_name: str, check: HealthCheck) -> SafetyAlert | None:
+def _check_health_threshold(check: HealthCheck) -> SafetyAlert | None:
     """Fetch an entity from HA and compare against configured thresholds."""
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
@@ -138,8 +137,8 @@ def _check_health_threshold(device_name: str, check: HealthCheck) -> SafetyAlert
 
     if state_val in ("unavailable", "unknown"):
         return SafetyAlert(
-            key=f"{device_name}_unavailable",
-            title=f"{device_name} sensor unavailable",
+            key=f"{check.name}_unavailable",
+            title=f"{check.name} sensor unavailable",
             message=f"Diagnostic sensor {check.entity_id} is '{state_val}'.",
             severity="warning",
         )
@@ -148,8 +147,8 @@ def _check_health_threshold(device_name: str, check: HealthCheck) -> SafetyAlert
     if check.expected_state is not None:
         if state_val != check.expected_state:
             return SafetyAlert(
-                key=f"{device_name}_fault",
-                title=f"{device_name} health check failed",
+                key=f"{check.name}_fault",
+                title=f"{check.name} health check failed",
                 message=check.message or f"{check.entity_id} is '{state_val}' (expected '{check.expected_state}')",
                 severity=check.severity,
             )
@@ -163,16 +162,16 @@ def _check_health_threshold(device_name: str, check: HealthCheck) -> SafetyAlert
 
     if check.min_value is not None and value <= check.min_value:
         return SafetyAlert(
-            key=f"{device_name}_fault",
-            title=f"{device_name} health check failed",
+            key=f"{check.name}_fault",
+            title=f"{check.name} health check failed",
             message=check.message or f"{check.entity_id} = {value}",
             severity=check.severity,
         )
 
     if check.max_value is not None and value >= check.max_value:
         return SafetyAlert(
-            key=f"{device_name}_fault",
-            title=f"{device_name} health check failed",
+            key=f"{check.name}_fault",
+            title=f"{check.name} health check failed",
             message=check.message or f"{check.entity_id} = {value}",
             severity=check.severity,
         )
