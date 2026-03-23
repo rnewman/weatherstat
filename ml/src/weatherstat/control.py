@@ -1051,7 +1051,6 @@ def write_command_json(
     decision: ControlDecision,
     opportunities: list | None = None,
     ineligible_zones: set[str] | None = None,
-    current_targets: dict[str, float] | None = None,
 ) -> Path:
     """Write executor-compatible command JSON.
 
@@ -1059,21 +1058,14 @@ def write_command_json(
     For ineligible zones, uses the current target (no-op for executor).
     """
     _ineligible = ineligible_zones or set()
-    _targets = current_targets or {}
-    up_target = (
-        _targets.get("upstairs", decision.upstairs_setpoint)
-        if "upstairs" in _ineligible else decision.upstairs_setpoint
-    )
-    dn_target = (
-        _targets.get("downstairs", decision.downstairs_setpoint)
-        if "downstairs" in _ineligible else decision.downstairs_setpoint
-    )
     command: dict[str, object] = {
         "timestamp": decision.timestamp,
-        "thermostatUpstairsTarget": up_target,
-        "thermostatDownstairsTarget": dn_target,
         "confidence": 1.0 - min(decision.total_cost / 10.0, 0.9),
     }
+    if "upstairs" not in _ineligible:
+        command["thermostatUpstairsTarget"] = decision.upstairs_setpoint
+    if "downstairs" not in _ineligible:
+        command["thermostatDownstairsTarget"] = decision.downstairs_setpoint
 
     # Blowers
     for bd in decision.blowers:
@@ -1627,14 +1619,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Prediction sanity checks
     sane = check_prediction_sanity(decision, current_temps)
 
-    # Write command JSON (ineligible zones get current target → executor lazy-skips)
-    _current_targets = {
-        "upstairs": float(up_target) if up_target != "?" else decision.upstairs_setpoint,
-        "downstairs": float(dn_target) if dn_target != "?" else decision.downstairs_setpoint,
-    }
+    # Write command JSON (omit targets for ineligible zones)
     cmd_path = write_command_json(
-        decision, opportunities=active_opps,
-        ineligible_zones=ineligible_zones, current_targets=_current_targets,
+        decision, opportunities=active_opps, ineligible_zones=ineligible_zones,
     )
     print(f"\n  Command JSON: {cmd_path}")
 

@@ -225,6 +225,13 @@ export async function executePrediction(
 
   for (const [name, entityId, desiredTarget] of thermostats) {
     const key = `thermostat_${name}`;
+
+    // Ineligible: no target in command JSON (thermostat off or gate device down)
+    if (desiredTarget === undefined) {
+      console.log(`[executor] ${key}: ineligible, skipping`);
+      continue;
+    }
+
     const current = readThermostat(stateMap, entityId);
 
     // Lazy: already at desired target
