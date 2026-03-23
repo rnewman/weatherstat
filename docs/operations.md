@@ -117,7 +117,7 @@ The executor reads the latest `command_*.json` and applies it via HA services.
 - 2-hour minimum hold time between mini-split mode changes
 - Per-device mode hold window (e.g., 10pm–7am): no mini-split mode changes during quiet hours, only target temperature adjustments
 - Refuses to execute if data is >15 minutes stale
-- Cold-sensor override: forces immediate heating when any sensor is significantly below comfort minimum
+- Cold-sensor override: forces immediate trajectory-effector activation when any sensor is significantly below comfort minimum
 - Dry-run is always the default
 
 ### Comfort profiles

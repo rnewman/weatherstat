@@ -87,10 +87,17 @@ increasing with horizon) — this likely represents underestimated heat loss
 
 ## Sweep Scalability
 
-Batch prediction gives ~30ms per sweep. Further optimization is only needed
-when the device count grows significantly.
+Batch prediction gives ~30ms per sweep (~7,400 scenarios with 2 trajectory
+effectors). The unified effector model generates scenarios as the cartesian
+product of per-effector options, so count grows as `|options|^N_independent`.
+
+**Current:** 2 trajectory (8 each) × 2 regulating (7 each) × 2 binary (3 each)
+= 8² × 7² × 3² ≈ 28K scenarios (pruned to ~7,400 by dependency constraints).
+Adding a 3rd trajectory effector: ~225K scenarios, ~1s sweep.
 
 **Future approaches (in priority order):**
+- **Trajectory grid reduction** — Coarser delay/duration grid for N>2
+  trajectory effectors. Receding horizon compensates.
 - **Window decomposition** — O(N) vs O(2^N). Independent per-window toggle.
   Needed at 10+ windows.
 - **Greedy coordinate descent** — O(Σ levels) vs O(∏ levels). Iterative

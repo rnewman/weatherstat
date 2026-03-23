@@ -14,7 +14,7 @@ The primary challenge is hydronic floor heating with 2-4 hour thermal lag, compo
 
 3. **Configuration-driven.** Adding a sensor, effector, or constraint should be a YAML edit, not a code change. The system discovers its own shape from configuration.
 
-4. **Sensors and effectors, not rooms.** The system optimizes sensor values by actuating effectors. Rooms are display labels, not structural entities. Constraints target sensors directly. Zones are a property of effectors (which thermostat controls which heating circuit), not of sensors.
+4. **Sensors and effectors, not rooms.** The system optimizes sensor values by actuating effectors. Rooms are display labels, not structural entities. Constraints target sensors directly. Effector dependencies (e.g., a blower depends on a thermostat) are expressed as direct references, not spatial groupings.
 
 5. **Learned over configured.** Sysid discovers physics (tau, gains, window effects) from data. Configuration declares what exists, not how things interact. Command/state pairs: every effector has intent (command) and reality (measured state). Sysid trains on state; control sets commands.
 
@@ -77,20 +77,18 @@ The primary challenge is hydronic floor heating with 2-4 hour thermal lag, compo
 
 Single source of truth for all entity IDs, effector definitions, comfort constraints, energy costs, and safety thresholds.
 
-The system is organized around five fundamental concepts:
+The system is organized around four fundamental concepts:
 - **Sensors** — observable quantities (temperature, humidity) with entity IDs and types
-- **Effectors** — actuatable devices (thermostats, mini splits, blowers, boiler) with command/state encodings and optional health checks
+- **Effectors** — actuatable devices (thermostats, mini splits, blowers) described by properties (`control_type`, `mode_control`, `depends_on`, `command_keys`) rather than categories. All share a unified `EffectorConfig` with per-effector command/state encodings and optional health checks
 - **Constraints** — scoring objectives on sensor values, with time-of-day bounds and asymmetric penalty weights, referencing sensors directly (not rooms)
 - **Windows** — environmental modifiers with binary state; their effect on sensor dynamics is learned by sysid (per-window cooling rate coefficients in TauModel)
-- **Zones** — topological grouping of effectors (which thermostat controls which heating circuit). Sensor-to-zone mapping is derived from the sysid coupling matrix (which thermostat has the highest gain for each sensor), not configured.
 
 **Contents:**
 - `location` — lat/lon/elevation/timezone (for solar position)
 - `sensors` — temperature and humidity entities (10+ humidity sensors)
-- `effectors` — thermostats, mini splits, blowers, boiler with mode encodings and health check thresholds
+- `effectors` — thermostats, mini splits, blowers with mode encodings and health check thresholds. Each has `control_type` (trajectory/regulating/binary), `mode_control` (manual/automatic), and optional `depends_on` (dependency on another effector)
 - `windows` — window/door sensors (effects learned by sysid, not configured)
-- `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights (no zone assignment — derived from coupling matrix)
-- `zones` — thermostat-to-circuit mapping
+- `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights (sensor-to-effector coupling derived from sysid coupling matrix)
 - `energy_costs` — per-device energy cost for the optimizer
 - `advisory` — effort costs, quiet hours, cooldown timers
 - `safety` — cooldown timers for infrastructure alerts
@@ -139,10 +137,12 @@ Where:
 - Each effector `e` contributes a gain (°F/hr per activity unit) delayed by its fitted lag
 - Solar gain is a per-sensor, per-hour profile from sysid, modulated by a weather-conditioned solar fraction (sunny=1.0, cloudy=0.15, clear-night=0.0, etc.)
 
-**Effector types:**
-- **Trajectory (thermostats):** Pre-computed binary activity from delay/duration parameters.
-- **Discrete (blowers):** Constant activity from mode (off=0, low=0.5, high=1.0).
-- **Regulating (mini splits):** Proportional activity computed inside the Euler loop: `activity = clip((target - T) / proportional_band, 0, 1)`. Activity drops to zero as the room reaches the target, modeling the mini split's PID controller.
+**Effector control types** (property of each effector, not separate code categories):
+- **Trajectory:** Pre-computed binary activity from delay/duration parameters. Used for slow-twitch effectors (e.g., hydronic thermostats with 45-75 min lag).
+- **Binary:** Constant activity from mode (off=0, low=0.5, high=1.0). Used for discrete-level effectors (e.g., blowers).
+- **Regulating:** Proportional activity computed inside the Euler loop: `activity = clip((target - T) / proportional_band, 0, 1)`. Activity drops to zero as the room reaches the target. Used for self-regulating climate devices (e.g., mini splits).
+
+**Effector dependencies:** Some effectors only produce useful output when a dependency is active (e.g., a blower circulating air over hydronic coils only helps when heat is flowing). Dependencies reference other effectors by name. The simulator models this via multiplicative activity gates; scenario generation prunes combinations where dependencies aren't met.
 
 **Integration:** Euler steps at 5-minute resolution, chaining hourly weather forecast segments for the outdoor temperature trajectory.
 
@@ -186,7 +186,7 @@ predict(state: HouseState, scenarios: list[TrajectoryScenario],
         params: SimParams, horizons: list[int]) -> (target_names, prediction_matrix)
 ```
 
-`HouseState` bundles all environmental state (current room temps, outdoor temp, forecast temps, window states, hour of day, recent HVAC history). `TrajectoryScenario` encodes the HVAC plan (thermostat trajectories with delay/duration, blower and mini-split modes). The controller treats this as a black box — it provides state and candidate actions, and receives `prediction_matrix[i, j]` (predicted temperature for scenario `i` at target `j`, where targets are room × horizon combinations).
+`HouseState` bundles all environmental state (current room temps, outdoor temp, forecast temps, window states, hour of day, recent HVAC history). `Scenario` encodes the HVAC plan (a dict of `EffectorDecision` per effector, each specifying mode, target, delay, and duration as applicable). The controller treats this as a black box — it provides state and candidate actions, and receives `prediction_matrix[i, j]` (predicted temperature for scenario `i` at target `j`, where targets are room × horizon combinations).
 
 **Vectorization:** Activity matrices `(n_scenarios, n_total_steps)` are built per effector using numpy broadcasting over delay/duration parameters. Total effector forcing is pre-computed per sensor via slice operations, so the Euler integration loop (72 timesteps) contains only numpy vector operations over all scenarios. This reduces Python loop iterations from ~4.3M to ~576 for a typical 7400-scenario sweep.
 
@@ -204,7 +204,7 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 5. Select the trajectory with the best score.
 6. Emit electronic commands for the executor.
 
-**Trajectory search:** Slow effectors (thermostats, 45-75 min lag) are parameterized as `[OFF × delay] → [ON × duration] → [OFF × remainder]`. Blowers use constant modes (off/low/high). Mini splits are treated as regulating effectors: the sweep generates target temperatures derived from the comfort schedule (off + preferred), not mode permutations. The boiler timeline is derived as the OR of both thermostat timelines. Blowers follow their zone thermostat (no heat to redistribute when the slab/radiators aren't active).
+**Trajectory search:** Effector options are generated per control_type: trajectory effectors get delay × duration grids, regulating effectors get mode + target combinations from comfort schedules, binary effectors get their supported modes. The sweep takes the cartesian product, with dependent effectors constrained by their parent's state. Boiler activity is confirmed via state_gate multiplication in the simulator.
 
 **Receding horizon:** Only the immediate action matters. A trajectory of "delay 2h then heat" means "stay off now." At the next 15-minute cycle, the controller re-evaluates with fresh data and may choose differently.
 
@@ -228,7 +228,7 @@ Window-open states widen the comfort band to avoid fighting ventilation.
 **Energy cost scaling:** Gas zone cost is proportional to `duration / max_horizon`. Mini-split cost is proportional to expected activity (target vs outdoor temperature within the proportional band).
 
 **Physical constraints:**
-- Blowers forced off when their zone's thermostat is off (no cold air circulation from radiator coils).
+- Dependent effectors forced off when their dependency is inactive (e.g., blowers off when thermostat isn't calling for heat).
 - Setpoint clamps (absolute safety bounds: 62–78°F).
 - Hold times: 10-minute minimum between setpoint changes; 2-hour minimum between mini-split mode changes.
 - Mode hold window: per-device configurable hours (e.g., 10pm–7am) during which mini-split mode changes are forbidden — only silent target temperature adjustments are allowed.
@@ -258,23 +258,26 @@ Applies the controller's commands to Home Assistant with safety checks.
 
 ---
 
-### 6. Advisory System (`ml/src/weatherstat/advisory.py`)
+### 6. Window Opportunities (`ml/src/weatherstat/advisory.py`)
 
-Generates human-actionable recommendations for things the system can't do electronically. Uses the physics simulator to evaluate whether toggling window states would improve comfort, given the committed electronic plan.
+Persistent, energy-aware recommendations for window state changes. Uses the physics simulator to evaluate whether toggling window states would improve comfort and/or save energy, given the committed electronic plan.
 
-**Advisory types:**
-- **Free cooling:** "Open [window] — outdoor temp is lower, room cools toward comfort range."
-- **Close windows:** "Close [window] — heating efficiency improves with window sealed."
+**Two-tier evaluation:**
+1. **Quick check:** Simulate winning scenario with window toggled → comfort delta.
+2. **Re-sweep** (if promising): Full scenario sweep with toggled window to find the best HVAC plan. Captures "open window + turn off mini split" energy savings.
 
-**Evaluation:** After the trajectory sweep commits to an electronic plan, the advisory system re-runs `predict()` for each window, toggling its state. If toggling improves comfort cost (measured against original, non-adjusted constraint schedules) by more than the effort threshold (from YAML `advisory.effort_cost`), an advisory is generated. Advisory messages identify the most-affected constrained sensor (data-driven from the constraint list and temperature deltas).
+**Two-threshold model:**
+- **Opportunity threshold** (0.3): minimum benefit to track (visible in control output).
+- **Notification threshold** (1.5): minimum benefit to push a mobile notification.
 
-**Key design constraint:** The electronic plan does NOT change based on advisories. The controller commits to the best electronic trajectory given current window states. Advisories are a separate, post-sweep evaluation. If the human acts on the advisory (e.g., opens a window), the next 15-minute cycle re-evaluates with the new state and naturally adjusts.
+**Lifecycle management:** Opportunities persist across control cycles. New ones are added, still-valid ones kept, expired ones dismissed (including HA persistent notifications). Per-window notification IDs prevent stacking.
+
+**Key design constraint:** The electronic plan does NOT change based on opportunities. The controller commits to the best electronic trajectory given current window states. If the human acts (e.g., opens a window), the next 15-minute cycle re-evaluates and naturally adjusts.
 
 **Dispatch:**
-- All triggered advisories are combined into a single notification (no spam).
 - Per-window cooldown timers prevent notification fatigue.
-- Quiet hours suppress push notifications (still logged).
-- Notifications use a fixed tag so each control cycle replaces the previous advisory.
+- Quiet hours suppress push notifications (still tracked).
+- Dismissed opportunities automatically clear HA persistent notifications.
 
 ---
 
@@ -283,12 +286,12 @@ Generates human-actionable recommendations for things the system can't do electr
 Detects infrastructure problems that prevent the control loop from working.
 
 **Check types:**
-- **Thermostat mode check:** Detects when a thermostat's `hvac_mode` is "off" while the controller wants to heat — setting the target has no effect in this state.
-- **Generic device health:** Iterates health check definitions from effector configs (e.g., `effectors.boiler.navien.health`). Fetches each entity's current state from HA and compares against configured min/max thresholds.
+- **Manual-mode effector check:** Detects when a manual-mode effector (e.g., thermostat) has `hvac_mode` "off" while the controller wants it active — setting the target has no effect in this state. Iterates all effectors with `mode_control: "manual"` from config.
+- **Generic device health:** Iterates health check definitions from the `health` YAML section. Fetches each entity's current state from HA and compares against configured min/max thresholds or expected state values.
 
 **Dispatch:** Safety alerts bypass quiet hours (these are urgent). Cooldown tracking prevents notification fatigue. Alerts reuse the advisory notification infrastructure.
 
-**Configuration-driven:** Health checks are defined per-effector in YAML with entity ID, min/max thresholds, severity, and message. Adding a health check = YAML edit.
+**Configuration-driven:** Health checks are defined in the `health` YAML section with entity ID, min/max thresholds, expected state, severity, and message. Adding a health check = YAML edit.
 
 ---
 
@@ -344,23 +347,24 @@ The collector is language-agnostic from the model's perspective.
 
 **Interface:** `predict(state: HouseState, scenarios, params, horizons) -> (target_names, prediction_matrix)`
 
-The controller treats the thermal model as a black box. `HouseState` bundles all environmental inputs; `TrajectoryScenario` encodes all HVAC plans. The prediction engine can be swapped without touching sweep logic, scoring, or constraints.
+The controller treats the thermal model as a black box. `HouseState` bundles all environmental inputs; `Scenario` encodes all HVAC plans (as a dict of `EffectorDecision` per effector). The prediction engine can be swapped without touching sweep logic, scoring, or constraints.
 
 ### Controller -> Executor
 
 **Interface:** `ControlDecision` JSON file in `~/.weatherstat/predictions/`.
 
 Contains:
-- Device states: thermostat setpoints, blower modes, mini-split modes + target temperatures.
+- Effector decisions: per-effector mode, target, delay, duration.
+- Command targets: per-effector setpoints for HA commands.
 - Predictions: per-sensor, per-horizon temperatures.
-- Trajectory info: delay and duration per zone.
+- Trajectory info: delay and duration per trajectory effector.
 - Timestamp and live/dry-run flag.
 
 ### Controller -> Advisory System
 
 **Interface:** Function calls within the control loop:
-1. `evaluate_window_advisories(state, winning_scenario, sim_params, schedules, base_hour)` — runs `predict()` per window toggle, returns advisories.
-2. `process_advisories(advisories, live, notification_target, current_hour)` — applies cooldowns, quiet hours, dispatches to HA.
+1. `evaluate_window_opportunities(state, winning_scenario, ...)` — runs `predict()` per window toggle, re-sweeps promising candidates for energy savings, returns `WindowOpportunity` list.
+2. `process_opportunities(opportunities, live, ...)` — manages lifecycle (add/keep/expire/dismiss), dispatches notifications to HA.
 
 ### Configuration -> Everything
 
