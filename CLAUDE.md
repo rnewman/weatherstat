@@ -49,16 +49,17 @@ just sysid            # System identification (fit thermal params from data)
 just control          # Single control cycle (dry-run, physics trajectory sweep)
 just control-loop     # 15-min control loop (dry-run)
 just control-live     # Single control cycle with live execution
+just control-loop-live # Loop control cycle with live execution
 just execute          # Apply latest command JSON to HA
 just comfort          # Comfort performance dashboard (last 7 days)
 just lint             # Lint both packages
+just lint-fix         # Lint and fix both packages
 just test             # Test both packages
 just typecheck        # TypeScript type-check
 ```
 
 ## Key Documentation
 
-- `docs/entities.md` — Full HA entity reference organized by zone
 - Entity IDs: `ha-client/src/entities.ts`
 - Snapshot schema: `ha-client/src/types.ts` (SnapshotRow interface)
 - Python mirror: `ml/src/weatherstat/types.py`

@@ -1,4 +1,4 @@
-# Operations Guide
+# Operations guide
 
 Running the weatherstat system: data collection, system identification, and physics-based control.
 
@@ -14,7 +14,7 @@ just init             # create ~/.weatherstat, copy example config
 All runtime data lives in `~/.weatherstat/` by default. Override with
 `WEATHERSTAT_DATA_DIR` env var.
 
-## 1. Data Collection
+## 1. Data collection
 
 The collector writes 5-minute snapshots to `~/.weatherstat/snapshots/snapshots.db` (SQLite).
 Every day of missed data is unrecoverable — start this first.
@@ -52,7 +52,7 @@ when data goes stale.
 sqlite3 ~/.weatherstat/snapshots/snapshots.db "SELECT COUNT(DISTINCT timestamp), MIN(timestamp), MAX(timestamp) FROM readings;"
 ```
 
-## 2. System Identification
+## 2. System identification
 
 Extract thermal parameters from collector data. This fits the physics model
 that the controller uses for all predictions.
@@ -76,7 +76,7 @@ just sysid --output custom_path.json  # custom output path
 
 Sysid uses all available collector data. More data = tighter parameter estimates.
 
-## 3. Control Loop
+## 3. Control loop
 
 The controller runs a physics-based trajectory sweep: for each combination of
 effector options (trajectory effectors get delay × duration grids, regulating
