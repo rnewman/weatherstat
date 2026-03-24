@@ -45,7 +45,6 @@ just collect          # Run HA state collector (5-min loop)
 just collect-once     # Collect a single snapshot
 just collect-durable  # Auto-restart collector + health monitoring
 just health           # Check if collector data is fresh
-just extract          # Extract historical data from HA
 just sysid            # System identification (fit thermal params from data)
 just control          # Single control cycle (dry-run, physics trajectory sweep)
 just control-loop     # 15-min control loop (dry-run)

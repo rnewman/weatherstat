@@ -20,9 +20,6 @@ collect-durable:
 health:
     bash scripts/check-health.sh
 
-# Extract historical data from HA
-extract *ARGS:
-    cd ml && uv run python -m weatherstat.extract {{ARGS}}
 
 # Lint both packages
 lint: lint-ts lint-py
