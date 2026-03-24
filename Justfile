@@ -95,6 +95,10 @@ execute:
 execute-force:
     cd ha-client && npx tsx src/index.ts execute --force
 
+# Discover HA entities and generate starter config
+discover *ARGS:
+    cd ml && uv run python ../scripts/discover.py {{ARGS}}
+
 # System identification: extract thermal parameters from collector data
 sysid *ARGS:
     cd ml && uv run python -m weatherstat.sysid {{ARGS}}
