@@ -215,7 +215,7 @@ def _enumerate_sensors() -> list[SensorSpec]:
     sensors: list[SensorSpec] = []
 
     for col_name in _CFG.temp_sensors:
-        if col_name == "outdoor_temp":
+        if _CFG.temp_sensors[col_name].role == "outdoor":
             continue
 
         sensors.append(SensorSpec(
@@ -399,24 +399,28 @@ def _preprocess(
     tz = _CFG.location.timezone
     df["_local_hour"] = df["_ts"].dt.tz_convert(tz).dt.hour
 
-    # Best outdoor temp: use met.no (ERA5/NWP) exclusively when available.
-    # The house-mounted side sensor reads ~3°F warm at all hours (house heat
-    # radiation through the wall) plus solar spikes of +10-12°F in the
-    # afternoon. Met.no data has no such biases.
-    # Backfill data is hourly; interpolate to fill 5-min gaps.
-    # Fall back to side sensor only for rows with no met coverage at all.
-    if "met_outdoor_temp" in df.columns and df["met_outdoor_temp"].notna().sum() > 100:
-        met = pd.to_numeric(df["met_outdoor_temp"], errors="coerce")
-        met = met.interpolate(method="linear", limit=24)  # fill up to 2h gaps
-        n_met = met.notna().sum()
-        n_fallback = met.isna().sum()
-        df["_outdoor_best"] = met.fillna(pd.to_numeric(df["outdoor_temp"], errors="coerce"))
-        if n_fallback > 0:
-            print(f"  Outdoor temp: met.no for {n_met}/{len(df)} rows, side sensor fallback for {n_fallback}")
-        else:
-            print(f"  Outdoor temp: met.no for all {n_met} rows")
+    # Best outdoor temp: prefer configured outdoor sensor, fall back to
+    # met.no weather data. Interpolate to fill gaps in hourly met data.
+    outdoor_col = _CFG.outdoor_sensor  # None if not configured
+    met_available = "met_outdoor_temp" in df.columns and df["met_outdoor_temp"].notna().sum() > 100
+    sensor_available = outdoor_col and outdoor_col in df.columns and df[outdoor_col].notna().sum() > 100
+
+    if sensor_available and met_available:
+        sensor = pd.to_numeric(df[outdoor_col], errors="coerce")
+        met = pd.to_numeric(df["met_outdoor_temp"], errors="coerce").interpolate(method="linear", limit=24)
+        df["_outdoor_best"] = sensor.fillna(met)
+        n_sensor = sensor.notna().sum()
+        n_fallback = sensor.isna().sum() - df["_outdoor_best"].isna().sum()
+        print(f"  Outdoor temp: {outdoor_col} for {n_sensor}/{len(df)} rows, met.no fallback for {n_fallback}")
+    elif sensor_available:
+        df["_outdoor_best"] = pd.to_numeric(df[outdoor_col], errors="coerce")
+        print(f"  Outdoor temp: {outdoor_col} (no met.no data)")
+    elif met_available:
+        met = pd.to_numeric(df["met_outdoor_temp"], errors="coerce").interpolate(method="linear", limit=24)
+        df["_outdoor_best"] = met
+        print(f"  Outdoor temp: met.no for {met.notna().sum()}/{len(df)} rows")
     else:
-        df["_outdoor_best"] = pd.to_numeric(df["outdoor_temp"], errors="coerce")
+        raise ValueError("No outdoor temperature source available (configure a sensor or ensure weather entity data)")
 
     # Outdoor temp rate-of-change (°F/hr, for weather control feature)
     dt_hours = 5.0 / 60.0

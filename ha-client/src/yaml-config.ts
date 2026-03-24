@@ -190,14 +190,17 @@ function loadYamlConfig() {
     });
   }
 
-  // 5. Outdoor temp
-  const outdoorSensor = raw.sensors.temperature["outdoor_temp"];
-  if (outdoorSensor) {
+  // 5. Outdoor temp sensor (optional — identified by role: "outdoor")
+  const outdoorEntry = Object.entries(raw.sensors.temperature).find(
+    ([, s]) => s.role === "outdoor",
+  );
+  const outdoorCol = outdoorEntry?.[0];
+  if (outdoorEntry) {
     columnDefs.push({
-      snake: "outdoor_temp",
-      camel: "outdoorTemp",
+      snake: outdoorEntry[0],
+      camel: snakeToCamel(outdoorEntry[0]),
       sqlType: "REAL",
-      extract: sensorNum(outdoorSensor.entity_id, 0),
+      extract: sensorNum(outdoorEntry[1].entity_id, 0),
     });
   }
 
@@ -293,9 +296,9 @@ function loadYamlConfig() {
     extract: (stateMap) => windowExtractors.some((fn) => fn(stateMap) === true),
   });
 
-  // 9. Per-room temperature sensors (exclude outdoor_temp and thermostat_* handled above)
+  // 9. Per-room temperature sensors (exclude outdoor and thermostat_* handled above)
   for (const [col, sensor] of Object.entries(raw.sensors.temperature)) {
-    if (col === "outdoor_temp" || col.startsWith("thermostat_")) continue;
+    if (col === outdoorCol || col.startsWith("thermostat_")) continue;
     columnDefs.push({
       snake: col,
       camel: snakeToCamel(col),
@@ -340,7 +343,7 @@ function loadYamlConfig() {
   // Includes non-thermostat, non-outdoor sensors from sensors.temperature.
   const tempSensors: Record<string, string> = {};
   for (const [col, sensor] of Object.entries(raw.sensors.temperature)) {
-    if (col.startsWith("thermostat_") || col === "outdoor_temp") continue;
+    if (col.startsWith("thermostat_") || col === outdoorCol) continue;
     const key = col.replace(/_temp$/, "");
     tempSensors[key] = sensor.entity_id;
   }
@@ -361,7 +364,6 @@ function loadYamlConfig() {
   return {
     effectors,
     // Sensor entity IDs
-    outdoorTempEntity: raw.sensors.temperature["outdoor_temp"]?.entity_id ?? "",
     weatherEntity: raw.weather.entity_id,
     notificationTarget: raw.notifications.target,
 

@@ -89,8 +89,10 @@ def log_decision(
     assert isinstance(decision, ControlDecision)
     path = init_db(db_path)
 
-    # Extract outdoor conditions from latest snapshot row
-    outdoor_temp = _safe_float(latest, "outdoor_temp")
+    # Extract outdoor conditions: prefer configured sensor, fall back to weather entity
+    from weatherstat.yaml_config import load_config
+    _outdoor_col = load_config().outdoor_sensor
+    outdoor_temp = (_safe_float(latest, _outdoor_col) if _outdoor_col else None) or _safe_float(latest, "met_outdoor_temp")
     outdoor_humidity = _safe_float(latest, "outdoor_humidity")
     wind_speed = _safe_float(latest, "wind_speed")
     weather_condition = str(latest.get("weather_condition", "")) if hasattr(latest, "get") else ""

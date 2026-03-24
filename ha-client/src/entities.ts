@@ -11,9 +11,6 @@ import { config } from "./yaml-config.ts";
 // Temperature sensors (per-room)
 export const TEMP_SENSORS = config.tempSensors;
 
-// Outdoor temperature
-export const OUTDOOR_TEMP = config.outdoorTempEntity;
-
 // Window/door sensors (for any_window_open)
 export const WINDOW_SENSORS = config.windowSensorEntityIds;
 

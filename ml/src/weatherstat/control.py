@@ -1165,8 +1165,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Current state
     latest = df_raw.iloc[-1]
-    # Prefer met.no outdoor temp (no house heat bias) over side sensor
-    out_temp = latest.get("met_outdoor_temp") or latest.get("outdoor_temp")
+    # Outdoor temp: prefer configured sensor, fall back to weather entity
+    _outdoor_col = _CFG.outdoor_sensor
+    out_temp = (latest.get(_outdoor_col) if _outdoor_col else None) or latest.get("met_outdoor_temp")
     now_str = df_raw["timestamp"].iloc[-1]
 
     # Build current temperature dict keyed by sensor column name

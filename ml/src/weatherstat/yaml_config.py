@@ -198,6 +198,14 @@ class WeatherstatConfig:
     # ── Derived properties (primary) ─────────────────────────────────
 
     @property
+    def outdoor_sensor(self) -> str | None:
+        """Column name of the configured outdoor temp sensor, if any."""
+        for col, cfg in self.temp_sensors.items():
+            if cfg.role == "outdoor":
+                return col
+        return None
+
+    @property
     def prediction_sensors(self) -> list[str]:
         """Ordered list of constraint sensor column names for prediction."""
         return [c.sensor for c in self.constraints]
@@ -428,10 +436,11 @@ class WeatherstatConfig:
         # Power sensors (numeric)
         for col in self.power_sensors:
             defs.append((col, "REAL"))
-        # Environment
+        # Environment (weather entity always provides met_outdoor_temp)
+        defs.append(("met_outdoor_temp", "REAL"))
+        if self.outdoor_sensor:
+            defs.append((self.outdoor_sensor, "REAL"))
         defs.extend([
-            ("outdoor_temp", "REAL"),
-            ("met_outdoor_temp", "REAL"),
             ("outdoor_humidity", "REAL"),
             ("wind_speed", "REAL"),
             ("weather_condition", "TEXT"),
@@ -444,7 +453,7 @@ class WeatherstatConfig:
         defs.append(("any_window_open", "INTEGER"))
         # Per-room temps (aggregate and individual)
         for col in self.temp_sensors:
-            if col not in ("outdoor_temp",) and not col.startswith("thermostat_"):
+            if col != self.outdoor_sensor and not col.startswith("thermostat_"):
                 defs.append((col, "REAL"))
         return defs
 
