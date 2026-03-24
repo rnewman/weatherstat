@@ -1,18 +1,38 @@
-# Weatherstat: how it works
+# Weatherstat
 
-Weatherstat is a physics-based smart thermostat controller for houses where conventional thermostats don't work well — particularly those with high thermal mass (hydronic floor heating, radiant panels, masonry walls) where the lag between turning on the heat and feeling the warmth is measured in hours, not minutes.
+## Docs
+
+* [Onboarding](docs/onboarding.md)
+* [Operations](docs/operations.md)
+* [Architecture](docs/ARCHITECTURE.md)
+
+## What is weatherstat?
+
+Weatherstat is a physics-based smart climate controller for houses where conventional thermostats don't work well — particularly those with high thermal mass (hydronic floor heating, radiant panels, masonry walls) where the lag between turning on the heat and feeling the warmth is measured in hours, not minutes.
+
+I built this because my home's conventional climate system — two thermostats driving hydronic heat (under-floor on one level, in-wall on another), two mini-splits primarily for cooling, and six in-wall blowers with manual two-speed switches, not to mention seemingly countless windows and shades — left my rooms a patchwork of too cold, too hot, and sometimes both in the same day.
+
+Weatherstat started out as an ML experiment: could a decision tree model do a good job of controlling these components?
+
+The answer was no, but it ended up with an [architecture](docs/ARCHITECTURE.md) that could.
 
 ## The problems
 
-A conventional thermostat is a reactive control system: it measures the temperature, compares it to a setpoint, and turns the heat on or off. This works for forced-air systems where the response is nearly instant. It fails badly for high-lag systems.
+A conventional thermostat is a reactive control system: it measures the temperature, compares it to a setpoint, and turns the heat on or off. This fails badly in at least four ways.
 
-Consider hydronic floor heating. You set the thermostat to 71°F. The room drops to 70°F. The thermostat calls for heat. Hot water starts flowing through the floor — but the thermal mass of the floor means the room won't warm up for 45–90 minutes. By the time the room reaches 71°F and the thermostat tells the heater to stop heating and pumping water, the floor and system have stored enough heat that the air temperature overshoots to 73°F. The thermostat turns off, but the room keeps warming. Then it cools slowly over hours. By the time it's cold again, the cycle repeats with the same overshoot. The result: wide temperature swings, wasted energy, and the thermostat is always fighting the last war.
+Firstly, it delivers a poor experience for high-lag systems. Forced-air HVAC systems can respond quite quickly, but consider hydronic floor heating. You set the thermostat to 71°F. The room drops to 70°F. The thermostat calls for heat. Hot water starts flowing through the floor — but the thermal mass of the floor means the room won't warm up for 45–90 minutes. By the time the room reaches 71°F and the thermostat tells the heater to stop heating and pumping water, the floor and system have stored enough heat that the air temperature overshoots to 73°F. The thermostat turns off, but the room keeps warming. Then it cools slowly over hours. By the time it's cold again, the cycle repeats with the same overshoot. The result: wide temperature swings, wasted energy, and the thermostat is always fighting the last war.
 
-This also fails badly when insolation comes into play. You get up and it's cold, so you set the thermostat to 72°. It begins warming up, finally getting up to temperature around 11am. The hydronic heat system continues to dump heat into the air for a couple more hours… but at this point the sun is fully up and is baking the south-facing windows. By 4 or 5pm, the living room is a toasty 77°. The thermostat will stay off until the living room cools, guaranteeing a cold-start problem again the following morning.
+Secondly, it ignores insolation. You get up and it's cold, so you set the thermostat to 72°. It begins warming up, finally getting up to temperature around 11am. The hydronic heat system continues to dump heat into the air for a couple more hours… but at this point the sun is fully up and is baking the south-facing windows. By 4 or 5pm, the living room is a toasty 77°. The thermostat will stay off until the living room cools, guaranteeing a cold-start problem again the following morning.
 
-The fix for both of these is to predict the future and act early. If you know the room will be too cold in two hours, start heating now. If you know the slab has enough stored heat, stop early. If you know it's going to be sunny today, don't add heat that the sun will provide.
+Thirdly, it can't account for windows. At that toasty 77°, the living room could be comfortable with half an hour of ventilation on a cool day — but I won't know until I come upstairs to make dinner. Wouldn't it be nice if my thermostat could tell me when opening or closing a window would make a big (and cheap!) difference?
 
-This requires a model of how the house actually behaves — how fast it loses heat, how much heat each device delivers, how solar gain and weather affect each room. That's what weatherstat builds.
+Fourthly, the typical thermostat has one or two sensors. Unless you have well-tuned central air with well-balanced registers that account for insolation, multiple rooms in a shared zone will end up at different temperatures — a bedroom with an open window might be 10°F cooler on one side of the room than the other. I want to be able to monitor many more than two points in my home, and automatically adjust all of my climate devices to make as many places comfortable as possible.
+
+The fix for the first two of these is to predict the future and act early. If you know the room will be too cold in two hours, start heating now. If you know the slab has enough stored heat, stop early. If you know it's going to be sunny today, don't add heat that the sun will provide.
+
+The fix for the second two is to be able to predict and optimize across many sensors and effectors: to explore the space of possible configurations of heating, cooling, windows, etc., to maximize comfort at minimal cost.
+
+This prediction and simulation requires a model of how the house actually behaves — how fast it loses heat, how much heat each device delivers, how solar gain and weather affect each room. That's what weatherstat builds.
 
 ### Sensors and effectors, not rooms
 
@@ -50,7 +70,7 @@ Every 15 minutes, weatherstat runs a control cycle:
 
 ### 1. Read the current state
 
-Pull the latest sensor data from Home Assistant: sensor temperatures, outdoor temperature, weather forecast, window states, HVAC device states. This is collected continuously by a snapshot collector that writes to a local SQLite database every 5 minutes.
+Pull the latest sensor data from Home Assistant: sensor temperatures, outdoor temperature, weather forecast, window states, climate entity states. This is collected continuously by a snapshot collector that writes to a local SQLite database every 5 minutes.
 
 ### 2. Generate candidate plans
 
