@@ -602,10 +602,7 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
         if not records:
             result[col_name] = np.nan
             continue
-        if col_name.endswith("_mode") or col_name in _CFG.state_sensors:
-            series = _history_to_series(records, value_fn=lambda s: s)
-        else:
-            series = _history_to_series(records)
+        series = _history_to_series(records, value_fn=lambda s: s) if col_name.endswith("_mode") or col_name in _CFG.state_sensors else _history_to_series(records)
         series = series[~series.index.duplicated(keep="last")]
         result[col_name] = series.reindex(time_index, method="ffill")
 

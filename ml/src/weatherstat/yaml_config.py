@@ -59,7 +59,7 @@ class EffectorYamlConfig:
     energy_cost: float | dict[str, float] = 0.0  # scalar or per-mode dict
     command_encoding: dict[str, float] | None = None  # separate command encoding (auto-mode climate)
     state_device: str | None = None  # state sensor confirming delivery
-    depends_on: str | None = None  # effector name this depends on
+    depends_on: tuple[str, ...] = ()  # effector names this depends on (ALL must be active)
     proportional_band: float = 1.0  # regulating: activity ramp width (°F)
     mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
 
@@ -454,6 +454,15 @@ def _find_yaml_path() -> Path:
     return resolve_data_dir() / "weatherstat.yaml"
 
 
+def _parse_depends_on(raw: str | list | None) -> tuple[str, ...]:
+    """Parse depends_on: accepts a string, list of strings, or None."""
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        return (raw,)
+    return tuple(str(x) for x in raw)
+
+
 def _parse_config(data: dict) -> WeatherstatConfig:
     """Parse raw YAML dict into a WeatherstatConfig."""
     loc = data["location"]
@@ -505,7 +514,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             energy_cost=energy_cost,
             command_encoding=cmd_enc,
             state_device=dev.get("state_device"),
-            depends_on=dev.get("depends_on"),
+            depends_on=_parse_depends_on(dev.get("depends_on")),
             proportional_band=float(dev.get("proportional_band", 1.0)),
             mode_hold_window=mode_hold_window,
         )

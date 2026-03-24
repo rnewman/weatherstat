@@ -34,7 +34,7 @@ interface RawConfig {
       state_encoding?: Record<string, number>;
       command_encoding?: Record<string, number>;
       state_device?: string;
-      depends_on?: string;
+      depends_on?: string | string[];
       proportional_band?: number;
       mode_hold_window?: [number, number];
       max_lag_minutes?: number;

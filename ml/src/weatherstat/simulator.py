@@ -386,12 +386,14 @@ def _build_activity_matrices(
 
         elif dtype == "blower":
             eff_cfg = EFFECTOR_MAP.get(name)
-            dep_name = eff_cfg.depends_on if eff_cfg else None
-            dep_active = (
-                trajectory_active.get(dep_name, np.ones((n, n_future), dtype=bool))
-                if dep_name
-                else np.ones((n, n_future), dtype=bool)
-            )
+            dep_names = eff_cfg.depends_on if eff_cfg else ()
+            if dep_names:
+                # AND gate: blower needs ALL parents active
+                dep_active = np.ones((n, n_future), dtype=bool)
+                for dname in dep_names:
+                    dep_active &= trajectory_active.get(dname, np.zeros((n, n_future), dtype=bool))
+            else:
+                dep_active = np.ones((n, n_future), dtype=bool)
             enc_vals = np.array([
                 encoding.get(s.effectors.get(name, EffectorDecision(name)).mode, 0.0)
                 for s in scenarios

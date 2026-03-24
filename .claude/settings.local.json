@@ -82,7 +82,9 @@
       "Read(//Users/rnewman/.claude/**)",
       "Read(//Users/rnewman/**)",
       "Bash(wc:*)",
-      "Bash(cut -d'\\(' -f1)"
+      "Bash(cut -d'\\(' -f1)",
+      "Bash(just verify:*)",
+      "Bash(git log:*)"
     ]
   }
 }

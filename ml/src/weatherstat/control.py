@@ -450,7 +450,7 @@ def compute_energy_cost(
         ec = eff_cfg.energy_cost
         if eff_cfg.control_type == "trajectory":
             dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
-            assert isinstance(ec, (int, float))
+            assert isinstance(ec, int | float)
             cost += ec * dur / max_h
 
         elif eff_cfg.control_type == "regulating":
@@ -462,7 +462,7 @@ def compute_energy_cost(
                 avg_activity = min(1.0, delta / p_band)
             else:
                 avg_activity = 0.5
-            assert isinstance(ec, (int, float))
+            assert isinstance(ec, int | float)
             cost += ec * avg_activity
 
         elif eff_cfg.control_type == "binary":
@@ -625,8 +625,8 @@ def generate_trajectory_scenarios(
     per_effector_options: dict[str, list[EffectorDecision]] = {}
 
     for eff in EFFECTORS:
-        if eff.depends_on is not None:
-            # Dependent effectors handled after their parent
+        if eff.depends_on:
+            # Dependent effectors handled after their parents
             continue
 
         if eff.control_type == "trajectory":
@@ -673,19 +673,21 @@ def generate_trajectory_scenarios(
     independent_options = [per_effector_options[n] for n in independent_names]
 
     # Dependent effectors: constrained by parent state
-    dependent_effectors = [e for e in EFFECTORS if e.depends_on is not None]
+    dependent_effectors = [e for e in EFFECTORS if e.depends_on]
 
     scenarios: list[Scenario] = []
     for combo in product(*independent_options):
         base_decisions = {ed.name: ed for ed in combo}
 
-        # Build dependent options: only sweep when parent is immediately active
+        # Build dependent options: only sweep when ALL parents are immediately active
         dep_option_lists: list[list[EffectorDecision]] = []
         dep_names: list[str] = []
         for dep in dependent_effectors:
-            parent = base_decisions.get(dep.depends_on or "")
-            parent_immediate = parent is not None and parent.mode != "off" and parent.delay_steps == 0
-            if parent_immediate:
+            all_parents_active = all(
+                (p := base_decisions.get(pname)) is not None and p.mode != "off" and p.delay_steps == 0
+                for pname in dep.depends_on
+            )
+            if all_parents_active:
                 dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep.supported_modes])
             else:
                 dep_option_lists.append([EffectorDecision(dep.name)])

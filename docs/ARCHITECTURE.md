@@ -86,10 +86,9 @@ The system is organized around four fundamental concepts:
 **Contents:**
 - `location` — lat/lon/elevation/timezone (for solar position)
 - `sensors` — temperature and humidity entities (10+ humidity sensors)
-- `effectors` — thermostats, mini splits, blowers with mode encodings and health check thresholds. Each has `control_type` (trajectory/regulating/binary), `mode_control` (manual/automatic), and optional `depends_on` (dependency on another effector)
+- `effectors` — flat dict of all HVAC devices (thermostats, mini splits, blowers), each declaring `control_type` (trajectory/regulating/binary), `mode_control` (manual/automatic), `supported_modes`, `state_encoding`, `max_lag_minutes`, `energy_cost`, and optional `depends_on` (string or list — ALL must be active), `state_device`, `proportional_band`, `mode_hold_window`
 - `windows` — window/door sensors (effects learned by sysid, not configured)
 - `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights (sensor-to-effector coupling derived from sysid coupling matrix)
-- `energy_costs` — per-device energy cost for the optimizer
 - `advisory` — effort costs, quiet hours, cooldown timers
 - `safety` — cooldown timers for infrastructure alerts
 - `defaults` — fallback values (e.g., `tau: 45.0` before sysid has run)
@@ -142,7 +141,7 @@ Where:
 - **Binary:** Constant activity from mode (off=0, low=0.5, high=1.0). Used for discrete-level effectors (e.g., blowers).
 - **Regulating:** Proportional activity computed inside the Euler loop: `activity = clip((target - T) / proportional_band, 0, 1)`. Activity drops to zero as the room reaches the target. Used for self-regulating climate devices (e.g., mini splits).
 
-**Effector dependencies:** Some effectors only produce useful output when a dependency is active (e.g., a blower circulating air over hydronic coils only helps when heat is flowing). Dependencies reference other effectors by name. The simulator models this via multiplicative activity gates; scenario generation prunes combinations where dependencies aren't met.
+**Effector dependencies:** Some effectors only produce useful output when all their dependencies are active (e.g., a blower circulating air over hydronic coils only helps when heat is flowing through them). `depends_on` references one or more parent effectors by name; the dependency is met when *all* parents are active (AND gate). The simulator models this via multiplicative activity gates; scenario generation prunes combinations where any parent is inactive.
 
 **Integration:** Euler steps at 5-minute resolution, chaining hourly weather forecast segments for the outdoor temperature trajectory.
 
@@ -182,7 +181,7 @@ These are guard rails, not root fixes. The fundamental issue is that OLS on obse
 The thermal model exposes a clean prediction interface to the controller:
 
 ```python
-predict(state: HouseState, scenarios: list[TrajectoryScenario],
+predict(state: HouseState, scenarios: list[Scenario],
         params: SimParams, horizons: list[int]) -> (target_names, prediction_matrix)
 ```
 
@@ -225,7 +224,7 @@ Window-open states widen the comfort band to avoid fighting ventilation.
 
 **Horizon weighting:** Closer predictions weighted higher (more accurate, more actionable).
 
-**Energy cost scaling:** Gas zone cost is proportional to `duration / max_horizon`. Mini-split cost is proportional to expected activity (target vs outdoor temperature within the proportional band).
+**Energy cost scaling:** Each effector's cost comes from its per-effector `energy_cost` config. Trajectory effectors: cost proportional to `duration / max_horizon`. Regulating effectors: cost proportional to expected activity (target vs outdoor temperature within proportional band). Binary effectors: per-mode cost dict.
 
 **Physical constraints:**
 - Dependent effectors forced off when their dependency is inactive (e.g., blowers off when thermostat isn't calling for heat).

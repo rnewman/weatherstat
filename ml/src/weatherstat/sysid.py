@@ -497,10 +497,7 @@ def _preprocess(
     # is 0.15 instead of 1.0; on a sunny day it's 1.0.
     from weatherstat.weather import condition_to_solar_fraction
 
-    if "weather_condition" in df.columns:
-        solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3)
-    else:
-        solar_frac = pd.Series(0.3, index=df.index)
+    solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3) if "weather_condition" in df.columns else pd.Series(0.3, index=df.index)
 
     for h in range(7, 18):
         df[f"_solar_h{h}"] = ((df["_local_hour"] == h).astype(float) * solar_frac)

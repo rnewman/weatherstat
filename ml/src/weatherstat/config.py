@@ -60,7 +60,7 @@ class EffectorConfig:
     mode_control: str  # "manual" or "automatic"
     supported_modes: tuple[str, ...]  # ("heat",), ("heat", "cool"), ("off", "low", "high")
     command_keys: dict[str, str]  # purpose -> camelCase key: {"target": "thermostatUpstairsTarget"}
-    depends_on: str | None = None  # effector name: "thermostat_downstairs"
+    depends_on: tuple[str, ...] = ()  # effector names: ("thermostat_downstairs",)
     state_device: str | None = None  # state sensor confirming delivery
     proportional_band: float = 1.0  # regulating: activity ramp width (°F)
     mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
