@@ -1,0 +1,111 @@
+/* Weatherstat TUI styles */
+
+Screen {
+    layout: vertical;
+}
+
+#status-header {
+    dock: top;
+    height: 2;
+    background: $surface;
+    color: $text;
+    padding: 0 1;
+}
+
+#status-footer {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* Tab content areas */
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 0;
+}
+
+/* Status tab: two-column layout */
+#status-grid {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    height: 1fr;
+}
+
+#left-col {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#right-col {
+    height: 1fr;
+    padding: 0 1;
+}
+
+.panel-title {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 0;
+}
+
+.panel {
+    margin-bottom: 1;
+}
+
+/* Temperature colors */
+.temp-cold {
+    color: $error;
+}
+
+.temp-warm {
+    color: $warning;
+}
+
+.temp-ok {
+    color: $success;
+}
+
+/* Mode indicators */
+.mode-live {
+    color: $error;
+    text-style: bold;
+}
+
+.mode-dry {
+    color: $success;
+    text-style: bold;
+}
+
+/* Predictions tab */
+#predictions-content {
+    padding: 1;
+    height: 1fr;
+    overflow-y: auto;
+}
+
+/* History tab */
+#history-content {
+    padding: 0;
+    height: 1fr;
+    layout: vertical;
+}
+
+#accuracy-panel {
+    height: auto;
+    max-height: 8;
+    padding: 0 1;
+}
+
+#history-table {
+    height: 1fr;
+}
+
+/* Log tab */
+#log-view {
+    height: 1fr;
+}

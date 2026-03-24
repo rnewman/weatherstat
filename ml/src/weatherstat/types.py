@@ -1,4 +1,4 @@
-"""Domain types mirroring the TypeScript side, using frozen dataclasses and StrEnum."""
+"""Domain types: frozen dataclasses and StrEnum."""
 
 from dataclasses import dataclass, field
 from enum import StrEnum

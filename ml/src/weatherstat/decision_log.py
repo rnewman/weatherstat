@@ -202,21 +202,21 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
         conn.close()
         return 0
 
-    # Load collector snapshots for lookups
+    # Load collector snapshots from EAV readings table
     if not SNAPSHOTS_DB.exists():
         conn.close()
         return 0
 
     snap_conn = sqlite3.connect(str(SNAPSHOTS_DB))
-    snap_df = pd.read_sql("SELECT * FROM snapshots ORDER BY timestamp", snap_conn)
-    snap_conn.close()
 
-    if snap_df.empty:
+    # Get distinct timestamps for efficient lookup
+    ts_df = pd.read_sql("SELECT DISTINCT timestamp FROM readings ORDER BY timestamp", snap_conn)
+    if ts_df.empty:
+        snap_conn.close()
         conn.close()
         return 0
 
-    # Parse snapshot timestamps once
-    snap_df["_ts"] = pd.to_datetime(snap_df["timestamp"], format="ISO8601", utc=True)
+    ts_df["_ts"] = pd.to_datetime(ts_df["timestamp"], format="ISO8601", utc=True)
 
     now = datetime.now(UTC)
     updated = 0
@@ -240,9 +240,9 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
                 all_fillable = False
                 continue
 
-            # Find the snapshot closest to decision_time + horizon
+            # Find the snapshot timestamp closest to decision_time + horizon
             target_time = decision_time + timedelta(minutes=horizon_min)
-            diffs = (snap_df["_ts"] - target_time).abs()
+            diffs = (ts_df["_ts"] - target_time).abs()
             closest_idx = diffs.idxmin()
             closest_diff_min = diffs.iloc[closest_idx].total_seconds() / 60
 
@@ -250,7 +250,12 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
             if closest_diff_min > 10:
                 continue
 
-            snap_row = snap_df.iloc[closest_idx]
+            # Load just this timestamp's readings from EAV and pivot to a dict
+            snap_ts = ts_df.iloc[closest_idx]["timestamp"]
+            snap_rows = snap_conn.execute(
+                "SELECT name, value FROM readings WHERE timestamp = ?", (snap_ts,)
+            ).fetchall()
+            snap_values = {r[0]: r[1] for r in snap_rows}
 
             for sensor_col in PREDICTION_SENSORS:
                 sensor_preds = predictions.get(sensor_col, {})
@@ -258,11 +263,14 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
                 if predicted is None:
                     continue
 
-                actual = snap_row.get(sensor_col)
-                if actual is None or (isinstance(actual, float) and pd.isna(actual)):
+                actual_str = snap_values.get(sensor_col)
+                if actual_str is None:
+                    continue
+                try:
+                    actual = float(actual_str)
+                except (ValueError, TypeError):
                     continue
 
-                actual = float(actual)
                 error = round(predicted - actual, 3)
 
                 if sensor_col not in outcomes:
@@ -302,6 +310,7 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
         )
         updated += 1
 
+    snap_conn.close()
     conn.commit()
     conn.close()
     return updated
@@ -363,6 +372,45 @@ def load_decision_log(db_path: Path | None = None, limit: int = 100) -> pd.DataF
     )
     conn.close()
     return df
+
+
+def accuracy_summary(hours: int = 24, db_path: Path | None = None) -> dict[str, dict[str, float]]:
+    """Return prediction accuracy stats per horizon from recent backfilled decisions.
+
+    Returns {horizon_label: {"mae": float, "bias": float, "n": int}}.
+    """
+    path = db_path or DECISION_LOG_DB
+    if not path.exists():
+        return {}
+
+    cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+    conn = sqlite3.connect(str(path))
+    rows = conn.execute(
+        "SELECT outcomes FROM decisions WHERE outcome_backfilled = 1 AND timestamp > ? AND outcomes IS NOT NULL",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+
+    # Aggregate errors per horizon
+    errors: dict[str, list[float]] = {}
+    for (outcomes_json,) in rows:
+        outcomes = json.loads(outcomes_json)
+        for _sensor, horizons in outcomes.items():
+            for h_label, data in horizons.items():
+                err = data.get("error")
+                if err is not None:
+                    errors.setdefault(h_label, []).append(float(err))
+
+    result: dict[str, dict[str, float]] = {}
+    for h_label in ("1h", "2h", "4h", "6h"):
+        errs = errors.get(h_label, [])
+        if errs:
+            result[h_label] = {
+                "mae": round(sum(abs(e) for e in errs) / len(errs), 3),
+                "bias": round(sum(errs) / len(errs), 3),
+                "n": len(errs),
+            }
+    return result
 
 
 def _safe_float(row: object, col: str) -> float | None:

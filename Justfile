@@ -4,32 +4,21 @@
 default:
     @just --list
 
-# Run HA state collector (5-min loop)
+# Run HA state collector (5-min loop, auto-recovery)
 collect:
-    cd ha-client && npx tsx src/index.ts collect
+    cd ml && uv run python -u -m weatherstat.collector collect
 
 # Collect a single snapshot
 collect-once:
-    cd ha-client && npx tsx src/index.ts once
-
-# Run collector with auto-restart + health monitoring
-collect-durable:
-    bash scripts/run-collector.sh
+    cd ml && uv run python -m weatherstat.collector once
 
 # Check collector health (is data fresh?)
 health:
     bash scripts/check-health.sh
 
 
-# Lint both packages
-lint: lint-ts lint-py
-
-# Lint TypeScript
-lint-ts:
-    cd ha-client && pnpm exec tsc --noEmit
-
 # Lint Python
-lint-py:
+lint:
     cd ml && uv run ruff check src/
 
 lint-fix:
@@ -39,20 +28,9 @@ lint-fix:
 fmt:
     cd ml && uv run ruff format src/ tests/
 
-# Test both packages
-test: test-ts test-py
-
-# Test TypeScript (placeholder)
-test-ts:
-    @echo "No TS tests yet"
-
 # Test Python
-test-py:
+test:
     cd ml && uv run pytest tests/
-
-# TypeScript type-check
-typecheck:
-    cd ha-client && pnpm exec tsc --noEmit
 
 # Single control cycle (dry-run, physics trajectory sweep)
 control:
@@ -76,9 +54,9 @@ control-loop-live:
         echo ""
         echo "── Control cycle: $(date) ──"
         if cd "$REPO_ROOT/ml" && uv run python -m weatherstat.control --live; then
-            cd "$REPO_ROOT"
+            cd "$REPO_ROOT/ml"
             echo "[control-loop-live] Executing command via HA..."
-            cd ha-client && npx tsx src/index.ts execute; cd "$REPO_ROOT"
+            uv run python -m weatherstat.executor
         else
             cd "$REPO_ROOT"
             echo "[control-loop-live] Control cycle failed (HA down?), will retry next cycle"
@@ -89,11 +67,11 @@ control-loop-live:
 
 # Execute latest command JSON via HA
 execute:
-    cd ha-client && npx tsx src/index.ts execute
+    cd ml && uv run python -m weatherstat.executor
 
 # Execute latest command, ignoring manual overrides
 execute-force:
-    cd ha-client && npx tsx src/index.ts execute --force
+    cd ml && uv run python -m weatherstat.executor --force
 
 # Discover HA entities and generate starter config
 discover *ARGS:
@@ -103,17 +81,20 @@ discover *ARGS:
 sysid *ARGS:
     cd ml && uv run python -m weatherstat.sysid {{ARGS}}
 
+# Interactive TUI dashboard
+tui:
+    cd ml && uv run --extra tui python -m weatherstat.tui
+
 # Comfort performance dashboard (last 7 days by default)
 comfort *ARGS:
     cd ml && uv run python ../scripts/plot_comfort.py {{ARGS}}
 
-# Verify live config parses correctly (both TS and Python)
+# Verify live config parses correctly
 verify:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Verifying weatherstat.yaml..."
-    node -e "const { config } = require('./ha-client/src/yaml-config.ts'); console.log('  TS: OK (' + Object.keys(config.effectors).length + ' effectors, ' + config.columnDefs.length + ' columns)')"
-    cd ml && uv run python -c "from weatherstat.yaml_config import load_config; cfg = load_config(); print(f'  Python: OK ({len(cfg.effectors)} effectors, {len(cfg.constraints)} constraints)'); from weatherstat.config import EFFECTORS; print(f'  Config: OK ({len(EFFECTORS)} effectors in EFFECTORS)')"
+    cd ml && uv run python -c "from weatherstat.yaml_config import load_config; cfg = load_config(); print(f'  Config: OK ({len(cfg.effectors)} effectors, {len(cfg.constraints)} constraints)'); from weatherstat.config import EFFECTORS; print(f'  Effectors: OK ({len(EFFECTORS)} in EFFECTORS)')"
     echo "Config OK."
 
 # ── Setup ────────────────────────────────────────────────────────────────
@@ -149,5 +130,4 @@ init:
 
 # Install all dependencies
 install:
-    cd ha-client && pnpm install
     cd ml && uv sync

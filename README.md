@@ -184,7 +184,7 @@ Home Assistant  ←──WebSocket/REST──→  Collector (TS, 5-min)
        └── Decision log (outcomes)
 ```
 
-The TypeScript side handles Home Assistant communication (reading state, executing commands). The Python side handles all modeling and control. They communicate through SQLite (collector → model) and JSON files (controller → executor).
+The system communicates with Home Assistant via REST API for both reading state (collector) and executing commands (executor). Data flows through SQLite (collector → model) and JSON files (controller → executor).
 
 Everything is driven by a single YAML config file that declares what sensors, effectors, windows, and comfort constraints exist. Adding a new device is a config edit — the collector picks it up automatically, sysid fits its parameters when re-run, and the control loop incorporates it into the sweep.
 

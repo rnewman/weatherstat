@@ -1,16 +1,15 @@
 # Weatherstat
 
-Hysteresis-aware smart thermostat system for hydronic floor heat with massive thermal lag. Two components:
+Hysteresis-aware smart thermostat system for hydronic floor heat with massive thermal lag.
 
-- **ha-client/** — TypeScript (pnpm, Node 25 native TS). Connects to Home Assistant to collect sensor snapshots and execute HVAC commands.
-- **ml/** — Python (uv, hatchling). Physics-based control: system identification, forward simulation, trajectory sweep.
+- **ml/** — Python (uv, hatchling). All pipeline stages: snapshot collection, system identification, forward simulation, trajectory sweep, command execution, TUI dashboard.
 
 ## Architecture
 
-- HA interface is abstracted behind `HAClient` (types.ts). WebSocket is one implementation; add-on/integration would use HA internal API.
-- Collector writes 5-min snapshots to SQLite (`~/.weatherstat/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Python reader pivots to wide DataFrame at load time, applying types from config. Sysid reads this for parameter fitting. Control output goes to JSON in `~/.weatherstat/predictions/`.
+- Collector fetches HA entity states via REST API and writes 5-min snapshots to SQLite (`~/.weatherstat/snapshots/snapshots.db`) in EAV format (`readings` table: timestamp, name, value). Python reader pivots to wide DataFrame at load time, applying types from config. Sysid reads this for parameter fitting. Control output goes to JSON in `~/.weatherstat/predictions/`.
+- Executor reads command JSON and applies HVAC commands via HA REST API, with lazy execution (skip if already correct) and override detection (respect manual changes).
 - Weather forecasts come from HA's `weather.forecast_home` entity (met.no). The collector stores hourly forecast snapshots; the simulator uses live forecasts for piecewise outdoor temp integration.
-- Entity IDs are real and live in `ha-client/src/entities.ts`. Full reference in `docs/entities.md`.
+- Entity IDs are configured in `weatherstat.yaml`. Full reference in `docs/entities.md`.
 - Sensor-to-zone mapping is derived from the sysid coupling matrix (which thermostat has the highest gain for each sensor), not configured in YAML.
 
 ## Development Stages
@@ -41,9 +40,8 @@ See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 ```bash
 just                  # List available tasks
 just init             # Initialize ~/.weatherstat data directory
-just collect          # Run HA state collector (5-min loop)
+just collect          # Run HA state collector (5-min loop, auto-recovery)
 just collect-once     # Collect a single snapshot
-just collect-durable  # Auto-restart collector + health monitoring
 just health           # Check if collector data is fresh
 just sysid            # System identification (fit thermal params from data)
 just control          # Single control cycle (dry-run, physics trajectory sweep)
@@ -51,28 +49,28 @@ just control-loop     # 15-min control loop (dry-run)
 just control-live     # Single control cycle with live execution
 just control-loop-live # Loop control cycle with live execution
 just execute          # Apply latest command JSON to HA
+just execute-force    # Apply ignoring manual overrides
+just tui              # Interactive TUI dashboard
 just comfort          # Comfort performance dashboard (last 7 days)
 just lint             # Lint both packages
 just lint-fix         # Lint and fix both packages
 just test             # Test both packages
-just typecheck        # TypeScript type-check
 ```
 
 ## Key Documentation
 
-- Entity IDs: `ha-client/src/entities.ts`
-- Snapshot schema: `ha-client/src/types.ts` (SnapshotRow interface)
-- Python mirror: `ml/src/weatherstat/types.py`
+- Entity IDs: `weatherstat.yaml` (configured per-house)
+- Domain types: `ml/src/weatherstat/types.py`
 - System identification: `ml/src/weatherstat/sysid.py`
+- Collector: `ml/src/weatherstat/collector.py`
+- Executor: `ml/src/weatherstat/executor.py`
 
 ## Conventions
 
-- TypeScript: strict mode, ESM, no default exports
 - Python: ruff for linting/formatting, frozen dataclasses, StrEnum for enums
-- All source files use explicit types — no `any` in TS, full type hints in Python
+- All source files use explicit types — full type hints in Python
 - Temperatures in Fahrenheit (matching HA configuration)
-- Parquet column names use snake_case (matching Python conventions)
-- TS interface properties use camelCase (matching TS conventions)
+- Snapshot column names use snake_case
 
 ## Data Directory
 

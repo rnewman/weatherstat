@@ -9,8 +9,7 @@ This guide walks you through setting up weatherstat for your house. You'll need 
 - **Temperature sensors** in the rooms you want to control (at least one)
 - **An outdoor temperature sensor** (or use HA's weather entity)
 - **Climate entities** (thermostats, mini-splits) and/or fans you want weatherstat to manage
-- **Node.js 25+** and **pnpm** (for the HA client / collector)
-- **Python 3.12+** and **uv** (for the ML / control pipeline)
+- **Python 3.12+** and **uv** (for the control pipeline)
 
 Optional but valuable:
 - Window/door binary sensors (sysid learns their thermal effect)
@@ -22,7 +21,7 @@ Optional but valuable:
 ```bash
 git clone https://github.com/your-org/weatherstat.git
 cd weatherstat
-just install          # installs pnpm + uv dependencies
+just install          # installs dependencies
 ```
 
 ## 2. Initialize the data directory
@@ -42,7 +41,7 @@ HA_URL=https://your-ha-instance.local:8123
 HA_TOKEN=your_long_lived_access_token_here
 ```
 
-Both the TypeScript collector and Python control code read from this file.
+All weatherstat components (collector, sysid, control, executor) read from this file.
 
 ## 4. Discover your entities
 
@@ -135,13 +134,12 @@ If you have window/door sensors, list them. You don't need to configure which ro
 just verify
 ```
 
-This runs both the TypeScript and Python config parsers to catch errors before you start collecting data.
+This runs the config parser to catch errors before you start collecting data.
 
 ## 7. Start collecting data
 
 ```bash
-just collect           # foreground, 5-min loop
-just collect-durable   # background with auto-restart (production)
+just collect           # 5-min loop with auto-recovery (Ctrl+C to stop)
 ```
 
 The collector writes snapshots to `~/.weatherstat/snapshots/snapshots.db` in EAV format. Each snapshot captures the full state of your house: temperatures, HVAC states, window states, weather conditions, and forecasts.

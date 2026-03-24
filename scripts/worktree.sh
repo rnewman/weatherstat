@@ -58,7 +58,6 @@ echo "Symlinked data/ -> $REPO_ROOT/data"
 # Install dependencies in the worktree
 echo ""
 echo "Installing dependencies..."
-(cd "$WORKTREE/ha-client" && pnpm install --frozen-lockfile 2>/dev/null) || true
 (cd "$WORKTREE/ml" && uv sync 2>/dev/null) || true
 
 echo ""

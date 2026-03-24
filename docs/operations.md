@@ -5,7 +5,7 @@ Running the weatherstat system: data collection, system identification, and phys
 ## Prerequisites
 
 ```bash
-just install          # pnpm + uv dependencies
+just install          # install dependencies
 just init             # create ~/.weatherstat, copy example config
 # then edit ~/.weatherstat/weatherstat.yaml with your entity IDs
 # and create ~/.weatherstat/.env with HA_URL and HA_TOKEN
@@ -22,19 +22,12 @@ Every day of missed data is unrecoverable — start this first.
 ### Start collecting
 
 ```bash
-just collect-durable   # recommended: auto-restart + health monitoring
+just collect           # 5-min loop with auto-recovery (Ctrl+C to stop)
+just collect-once      # single snapshot (for diagnostics)
 ```
 
-This runs the collector in a restart loop with exponential backoff (5s to 5min)
-and a background health check every 5 minutes. Logs go to `logs/collector.log`.
-Stop with Ctrl+C for clean shutdown.
-
-For quick testing:
-
-```bash
-just collect-once      # single snapshot
-just collect           # loop without restart wrapper
-```
+The collector fetches all entity states via REST API, so each snapshot is
+independent. If a fetch fails, it logs the error and retries next cycle.
 
 ### Health check
 
@@ -99,17 +92,21 @@ just control-loop      # 15-min loop, writes command JSON but doesn't execute
 
 ```bash
 just control-live      # single cycle, writes command JSON AND saves state
-just execute           # tell HA to apply the latest command_*.json
+just execute           # apply the latest command_*.json to HA
+just execute-force     # apply ignoring manual overrides
 ```
 
 For continuous operation:
 
 ```bash
 just control-loop-live # 15-min loop: control cycle + execute via HA
+just tui               # interactive dashboard: monitor, control, execute (recommended)
 ```
 
 The control module writes `~/.weatherstat/predictions/command_YYYYMMDD_HHMMSS.json`.
-The executor reads the latest `command_*.json` and applies it via HA services.
+The executor reads the latest `command_*.json` and applies it via HA REST API,
+with lazy execution (skips devices already in the desired state) and override
+detection (respects manual changes for 30 minutes).
 
 ### Safety rails
 
@@ -171,7 +168,7 @@ just init
 # Edit ~/.weatherstat/weatherstat.yaml and ~/.weatherstat/.env
 
 # Day 1: Start collecting
-just collect-durable &       # background, or in a tmux/screen session
+just collect &               # background, or in a tmux/screen session
 
 # After a few days of data: fit thermal parameters
 just sysid -v

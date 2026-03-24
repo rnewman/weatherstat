@@ -29,8 +29,7 @@ The primary challenge is hydronic floor heating with 2-4 hour thermal lag, compo
 ```
                         +-----------------+
                         |  Home Assistant  |
-                        |  (WebSocket +   |
-                        |   REST API)     |
+                        |   (REST API)    |
                         +--------+--------+
                                  |
                     reads state   |   executes commands
@@ -38,14 +37,14 @@ The primary challenge is hydronic floor heating with 2-4 hour thermal lag, compo
                    |                           |
             +------v------+             +------v------+
             |  Collector   |             |  Executor    |
-            |  (TS, 5-min) |             |  (TS)        |
+            |  (5-min)     |             |              |
             +------+------+             +------^------+
                    |                           |
                    | SQLite snapshots           | command JSON
                    |                           |
             +------v--------------------------+------+
             |           Thermal Model                 |
-            |  (Python: grey-box forward simulator)   |
+            |  (grey-box forward simulator)            |
             |                                         |
             |  +-------------+  +------------------+  |
             |  | Physics Core |  | Learned Params   |  |
@@ -93,27 +92,27 @@ The system is organized around four fundamental concepts:
 - `safety` — cooldown timers for infrastructure alerts
 - `defaults` — fallback values (e.g., `tau: 45.0` before sysid has run)
 
-**Read by:** every other component (TS via `yaml-config.ts`, Python via `yaml_config.py`). Both loaders produce typed configuration objects. Adding a sensor or device to the YAML automatically propagates to collection, prediction, and control.
+**Read by:** every other component (via `yaml_config.py`). The loader produces typed configuration objects. Adding a sensor or device to the YAML automatically propagates to collection, prediction, and control.
 
 **Currently:** manually maintained. See "Config Generator" in future components.
 
 ---
 
-### 2. Collector (`ha-client/src/collector.ts`)
+### 2. Collector (`ml/src/weatherstat/collector.py`)
 
 Periodically sample the full state of the house and persist it for training and analysis.
 
 **Behavior:**
 - Runs every 5 minutes.
-- Reads all monitored entities from HA via WebSocket subscription.
+- Reads all monitored entities from HA via REST API (`GET /api/states`).
 - Extracts values using config-driven column definitions (temperature attributes, HVAC actions/modes/targets, window states, weather conditions).
-- Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`) from HA's met.no integration for use by the simulator.
+- Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`) from HA's met.no integration via service call.
 - Deduplicates by rounding timestamps to the snapshot interval.
 - Writes to SQLite (`~/.weatherstat/snapshots/snapshots.db`) in EAV format: `readings` table with `(timestamp, name, value)` triples. No schema changes needed to add sensors.
 
-**Output:** SQLite database with 5-minute resolution. The `readings` table stores `(timestamp, name, value)` triples (~74 readings per snapshot). The Python reader pivots this to a wide DataFrame at load time, applying types from config.
+**Output:** SQLite database with 5-minute resolution. The `readings` table stores `(timestamp, name, value)` triples (~80 readings per snapshot). The Python reader pivots this to a wide DataFrame at load time, applying types from config.
 
-**Operational:** `just collect-durable` runs with auto-restart and health monitoring. `just health` checks data freshness.
+**Operational:** `just collect` runs the 5-min loop with auto-recovery. `just health` checks data freshness.
 
 ---
 
@@ -239,16 +238,17 @@ Window-open states widen the comfort band to avoid fighting ventilation.
 
 ---
 
-### 5. Executor (`ha-client/src/executor.ts`)
+### 5. Executor (`ml/src/weatherstat/executor.py`)
 
 Applies the controller's commands to Home Assistant with safety checks.
 
 **Behavior:**
-- Reads the latest `ControlDecision` JSON.
-- For each device command, checks current HA state (lazy execution — skip if already in desired state).
+- Reads the latest `command_*.json` from `predictions/`.
+- For each effector, checks current HA state via REST API (lazy execution — skip if already in desired state).
 - Calls HA services: `climate.set_temperature`, `climate.set_hvac_mode`, `fan.set_preset_mode`, etc.
-- Detects manual overrides: if device state doesn't match what the executor last set, a human intervened. Respects the override until the next control cycle (or `--force`).
+- Detects manual overrides: if device state doesn't match what the executor last set, a human intervened. Respects the override for 30 minutes (or `--force`).
 - Persists executor state for override tracking across restarts.
+- Returns structured `ExecutorResult` with per-device actions, used by the TUI to display override status.
 
 **Safety:**
 - Never executes without explicit `--live` flag.
@@ -367,7 +367,7 @@ Contains:
 
 ### Configuration -> Everything
 
-**Interface:** `weatherstat.yaml` parsed by `yaml-config.ts` (TS) and `yaml_config.py` (Python).
+**Interface:** `weatherstat.yaml` parsed by `yaml_config.py`.
 
 ---
 

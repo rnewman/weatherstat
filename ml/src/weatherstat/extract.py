@@ -313,6 +313,45 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
     return df
 
 
+def snapshot_status(db_path: Path | None = None) -> tuple[str, int]:
+    """Return (latest_timestamp, row_count) from the readings table.
+
+    Lightweight query for TUI status display — avoids loading full DataFrame.
+    Returns ("", 0) if the database doesn't exist or is empty.
+    """
+    path = db_path or SNAPSHOTS_DB
+    if not path.exists():
+        return ("", 0)
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute("SELECT MAX(timestamp), COUNT(*) FROM readings").fetchone()
+        if row and row[0]:
+            return (str(row[0]), int(row[1]))
+        return ("", 0)
+    finally:
+        conn.close()
+
+
+def latest_snapshot_values(db_path: Path | None = None) -> dict[str, str]:
+    """Return {name: value} for the most recent timestamp in readings.
+
+    Lightweight EAV query for TUI — no pivot, no type coercion.
+    """
+    path = db_path or SNAPSHOTS_DB
+    if not path.exists():
+        return {}
+    conn = sqlite3.connect(str(path))
+    try:
+        row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
+        if not row or not row[0]:
+            return {}
+        ts = row[0]
+        rows = conn.execute("SELECT name, value FROM readings WHERE timestamp = ?", (ts,)).fetchall()
+        return {r[0]: r[1] for r in rows}
+    finally:
+        conn.close()
+
+
 # ── Live state fetch ─────────────────────────────────────────────────────────
 
 
