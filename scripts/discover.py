@@ -321,7 +321,6 @@ def generate_yaml(c: Classified) -> str:
     # ── Sensors ──
     w("# ── Sensors: observable quantities ────────────────────────────────────────")
     w("# key = snake_case column name used in snapshots and features.")
-    w("# 'statistics: true' enables long-term data extraction (hourly) for sysid.")
     w("# One temperature sensor MUST have 'role: outdoor' for the physics model.")
     w()
     w("sensors:")
@@ -341,7 +340,6 @@ def generate_yaml(c: Classified) -> str:
             is_outdoor = e in outdoor_candidates
             w(f"    {name}:")
             w(f"      entity_id: {e.entity_id}")
-            w("      statistics: true")
             if is_outdoor:
                 w("      role: outdoor")
             w(f"      # {e.friendly_name} — currently {e.state}{e.unit}")
@@ -351,7 +349,6 @@ def generate_yaml(c: Classified) -> str:
             w("    # Add one with 'role: outdoor' — required for the physics model.")
             w("    # outdoor_temp:")
             w("    #   entity_id: sensor.your_outdoor_sensor")
-            w("    #   statistics: true")
             w("    #   role: outdoor")
 
     # Humidity

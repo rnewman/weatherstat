@@ -27,7 +27,6 @@ class LocationConfig:
 class TempSensorConfig:
     column_name: str  # snake_case column in SQLite/Parquet
     entity_id: str
-    statistics: bool  # has long-term hourly stats
     role: str = ""  # "outdoor" for the reference sensor
 
 
@@ -35,7 +34,6 @@ class TempSensorConfig:
 class HumiditySensorConfig:
     column_name: str
     entity_id: str
-    statistics: bool
 
 
 @dataclass(frozen=True)
@@ -221,15 +219,13 @@ class WeatherstatConfig:
         return {c.sensor: c.label for c in self.constraints}
 
     @property
-    def statistics_entities(self) -> dict[str, str]:
-        """col_name -> entity_id for sensors with long-term hourly statistics."""
+    def numeric_sensor_entities(self) -> dict[str, str]:
+        """col_name -> entity_id for all temperature and humidity sensors."""
         result: dict[str, str] = {}
         for col, cfg in self.temp_sensors.items():
-            if cfg.statistics:
-                result[col] = cfg.entity_id
+            result[col] = cfg.entity_id
         for col, cfg in self.humidity_sensors.items():
-            if cfg.statistics:
-                result[col] = cfg.entity_id
+            result[col] = cfg.entity_id
         return result
 
     @property
@@ -276,7 +272,7 @@ class WeatherstatConfig:
     def all_history_entities(self) -> list[str]:
         """All entity IDs for raw history extraction."""
         ids: list[str] = []
-        ids.extend(self.statistics_entities.values())
+        ids.extend(self.numeric_sensor_entities.values())
         ids.extend(self.climate_entities.values())
         ids.extend(self.fan_entities.values())
         ids.extend(self.sensor_entities.values())
@@ -493,7 +489,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         temp_sensors[col_name] = TempSensorConfig(
             column_name=col_name,
             entity_id=sensor["entity_id"],
-            statistics=sensor.get("statistics", False),
             role=sensor.get("role", ""),
         )
 
@@ -503,7 +498,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         humidity_sensors[col_name] = HumiditySensorConfig(
             column_name=col_name,
             entity_id=sensor["entity_id"],
-            statistics=sensor.get("statistics", False),
         )
 
     # ── Effectors (flat dict, each declares its own properties) ─────

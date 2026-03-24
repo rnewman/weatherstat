@@ -22,7 +22,7 @@ _CFG = load_config()
 
 # ── Entity definitions (from YAML config) ──────────────────────────────────
 
-STATISTICS_ENTITIES: dict[str, str] = _CFG.statistics_entities
+NUMERIC_SENSOR_ENTITIES: dict[str, str] = _CFG.numeric_sensor_entities
 CLIMATE_ENTITIES: dict[str, str] = _CFG.climate_entities
 FAN_ENTITIES: dict[str, str] = _CFG.fan_entities
 SENSOR_ENTITIES: dict[str, str] = _CFG.sensor_entities
@@ -327,7 +327,7 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
     start = end - timedelta(hours=hours_back)
 
     # Fetch sensor entities (no attributes needed)
-    sensor_ids = list(STATISTICS_ENTITIES.values()) + list(SENSOR_ENTITIES.values())
+    sensor_ids = list(NUMERIC_SENSOR_ENTITIES.values()) + list(SENSOR_ENTITIES.values())
     sensor_history = fetch_history(sensor_ids, start, end)
 
     # Fetch climate + fan + weather entities (with attributes)
@@ -343,7 +343,7 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
     result.index.name = "timestamp"
 
     # Process temperature/numeric sensors
-    for col_name, entity_id in {**STATISTICS_ENTITIES, **SENSOR_ENTITIES}.items():
+    for col_name, entity_id in {**NUMERIC_SENSOR_ENTITIES, **SENSOR_ENTITIES}.items():
         records = sensor_history.get(entity_id, [])
         if not records:
             result[col_name] = np.nan

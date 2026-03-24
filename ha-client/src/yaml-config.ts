@@ -19,8 +19,8 @@ const YAML_PATH = resolve(dataDir, "weatherstat.yaml");
 
 interface RawConfig {
   sensors: {
-    temperature: Record<string, { entity_id: string; statistics?: boolean; role?: string }>;
-    humidity: Record<string, { entity_id: string; statistics?: boolean }>;
+    temperature: Record<string, { entity_id: string; role?: string }>;
+    humidity: Record<string, { entity_id: string }>;
     state?: Record<string, { entity_id: string; encoding: Record<string, number> }>;
     power?: Record<string, { entity_id: string }>;
   };
