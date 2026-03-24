@@ -117,8 +117,8 @@ def load_comfort_schedules(cfg) -> dict[str, list[dict]]:
     Returns: {label: [{start_hour, end_hour, min, max, preferred}, ...]}
     """
     schedules: dict[str, list[dict]] = {}
-    for label, entries in cfg.comfort.items():
-        schedules[label] = [
+    for constraint in cfg.constraints:
+        schedules[constraint.label] = [
             {
                 "start_hour": e.start_hour,
                 "end_hour": e.end_hour,
@@ -126,7 +126,7 @@ def load_comfort_schedules(cfg) -> dict[str, list[dict]]:
                 "max": e.max_temp,
                 "preferred": e.preferred,
             }
-            for e in entries
+            for e in constraint.entries
         ]
     return schedules
 
@@ -169,36 +169,41 @@ def compute_comfort_bands(
 def build_sensor_dedicated_effectors(cfg, params) -> dict[str, list[str]]:
     """For each constrained sensor, find the effectors that are 'dedicated' to it.
 
-    An effector is dedicated to a sensor if:
-    1. It's the sensor's zone thermostat (from coupling matrix), OR
-    2. It's a mini split or blower whose name matches the sensor label
-       (e.g., mini_split_bedroom is dedicated to bedroom)
+    An effector is dedicated to a sensor if it has the highest gain for that
+    sensor among trajectory effectors, OR it's a regulating/binary effector
+    whose name matches the sensor label (e.g., mini_split_bedroom for bedroom).
 
     Cross-talk gains (bedroom mini split has 0.093 gain to kitchen) are
     intentionally excluded — the optimizer balances those trade-offs, and
     showing them as "available capacity" is misleading.
     """
-    from weatherstat.control import _derive_sensor_zones
-
-    sensor_zones = _derive_sensor_zones(params.gains)
     label_to_sensor_col = {c.label: c.sensor for c in cfg.constraints}
 
+    # Find best trajectory effector per sensor from coupling matrix
+    trajectory_effectors = {n for n, e in cfg.effectors.items() if e.control_type == "trajectory"}
+    best_trajectory: dict[str, str] = {}  # sensor_col -> effector_name
+    for (effector, sensor_col), (gain, _lag) in params.gains.items():
+        if effector not in trajectory_effectors or gain <= 0:
+            continue
+        prev_gain = params.gains.get((best_trajectory.get(sensor_col, ""), sensor_col), (0.0, 0.0))[0]
+        if sensor_col not in best_trajectory or gain > prev_gain:
+            best_trajectory[sensor_col] = effector
+
     dedicated: dict[str, list[str]] = {}
-    for label in label_to_sensor_col:
+    for label, sensor_col in label_to_sensor_col.items():
         effs: list[str] = []
 
-        # Zone thermostat
-        zone = sensor_zones.get(label)
-        if zone:
-            effs.append(f"thermostat_{zone}")
+        # Zone thermostat (highest-gain trajectory effector)
+        if sensor_col in best_trajectory:
+            effs.append(best_trajectory[sensor_col])
 
-        # Dedicated mini split (name matches label)
-        if label in cfg.mini_splits:
-            effs.append(f"mini_split_{label}")
-
-        # Dedicated blower (name matches label)
-        if label in cfg.blowers:
-            effs.append(f"blower_{label}")
+        # Dedicated regulating/binary effectors (name matches label)
+        for eff_name, eff_cfg in cfg.effectors.items():
+            if eff_cfg.control_type in ("regulating", "binary"):
+                # e.g., "mini_split_bedroom" -> "bedroom", "blower_office" -> "office"
+                suffix = eff_name.split("_", 1)[1] if "_" in eff_name else eff_name
+                if suffix == label:
+                    effs.append(eff_name)
 
         dedicated[label] = effs
 
