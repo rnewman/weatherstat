@@ -128,6 +128,6 @@ init:
     fi
     echo "Ready: $DATA_DIR"
 
-# Install all dependencies
+# Install all dependencies (including dev tools: pytest, ruff)
 install:
-    uv sync
+    uv sync --extra dev
