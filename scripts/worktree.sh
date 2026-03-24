@@ -58,7 +58,7 @@ echo "Symlinked data/ -> $REPO_ROOT/data"
 # Install dependencies in the worktree
 echo ""
 echo "Installing dependencies..."
-(cd "$WORKTREE/ml" && uv sync 2>/dev/null) || true
+(cd "$WORKTREE" && uv sync 2>/dev/null) || true
 
 echo ""
 echo "Done! Experiment worktree ready:"
@@ -68,7 +68,7 @@ echo "  Data:   shared via symlink"
 echo ""
 echo "Workflow:"
 echo "  cd $WORKTREE"
-echo "  # Edit ml/src/weatherstat/features.py (or wherever)"
+echo "  # Edit src/weatherstat/features.py (or wherever)"
 echo "  just train-experiment $NAME          # train to data/models/$NAME/"
 echo "  just experiment-compare $NAME        # compare vs production"
 echo "  # If better: merge branch, just train to promote to production"

@@ -2,7 +2,7 @@
 
 Hysteresis-aware smart thermostat system for hydronic floor heat with massive thermal lag.
 
-- **ml/** — Python (uv, hatchling). All pipeline stages: snapshot collection, system identification, forward simulation, trajectory sweep, command execution, TUI dashboard.
+- **src/** — Python (uv, hatchling). All pipeline stages: snapshot collection, system identification, forward simulation, trajectory sweep, command execution, TUI dashboard.
 
 ## Architecture
 
@@ -60,10 +60,10 @@ just test             # Test both packages
 ## Key Documentation
 
 - Entity IDs: `weatherstat.yaml` (configured per-house)
-- Domain types: `ml/src/weatherstat/types.py`
-- System identification: `ml/src/weatherstat/sysid.py`
-- Collector: `ml/src/weatherstat/collector.py`
-- Executor: `ml/src/weatherstat/executor.py`
+- Domain types: `src/weatherstat/types.py`
+- System identification: `src/weatherstat/sysid.py`
+- Collector: `src/weatherstat/collector.py`
+- Executor: `src/weatherstat/executor.py`
 
 ## Conventions
 

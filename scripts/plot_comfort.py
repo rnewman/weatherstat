@@ -41,7 +41,7 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 def _init_weatherstat():
     """Add weatherstat to sys.path and return config + sim params."""
     import sys
-    sys.path.insert(0, str(PROJECT_ROOT / "ml" / "src"))
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
     from weatherstat.simulator import load_sim_params
     from weatherstat.yaml_config import load_config
     return load_config(), load_sim_params()
@@ -50,7 +50,7 @@ def _init_weatherstat():
 def _resolve_paths() -> tuple[Path, Path, Path]:
     """Resolve data paths from weatherstat config module."""
     import sys
-    sys.path.insert(0, str(PROJECT_ROOT / "ml" / "src"))
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
     from weatherstat.config import DATA_DIR, DECISION_LOG_DB, SNAPSHOTS_DB
     return SNAPSHOTS_DB, DECISION_LOG_DB, DATA_DIR
 

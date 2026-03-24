@@ -6,11 +6,11 @@ default:
 
 # Run HA state collector (5-min loop, auto-recovery)
 collect:
-    cd ml && uv run python -u -m weatherstat.collector collect
+    uv run python -u -m weatherstat.collector collect
 
 # Collect a single snapshot
 collect-once:
-    cd ml && uv run python -m weatherstat.collector once
+    uv run python -m weatherstat.collector once
 
 # Check collector health (is data fresh?)
 health:
@@ -19,30 +19,30 @@ health:
 
 # Lint Python
 lint:
-    cd ml && uv run ruff check src/
+    uv run ruff check src/
 
 lint-fix:
-    uv run ruff check --fix ml/src/ ml/tests/
+    uv run ruff check --fix src/ tests/
 
 # Format Python
 fmt:
-    cd ml && uv run ruff format src/ tests/
+    uv run ruff format src/ tests/
 
 # Test Python
 test:
-    cd ml && uv run pytest tests/
+    uv run pytest tests/
 
 # Single control cycle (dry-run, physics trajectory sweep)
 control:
-    cd ml && uv run python -m weatherstat.control
+    uv run python -m weatherstat.control
 
 # Run control loop (dry-run, 15-min interval)
 control-loop:
-    cd ml && uv run python -m weatherstat.control --loop
+    uv run python -m weatherstat.control --loop
 
 # Single control cycle with live execution
 control-live:
-    cd ml && uv run python -m weatherstat.control --live
+    uv run python -m weatherstat.control --live
 
 # Live control loop (15-min interval, generates + executes via HA)
 control-loop-live:
@@ -53,8 +53,8 @@ control-loop-live:
     while true; do
         echo ""
         echo "── Control cycle: $(date) ──"
-        if cd "$REPO_ROOT/ml" && uv run python -m weatherstat.control --live; then
-            cd "$REPO_ROOT/ml"
+        if cd "$REPO_ROOT" && uv run python -m weatherstat.control --live; then
+            cd "$REPO_ROOT"
             echo "[control-loop-live] Executing command via HA..."
             uv run python -m weatherstat.executor
         else
@@ -67,34 +67,34 @@ control-loop-live:
 
 # Execute latest command JSON via HA
 execute:
-    cd ml && uv run python -m weatherstat.executor
+    uv run python -m weatherstat.executor
 
 # Execute latest command, ignoring manual overrides
 execute-force:
-    cd ml && uv run python -m weatherstat.executor --force
+    uv run python -m weatherstat.executor --force
 
 # Discover HA entities and generate starter config
 discover *ARGS:
-    cd ml && uv run python ../scripts/discover.py {{ARGS}}
+    uv run python ../scripts/discover.py {{ARGS}}
 
 # System identification: extract thermal parameters from collector data
 sysid *ARGS:
-    cd ml && uv run python -m weatherstat.sysid {{ARGS}}
+    uv run python -m weatherstat.sysid {{ARGS}}
 
 # Interactive TUI dashboard
 tui:
-    cd ml && uv run --extra tui python -m weatherstat.tui
+    uv run --extra tui python -m weatherstat.tui
 
 # Comfort performance dashboard (last 7 days by default)
 comfort *ARGS:
-    cd ml && uv run python ../scripts/plot_comfort.py {{ARGS}}
+    uv run python ../scripts/plot_comfort.py {{ARGS}}
 
 # Verify live config parses correctly
 verify:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Verifying weatherstat.yaml..."
-    cd ml && uv run python -c "from weatherstat.yaml_config import load_config; cfg = load_config(); print(f'  Config: OK ({len(cfg.effectors)} effectors, {len(cfg.constraints)} constraints)'); from weatherstat.config import EFFECTORS; print(f'  Effectors: OK ({len(EFFECTORS)} in EFFECTORS)')"
+    uv run python -c "from weatherstat.yaml_config import load_config; cfg = load_config(); print(f'  Config: OK ({len(cfg.effectors)} effectors, {len(cfg.constraints)} constraints)'); from weatherstat.config import EFFECTORS; print(f'  Effectors: OK ({len(EFFECTORS)} in EFFECTORS)')"
     echo "Config OK."
 
 # ── Setup ────────────────────────────────────────────────────────────────
@@ -130,4 +130,4 @@ init:
 
 # Install all dependencies
 install:
-    cd ml && uv sync
+    uv sync

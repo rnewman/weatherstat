@@ -98,7 +98,7 @@ The system is organized around four fundamental concepts:
 
 ---
 
-### 2. Collector (`ml/src/weatherstat/collector.py`)
+### 2. Collector (`src/weatherstat/collector.py`)
 
 Periodically sample the full state of the house and persist it for training and analysis.
 
@@ -120,7 +120,7 @@ Periodically sample the full state of the house and persist it for training and 
 
 The core prediction engine. A grey-box model: physics provides the structure, data provides the parameters.
 
-#### 3a. Physics Core (`ml/src/weatherstat/simulator.py`)
+#### 3a. Physics Core (`src/weatherstat/simulator.py`)
 
 Forward-simulates room temperatures by Euler-integrating the thermal dynamics of each sensor at 5-minute resolution:
 
@@ -146,7 +146,7 @@ Where:
 
 **Batch simulation:** The controller calls `predict()` with thousands of candidate scenarios. Each scenario specifies effector timelines (trajectory-parameterized), and the simulator evaluates all of them against the same initial conditions. Internally, Euler integration is vectorized across all scenarios using numpy — the outer loop is over sensors and timesteps, with numpy broadcasting handling all scenarios simultaneously.
 
-#### 3b. System Identification (`ml/src/weatherstat/sysid.py`)
+#### 3b. System Identification (`src/weatherstat/sysid.py`)
 
 Fits all thermal model parameters from observed collector data using a two-stage approach.
 
@@ -190,7 +190,7 @@ predict(state: HouseState, scenarios: list[Scenario],
 
 ---
 
-### 4. Controller (`ml/src/weatherstat/control.py`)
+### 4. Controller (`src/weatherstat/control.py`)
 
 Decides what HVAC actions to take right now, using receding-horizon optimization (MPC with trajectory search).
 
@@ -238,7 +238,7 @@ Window-open states widen the comfort band to avoid fighting ventilation.
 
 ---
 
-### 5. Executor (`ml/src/weatherstat/executor.py`)
+### 5. Executor (`src/weatherstat/executor.py`)
 
 Applies the controller's commands to Home Assistant with safety checks.
 
@@ -257,7 +257,7 @@ Applies the controller's commands to Home Assistant with safety checks.
 
 ---
 
-### 6. Window Opportunities (`ml/src/weatherstat/advisory.py`)
+### 6. Window Opportunities (`src/weatherstat/advisory.py`)
 
 Persistent, energy-aware recommendations for window state changes. Uses the physics simulator to evaluate whether toggling window states would improve comfort and/or save energy, given the committed electronic plan.
 
@@ -280,7 +280,7 @@ Persistent, energy-aware recommendations for window state changes. Uses the phys
 
 ---
 
-### 7. Safety System (`ml/src/weatherstat/safety.py`)
+### 7. Safety System (`src/weatherstat/safety.py`)
 
 Detects infrastructure problems that prevent the control loop from working.
 
@@ -294,7 +294,7 @@ Detects infrastructure problems that prevent the control loop from working.
 
 ---
 
-### 8. Decision Log (`ml/src/weatherstat/decision_log.py`)
+### 8. Decision Log (`src/weatherstat/decision_log.py`)
 
 Records every control decision with full context.
 
@@ -403,4 +403,4 @@ We built a full LightGBM pipeline: 8 rooms x 5 horizons = 40 models trained on c
 
 **The lesson:** ML is a powerful function approximator, but for a physical system with known structure, encoding that structure directly produces better predictions with less data, better extrapolation, and — crucially — reliable counterfactual reasoning. ML remains the right tool for components that are genuinely hard to model (solar gain, occupancy effects).
 
-See `docs/EXPERIMENTS.md` for detailed experiment results and metrics. The ML training pipeline has been archived to `archive/ml/` for reference.
+See `docs/EXPERIMENTS.md` for detailed experiment results and metrics. The ML training pipeline has been archived to `archive/` for reference.

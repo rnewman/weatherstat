@@ -20,8 +20,8 @@ from pathlib import Path
 
 import requests
 
-# Add ml/src to path so we can import config
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ml" / "src"))
+# Add src to path so we can import config
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from weatherstat.config import SNAPSHOTS_DB  # noqa: E402
 

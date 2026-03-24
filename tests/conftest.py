@@ -19,7 +19,7 @@ from pathlib import Path
 
 # ── Set up isolated data dir BEFORE any weatherstat imports ──────────────
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 _EXAMPLE_YAML = _REPO_ROOT / "weatherstat.yaml.example"
 
 # Create a persistent temp directory for the test session.
