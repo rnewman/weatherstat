@@ -36,7 +36,7 @@ lint-py:
     cd ml && uv run ruff check src/
 
 lint-fix:
-    cd ml && uv run ruff check src/ --fix
+    uv run ruff check --fix ml/src/ ml/tests/
 
 # Format Python
 fmt:
@@ -105,6 +105,15 @@ sysid *ARGS:
 # Comfort performance dashboard (last 7 days by default)
 comfort *ARGS:
     cd ml && uv run python ../scripts/plot_comfort.py {{ARGS}}
+
+# Verify live config parses correctly (both TS and Python)
+verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Verifying weatherstat.yaml..."
+    node -e "const { config } = require('./ha-client/src/yaml-config.ts'); console.log('  TS: OK (' + Object.keys(config.effectors).length + ' effectors, ' + config.columnDefs.length + ' columns)')"
+    cd ml && uv run python -c "from weatherstat.yaml_config import load_config; cfg = load_config(); print(f'  Python: OK ({len(cfg.effectors)} effectors, {len(cfg.constraints)} constraints)'); from weatherstat.config import EFFECTORS; print(f'  Config: OK ({len(EFFECTORS)} effectors in EFFECTORS)')"
+    echo "Config OK."
 
 # ── Setup ────────────────────────────────────────────────────────────────
 
