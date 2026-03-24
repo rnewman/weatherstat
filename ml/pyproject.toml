@@ -5,19 +5,15 @@ build-backend = "hatchling.build"
 [project]
 name = "weatherstat"
 version = "0.1.0"
-description = "LightGBM training/inference pipeline for smart thermostat control"
+description = "Physics-based HVAC control: system identification, forward simulation, trajectory sweep"
 requires-python = ">=3.12"
 dependencies = [
-    "lightgbm>=4.5",
-    "scikit-learn>=1.5",
-    "pandas>=2.2",
-    "pyarrow>=18.0",
-    "astral>=3.2",
-    "numpy>=2.0",
-    "requests>=2.32",
-    "websockets>=14.0",
     "matplotlib>=3.9",
+    "numpy>=2.0",
+    "pandas>=2.2",
     "pyyaml>=6.0",
+    "requests>=2.32",
+    "scipy>=1.14",
 ]
 
 [project.optional-dependencies]
