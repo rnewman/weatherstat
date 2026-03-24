@@ -1,0 +1,244 @@
+# Weatherstat house configuration.
+# See docs/onboarding.md for setup guide and field-by-field documentation.
+# Copy to ~/.weatherstat/weatherstat.yaml and edit for your house,
+# or run `just discover` to auto-generate a starter config.
+
+location:
+  latitude: 48.00
+  longitude: -121.00
+  elevation: 30            # meters above sea level
+  timezone: America/Los_Angeles
+
+# ── Sensors ─────────────────────────────────────────────────────────────
+# key = column name in snapshots (snake_case)
+
+sensors:
+  temperature:
+    thermostat_upstairs_temp:
+      entity_id: sensor.upstairs_thermostat_air_temperature
+    thermostat_downstairs_temp:
+      entity_id: sensor.downstairs_thermostat_air_temperature
+    family_room_temp:
+      entity_id: sensor.climate_family_room_air_temperature
+    office_temp:
+      entity_id: sensor.climate_office_air_temperature
+    kitchen_temp:
+      entity_id: sensor.kitchen_air_temperature
+    bedroom_temp:
+      entity_id: sensor.climate_bedroom_air_temperature
+    piano_temp:
+      entity_id: sensor.climate_piano_air_temperature
+    bathroom_temp:
+      entity_id: sensor.climate_bathroom_air_temperature
+    living_room_temp:
+      entity_id: sensor.living_room_aggregate_temperature
+    outdoor_temp:
+      entity_id: sensor.climate_side_air_temperature
+      role: outdoor        # used for envelope heat loss; falls back to weather entity
+
+  humidity:
+    upstairs_humidity:
+      entity_id: sensor.upstairs_thermostat_humidity
+    downstairs_humidity:
+      entity_id: sensor.downstairs_thermostat_humidity
+    bedroom_humidity:
+      entity_id: sensor.climate_bedroom_humidity
+
+  # State sensors: categorical with encoding (e.g., boiler heating mode)
+  state:
+    combi_heating:
+      entity_id: sensor.combi_heating_mode
+      encoding: { "Space Heating": 1, "Idle": 0, "Domestic Hot Water": 0, "DHW Recirculating": 0 }
+
+  # Power sensors: numeric energy/power measurements
+  power:
+    combi_gas_usage:
+      entity_id: sensor.combi_current_gas_usage
+
+# ── Effectors ───────────────────────────────────────────────────────────
+
+effectors:
+  # Trajectory: slow-response, on/off timing search (hydronic, radiant floor)
+  thermostat_upstairs:
+    entity_id: climate.upstairs_thermostat
+    control_type: trajectory
+    mode_control: manual           # you control heat/off; system sets target temp
+    supported_modes: [heat]
+    state_device: combi_heating   # confirms heat is actually being delivered
+    state_encoding: { heating: 1, idle: 0, "off": 0 }
+    max_lag_minutes: 90
+    energy_cost: 0.010
+  thermostat_downstairs:
+    entity_id: climate.downstairs_thermostat
+    control_type: trajectory
+    mode_control: manual
+    supported_modes: [heat]
+    state_device: combi_heating
+    state_encoding: { heating: 1, idle: 0, "off": 0 }
+    max_lag_minutes: 90
+    energy_cost: 0.010
+
+  # Regulating: proportional target temperature search (mini-splits, radiator valves)
+  mini_split_bedroom:
+    entity_id: climate.bedroom_split
+    control_type: regulating
+    mode_control: automatic        # system decides heat/cool/off
+    supported_modes: [heat, cool]
+    proportional_band: 1.0         # activity ramps 0→1 over this many °F from target
+    mode_hold_window: [22, 7]      # suppress mode changes during sleep hours
+    command_encoding: { "off": 0, heat: 1, cool: -1, fan_only: 0.5, dry: 0.25, auto: 0.5, heat_cool: 0.5 }
+    state_encoding: { heating: 1, cooling: -1, drying: 0.25, idle: 0, "off": 0 }
+    max_lag_minutes: 15
+    energy_cost: 0.005
+  mini_split_living_room:
+    entity_id: climate.living_room_split
+    control_type: regulating
+    mode_control: automatic
+    supported_modes: [heat, cool]
+    proportional_band: 1.0
+    mode_hold_window: [23, 6]
+    command_encoding: { "off": 0, heat: 1, cool: -1, fan_only: 0.5, dry: 0.25, auto: 0.5, heat_cool: 0.5 }
+    state_encoding: { heating: 1, cooling: -1, drying: 0.25, idle: 0, "off": 0 }
+    max_lag_minutes: 15
+    energy_cost: 0.005
+
+  # Binary: discrete-mode devices (fans, dampers)
+  blower_family_room:
+    entity_id: fan.blower_1
+    control_type: binary
+    mode_control: automatic
+    supported_modes: ["off", low, high]
+    depends_on: thermostat_downstairs  # only useful when parent is actively heating
+    state_encoding: { "off": 0, low: 1, high: 2 }
+    max_lag_minutes: 5
+    energy_cost: { "off": 0.0, low: 0.001, high: 0.002 }
+  blower_office:
+    entity_id: fan.blower_office
+    control_type: binary
+    mode_control: automatic
+    supported_modes: ["off", low, high]
+    depends_on: thermostat_downstairs
+    state_encoding: { "off": 0, low: 1, high: 2 }
+    max_lag_minutes: 5
+    energy_cost: { "off": 0.0, low: 0.001, high: 0.002 }
+  blower_gym:
+    entity_id: fan.blower_gym
+    control_type: binary
+    mode_control: automatic
+    supported_modes: ["off", low, high]
+    depends_on: thermostat_downstairs
+    state_encoding: { "off": 0, low: 1, high: 2 }
+    max_lag_minutes: 5
+    energy_cost: { "off": 0.0, low: 0.001, high: 0.002 }
+
+# ── Health checks ───────────────────────────────────────────────────────
+# Alert if a device sensor is out of range or in an unexpected state.
+
+health:
+  combi_connection:
+    entity: binary_sensor.combi_connection_status
+    expected_state: "on"
+    severity: critical
+    message: "Combi boiler connection lost"
+  combi_return:
+    entity: sensor.combi_sh_return_temp
+    min_value: 33
+    severity: critical
+    message: "Boiler return temp too low"
+
+# ── Windows ─────────────────────────────────────────────────────────────
+# Binary sensors for windows and doors. Sysid learns per-window thermal
+# coupling from data — you don't need to configure which rooms they affect.
+
+windows:
+  basement:
+    entity_id: binary_sensor.window_basement_intrusion
+  family_room:
+    entity_id: binary_sensor.window_family_room_intrusion
+  bedroom:
+    entity_id: binary_sensor.window_bedroom_intrusion
+  office:
+    entity_id: binary_sensor.window_office_window_door_is_open
+  kitchen:
+    entity_id: binary_sensor.kitchen_window_sensor_intrusion
+  piano:
+    entity_id: binary_sensor.window_piano_is_open
+  bathroom:
+    entity_id: binary_sensor.bathroom_high_window_open
+  living_room:
+    entity_id: binary_sensor.living_room_window_is_open
+
+weather:
+  entity_id: weather.forecast_home   # met.no or other HA weather integration
+
+# ── Constraints ─────────────────────────────────────────────────────────
+# Comfort targets per sensor. Not every sensor needs a constraint — sensors
+# without one are still collected but don't drive HVAC decisions.
+#
+# preferred: ideal temp — cost rises continuously away from it
+# min/max: hard rails — steep additional penalty (10×) beyond them
+# cold_penalty/hot_penalty: asymmetric weights (default 2.0 / 1.0)
+# hours: [start, end) — wraps midnight, e.g. [22, 6] = 10pm–6am
+#
+# Sensor-to-zone mapping is derived from sysid coupling, not configured.
+
+constraints:
+  comfort_entity: input_select.thermostat_mode   # HA entity for Home/Away mode
+  profiles:
+    Home: {}               # base schedules unchanged
+    Away:                  # offset-based adjustments when away
+      preferred_offset: -3
+      min_offset: -3
+      max_offset: 2
+  window_open_offset: { min: -1, max: 1 }   # relax bounds when windows are open
+  mrt_correction:          # compensate for cold/warm walls (mean radiant temp effect)
+    alpha: 0.1             # °F comfort shift per °F outdoor deviation from reference
+    reference_temp: 50     # outdoor temp (°F) where current targets feel right
+    max_offset: 3.0        # cap correction magnitude (°F)
+  schedules:
+    - sensor: thermostat_upstairs_temp
+      # mrt_weight: 1.0   # per-sensor multiplier on MRT correction (default 1.0)
+      schedule:
+        - { hours: [0, 24], preferred: 71, min: 70, max: 75, hot_penalty: 0.5 }
+    - sensor: thermostat_downstairs_temp
+      schedule:
+        - { hours: [0, 24], preferred: 71, min: 70, max: 74 }
+    - sensor: bedroom_temp
+      schedule:            # multiple blocks for day/night comfort
+        - { hours: [6, 9], preferred: 71, min: 70, max: 73, cold_penalty: 2.0, hot_penalty: 2.0 }
+        - { hours: [9, 21], preferred: 70, min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
+        - { hours: [21, 6], preferred: 70, min: 68, max: 72, cold_penalty: 2.0, hot_penalty: 0.75 }
+    - sensor: office_temp
+      schedule:
+        - { hours: [0, 24], preferred: 72, min: 70, max: 74 }
+    - sensor: family_room_temp
+      schedule:
+        - { hours: [0, 24], preferred: 71, min: 70, max: 74 }
+    - sensor: kitchen_temp
+      schedule:
+        - { hours: [0, 24], preferred: 71, min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
+    - sensor: piano_temp
+      schedule:
+        - { hours: [0, 24], preferred: 71, min: 69, max: 75, cold_penalty: 1.0, hot_penalty: 0.5 }
+    - sensor: bathroom_temp
+      schedule:
+        - { hours: [0, 24], preferred: 71, min: 68, max: 76, cold_penalty: 0.5, hot_penalty: 0.3 }
+
+notifications:
+  target: notify.mobile_app_phone    # HA notify service target
+
+advisory:
+  opportunity_threshold: 0.3    # minimum benefit to track a window opportunity
+  notification_threshold: 1.5   # minimum benefit to push a notification
+  quiet_hours: [22, 7]          # suppress notifications during these hours
+  cooldowns:
+    free_cooling: 14400         # seconds between re-notifying about open opportunities
+    close_windows: 3600
+
+safety:
+  cooldowns:
+    thermostat_off: 3600        # seconds between re-alerting
+    device_fault: 1800
+
+defaults:
+  tau: 45.0   # envelope time constant (hours) — starting guess before sysid runs

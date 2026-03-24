@@ -110,8 +110,8 @@ class TestCheckDeviceHealth:
     def test_no_alert_when_healthy(self) -> None:
         """All checks pass → no alert."""
         states = {
-            "binary_sensor.navien_navien_connection_status": "on",
-            "sensor.navien_navien_sh_return_temp": "120.0",
+            "binary_sensor.combi_connection_status": "on",
+            "sensor.combi_sh_return_temp": "120.0",
         }
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
@@ -120,25 +120,25 @@ class TestCheckDeviceHealth:
     def test_alert_when_below_min(self) -> None:
         """Sensor value at or below min_value → critical alert."""
         states = {
-            "binary_sensor.navien_navien_connection_status": "on",
-            "sensor.navien_navien_sh_return_temp": "32.0",
+            "binary_sensor.combi_connection_status": "on",
+            "sensor.combi_sh_return_temp": "32.0",
         }
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 1
-        assert alerts[0].key == "navien_return_fault"
+        assert alerts[0].key == "combi_return_fault"
         assert alerts[0].severity == "critical"
 
     def test_alert_when_connection_lost(self) -> None:
         """Connection status off → critical alert."""
         states = {
-            "binary_sensor.navien_navien_connection_status": "off",
-            "sensor.navien_navien_sh_return_temp": "120.0",
+            "binary_sensor.combi_connection_status": "off",
+            "sensor.combi_sh_return_temp": "120.0",
         }
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 1
-        assert alerts[0].key == "navien_connection_fault"
+        assert alerts[0].key == "combi_connection_fault"
         assert alerts[0].severity == "critical"
         assert "connection" in alerts[0].message.lower()
 
@@ -187,7 +187,7 @@ class TestProcessSafetyAlerts:
     def test_multiple_alerts(self) -> None:
         alerts = [
             SafetyAlert(key="thermostat_upstairs_off", title="T1", message="m1"),
-            SafetyAlert(key="navien_fault", title="T2", message="m2"),
+            SafetyAlert(key="combi_fault", title="T2", message="m2"),
         ]
         result = process_safety_alerts(alerts, live=False)
         assert len(result) == 2

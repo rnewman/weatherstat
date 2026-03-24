@@ -35,18 +35,12 @@ _SENSOR_COLS = [
     "thermostat_upstairs_temp",
     "thermostat_downstairs_temp",
     "bedroom_temp",
-    "bedroom_aggregate_temp",
     "office_temp",
-    "office_bookshelf_temp",
     "family_room_temp",
     "kitchen_temp",
     "piano_temp",
     "bathroom_temp",
     "living_room_temp",
-    "living_room_climate_temp",
-    "basement_temp",
-    "upstairs_aggregate_temp",
-    "downstairs_aggregate_temp",
 ]
 
 _THERMAL_PARAMS: dict = {
@@ -55,8 +49,8 @@ _THERMAL_PARAMS: dict = {
     "data_end": "2026-03-14T00:00:00Z",
     "n_snapshots": 10000,
     "effectors": [
-        {"name": "thermostat_upstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat", "state_gate": "navien_heating"},
-        {"name": "thermostat_downstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat", "state_gate": "navien_heating"},
+        {"name": "thermostat_upstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat", "state_gate": "combi_heating"},
+        {"name": "thermostat_downstairs", "encoding": {"heating": 1.0}, "device_type": "thermostat", "state_gate": "combi_heating"},
         {"name": "blower_family_room", "encoding": {"off": 0, "low": 1, "high": 2}, "device_type": "blower"},
         {"name": "blower_office", "encoding": {"off": 0, "low": 1, "high": 2}, "device_type": "blower"},
         {"name": "blower_gym", "encoding": {"off": 0, "low": 1, "high": 2}, "device_type": "blower"},
@@ -64,8 +58,8 @@ _THERMAL_PARAMS: dict = {
         {"name": "mini_split_living_room", "encoding": {"off": 0, "heat": 1, "cool": -1}, "device_type": "mini_split"},
     ],
     "state_gates": {
-        "navien_heating": {
-            "column": "navien_heating",
+        "combi_heating": {
+            "column": "combi_heating",
             "encoding": {"Space Heating": 1.0, "Idle": 0.0, "Domestic Hot Water": 0.0, "DHW Recirculating": 0.0},
         },
     },
@@ -74,21 +68,15 @@ _THERMAL_PARAMS: dict = {
     "effector_sensor_gains": [
         # Thermostats → own zone (significant t-statistics)
         {"effector": "thermostat_upstairs", "sensor": "thermostat_upstairs_temp", "gain_f_per_hour": 0.7, "best_lag_minutes": 45, "t_statistic": 3.0, "negligible": False},
-        {"effector": "thermostat_upstairs", "sensor": "upstairs_aggregate_temp", "gain_f_per_hour": 0.6, "best_lag_minutes": 45, "t_statistic": 2.5, "negligible": False},
         {"effector": "thermostat_upstairs", "sensor": "bedroom_temp", "gain_f_per_hour": 0.4, "best_lag_minutes": 60, "t_statistic": 2.0, "negligible": False},
-        {"effector": "thermostat_upstairs", "sensor": "bedroom_aggregate_temp", "gain_f_per_hour": 0.9, "best_lag_minutes": 60, "t_statistic": 3.0, "negligible": False},
         {"effector": "thermostat_upstairs", "sensor": "bathroom_temp", "gain_f_per_hour": 0.3, "best_lag_minutes": 55, "t_statistic": 1.8, "negligible": False},
         {"effector": "thermostat_downstairs", "sensor": "thermostat_downstairs_temp", "gain_f_per_hour": 0.8, "best_lag_minutes": 45, "t_statistic": 3.5, "negligible": False},
-        {"effector": "thermostat_downstairs", "sensor": "downstairs_aggregate_temp", "gain_f_per_hour": 0.7, "best_lag_minutes": 45, "t_statistic": 3.0, "negligible": False},
         {"effector": "thermostat_downstairs", "sensor": "family_room_temp", "gain_f_per_hour": 0.5, "best_lag_minutes": 50, "t_statistic": 2.5, "negligible": False},
         {"effector": "thermostat_downstairs", "sensor": "kitchen_temp", "gain_f_per_hour": 0.4, "best_lag_minutes": 50, "t_statistic": 2.0, "negligible": False},
         {"effector": "thermostat_downstairs", "sensor": "office_temp", "gain_f_per_hour": 0.3, "best_lag_minutes": 55, "t_statistic": 1.5, "negligible": False},
-        {"effector": "thermostat_downstairs", "sensor": "office_bookshelf_temp", "gain_f_per_hour": 0.3, "best_lag_minutes": 55, "t_statistic": 1.5, "negligible": False},
         # Mini splits → own room only (high t-stat, no cross-coupling)
         {"effector": "mini_split_bedroom", "sensor": "bedroom_temp", "gain_f_per_hour": 1.3, "best_lag_minutes": 10, "t_statistic": 4.5, "negligible": False},
-        {"effector": "mini_split_bedroom", "sensor": "bedroom_aggregate_temp", "gain_f_per_hour": 1.3, "best_lag_minutes": 10, "t_statistic": 4.9, "negligible": False},
         {"effector": "mini_split_living_room", "sensor": "living_room_temp", "gain_f_per_hour": 0.8, "best_lag_minutes": 5, "t_statistic": 2.5, "negligible": False},
-        {"effector": "mini_split_living_room", "sensor": "living_room_climate_temp", "gain_f_per_hour": 0.8, "best_lag_minutes": 5, "t_statistic": 2.5, "negligible": False},
         {"effector": "mini_split_living_room", "sensor": "piano_temp", "gain_f_per_hour": 1.2, "best_lag_minutes": 5, "t_statistic": 1.6, "negligible": False},
     ],
     "solar_gains": [
