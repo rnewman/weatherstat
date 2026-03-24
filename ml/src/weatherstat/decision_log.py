@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from weatherstat.config import DECISION_LOG_DB, PREDICTION_LABELS, SNAPSHOTS_DB
+from weatherstat.config import DECISION_LOG_DB, PREDICTION_SENSORS, SNAPSHOTS_DB
 
 # Horizon durations in minutes, keyed by the label used in predictions
 HORIZON_MINUTES: dict[str, int] = {"1h": 60, "2h": 120, "4h": 240, "6h": 360}
@@ -216,12 +216,6 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
     # Parse snapshot timestamps once
     snap_df["_ts"] = pd.to_datetime(snap_df["timestamp"], format="ISO8601", utc=True)
 
-    # Room temp columns from config
-    from weatherstat.yaml_config import load_config
-
-    cfg = load_config()
-    room_temp_cols = cfg.room_temp_columns
-
     now = datetime.now(UTC)
     updated = 0
 
@@ -256,26 +250,22 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
 
             snap_row = snap_df.iloc[closest_idx]
 
-            for label in PREDICTION_LABELS:
-                label_preds = predictions.get(label, {})
-                predicted = label_preds.get(horizon_label)
+            for sensor_col in PREDICTION_SENSORS:
+                sensor_preds = predictions.get(sensor_col, {})
+                predicted = sensor_preds.get(horizon_label)
                 if predicted is None:
                     continue
 
-                temp_col = room_temp_cols.get(label)
-                if temp_col is None:
-                    continue
-
-                actual = snap_row.get(temp_col)
+                actual = snap_row.get(sensor_col)
                 if actual is None or (isinstance(actual, float) and pd.isna(actual)):
                     continue
 
                 actual = float(actual)
                 error = round(predicted - actual, 3)
 
-                if label not in outcomes:
-                    outcomes[label] = {}
-                outcomes[label][horizon_label] = {
+                if sensor_col not in outcomes:
+                    outcomes[sensor_col] = {}
+                outcomes[sensor_col][horizon_label] = {
                     "predicted": round(predicted, 2),
                     "actual": round(actual, 2),
                     "error": error,

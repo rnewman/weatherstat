@@ -253,9 +253,9 @@ class TestSimulatorDependencyGating:
 
     def _make_state(self, outdoor: float = 42.0, hour: float = 14.5) -> HouseState:
         temps = {
-            "upstairs": 70.0, "downstairs": 69.0, "bedroom": 68.5,
-            "office": 67.0, "office_bookshelf": 67.0, "family_room": 69.5,
-            "kitchen": 68.0, "piano": 67.5, "bathroom": 68.0, "living_room": 69.0,
+            "thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5,
+            "office_temp": 67.0, "family_room_temp": 69.5,
+            "kitchen_temp": 68.0, "piano_temp": 67.5, "bathroom_temp": 68.0, "living_room_temp": 69.0,
         }
         return HouseState(
             current_temps=temps,

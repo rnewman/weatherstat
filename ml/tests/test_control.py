@@ -45,7 +45,7 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
 
     defaults = {s.label: s for s in default_comfort_schedules()}
     for label, entries in overrides.items():
-        defaults[label] = ComfortSchedule(label=label, entries=tuple(entries))
+        defaults[label] = ComfortSchedule(sensor=f"{label}_temp", label=label, entries=tuple(entries))
     return list(defaults.values())
 
 
@@ -62,6 +62,7 @@ class TestComfortCost:
         """
         schedules = [
             ComfortSchedule(
+                sensor="upstairs_temp",
                 label="upstairs",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72.0, 70.0, 74.0, hot_penalty=2.0)),),
             ),
@@ -102,6 +103,7 @@ class TestComfortCost:
         """Room exactly at preferred temperature -> zero cost."""
         schedules = [
             ComfortSchedule(
+                sensor="upstairs_temp",
                 label="upstairs",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 69.0, 74.0)),),
             ),
@@ -114,6 +116,7 @@ class TestComfortCost:
         """Room within [min, max] but not at preferred -> non-zero continuous cost."""
         schedules = [
             ComfortSchedule(
+                sensor="upstairs_temp",
                 label="upstairs",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 69.0, 74.0)),),
             ),
@@ -286,6 +289,7 @@ class TestMrtCorrection:
     def test_cold_day_raises_targets(self) -> None:
         """35°F outside, ref=50, alpha=0.1 → +1.5°F offset."""
         schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
         )]
@@ -299,6 +303,7 @@ class TestMrtCorrection:
     def test_warm_day_lowers_targets(self) -> None:
         """80°F outside, ref=50, alpha=0.1 → clamped to -3.0°F."""
         schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
         )]
@@ -317,6 +322,7 @@ class TestMrtCorrection:
     def test_clamped_at_max(self) -> None:
         """0°F outside → raw offset 5.0, clamped to 3.0."""
         schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
         )]
@@ -335,6 +341,7 @@ class TestMrtCorrection:
     def test_penalties_preserved(self) -> None:
         """MRT correction shifts temps but preserves penalty weights."""
         schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0, 3.0, 0.5)),),
         )]
@@ -346,12 +353,13 @@ class TestMrtCorrection:
     def test_mrt_weight_scales_offset(self) -> None:
         """Per-sensor weight=0.5 produces half the offset."""
         schedules = [ComfortSchedule(
+            sensor="piano_temp",
             label="piano",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 70.0, 74.0)),),
         )]
         # Base offset: 0.1 * (50 - 35) = 1.5°F; weighted: 1.5 * 0.5 = 0.75°F
         adjusted, base_offset = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"piano": 0.5},
+            schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.5},
         )
         assert abs(base_offset - 1.5) < 0.01
         entry = adjusted[0].entries[0]
@@ -361,11 +369,12 @@ class TestMrtCorrection:
     def test_mrt_weight_zero_no_adjustment(self) -> None:
         """Per-sensor weight=0.0 suppresses MRT correction for that sensor."""
         schedules = [ComfortSchedule(
+            sensor="piano_temp",
             label="piano",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 70.0, 74.0)),),
         )]
         adjusted, base_offset = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"piano": 0.0},
+            schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.0},
         )
         assert abs(base_offset - 1.5) < 0.01
         entry = adjusted[0].entries[0]
@@ -375,17 +384,19 @@ class TestMrtCorrection:
         """Two sensors with different weights get different offsets."""
         schedules = [
             ComfortSchedule(
+                sensor="piano_temp",
                 label="piano",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 70.0, 74.0)),),
             ),
             ComfortSchedule(
+                sensor="bathroom_temp",
                 label="bathroom",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bathroom", 72.0, 70.0, 74.0)),),
             ),
         ]
         # Base offset: 1.5°F; piano×0.5=0.75, bathroom×1.5=2.25
         adjusted, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"piano": 0.5, "bathroom": 1.5},
+            schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.5, "bathroom_temp": 1.5},
         )
         piano_pref = adjusted[0].entries[0].comfort.preferred
         bath_pref = adjusted[1].entries[0].comfort.preferred
@@ -395,6 +406,7 @@ class TestMrtCorrection:
     def test_mrt_weight_default_backward_compat(self) -> None:
         """No weights dict (None) produces same behavior as uniform weight=1.0."""
         schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 70.0, 74.0)),),
         )]
@@ -637,6 +649,7 @@ class TestRegulatingSweepOptions:
     def _bedroom_schedule(self, min_t: float = 68.0, max_t: float = 72.0) -> list[ComfortSchedule]:
         preferred = (min_t + max_t) / 2.0
         return [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", preferred, min_t, max_t)),),
         )]
@@ -644,13 +657,13 @@ class TestRegulatingSweepOptions:
     def test_sweep_options_include_off(self) -> None:
         """Off should always be an option."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 68.0})
         assert any(o.mode == "off" for o in options)
 
     def test_sweep_options_preferred_target(self) -> None:
         """Should generate off + preferred target."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 68.0})
         assert len(options) == 2  # off + preferred
         active = [o for o in options if o.mode != "off"]
         assert len(active) == 1
@@ -659,14 +672,14 @@ class TestRegulatingSweepOptions:
     def test_sweep_mode_heat_when_cold(self) -> None:
         """Mode should be 'heat' when room temp is below preferred."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 68.0})
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 68.0})
         active = [o for o in options if o.mode != "off"]
         assert all(o.mode == "heat" for o in active)
 
     def test_sweep_mode_cool_when_hot(self) -> None:
         """Mode should be 'cool' when room temp is above preferred."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom": 72.0})
+        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 72.0})
         active = [o for o in options if o.mode != "off"]
         assert all(o.mode == "cool" for o in active)
 
@@ -685,6 +698,7 @@ class TestModeHoldWindow:
 
     def _bedroom_schedule(self) -> list[ComfortSchedule]:
         return [ComfortSchedule(
+            sensor="bedroom_temp",
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
         )]
@@ -710,7 +724,7 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         # Hour 23 is inside bedroom's hold window [22, 7]
         options = _regulating_sweep_options(
-            eff, self._bedroom_schedule(), 23, prev_state, current_temps={"bedroom": 68.0},
+            eff, self._bedroom_schedule(), 23, prev_state, current_temps={"bedroom_temp": 68.0},
         )
         # All options should be "heat" (current mode)
         assert all(o.mode == "heat" for o in options)
@@ -729,7 +743,7 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         # Hour 12 is outside hold window — mode should be unlocked
         options = _regulating_sweep_options(
-            eff, self._bedroom_schedule(), 12, prev_state, current_temps={"bedroom": 68.0},
+            eff, self._bedroom_schedule(), 12, prev_state, current_temps={"bedroom_temp": 68.0},
         )
         assert any(o.mode == "off" for o in options)
 
@@ -738,7 +752,7 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         options = _regulating_sweep_options(
             eff, self._bedroom_schedule(), 12,
-            current_temps={"bedroom": 73.0},  # 3 deg F above preferred 70
+            current_temps={"bedroom_temp": 73.0},  # 3 deg F above preferred 70
         )
         # Room is above preferred — cool mode should be offered
         assert any(o.mode == "cool" for o in options)
@@ -748,7 +762,7 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         options = _regulating_sweep_options(
             eff, self._bedroom_schedule(), 12,
-            current_temps={"bedroom": 70.5},  # within proportional_band of preferred 70
+            current_temps={"bedroom_temp": 70.5},  # within proportional_band of preferred 70
         )
         # Room is 0.5 deg F above preferred — should get cool option
         assert any(o.mode == "cool" for o in options)
@@ -792,16 +806,18 @@ class TestTrajectoryWithSchedules:
         """With schedules, should have 2 options per split (off + preferred)."""
         schedules = [
             ComfortSchedule(
+                sensor="bedroom_temp",
                 label="bedroom",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
             ),
             ComfortSchedule(
+                sensor="living_room_temp",
                 label="living_room",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 69.0, 74.0)),),
             ),
         ]
         # Room temps below preferred -> heat mode for both splits
-        current_temps = {"bedroom": 68.0, "living_room": 69.0}
+        current_temps = {"bedroom_temp": 68.0, "living_room_temp": 69.0}
         scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
         # 4 mini split combos (2x2): off + preferred per split
         split_combos = set()
@@ -818,11 +834,12 @@ class TestTrajectoryWithSchedules:
         """All-off baseline should still be in scenario set."""
         schedules = [
             ComfortSchedule(
+                sensor="bedroom_temp",
                 label="bedroom",
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 68.0, 72.0)),),
             ),
         ]
-        current_temps = {"bedroom": 68.0}
+        current_temps = {"bedroom_temp": 68.0}
         scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
         all_off = [
             s for s in scenarios

@@ -198,14 +198,19 @@ class WeatherstatConfig:
     # ── Derived properties (primary) ─────────────────────────────────
 
     @property
+    def prediction_sensors(self) -> list[str]:
+        """Ordered list of constraint sensor column names for prediction."""
+        return [c.sensor for c in self.constraints]
+
+    @property
     def prediction_labels(self) -> list[str]:
-        """Ordered list of constraint labels for prediction."""
+        """Ordered list of constraint display labels."""
         return [c.label for c in self.constraints]
 
     @property
-    def room_temp_columns(self) -> dict[str, str]:
-        """label -> sensor column name for prediction targets."""
-        return {c.label: c.sensor for c in self.constraints}
+    def sensor_labels(self) -> dict[str, str]:
+        """sensor column -> display label for all constraints."""
+        return {c.sensor: c.label for c in self.constraints}
 
     @property
     def statistics_entities(self) -> dict[str, str]:

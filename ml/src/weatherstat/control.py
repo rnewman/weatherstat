@@ -31,8 +31,9 @@ from weatherstat.config import (
     CONTROL_STATE_FILE,
     EFFECTOR_MAP,
     EFFECTORS,
-    PREDICTION_LABELS,
+    PREDICTION_SENSORS,
     PREDICTIONS_DIR,
+    SENSOR_LABELS,
 )
 from weatherstat.extract import fetch_recent_history
 from weatherstat.types import (
@@ -44,7 +45,7 @@ from weatherstat.types import (
     RoomComfort,
     Scenario,
 )
-from weatherstat.yaml_config import ComfortProfile, MrtCorrectionConfig, load_config
+from weatherstat.yaml_config import ComfortProfile, ConstraintSchedule, MrtCorrectionConfig, load_config
 
 _CFG = load_config()
 
@@ -132,7 +133,7 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
             )
             for e in constraint.entries
         )
-        schedules.append(ComfortSchedule(label=constraint.label, entries=schedule_entries))
+        schedules.append(ComfortSchedule(sensor=constraint.sensor, label=constraint.label, entries=schedule_entries))
     return schedules
 
 
@@ -188,7 +189,7 @@ def adjust_schedules_for_windows(
             )
             for e in schedule.entries
         )
-        adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
+        adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
     return adjusted
 
 
@@ -250,7 +251,7 @@ def apply_comfort_profile(
             )
             for e in schedule.entries
         )
-        adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
+        adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
     return adjusted
 
 
@@ -274,7 +275,7 @@ def apply_mrt_correction(
         schedules: Comfort schedules for all constrained sensors.
         outdoor_temp: Current outdoor temperature (°F).
         mrt_config: Correction parameters, or None to skip.
-        mrt_weights: Per-sensor label → weight multiplier (default 1.0).
+        mrt_weights: Per-sensor column → weight multiplier (default 1.0).
 
     Returns:
         (adjusted_schedules, base_offset). Base offset before per-sensor weighting.
@@ -290,7 +291,7 @@ def apply_mrt_correction(
 
     adjusted: list[ComfortSchedule] = []
     for schedule in schedules:
-        weight = (mrt_weights or {}).get(schedule.label, 1.0)
+        weight = (mrt_weights or {}).get(schedule.sensor, 1.0)
         sensor_offset = offset * weight
         new_entries = tuple(
             ComfortScheduleEntry(
@@ -307,7 +308,7 @@ def apply_mrt_correction(
             )
             for e in schedule.entries
         )
-        adjusted.append(ComfortSchedule(label=schedule.label, entries=new_entries))
+        adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
     return adjusted, offset
 
 
@@ -354,7 +355,6 @@ def compute_comfort_cost(
     horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
 
     for schedule in schedules:
-        label = schedule.label
         for h in CONTROL_HORIZONS:
             weight = HORIZON_WEIGHTS.get(h, 0.5)
             hours_ahead = horizon_hours.get(h, h // 12)
@@ -364,7 +364,7 @@ def compute_comfort_cost(
             if comfort is None:
                 continue
 
-            pred_temp = predictions.get(f"{label}_temp_t+{h}")
+            pred_temp = predictions.get(f"{schedule.sensor}_t+{h}")
             if pred_temp is None:
                 continue
 
@@ -397,7 +397,6 @@ def compute_comfort_cost_by_sensor(
     horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
 
     for schedule in schedules:
-        label = schedule.label
         sensor_cost = 0.0
         for h in CONTROL_HORIZONS:
             weight = HORIZON_WEIGHTS.get(h, 0.5)
@@ -408,7 +407,7 @@ def compute_comfort_cost_by_sensor(
             if comfort is None:
                 continue
 
-            pred_temp = predictions.get(f"{label}_temp_t+{h}")
+            pred_temp = predictions.get(f"{schedule.sensor}_t+{h}")
             if pred_temp is None:
                 continue
 
@@ -423,7 +422,7 @@ def compute_comfort_cost_by_sensor(
             elif pred_temp > comfort.max_temp:
                 delta = pred_temp - comfort.max_temp
                 sensor_cost += delta**2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
-        costs[label] = sensor_cost
+        costs[schedule.label] = sensor_cost
     return costs
 
 
@@ -472,41 +471,45 @@ def compute_energy_cost(
     return cost
 
 
-def _derive_sensor_zones(gains: dict[tuple[str, str], tuple[float, float]]) -> dict[str, str]:
-    """Derive sensor → thermostat effector mapping from the sysid coupling matrix.
+def _emergency_effector(
+    gains: dict[tuple[str, str], tuple[float, float]],
+    constraints: list[ConstraintSchedule],
+) -> dict[str, str]:
+    """For each constrained sensor, find the trajectory effector with the highest gain.
 
-    For each sensor, find the trajectory effector with the highest positive gain.
-    Returns label -> effector_name (e.g., {"bedroom": "thermostat_upstairs"}).
+    Used by the cold-sensor safety override to decide which effector to force on.
+    Returns sensor_col -> effector_name (e.g., {"bedroom_temp": "thermostat_upstairs"}).
     """
     trajectory_effectors = {e.name for e in EFFECTORS if e.control_type == "trajectory"}
+    constrained_sensors = {c.sensor for c in constraints}
 
-    # Accumulate best thermostat gain per sensor
-    best: dict[str, tuple[str, float]] = {}  # sensor_label -> (effector_name, gain)
-    for (effector, sensor), (gain, _lag) in gains.items():
+    best: dict[str, tuple[str, float]] = {}  # sensor_col -> (effector_name, gain)
+    for (effector, sensor_col), (gain, _lag) in gains.items():
         if effector not in trajectory_effectors or gain <= 0:
             continue
-        label = sensor.removeprefix("thermostat_").removesuffix("_temp")
-        prev = best.get(label)
+        if sensor_col not in constrained_sensors:
+            continue
+        prev = best.get(sensor_col)
         if prev is None or gain > prev[1]:
-            best[label] = (effector, gain)
+            best[sensor_col] = (effector, gain)
 
-    return {label: eff_name for label, (eff_name, _) in best.items()}
+    return {sensor_col: eff_name for sensor_col, (eff_name, _) in best.items()}
 
 
-def _zone_comfort_max(label: str, schedules: list[ComfortSchedule], hour: int) -> float:
-    """Get the comfort max for a constraint label at the given hour."""
+def _comfort_max(sensor: str, schedules: list[ComfortSchedule], hour: int) -> float:
+    """Get the comfort max for a sensor at the given hour."""
     for s in schedules:
-        if s.label == label:
+        if s.sensor == sensor:
             c = s.comfort_at(hour)
             if c is not None:
                 return c.max_temp
     return ABSOLUTE_MAX
 
 
-def _zone_comfort_min(label: str, schedules: list[ComfortSchedule], hour: int) -> float:
-    """Get the comfort min for a constraint label at the given hour."""
+def _comfort_min(sensor: str, schedules: list[ComfortSchedule], hour: int) -> float:
+    """Get the comfort min for a sensor at the given hour."""
     for s in schedules:
-        if s.label == label:
+        if s.sensor == sensor:
             c = s.comfort_at(hour)
             if c is not None:
                 return c.min_temp
@@ -551,14 +554,15 @@ def _regulating_sweep_options(
     from weatherstat.config import EffectorConfig
 
     assert isinstance(eff, EffectorConfig)
-    # Label for comfort schedule lookup: name without prefix (e.g., "mini_split_bedroom" -> "bedroom")
-    label = eff.name.removeprefix("mini_split_")
+    # Sensor column for comfort schedule lookup
+    # Convention: "mini_split_bedroom" serves sensor "bedroom_temp"
+    sensor_col = eff.name.removeprefix("mini_split_") + "_temp"
     options: list[EffectorDecision] = [EffectorDecision(eff.name)]
 
     # Find preferred temperature for this effector's sensor
     preferred: float | None = None
     for sched in schedules:
-        if sched.label == label:
+        if sched.sensor == sensor_col:
             comfort = sched.comfort_at(base_hour)
             if comfort is not None:
                 preferred = comfort.preferred
@@ -568,7 +572,7 @@ def _regulating_sweep_options(
         return options
 
     # Derive mode from room temp vs preferred (default heat — safer in winter)
-    room_temp = (current_temps or {}).get(label)
+    room_temp = (current_temps or {}).get(sensor_col)
     mode = ("cool" if room_temp > preferred else "heat") if room_temp is not None else "heat"
 
     # Skip on-option if the effector would be idle: room already past target
@@ -733,7 +737,7 @@ def sweep_scenarios_physics(
 
     assert isinstance(sim_params, SimParams)
 
-    sensor_zones = _derive_sensor_zones(sim_params.gains)
+    emergency = _emergency_effector(sim_params.gains, _CFG.constraints)
     _ineligible = ineligible_effectors or set()
     scenarios = generate_trajectory_scenarios(
         schedules,
@@ -748,17 +752,15 @@ def sweep_scenarios_physics(
     # ── Physical constraints: block trajectory effectors at/above comfort max ──
     blocked_effectors: set[str] = set()
     for eff in EFFECTORS:
-        if eff.control_type != "trajectory":
+        if eff.control_type != "trajectory" or not eff.temp_col:
             continue
-        # Trajectory effector label from temp_col (e.g., "thermostat_upstairs_temp" -> "upstairs")
-        label = eff.name.removeprefix("thermostat_")
-        eff_temp = current_temps.get(label)
+        eff_temp = current_temps.get(eff.temp_col)
         if eff_temp is None:
             continue
-        eff_max = _zone_comfort_max(label, schedules, base_hour)
+        eff_max = _comfort_max(eff.temp_col, schedules, base_hour)
         if eff_temp >= eff_max:
             blocked_effectors.add(eff.name)
-            blocked_reasons.append(f"{label} at/above max ({eff_temp:.1f}°F >= {eff_max:.0f}°F)")
+            blocked_reasons.append(f"{eff.name} at/above max ({eff_temp:.1f}°F >= {eff_max:.0f}°F)")
 
     if blocked_effectors:
         scenarios = [
@@ -828,18 +830,17 @@ def sweep_scenarios_physics(
         cold_effectors: set[str] = set()
         cold_info: list[str] = []
         for schedule in schedules:
-            label = schedule.label
-            temp = current_temps.get(label)
+            temp = current_temps.get(schedule.sensor)
             if temp is None:
                 continue
             comfort = schedule.comfort_at(base_hour)
             if comfort is None:
                 continue
             if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
-                eff_name = sensor_zones.get(label)
+                eff_name = emergency.get(schedule.sensor)
                 if eff_name:
                     cold_effectors.add(eff_name)
-                    cold_info.append(f"{label} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
+                    cold_info.append(f"{schedule.label} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
 
         # Remove blocked or ineligible effectors from cold override set
         cold_effectors -= blocked_effectors
@@ -885,13 +886,13 @@ def sweep_scenarios_physics(
 
         if eff_cfg.control_type == "trajectory":
             # Trajectory effector: compute cautious setpoint
-            label = ed.name.removeprefix("thermostat_")
-            eff_temp = current_temps.get(label, 70.0)
+            temp_col = eff_cfg.temp_col
+            eff_temp = current_temps.get(temp_col, 70.0)
             heating_now = ed.mode != "off" and ed.delay_steps == 0
             setpoint = _cautious_setpoint(
                 eff_temp,
                 heating_now,
-                comfort_min=_zone_comfort_min(label, schedules, base_hour),
+                comfort_min=_comfort_min(temp_col, schedules, base_hour),
             )
             command_targets[ed.name] = setpoint
             if ed.mode != "off":
@@ -903,16 +904,16 @@ def sweep_scenarios_physics(
         elif eff_cfg.control_type == "regulating" and ed.target is not None:
             command_targets[ed.name] = ed.target
 
-    label_preds: dict[str, dict[str, float]] = {}
-    for label in PREDICTION_LABELS:
+    sensor_preds: dict[str, dict[str, float]] = {}
+    for sensor_col in PREDICTION_SENSORS:
         rpred: dict[str, float] = {}
         for h in CONTROL_HORIZONS:
-            key = f"{label}_temp_t+{h}"
+            key = f"{sensor_col}_t+{h}"
             val = predictions.get(key)
             if val is not None:
                 rpred[HORIZON_LABELS[h]] = round(val, 2)
         if rpred:
-            label_preds[label] = rpred
+            sensor_preds[sensor_col] = rpred
 
     decision = ControlDecision(
         timestamp=datetime.now(UTC).isoformat(),
@@ -921,7 +922,7 @@ def sweep_scenarios_physics(
         total_cost=round(total, 4),
         comfort_cost=round(comfort, 4),
         energy_cost=round(energy, 4),
-        predictions=label_preds,
+        predictions=sensor_preds,
         trajectory_info=trajectory_info,
     )
     return decision, scenario
@@ -1006,14 +1007,15 @@ def check_prediction_sanity(
     decision: ControlDecision,
     current_temps: dict[str, float],
 ) -> bool:
-    """Return True if 1h predictions look reasonable for all labels."""
+    """Return True if 1h predictions look reasonable for all sensors."""
     safe = True
-    for label, preds in decision.predictions.items():
+    for sensor_col, preds in decision.predictions.items():
         pred_1h = preds.get("1h")
-        current = current_temps.get(label)
+        current = current_temps.get(sensor_col)
         if pred_1h is None or current is None:
             continue
         if abs(pred_1h - current) > MAX_1H_CHANGE:
+            label = SENSOR_LABELS.get(sensor_col, sensor_col)
             print(f"  WARNING: {label} 1h pred {pred_1h:.1f}°F >{MAX_1H_CHANGE}°F from current {current:.1f}°F")
             safe = False
     return safe
@@ -1162,44 +1164,43 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         return None
 
     # Current state
-    room_temp_columns = _CFG.room_temp_columns
-
     latest = df_raw.iloc[-1]
     # Prefer met.no outdoor temp (no house heat bias) over side sensor
     out_temp = latest.get("met_outdoor_temp") or latest.get("outdoor_temp")
     now_str = df_raw["timestamp"].iloc[-1]
 
-    # Build current temperature dict for all rooms (for sanity checks and display)
+    # Build current temperature dict keyed by sensor column name
     current_temps: dict[str, float] = {}
-    for room, col in room_temp_columns.items():
-        val = latest.get(col)
+    for sensor_col in PREDICTION_SENSORS:
+        val = latest.get(sensor_col)
         if val is not None and not (isinstance(val, float) and np.isnan(val)):
-            current_temps[room] = float(val)
+            current_temps[sensor_col] = float(val)
 
     print(f"\n[control] Current state ({now_str}):")
     # Show trajectory effector temps and setpoints
+    traj_sensors: set[str] = set()
     for eff in EFFECTORS:
-        if eff.control_type == "trajectory":
-            label = eff.name.removeprefix("thermostat_")
-            eff_temp = current_temps.get(label, 70.0)
+        if eff.control_type == "trajectory" and eff.temp_col:
+            traj_sensors.add(eff.temp_col)
+            label = SENSOR_LABELS.get(eff.temp_col, eff.name)
+            eff_temp = current_temps.get(eff.temp_col, 70.0)
             eff_target = latest.get(f"{eff.name}_target", "?")
             print(f"  {label:<14} {eff_temp:.1f}°F (setpoint: {eff_target}°F)")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         print(f"  Outdoor:     {float(out_temp):.1f}°F (sensor)")
     window_cols = _CFG.window_display_map
-    open_windows = [label for col, label in window_cols.items() if bool(latest.get(col, False))]
+    open_windows = [wlabel for col, wlabel in window_cols.items() if bool(latest.get(col, False))]
     if open_windows:
         print(f"  Windows:     {', '.join(open_windows)} open")
     else:
         print("  Windows:     all closed")
-    # Show all prediction labels that aren't trajectory effector zones
-    traj_labels = {eff.name.removeprefix("thermostat_") for eff in EFFECTORS if eff.control_type == "trajectory"}
-    other_labels = [la for la in PREDICTION_LABELS if la not in traj_labels]
-    lw = max((len(la) for la in other_labels), default=14) + 2
-    for la in other_labels:
-        t = current_temps.get(la)
+    # Show other prediction sensors (not trajectory effectors)
+    other_sensors = [s for s in PREDICTION_SENSORS if s not in traj_sensors]
+    lw = max((len(SENSOR_LABELS.get(s, s)) for s in other_sensors), default=14) + 2
+    for sensor_col in other_sensors:
+        t = current_temps.get(sensor_col)
         if t is not None:
-            print(f"  {la:<{lw}} {t:.1f}°F")
+            print(f"  {SENSOR_LABELS.get(sensor_col, sensor_col):<{lw}} {t:.1f}°F")
     # Show current effector states
     for eff in EFFECTORS:
         if eff.control_type == "trajectory":
@@ -1272,15 +1273,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Configured weight takes priority if explicitly set (!= 1.0).
     _out_valid = out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
     _mrt_outdoor = float(out_temp) if _out_valid else 50.0
-    _sensor_to_label = {c.sensor: c.label for c in _CFG.constraints}
-    _derived_by_label = {_sensor_to_label[s]: w for s, w in sim_params.mrt_weights.items() if s in _sensor_to_label}
     _mrt_weights = {
-        c.label: (c.mrt_weight if c.mrt_weight != 1.0 else _derived_by_label.get(c.label, 1.0))
+        c.sensor: (c.mrt_weight if c.mrt_weight != 1.0 else sim_params.mrt_weights.get(c.sensor, 1.0))
         for c in _CFG.constraints
     }
     schedules, mrt_offset = apply_mrt_correction(schedules, _mrt_outdoor, _CFG.mrt_correction, _mrt_weights)
     if abs(mrt_offset) >= 0.05:
-        _varying = {lbl: w for lbl, w in _mrt_weights.items() if w != 1.0}
+        _varying = {SENSOR_LABELS.get(s, s): w for s, w in _mrt_weights.items() if w != 1.0}
         if _varying:
             _wparts = ", ".join(f"{lbl}={w:.1f}" for lbl, w in _varying.items())
             print(f"  MRT:         {mrt_offset:+.1f}°F base (outdoor {_mrt_outdoor:.0f}°F), weights: {_wparts}")
@@ -1543,18 +1542,19 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             print(f"  {s:<{col_w2}} {dc:>10.3f} {oc:>10.3f} {saving:>+10.3f}")
 
     # ── Predicted temperatures (decision vs all-off) ──
-    col_w = max(len(lbl) for lbl in PREDICTION_LABELS) + 2
+    col_w = max(len(SENSOR_LABELS.get(s, s)) for s in PREDICTION_SENSORS) + 2
     header = f"  {'Sensor':<{col_w}}" + "".join(f"{'dec ' + h:>9}{'off ' + h:>9}" for h in horizons)
     print("\n  Predicted temperatures (decision vs all-off):")
     print(header)
     print(f"  {'-' * (col_w + 18 * len(horizons))}")
-    for label in PREDICTION_LABELS:
-        dec_vals = decision.predictions.get(label, {})
-        row = f"  {label:<{col_w}}"
+    for sensor_col in PREDICTION_SENSORS:
+        display = SENSOR_LABELS.get(sensor_col, sensor_col)
+        dec_vals = decision.predictions.get(sensor_col, {})
+        row = f"  {display:<{col_w}}"
         has_any = False
         for h_step, h_label in zip(CONTROL_HORIZONS, horizons, strict=True):
             dec_t = dec_vals.get(h_label)
-            off_key = f"{label}_temp_t+{h_step}"
+            off_key = f"{sensor_col}_t+{h_step}"
             off_t = off_preds.get(off_key)
             if dec_t is not None:
                 has_any = True

@@ -35,8 +35,9 @@ HA_TOKEN = os.environ.get("HA_TOKEN", "")
 # Prediction horizons (in steps). At 5-min intervals: 12=1h, 24=2h, 48=4h, etc.
 HORIZONS_5MIN = [12, 24, 48, 72, 144]  # 1h, 2h, 4h, 6h, 12h
 
-# Constraint labels to predict temperatures for (from YAML config)
-PREDICTION_LABELS = _CFG.prediction_labels
+# Constraint sensor columns and display labels (from YAML config)
+PREDICTION_SENSORS = _CFG.prediction_sensors
+SENSOR_LABELS = _CFG.sensor_labels  # sensor -> label
 
 # ── HVAC device configuration ─────────────────────────────────────────────
 

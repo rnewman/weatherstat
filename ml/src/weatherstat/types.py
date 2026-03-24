@@ -112,9 +112,10 @@ class ComfortScheduleEntry:
 
 @dataclass(frozen=True)
 class ComfortSchedule:
-    """Time-of-day comfort schedule for a constraint label (sensor)."""
+    """Time-of-day comfort schedule for a sensor."""
 
-    label: str
+    sensor: str  # sensor column name: "bedroom_temp"
+    label: str  # display label: "bedroom"
     entries: tuple[ComfortScheduleEntry, ...] = field(default_factory=tuple)
 
     def comfort_at(self, hour: int) -> RoomComfort | None:

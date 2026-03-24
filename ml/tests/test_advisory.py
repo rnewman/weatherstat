@@ -80,7 +80,7 @@ def _make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSche
 
     defaults = {s.label: s for s in default_comfort_schedules()}
     for label, entries in overrides.items():
-        defaults[label] = ComfortSchedule(label=label, entries=tuple(entries))
+        defaults[label] = ComfortSchedule(sensor=f"{label}_temp", label=label, entries=tuple(entries))
     return list(defaults.values())
 
 

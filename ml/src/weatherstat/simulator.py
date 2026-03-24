@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from weatherstat.config import DATA_DIR, EFFECTOR_MAP, PREDICTION_LABELS
+from weatherstat.config import DATA_DIR, EFFECTOR_MAP, PREDICTION_SENSORS
 from weatherstat.types import EffectorDecision, Scenario
 
 # Minimum |t-statistic| for an effector→sensor gain to be used in simulation.
@@ -472,16 +472,14 @@ def predict(
     n_total = _HISTORY_STEPS + n_future
     horizon_set = set(horizons)
 
-    # Build target names: label_temp_t+horizon for each label in PREDICTION_LABELS
-    label_to_sensor = _label_to_sensor_map(params.sensors)
+    # Build target names: sensor_t+horizon for each sensor in PREDICTION_SENSORS
     target_names: list[str] = []
     target_info: list[tuple[str, int]] = []
-    for label in PREDICTION_LABELS:
-        sensor_col = label_to_sensor.get(label)
-        if sensor_col is None:
+    for sensor_col in PREDICTION_SENSORS:
+        if sensor_col not in params.sensors:
             continue
         for h in horizons:
-            target_names.append(f"{label}_temp_t+{h}")
+            target_names.append(f"{sensor_col}_t+{h}")
             target_info.append((sensor_col, h))
 
     n_targets = len(target_names)
@@ -537,15 +535,7 @@ def predict(
         else:
             solar_vec = base_solar
 
-        # Current temp (try sensor col name, then label name)
-        cur_temp = state.current_temps.get(sensor_col)
-        if cur_temp is None:
-            for lbl, sc in label_to_sensor.items():
-                if sc == sensor_col:
-                    cur_temp = state.current_temps.get(lbl)
-                    break
-        if cur_temp is None:
-            cur_temp = 70.0
+        cur_temp = state.current_temps.get(sensor_col, 70.0)
 
         # Pre-compute total effector forcing: (n_scenarios, max_horizon + 1)
         # Vectorized over both scenarios AND timesteps — one slice op per effector
@@ -628,33 +618,6 @@ def predict(
 
     return target_names, result
 
-
-# ── Label-to-sensor mapping ──────────────────────────────────────────────
-
-
-def _label_to_sensor_map(sensor_names: list[str]) -> dict[str, str]:
-    """Map PREDICTION_LABELS to sensor column names from sysid.
-
-    Labels are like "bedroom", "upstairs".
-    Sensor columns are like "bedroom_temp", "thermostat_upstairs_temp".
-    """
-    mapping: dict[str, str] = {}
-    for label in PREDICTION_LABELS:
-        # Direct: "bedroom" -> "bedroom_temp"
-        candidate = f"{label}_temp"
-        if candidate in sensor_names:
-            mapping[label] = candidate
-            continue
-        # Thermostat zone: "upstairs" -> "thermostat_upstairs_temp"
-        candidate = f"thermostat_{label}_temp"
-        if candidate in sensor_names:
-            mapping[label] = candidate
-            continue
-        # Aggregate: "upstairs" -> "upstairs_aggregate_temp"
-        candidate = f"{label}_aggregate_temp"
-        if candidate in sensor_names:
-            mapping[label] = candidate
-    return mapping
 
 
 # ── Recent history extraction from snapshot data ─────────────────────────
