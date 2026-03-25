@@ -20,6 +20,8 @@ Weatherstat started out as an ML experiment: could a decision tree model do a go
 
 The answer was no, but I ended up with an [architecture](docs/ARCHITECTURE.md) that could.
 
+Examples in this README are all in °F, my local unit; the system itself is unit-agnostic, just like the math. Constants and thresholds are configurable.
+
 ## The problems
 
 A conventional thermostat is a reactive control system: it measures the temperature, compares it to a setpoint, and turns the heat on or off. This fails badly in at least four ways.
@@ -70,7 +72,7 @@ The system doesn't assume or configure these parameters. It *learns* them from y
 
 ## What the system does
 
-Every 15 minutes, weatherstat runs a control cycle:
+Every 15 minutes (configurable), weatherstat runs a control cycle:
 
 ### 1. Read the current state
 
