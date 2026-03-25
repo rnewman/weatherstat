@@ -287,9 +287,9 @@ class WeatherstatApp(App):
                 pass
 
     def _load_control_state(self) -> None:
-        from weatherstat.config import ADVISORY_STATE_FILE, CONTROL_STATE_FILE
+        """Load effector state + opportunities from state files (startup only)."""
+        from weatherstat.config import CONTROL_STATE_FILE
 
-        # Load effector state from control_state.json
         if CONTROL_STATE_FILE.exists():
             try:
                 data = json.loads(CONTROL_STATE_FILE.read_text())
@@ -304,8 +304,12 @@ class WeatherstatApp(App):
                 )
             except Exception:
                 pass
+        self._load_opportunities()
 
-        # Load opportunities from advisory_state.json
+    def _load_opportunities(self) -> None:
+        """Refresh opportunity panel from advisory_state.json."""
+        from weatherstat.config import ADVISORY_STATE_FILE
+
         if ADVISORY_STATE_FILE.exists():
             try:
                 data = json.loads(ADVISORY_STATE_FILE.read_text())
@@ -521,14 +525,17 @@ class WeatherstatApp(App):
             decisions=eff_dicts,
             command_targets=decision.command_targets,
             costs=(decision.total_cost, decision.comfort_cost, decision.energy_cost),
-            baseline_cost=self._baseline_cost,
+            baseline_cost=decision.baseline_cost if decision.baseline_cost else self._baseline_cost,
+            rationale=decision.rationale,
+            sensor_costs=decision.sensor_costs,
+            baseline_sensor_costs=decision.baseline_sensor_costs,
         )
 
         # Update predictions panel
         self.query_one(PredictionPanel).set_data(decision.predictions, SENSOR_LABELS)
 
-        # Refresh opportunities from state file
-        self._load_control_state()
+        # Refresh opportunities from state file (don't overwrite effector panel)
+        self._load_opportunities()
 
     # ── Executor ───────────────────────────────────────────────────────────
 

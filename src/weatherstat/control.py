@@ -1521,6 +1521,50 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         parts.append(")")
         return "".join(parts)
 
+    def _state_rationale(ed: EffectorDecision) -> str:
+        """Build rationale from current state: why is this device on or off?"""
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None:
+            return ""
+        # Find the sensor this effector most affects
+        sensor_col = ""
+        if eff_cfg.control_type == "trajectory":
+            sensor_col = eff_cfg.temp_col  # e.g., "thermostat_upstairs_temp"
+        elif eff_cfg.control_type == "regulating":
+            sensor_col = ed.name.removeprefix("mini_split_") + "_temp"
+        elif eff_cfg.control_type == "binary":
+            # Blowers affect the rooms they serve — use naming convention
+            room = ed.name.removeprefix("blower_")
+            sensor_col = f"{room}_temp"
+
+        if not sensor_col:
+            return ""
+
+        temp = current_temps.get(sensor_col)
+        if temp is None:
+            return ""
+
+        # Find comfort bounds for this sensor
+        for sched in schedules:
+            if sched.sensor == sensor_col:
+                c = sched.comfort_at(base_hour)
+                if c is None:
+                    return ""
+                label = sched.label
+                if ed.mode == "off":
+                    if c.preferred_lo <= temp <= c.preferred_hi:
+                        return f"{label} {temp:.1f}{UNIT_SYMBOL} in preferred [{c.preferred_lo:.0f}-{c.preferred_hi:.0f}]"
+                    if c.min_temp <= temp <= c.max_temp:
+                        return f"{label} {temp:.1f}{UNIT_SYMBOL} in comfort [{c.min_temp:.0f}-{c.max_temp:.0f}]"
+                    return f"{label} {temp:.1f}{UNIT_SYMBOL} outside [{c.min_temp:.0f}-{c.max_temp:.0f}]"
+                # Device is on — explain what it's doing
+                target = decision.command_targets.get(ed.name, ed.target)
+                if target is not None and eff_cfg.control_type == "trajectory" and temp > target:
+                    return f"standby: {label} {temp:.1f}{UNIT_SYMBOL} above {target:.0f}{UNIT_SYMBOL} target"
+                return f"{label} {temp:.1f}{UNIT_SYMBOL}, target {target}{UNIT_SYMBOL}" if target else ""
+        return ""
+
+    rationale_map: dict[str, str] = {}
     for ed in decision.effectors:
         eff_cfg = EFFECTOR_MAP.get(ed.name)
         if eff_cfg is None:
@@ -1531,18 +1575,38 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             on_label = "ON" if ed.mode != "off" and ed.delay_steps == 0 else "OFF"
             print(f"  {label} heating:  {on_label} -> setpoint {setpoint:.0f}{UNIT_SYMBOL}")
             if ed.mode != "off":
-                print(_counterfactual_rationale(ed.name))
+                r = _counterfactual_rationale(ed.name)
+                print(r)
+                r_text = r.strip().removeprefix("-> ")
+                if not r_text or r_text == "no significant effect":
+                    r_text = _state_rationale(ed)
+                rationale_map[ed.name] = r_text
+            else:
+                rationale_map[ed.name] = _state_rationale(ed)
         elif eff_cfg.control_type == "regulating":
             if ed.mode == "off":
                 print(f"  {ed.name:<20} off")
+                rationale_map[ed.name] = _state_rationale(ed)
             else:
                 target_str = f" @ {ed.target:.0f}{UNIT_SYMBOL}" if ed.target is not None else ""
                 print(f"  {ed.name:<20} {ed.mode}{target_str}")
-                print(_counterfactual_rationale(ed.name))
+                r = _counterfactual_rationale(ed.name)
+                print(r)
+                r_text = r.strip().removeprefix("-> ")
+                if not r_text or r_text == "no significant effect":
+                    r_text = _state_rationale(ed)
+                rationale_map[ed.name] = r_text
         elif eff_cfg.control_type == "binary":
             print(f"  {ed.name:<20} {ed.mode}")
             if ed.mode != "off":
-                print(_counterfactual_rationale(ed.name))
+                r = _counterfactual_rationale(ed.name)
+                print(r)
+                r_text = r.strip().removeprefix("-> ")
+                if not r_text or r_text == "no significant effect":
+                    r_text = _state_rationale(ed)
+                rationale_map[ed.name] = r_text
+            else:
+                rationale_map[ed.name] = _state_rationale(ed)
     if decision.trajectory_info:
         for eff_name, info in decision.trajectory_info.items():
             delay_h = info["delay_steps"] * 5 / 60
@@ -1598,6 +1662,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 row += f"{'--':>9}"
         if has_any:
             print(row)
+
+    # Store rationale data on the decision for TUI display
+    object.__setattr__(decision, "rationale", rationale_map)
+    object.__setattr__(decision, "sensor_costs", dec_sensor_costs)
+    object.__setattr__(decision, "baseline_sensor_costs", off_sensor_costs)
+    object.__setattr__(decision, "baseline_cost", off_comfort)
 
     # ── Window opportunities (persistent, energy-aware) ──
     from weatherstat.advisory import evaluate_window_opportunities, process_opportunities

@@ -227,6 +227,9 @@ class EffectorPanel(Static):
         self._costs: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._baseline_cost: float | None = None
         self._overrides: dict[str, str] = {}  # effector_name -> description
+        self._rationale: dict[str, str] = {}  # effector_name -> explanation
+        self._sensor_costs: dict[str, float] = {}
+        self._baseline_sensor_costs: dict[str, float] = {}
 
     def set_overrides(self, overrides: dict[str, str]) -> None:
         self._overrides = overrides
@@ -242,11 +245,17 @@ class EffectorPanel(Static):
         command_targets: dict[str, float],
         costs: tuple[float, float, float] = (0.0, 0.0, 0.0),
         baseline_cost: float | None = None,
+        rationale: dict[str, str] | None = None,
+        sensor_costs: dict[str, float] | None = None,
+        baseline_sensor_costs: dict[str, float] | None = None,
     ) -> None:
         self._decisions = decisions
         self._command_targets = command_targets
         self._costs = costs
         self._baseline_cost = baseline_cost
+        self._rationale = rationale or {}
+        self._sensor_costs = sensor_costs or {}
+        self._baseline_sensor_costs = baseline_sensor_costs or {}
         self._refresh()
 
     def _refresh(self) -> None:
@@ -267,10 +276,12 @@ class EffectorPanel(Static):
                 # A thermostat in "heat" mode with setpoint below room temp isn't
                 # actually heating — it's on standby as a safety net.
                 room_temp = self._current_temps.get(f"{name}_temp")
+                is_heat = mode in ("heat", "heating")
+                is_cool = mode in ("cool", "cooling")
                 actively_working = (
                     target is None
                     or room_temp is None
-                    or not ((mode == "heat" and target <= room_temp) or (mode == "cool" and target >= room_temp))
+                    or not ((is_heat and target <= room_temp) or (is_cool and target >= room_temp))
                 )
 
                 if actively_working:
@@ -292,10 +303,35 @@ class EffectorPanel(Static):
                 line += f"  [bold red]OVERRIDE[/] ({override})"
             lines.append(line)
 
+            # Inline rationale
+            r = self._rationale.get(name)
+            if r:
+                lines.append(f"    [dim]{r}[/]")
+
         total, comfort, energy = self._costs
         lines.append(f"\n  Cost: {total:.1f}  (comfort {comfort:.1f} + energy {energy:.2f})")
         if self._baseline_cost is not None:
             lines.append(f"  vs all-off: {self._baseline_cost:.1f}")
+
+        # Per-sensor cost breakdown (only sensors with non-trivial cost)
+        sensors_with_cost = sorted(
+            s
+            for s in set(self._sensor_costs) | set(self._baseline_sensor_costs)
+            if self._sensor_costs.get(s, 0) > 0.01 or self._baseline_sensor_costs.get(s, 0) > 0.01
+        )
+        if sensors_with_cost:
+            lines.append("")
+            for s in sensors_with_cost:
+                dc = self._sensor_costs.get(s, 0)
+                oc = self._baseline_sensor_costs.get(s, 0)
+                saving = oc - dc
+                label = s.removesuffix("_temp")
+                if abs(saving) < 0.01:
+                    lines.append(f"  [dim]{label:<16} {dc:>6.1f}[/]")
+                elif saving > 0:
+                    lines.append(f"  {label:<16} {dc:>6.1f}  [green]{saving:>+6.1f}[/]")
+                else:
+                    lines.append(f"  {label:<16} {dc:>6.1f}  [red]{saving:>+6.1f}[/]")
 
         self.update("\n".join(lines))
 

@@ -193,6 +193,10 @@ class ControlDecision:
     energy_cost: float = 0.0
     predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # label -> {horizon -> temp}
     trajectory_info: dict[str, dict[str, int | None]] = field(default_factory=dict)
+    rationale: dict[str, str] = field(default_factory=dict)  # effector_name -> explanation text
+    sensor_costs: dict[str, float] = field(default_factory=dict)  # sensor -> decision comfort cost
+    baseline_sensor_costs: dict[str, float] = field(default_factory=dict)  # sensor -> all-off comfort cost
+    baseline_cost: float = 0.0  # all-off total comfort cost
     dry_run: bool = True
 
 
