@@ -1425,7 +1425,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for h in CONTROL_HORIZONS:
             h_label = HORIZON_LABELS[h]
             if h_label in preds:
-                dec_flat[f"{label}_temp_t+{h}"] = preds[h_label]
+                dec_flat[f"{label}_t+{h}"] = preds[h_label]
     dec_sensor_costs = compute_comfort_cost_by_sensor(dec_flat, schedules, base_hour)
     off_sensor_costs = compute_comfort_cost_by_sensor(off_preds, schedules, base_hour)
 

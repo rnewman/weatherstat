@@ -152,16 +152,17 @@ Fits all thermal model parameters from observed collector data using a two-stage
 
 **Stage 1 — Tau fitting (scipy `curve_fit`):** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off AND all windows are closed (sealed envelope). Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via nonlinear least squares on each contiguous segment. Multiple segments → weighted median → `tau_base` (sealed envelope time constant).
 
-**Stage 2 — Effector gains, solar profiles, and window effects (numpy linear regression):** With tau_base fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on: lagged effector activity (coarse time bins capturing delay), hour-of-day indicators (solar gain), per-window `window_state × (T_out - T)` features (cooling rate when open), and window pair interactions (cross-breeze effects). One regression per sensor.
+**Stage 2 — Effector gains, solar profiles, and window effects (ridge regression):** With tau_base fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on: lagged effector activity (coarse time bins capturing delay), hour-of-day indicators (solar gain), weather control features (ΔT², wind×ΔT, dT_outdoor/dt), per-window `window_state × (T_out - T)` features (cooling rate when open), and window pair interactions (cross-breeze effects). One regression per sensor.
 
-The regression uses `np.linalg.lstsq` (OLS) with automatic fallback to ridge regression (`np.linalg.solve` with L2 penalty) when the condition number indicates collinear effectors. T-statistics flag negligible gains (|gain| < 0.05°F/hr AND |t-stat| < 2.0).
+The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). Solar and window features are pre-scaled by their standard deviation so the penalty falls proportionally; effector features are left in raw scale for full regularization against confounded gains. T-statistics flag negligible gains (|gain| < 0.05°F/hr AND |t-stat| < 2.0).
+
+**Smoothed derivative:** The dT/dt computation uses a smoothed central difference rather than naive 5-minute intervals. Temperature is first smoothed with a centered rolling mean (default: 15-minute half-window), then differentiated over the smoothed values. This is critical: naive 5-minute central differences amplify sensor noise (~±0.1°F jitter) into ~10°F/hr of derivative noise, drowning effector signals of ~0.3°F/hr. The smoothed derivative reduces noise ~5× while preserving signals on the timescale of effector lags (≥15 min). See `docs/debugging-notes.md` § "Derivative Noise" for the full analysis.
 
 **Gain filtering at load time:** The simulator applies additional filters when loading gains from `thermal_params.json`:
 - **t-statistic threshold** (|t| ≥ 1.5): prunes gains that are likely confounded (e.g., bedroom split correlates with other warming sources but doesn't cause it). Without this, OLS attributes correlated warming to whichever effector happens to be active.
 - **Magnitude cap** (≤ 3.0°F/hr): catches physically implausible gains from sensors near vents, unobserved heat sources, or short data histories.
-- **Mode-direction clamp**: in the Euler loop, heating contributions are clamped ≥ 0 and cooling contributions ≤ 0, preventing confounded gains from producing physically impossible effects (e.g., cooling a room making it warmer).
-
-These are guard rails, not root fixes. The fundamental issue is that OLS on observational data produces confounded gains when effector activity correlates with unobserved variables (outdoor conditions, occupant behavior). See `docs/FUTURE.md` § "Causal Gain Identification" for planned improvements.
+- **Mode-direction sign filter**: heating-only effectors (trajectory with `supported_modes: [heat]`) cannot have negative gains, and vice versa. Confounded OLS can produce these nonsensical cross-coupling effects.
+- **Mode-direction clamp**: in the Euler loop for regulating effectors, heating contributions are clamped ≥ 0 and cooling contributions ≤ 0, preventing confounded gains from producing physically impossible effects.
 
 **What it extracts:**
 - **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.

@@ -120,10 +120,12 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         )
 
     # Gain lookup: filter by negligible flag, t-statistic significance,
-    # and physical plausibility (gain magnitude).
+    # physical plausibility (gain magnitude), and mode-direction consistency
+    # (heating-only effectors can't have negative gains).
     gains: dict[tuple[str, str], tuple[float, float]] = {}
     n_pruned_t = 0
     n_pruned_mag = 0
+    n_pruned_sign = 0
     for g in data["effector_sensor_gains"]:
         if g["negligible"]:
             continue
@@ -133,12 +135,27 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         if abs(g["gain_f_per_hour"]) > _MAX_GAIN_MAGNITUDE:
             n_pruned_mag += 1
             continue
+        # Mode-direction filter: a heating-only effector can't cool (negative gain),
+        # and a cooling-only effector can't heat (positive gain). Confounded OLS
+        # can produce these nonsensical cross-coupling effects.
+        eff_cfg = EFFECTOR_MAP.get(g["effector"])
+        if eff_cfg is not None:
+            modes = set(eff_cfg.supported_modes)
+            gain_val = g["gain_f_per_hour"]
+            if "heat" in modes and "cool" not in modes and gain_val < 0:
+                n_pruned_sign += 1
+                continue
+            if "cool" in modes and "heat" not in modes and gain_val > 0:
+                n_pruned_sign += 1
+                continue
         gains[(g["effector"], g["sensor"])] = (g["gain_f_per_hour"], g["best_lag_minutes"])
     pruned_parts: list[str] = []
     if n_pruned_t:
         pruned_parts.append(f"{n_pruned_t} by |t| < {_MIN_T_STATISTIC:.1f}")
     if n_pruned_mag:
         pruned_parts.append(f"{n_pruned_mag} by |gain| > {_MAX_GAIN_MAGNITUDE:.1f}°F/hr")
+    if n_pruned_sign:
+        pruned_parts.append(f"{n_pruned_sign} by wrong sign for mode")
     if pruned_parts:
         print(f"  [sim] Pruned gains: {', '.join(pruned_parts)}")
 

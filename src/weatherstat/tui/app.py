@@ -98,6 +98,10 @@ class WeatherstatApp(App):
         self._baseline_cost: float | None = None
         self._overrides: dict[str, str] = {}  # effector_name -> description
 
+        # MRT weights from sysid (loaded once at startup, refreshed after sysid runs)
+        self._mrt_weights_cache: dict[str, float] = {}
+        self._load_mrt_weights()
+
     def compose(self) -> ComposeResult:
         yield StatusHeader()
         with TabbedContent(initial="status"):
@@ -231,6 +235,18 @@ class WeatherstatApp(App):
         self._load_control_state()
         self._refresh_history()
 
+    def _load_mrt_weights(self) -> None:
+        """Load sysid-derived MRT weights from thermal_params.json."""
+        from weatherstat.config import DATA_DIR
+
+        params_file = DATA_DIR / "thermal_params.json"
+        if params_file.exists():
+            try:
+                data = json.loads(params_file.read_text())
+                self._mrt_weights_cache = data.get("mrt_weights", {})
+            except Exception:
+                pass
+
     def _load_sysid_status(self) -> None:
         from weatherstat.config import DATA_DIR
 
@@ -310,6 +326,12 @@ class WeatherstatApp(App):
     def _refresh_temps(self) -> None:
         try:
             from weatherstat.config import PREDICTION_SENSORS, SENSOR_LABELS
+            from weatherstat.control import (
+                apply_comfort_profile,
+                apply_mrt_correction,
+                default_comfort_schedules,
+                fetch_active_comfort_profile,
+            )
             from weatherstat.extract import latest_snapshot_values
             from weatherstat.yaml_config import load_config
 
@@ -327,18 +349,44 @@ class WeatherstatApp(App):
                     with contextlib.suppress(ValueError, TypeError):
                         temps[sensor_col] = float(val)
 
-            # Comfort bounds from current schedule
+            # Comfort schedules: base → profile offsets → MRT correction
+            schedules = default_comfort_schedules()
+            active_profile = fetch_active_comfort_profile()
+            schedules = apply_comfort_profile(schedules, active_profile)
+            if active_profile is not None:
+                self.query_one(StatusHeader).set_state(profile=active_profile.name)
+
+            # Outdoor temp (needed for MRT and header)
+            outdoor_col = cfg.outdoor_sensor
+            outdoor_temp = None
+            for col in [outdoor_col, "met_outdoor_temp"]:
+                if col and col in values:
+                    with contextlib.suppress(ValueError, TypeError):
+                        outdoor_temp = float(values[col])
+                        break
+            if outdoor_temp is not None:
+                self.query_one(StatusHeader).set_state(outdoor_temp=outdoor_temp)
+
+            # MRT correction using outdoor temp and sysid-derived weights
+            if outdoor_temp is not None and cfg.mrt_correction:
+                mrt_weights: dict[str, float] = {}
+                for c in cfg.constraints:
+                    w = c.mrt_weight
+                    if w == 1.0:
+                        # Use sysid-derived weight if available
+                        w = self._mrt_weights_cache.get(c.sensor, 1.0)
+                    mrt_weights[c.sensor] = w
+                schedules, _mrt_offset = apply_mrt_correction(
+                    schedules, outdoor_temp, cfg.mrt_correction, mrt_weights
+                )
+
+            # Extract comfort bounds from adjusted schedules
             now_hour = datetime.now().hour
             comfort: dict[str, tuple[float, float, float]] = {}
-            for cs in cfg.constraints:
-                for entry in cs.entries:
-                    if entry.start_hour <= entry.end_hour:
-                        active = entry.start_hour <= now_hour < entry.end_hour
-                    else:
-                        active = now_hour >= entry.start_hour or now_hour < entry.end_hour
-                    if active:
-                        comfort[cs.label] = (entry.min_temp, entry.preferred, entry.max_temp)
-                        break
+            for s in schedules:
+                c = s.comfort_at(now_hour)
+                if c is not None:
+                    comfort[s.label] = (c.min_temp, c.preferred, c.max_temp)
 
             self.query_one(TemperaturePanel).set_data(temps, comfort, SENSOR_LABELS)
 
@@ -349,17 +397,6 @@ class WeatherstatApp(App):
                 if val is not None:
                     windows[display_name] = val in ("True", "true", "1", "1.0")
             self.query_one(WindowPanel).set_data(windows)
-
-            # Outdoor temp
-            outdoor_col = cfg.outdoor_sensor
-            outdoor_temp = None
-            for col in [outdoor_col, "met_outdoor_temp"]:
-                if col and col in values:
-                    with contextlib.suppress(ValueError, TypeError):
-                        outdoor_temp = float(values[col])
-                        break
-            if outdoor_temp is not None:
-                self.query_one(StatusHeader).set_state(outdoor_temp=outdoor_temp)
 
             # Forecast
             forecasts: dict[str, float] = {}
@@ -506,6 +543,7 @@ class WeatherstatApp(App):
                 self._log(f"[sysid] {line}")
 
         self._sysid_running = False
+        self._load_mrt_weights()  # refresh sysid-derived MRT weights
         self.call_from_thread(self.query_one(StatusHeader).set_state, sysid_running=False)
         self.call_from_thread(self._load_sysid_status)
 

@@ -122,6 +122,65 @@ filter at sysid time for sensors with < N tau segments.
 
 ---
 
+## Derivative Noise and Smoothed Differentiation (2026-03-24)
+
+### The problem
+
+Sysid fits gains by regressing Newton residuals (`dT/dt_observed - dT/dt_newton`) on effector activity. The `dT/dt_observed` term is computed numerically from 5-minute temperature snapshots. The naive approach — central differences, `(T[i+1] - T[i-1]) / (2 × 5min)` — amplifies sensor noise catastrophically.
+
+A temperature sensor with ±0.1°F jitter produces ±1.2°F/hr of derivative noise. With real sensor behavior (air currents, HVAC cycling, measurement quantization), the 5-minute dT/dt residual has a standard deviation of **~10.5°F/hr**. A thermostat gain of 0.3°F/hr is a 35:1 noise-to-signal ratio.
+
+The lag-2 autocorrelation of the 5-minute residual is **-0.615** — a hallmark of central-difference noise amplification. The reading `T[i+1]` appears with positive sign at step `i` and negative sign at step `i+2`, creating strong anti-correlation between adjacent derivative estimates.
+
+### Diagnosis
+
+Thermostat gains had reasonable magnitudes (0.2–0.6°F/hr) but t-statistics below 1.5 for almost all sensors, causing the simulator to prune them. The control loop treated thermostats as having zero effect. The univariate correlation between thermostat activity and the Newton residual was ~0.01 — a real signal buried under noise.
+
+Testing with longer differentiation windows revealed the signal clearly:
+
+| Window | Residual std | Thermostat t-stat | Gain |
+|--------|-------------|-------------------|------|
+| 5 min | 10.5°F/hr | 1.05 | 0.25 |
+| 15 min | 2.0°F/hr | **6.28** | 0.29 |
+| 30 min | 0.8°F/hr | **18.3** | 0.33 |
+| 60 min | 0.5°F/hr | **34.5** | 0.33 |
+
+The gain is stable across all windows (~0.3°F/hr), confirming it's a real physical effect. Only the noise changes.
+
+### The fix
+
+Smooth temperature with a centered rolling mean (default half-window: 3 steps = 15 min, total kernel 35 min), then compute central differences on the smoothed series. This reduces noise ~5× while preserving signals on the timescale of effector lags (≥15 min for fast effectors like blowers, ≥45 min for hydronic).
+
+After the fix: thermostat gains go from 1 surviving (out of 32) to **25 surviving**, all with positive signs and physically reasonable magnitudes. The control loop now correctly turns on thermostats when heating is needed.
+
+### The fundamental principle
+
+Numerical differentiation amplifies high-frequency noise by a factor proportional to `1/Δt`. The signal-to-noise ratio of the derivative depends on the relationship between three timescales:
+
+1. **Signal timescale** (τ_signal): how fast the effect you're measuring changes. For thermostat heating, this is the thermal lag — 15–90 minutes.
+2. **Sampling interval** (Δt): the gap between observations. Here, 5 minutes.
+3. **Noise amplitude** (σ_noise): the sensor measurement jitter. Here, ~±0.1°F.
+
+The derivative SNR scales as:
+
+```
+SNR_derivative ∝ (signal_amplitude × Δt_diff) / σ_noise
+```
+
+where `Δt_diff` is the differentiation window. When `Δt_diff` is much shorter than the signal timescale, you're wasting SNR on temporal resolution you don't need. The optimal differentiation window is **as long as you can afford** without blurring the signal — roughly the shortest effector lag you need to resolve.
+
+In practice: if your fastest effector has a 15-minute lag and your data is sampled every 5 minutes, differentiating over 5 minutes gives 3× more temporal resolution than you need while amplifying noise 3×. A 15-minute window matches the signal timescale, maximizing SNR without sacrificing useful temporal detail.
+
+### Secondary finding: weather control absorption
+
+Even after noise reduction, the weather control features (ΔT², wind×ΔT, dT_outdoor/dt) partially absorb the thermostat signal — the thermostat t-stat drops from 6.28 to ~5.3 when weather controls are included. This is expected: thermostats run more when it's cold, and the weather features capture cold-weather nonlinearities. The signal is strong enough now that this absorption doesn't push gains below significance, but it's a factor to monitor.
+
+### Secondary finding: mode-direction sign filter
+
+During investigation, discovered that `thermostat_downstairs → living_room_climate_temp` had a negative gain (−0.087°F/hr, t=−1.69) that passed the t-stat filter. A negative gain from a heating-only effector is physical nonsense — it says "turning on the heat cools the living room." Added a mode-direction sign filter in `simulator.load_sim_params()`: heating-only effectors (`supported_modes: [heat]`) cannot have negative gains, and cooling-only effectors cannot have positive gains.
+
+---
+
 ## Diagnostic Playbook
 
 ### "Why is sensor X predicted at Y°F?"

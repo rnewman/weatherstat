@@ -467,19 +467,32 @@ def _preprocess(
             if gate_col in df.columns:
                 df[f"_eff_{eff.name}"] *= df[gate_col]
 
-    # Compute dT/dt for each sensor (°F/hr, central differences)
+    # Compute dT/dt for each sensor (°F/hr).
+    #
+    # Naive 5-minute central differences amplify sensor noise: ±0.1°F jitter
+    # becomes ±1.2°F/hr in the derivative, producing a residual std of ~10°F/hr
+    # that drowns effector signals of ~0.3°F/hr. The lag-2 autocorrelation of
+    # -0.6 confirms this is differentiation noise, not real temperature dynamics.
+    #
+    # Fix: smooth temperature with a centered rolling mean, then differentiate
+    # over the wider window. With a 3-step (15-min) half-window, noise drops
+    # ~5× while preserving signals on the timescale of effector lags (≥15 min).
+    _SMOOTH_HALF_WINDOW = 3  # steps; total smoothing = (2w+1)×5 = 35 min
     dt_hours = 5.0 / 60.0  # 5-minute intervals
+    w = _SMOOTH_HALF_WINDOW
     for sensor in sensors:
         col = sensor.temp_column
         if col not in df.columns:
             continue
         temps = df[col].values.astype(float)
+        # Smooth with centered rolling mean to suppress sensor jitter
+        temps_smooth = pd.Series(temps).rolling(
+            2 * w + 1, center=True, min_periods=w + 1,
+        ).mean().values
+        # Central differences on smoothed series (span = 2w steps = 2w×5 min)
         dT = np.full_like(temps, np.nan)
-        # Central differences for interior points
-        dT[1:-1] = (temps[2:] - temps[:-2]) / (2 * dt_hours)
-        # Forward/backward at edges
-        dT[0] = (temps[1] - temps[0]) / dt_hours if len(temps) > 1 else 0.0
-        dT[-1] = (temps[-1] - temps[-2]) / dt_hours if len(temps) > 1 else 0.0
+        if len(temps) > 2 * w:
+            dT[w:-w] = (temps_smooth[2 * w:] - temps_smooth[:-2 * w]) / (2 * w * dt_hours)
         df[f"_dTdt_{sensor.name}"] = dT
 
     # Generate lagged effector features in coarse bins derived from max_lag_minutes

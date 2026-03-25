@@ -161,17 +161,6 @@ def evaluate_window_opportunities(
             continue
 
         # Re-sweep: find best HVAC plan with toggled window
-        # Build zone current temps from config-driven effectors
-        from weatherstat.config import EFFECTORS
-
-        zone_current_temps: dict[str, float] = {}
-        if current_temps:
-            for eff in EFFECTORS:
-                # Strip prefix to get the zone/room name used in current_temps
-                label = eff.name.removeprefix("thermostat_").removeprefix("mini_split_").removeprefix("blower_")
-                if label in current_temps:
-                    zone_current_temps[eff.name] = current_temps[label]
-
         resweep_decision, _resweep_scenario = sweep_scenarios_physics(
             current_temps=state.current_temps,
             outdoor_temp=state.outdoor_temp,
@@ -180,7 +169,6 @@ def evaluate_window_opportunities(
             sim_params=sim_params,
             hour_of_day=state.hour_of_day,
             recent_history=state.recent_history,
-            zone_current_temps=zone_current_temps,
             schedules=schedules,
             base_hour=base_hour,
             prev_state=prev_state,
