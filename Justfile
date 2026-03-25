@@ -54,7 +54,7 @@ tui *ARGS:
 
 # Comfort performance dashboard (last 7 days by default)
 comfort *ARGS:
-    uv run python ../scripts/plot_comfort.py {{ARGS}}
+    uv run python ./scripts/plot_comfort.py {{ARGS}}
 
 # Verify live config parses correctly
 verify:
