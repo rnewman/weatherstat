@@ -19,9 +19,9 @@ from datetime import UTC, datetime
 
 import requests
 
-from weatherstat.config import DATA_DIR, EFFECTORS, PREDICTIONS_DIR
+from weatherstat.config import DATA_DIR, EFFECTORS, PREDICTIONS_DIR, UNIT_SYMBOL, delta_temp
 
-TARGET_TOLERANCE = 0.5
+TARGET_TOLERANCE = delta_temp(0.5)
 OVERRIDE_STALE_SECONDS = 30 * 60  # 30 minutes
 
 _EXECUTOR_STATE_FILE = DATA_DIR / "executor_state.json"
@@ -235,8 +235,8 @@ def execute(*, force: bool = False, log: print = print) -> ExecutorResult:
             current_target = _read_climate_target(eff.entity_id)
 
             if current_target is not None and abs(current_target - desired_target) < TARGET_TOLERANCE:
-                log(f"[executor] {eff.name}: already at {current_target}°F")
-                result.actions.append(DeviceAction(eff.name, "already_correct", f"{current_target}°F"))
+                log(f"[executor] {eff.name}: already at {current_target}{UNIT_SYMBOL}")
+                result.actions.append(DeviceAction(eff.name, "already_correct", f"{current_target}{UNIT_SYMBOL}"))
                 continue
 
             last = last_devices.get(eff.name, {})
@@ -247,15 +247,15 @@ def execute(*, force: bool = False, log: print = print) -> ExecutorResult:
                 and current_target is not None
                 and abs(current_target - last_target) > TARGET_TOLERANCE
             ):
-                detail = f"target {current_target}°F, we set {last_target}°F"
+                detail = f"target {current_target}{UNIT_SYMBOL}, we set {last_target}{UNIT_SYMBOL}"
                 log(f"[executor] {eff.name}: override detected ({detail})")
                 result.actions.append(DeviceAction(eff.name, "override", detail))
                 continue
 
             _call_service("climate", "set_temperature", eff.entity_id, {"temperature": desired_target})
-            log(f"[executor] {eff.name}: set to {desired_target}°F")
+            log(f"[executor] {eff.name}: set to {desired_target}{UNIT_SYMBOL}")
             updated_devices[eff.name] = {"target": desired_target}
-            result.actions.append(DeviceAction(eff.name, "applied", f"{desired_target}°F"))
+            result.actions.append(DeviceAction(eff.name, "applied", f"{desired_target}{UNIT_SYMBOL}"))
 
         elif eff.control_type == "regulating":
             # Automatic-mode climate (mini-split): mode + target
@@ -276,7 +276,7 @@ def execute(*, force: bool = False, log: print = print) -> ExecutorResult:
                 or (desired_target is not None and current_target is not None and abs(current_target - float(desired_target)) < TARGET_TOLERANCE)
             )
             if mode_match and target_match:
-                desc = "off" if desired_mode == "off" else f"{desired_mode} @ {current_target}°F"
+                desc = "off" if desired_mode == "off" else f"{desired_mode} @ {current_target}{UNIT_SYMBOL}"
                 log(f"[executor] {eff.name}: already {desc}")
                 result.actions.append(DeviceAction(eff.name, "already_correct", desc))
                 continue
@@ -291,7 +291,7 @@ def execute(*, force: bool = False, log: print = print) -> ExecutorResult:
             _call_service("climate", "set_hvac_mode", eff.entity_id, {"hvac_mode": desired_mode})
             if desired_mode != "off" and desired_target is not None:
                 _call_service("climate", "set_temperature", eff.entity_id, {"temperature": float(desired_target)})
-            desc = "off" if desired_mode == "off" else f"{desired_mode} @ {desired_target}°F"
+            desc = "off" if desired_mode == "off" else f"{desired_mode} @ {desired_target}{UNIT_SYMBOL}"
             log(f"[executor] {eff.name}: set to {desc}")
             updated_devices[eff.name] = {"mode": desired_mode, "target": desired_target}
             result.actions.append(DeviceAction(eff.name, "applied", desc))

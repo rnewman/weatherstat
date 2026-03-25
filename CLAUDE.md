@@ -33,6 +33,7 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 17. **Persistent window opportunities** (done) — Fire-and-forget advisories replaced with persistent, energy-aware "opportunities" model. Two thresholds: opportunity (track in state) and notification (push to phone). Re-sweep: evaluates best HVAC plan with window toggled to capture energy savings (e.g., open window + turn off mini split). Lifecycle management: new opportunities added, still-valid kept, expired dismissed via `persistent_notification/dismiss`. Per-window notification IDs prevent stacking.
 18. **Unified effector model** (done) — Single `EffectorDecision` type replaces `ThermostatTrajectory`, `BlowerDecision`, `MiniSplitDecision`. `EffectorConfig` with `control_type`/`mode_control`/`depends_on`/`command_keys` replaces per-type config classes. Scenario generation iterates `EFFECTORS` tuple from config with `itertools.product`. No hardcoded device names anywhere. TS executor iterates config dicts dynamically. Effector eligibility gate: pre-sweep check excludes manual-mode effectors that are off or whose state_device is unavailable. Dead code pruned: legacy advisory types, boiler backward-compat, LGBM params, encoding aliases.
 19. **Smoothed derivative & gain recovery** (done) — 5-minute central differences amplified sensor noise (~10°F/hr) drowning thermostat signals (~0.3°F/hr). Smoothed derivative (15-min half-window rolling mean + wider central difference) reduces noise ~5×, recovering thermostat gains from 1/32 surviving to 25/32. Mode-direction sign filter prevents heating-only effectors from having negative gains. Per-sensor cost display bug fixed (key format mismatch). TUI comfort bars now reflect active comfort profile + MRT correction. See `docs/debugging-notes.md` § "Derivative Noise".
+20. **Celsius support & configurable defaults** (done) — `unit: F` or `unit: C` in location block. All hardcoded temperature constants converted via `abs_temp()`/`delta_temp()` from canonical °F at load time. Control thresholds (`setpoint_min`, `setpoint_max`, `cautious_offset`, `max_1h_change`, `min_improvement`, `cold_room_override`) configurable in `defaults:` section. Display formatting uses `UNIT_SYMBOL` throughout. Dead-band preferred range: `preferred` can be a point or `[lo, hi]` range with zero cost inside the band; `preferred_widen` in profiles expands point targets into dead bands.
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
@@ -71,7 +72,7 @@ just test             # Test both packages
 
 - Python: ruff for linting/formatting, frozen dataclasses, StrEnum for enums
 - All source files use explicit types — full type hints in Python
-- Temperatures in Fahrenheit (matching HA configuration)
+- Temperature unit configurable via `unit` in weatherstat.yaml location block (F or C). Built-in defaults are canonical °F, converted at load time via `abs_temp()`/`delta_temp()`. All runtime values are in the configured unit.
 - Snapshot column names use snake_case
 
 ## Data Directory

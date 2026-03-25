@@ -8,6 +8,7 @@ location:
   longitude: -121.00
   elevation: 30            # meters above sea level
   timezone: America/Los_Angeles
+  unit: F                  # temperature unit: F (Fahrenheit) or C (Celsius)
 
 # ── Sensors ─────────────────────────────────────────────────────────────
 # key = column name in snapshots (snake_case)
@@ -243,3 +244,10 @@ safety:
 
 defaults:
   tau: 45.0   # envelope time constant (hours) — starting guess before sysid runs
+  # Control thresholds (in configured unit). Defaults shown are for °F.
+  # setpoint_min: 62         # absolute minimum setpoint
+  # setpoint_max: 78         # absolute maximum setpoint
+  # cautious_offset: 2       # setpoint offset above/below current temp
+  # max_1h_change: 5         # sanity check: max predicted 1h change
+  # min_improvement: 1       # min cost improvement to justify turning on HVAC
+  # cold_room_override: 1    # force heating when this far below comfort min

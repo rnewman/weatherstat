@@ -34,6 +34,9 @@ from weatherstat.config import (
     PREDICTION_SENSORS,
     PREDICTIONS_DIR,
     SENSOR_LABELS,
+    UNIT_SYMBOL,
+    abs_temp,
+    delta_temp,
 )
 from weatherstat.extract import fetch_recent_history
 from weatherstat.types import (
@@ -54,11 +57,11 @@ _CFG = load_config()
 # Cautious setpoint offset: when the control loop decides "heat on", we set the
 # thermostat to current_temp + CAUTIOUS_OFFSET. If the loop is interrupted, the
 # house drifts gently instead of running away to extreme temperatures.
-CAUTIOUS_OFFSET = 2  # °F above/below current temp
+CAUTIOUS_OFFSET = _CFG.cautious_offset if _CFG.cautious_offset is not None else delta_temp(2)
 
 # Absolute safety bounds (in case of stale current_temp or other weirdness)
-ABSOLUTE_MIN = 62
-ABSOLUTE_MAX = 78
+ABSOLUTE_MIN = _CFG.setpoint_min if _CFG.setpoint_min is not None else abs_temp(62)
+ABSOLUTE_MAX = _CFG.setpoint_max if _CFG.setpoint_max is not None else abs_temp(78)
 
 # Minimum hold time before changing setpoints (seconds).
 # Must be less than LOOP_INTERVAL_SECONDS so every cycle produces a fresh decision.
@@ -68,7 +71,7 @@ MIN_HOLD_SECONDS = 10 * 60  # 10 minutes
 MAX_STALE_SECONDS = 15 * 60  # 15 minutes
 
 # Maximum predicted 1h temperature change before logging warning
-MAX_1H_CHANGE = 5.0  # °F
+MAX_1H_CHANGE = _CFG.max_1h_change if _CFG.max_1h_change is not None else delta_temp(5.0)
 
 # Horizon weights: nearer predictions matter more, model is more accurate
 HORIZON_WEIGHTS: dict[int, float] = {
@@ -81,14 +84,14 @@ HORIZON_WEIGHTS: dict[int, float] = {
 
 # Minimum cost improvement over all-off required to justify active HVAC.
 # Prevents noise-driven decisions when model predictions barely differ between
-# scenarios. Equivalent to requiring ~1°F of genuine comfort improvement at
+# scenarios. Equivalent to requiring ~1° of genuine comfort improvement at
 # one horizon before turning on heating.
-MIN_IMPROVEMENT = 1.0
+MIN_IMPROVEMENT = _CFG.min_improvement if _CFG.min_improvement is not None else delta_temp(1.0)
 
 # Cold-room override: force zone heating when a room's current temperature is
 # this far below its comfort min. Compensates for undertrained models that
 # predict rooms warming without HVAC (because training data is all HVAC-on).
-COLD_ROOM_OVERRIDE = 1.0  # °F below comfort_min
+COLD_ROOM_OVERRIDE = _CFG.cold_room_override if _CFG.cold_room_override is not None else delta_temp(1.0)
 
 # Control loop interval
 LOOP_INTERVAL_SECONDS = 15 * 60  # 15 minutes
@@ -279,7 +282,7 @@ def apply_mrt_correction(
 
     Args:
         schedules: Comfort schedules for all constrained sensors.
-        outdoor_temp: Current outdoor temperature (°F).
+        outdoor_temp: Current outdoor temperature (in configured unit).
         mrt_config: Correction parameters, or None to skip.
         mrt_weights: Per-sensor column → weight multiplier (default 1.0).
 
@@ -689,7 +692,7 @@ def generate_trajectory_scenarios(
             else:
                 per_effector_options[eff.name] = [
                     EffectorDecision(eff.name),
-                    EffectorDecision(eff.name, mode="heat", target=70.0),
+                    EffectorDecision(eff.name, mode="heat", target=abs_temp(70.0)),
                 ]
 
         elif eff.control_type == "binary":
@@ -783,7 +786,7 @@ def sweep_scenarios_physics(
         eff_max = _comfort_max(eff.temp_col, schedules, base_hour)
         if eff_temp >= eff_max:
             blocked_effectors.add(eff.name)
-            blocked_reasons.append(f"{eff.name} at/above max ({eff_temp:.1f}°F >= {eff_max:.0f}°F)")
+            blocked_reasons.append(f"{eff.name} at/above max ({eff_temp:.1f}{UNIT_SYMBOL} >= {eff_max:.0f}{UNIT_SYMBOL})")
 
     if blocked_effectors:
         scenarios = [
@@ -863,7 +866,7 @@ def sweep_scenarios_physics(
                 eff_name = emergency.get(schedule.sensor)
                 if eff_name:
                     cold_effectors.add(eff_name)
-                    cold_info.append(f"{schedule.label} ({temp:.1f}°F < {comfort.min_temp:.0f}°F)")
+                    cold_info.append(f"{schedule.label} ({temp:.1f}{UNIT_SYMBOL} < {comfort.min_temp:.0f}{UNIT_SYMBOL})")
 
         # Remove blocked or ineligible effectors from cold override set
         cold_effectors -= blocked_effectors
@@ -910,7 +913,7 @@ def sweep_scenarios_physics(
         if eff_cfg.control_type == "trajectory":
             # Trajectory effector: compute cautious setpoint
             temp_col = eff_cfg.temp_col
-            eff_temp = current_temps.get(temp_col, 70.0)
+            eff_temp = current_temps.get(temp_col, abs_temp(70.0))
             heating_now = ed.mode != "off" and ed.delay_steps == 0
             setpoint = _cautious_setpoint(
                 eff_temp,
@@ -1039,7 +1042,7 @@ def check_prediction_sanity(
             continue
         if abs(pred_1h - current) > MAX_1H_CHANGE:
             label = SENSOR_LABELS.get(sensor_col, sensor_col)
-            print(f"  WARNING: {label} 1h pred {pred_1h:.1f}°F >{MAX_1H_CHANGE}°F from current {current:.1f}°F")
+            print(f"  WARNING: {label} 1h pred {pred_1h:.1f}{UNIT_SYMBOL} >{MAX_1H_CHANGE}{UNIT_SYMBOL} from current {current:.1f}{UNIT_SYMBOL}")
             safe = False
     return safe
 
@@ -1207,11 +1210,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if eff.control_type == "trajectory" and eff.temp_col:
             traj_sensors.add(eff.temp_col)
             label = SENSOR_LABELS.get(eff.temp_col, eff.name)
-            eff_temp = current_temps.get(eff.temp_col, 70.0)
+            eff_temp = current_temps.get(eff.temp_col, abs_temp(70.0))
             eff_target = latest.get(f"{eff.name}_target", "?")
-            print(f"  {label:<14} {eff_temp:.1f}°F (setpoint: {eff_target}°F)")
+            print(f"  {label:<14} {eff_temp:.1f}{UNIT_SYMBOL} (setpoint: {eff_target}{UNIT_SYMBOL})")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
-        print(f"  Outdoor:     {float(out_temp):.1f}°F (sensor)")
+        print(f"  Outdoor:     {float(out_temp):.1f}{UNIT_SYMBOL} (sensor)")
     window_cols = _CFG.window_display_map
     open_windows = [wlabel for col, wlabel in window_cols.items() if bool(latest.get(col, False))]
     if open_windows:
@@ -1224,7 +1227,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     for sensor_col in other_sensors:
         t = current_temps.get(sensor_col)
         if t is not None:
-            print(f"  {SENSOR_LABELS.get(sensor_col, sensor_col):<{lw}} {t:.1f}°F")
+            print(f"  {SENSOR_LABELS.get(sensor_col, sensor_col):<{lw}} {t:.1f}{UNIT_SYMBOL}")
     # Show current effector states
     for eff in EFFECTORS:
         if eff.control_type == "trajectory":
@@ -1232,7 +1235,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if eff.control_type == "regulating":
             mode = str(latest.get(f"{eff.name}_mode", "?"))
             target = latest.get(f"{eff.name}_target", "?")
-            print(f"  {eff.name:<20} {mode} @ {target}°F")
+            print(f"  {eff.name:<20} {mode} @ {target}{UNIT_SYMBOL}")
         elif eff.control_type == "binary":
             mode = str(latest.get(f"{eff.name}_mode", "?"))
             print(f"  {eff.name:<20} {mode}")
@@ -1249,7 +1252,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for label in ["1h", "2h", "4h", "6h", "12h"]:
             entry = at_horizons.get(label)
             if entry is not None:
-                parts.append(f"{label}:{entry.temperature:.0f}°F")
+                parts.append(f"{label}:{entry.temperature:.0f}{UNIT_SYMBOL}")
         if parts:
             print(f"  Forecast:    {', '.join(parts)}")
     else:
@@ -1300,7 +1303,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Merge configured weights (from YAML) with derived weights (from sysid solar profiles).
     # Configured weight takes priority if explicitly set (!= 1.0).
     _out_valid = out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
-    _mrt_outdoor = float(out_temp) if _out_valid else 50.0
+    _mrt_outdoor = float(out_temp) if _out_valid else abs_temp(50.0)
     _mrt_weights = {
         c.sensor: (c.mrt_weight if c.mrt_weight != 1.0 else sim_params.mrt_weights.get(c.sensor, 1.0))
         for c in _CFG.constraints
@@ -1310,9 +1313,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         _varying = {SENSOR_LABELS.get(s, s): w for s, w in _mrt_weights.items() if w != 1.0}
         if _varying:
             _wparts = ", ".join(f"{lbl}={w:.1f}" for lbl, w in _varying.items())
-            print(f"  MRT:         {mrt_offset:+.1f}°F base (outdoor {_mrt_outdoor:.0f}°F), weights: {_wparts}")
+            print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} base (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL}), weights: {_wparts}")
         else:
-            print(f"  MRT:         {mrt_offset:+.1f}°F (outdoor {_mrt_outdoor:.0f}°F)")
+            print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL})")
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     constraint_labels = {c.label for c in _CFG.constraints}
     schedules = adjust_schedules_for_windows(
@@ -1350,7 +1353,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 forecast_temp_list.append(forecast_temp_list[-1])
                 solar_fractions.append(solar_fractions[-1])
             else:
-                forecast_temp_list.append(float(out_temp) if out_temp is not None else 50.0)
+                forecast_temp_list.append(float(out_temp) if out_temp is not None else abs_temp(50.0))
                 solar_fractions.append(solar_fractions[-1])
 
     fractional_hour = base_hour + local_now.minute / 60.0
@@ -1365,7 +1368,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     elif out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         outdoor = float(out_temp)
     else:
-        outdoor = 50.0
+        outdoor = abs_temp(50.0)
     # ── Effector eligibility ──
     ineligible = check_effector_eligibility()
     ineligible_effectors = set(ineligible) if ineligible else None
@@ -1526,14 +1529,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             label = ed.name.removeprefix("thermostat_")
             setpoint = decision.command_targets.get(ed.name, 0)
             on_label = "ON" if ed.mode != "off" and ed.delay_steps == 0 else "OFF"
-            print(f"  {label} heating:  {on_label} -> setpoint {setpoint:.0f}°F")
+            print(f"  {label} heating:  {on_label} -> setpoint {setpoint:.0f}{UNIT_SYMBOL}")
             if ed.mode != "off":
                 print(_counterfactual_rationale(ed.name))
         elif eff_cfg.control_type == "regulating":
             if ed.mode == "off":
                 print(f"  {ed.name:<20} off")
             else:
-                target_str = f" @ {ed.target:.0f}°F" if ed.target is not None else ""
+                target_str = f" @ {ed.target:.0f}{UNIT_SYMBOL}" if ed.target is not None else ""
                 print(f"  {ed.name:<20} {ed.mode}{target_str}")
                 print(_counterfactual_rationale(ed.name))
         elif eff_cfg.control_type == "binary":

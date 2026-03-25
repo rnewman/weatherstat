@@ -63,7 +63,7 @@ class EffectorConfig:
     command_keys: dict[str, str]  # purpose -> camelCase key: {"target": "thermostatUpstairsTarget"}
     depends_on: tuple[str, ...] = ()  # effector names: ("thermostat_downstairs",)
     state_device: str | None = None  # state sensor confirming delivery
-    proportional_band: float = 1.0  # regulating: activity ramp width (°F)
+    proportional_band: float = 1.0  # regulating: activity ramp width (in configured unit)
     mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
     mode_encoding: dict[str, float] = field(default_factory=dict)  # for energy cost / sysid
     temp_col: str = ""  # sensor column for current temp (climate entities)
@@ -118,4 +118,18 @@ ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
 ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
 ADVISORY_OPPORTUNITY_THRESHOLD: float = _CFG.advisory.opportunity_threshold
 ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
+
+# ── Temperature unit helpers ─────────────────────────────────────────────
+
+UNIT_SYMBOL: str = _CFG.unit_symbol
+
+
+def abs_temp(fahrenheit: float) -> float:
+    """Convert an absolute temperature from canonical °F to the configured unit."""
+    return _CFG.abs_temp(fahrenheit)
+
+
+def delta_temp(fahrenheit_delta: float) -> float:
+    """Convert a temperature delta from canonical °F to the configured unit."""
+    return _CFG.delta_temp(fahrenheit_delta)
 

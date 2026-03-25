@@ -4,7 +4,7 @@ This guide walks you through setting up weatherstat for your house. You'll need 
 
 ## Prerequisites
 
-- **Home Assistant** with WebSocket API access
+- **Home Assistant** with REST API access
 - **Long-lived access token** (HA → Profile → Security → Long-Lived Access Tokens)
 - **Temperature sensors** in the rooms you want to control (at least one)
 - **An outdoor temperature sensor** (or use HA's weather entity)
@@ -148,9 +148,21 @@ With this config, a bedroom with `preferred: 72, min: 70, max: 74` in Home mode 
 
 If you have window/door sensors, list them. You don't need to configure which rooms they affect — sysid learns the thermal coupling from data.
 
+### Temperature unit
+
+Set `unit: F` or `unit: C` in the `location` block. All temperatures in the config (comfort schedules, MRT parameters, control thresholds) are in this unit. Sensor values from HA must also be in this unit. Default is `F`.
+
 ### Defaults
 
 `tau: 45.0` is the envelope time constant used before sysid runs. If your house is well-insulated, 40–60 is reasonable. Poorly insulated: 10–20. This is just a starting guess; sysid replaces it with a fitted value.
+
+The `defaults` section also accepts optional control thresholds (in configured unit):
+
+- **`setpoint_min`** / **`setpoint_max`**: Absolute safety bounds for thermostat setpoints. Default: 62–78°F (17–26°C).
+- **`cautious_offset`**: When heating is on, set thermostat to current + this offset. Prevents runaway if the control loop stops. Default: 2°F (1.1°C).
+- **`max_1h_change`**: Flag predictions with 1-hour changes larger than this. Default: 5°F (2.8°C).
+- **`min_improvement`**: Minimum cost improvement over all-off to justify running HVAC. Default: 1°F (0.6°C).
+- **`cold_room_override`**: Force zone heating when a room is this far below comfort min. Default: 1°F (0.6°C).
 
 ## 6. Verify the config
 

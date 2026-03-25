@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from weatherstat.config import DATA_DIR, EFFECTOR_MAP, PREDICTION_SENSORS
+from weatherstat.config import DATA_DIR, EFFECTOR_MAP, PREDICTION_SENSORS, UNIT_SYMBOL, abs_temp, delta_temp
 from weatherstat.types import EffectorDecision, Scenario
 
 # Minimum |t-statistic| for an effector→sensor gain to be used in simulation.
@@ -24,10 +24,10 @@ from weatherstat.types import EffectorDecision, Scenario
 # when the house is warming for other reasons → OLS attributes warming to split).
 _MIN_T_STATISTIC = 1.5
 
-# Maximum plausible gain magnitude (°F/hr). Gains larger than this are almost
-# certainly confounded or from a sensor near a vent/register. Typical real
-# gains: thermostats 0.3-1.0, mini splits 1.0-1.5, blowers <0.5.
-_MAX_GAIN_MAGNITUDE = 3.0
+# Maximum plausible gain magnitude (per hour, in configured unit). Gains larger
+# than this are almost certainly confounded or from a sensor near a vent/register.
+# Typical real gains (°F/hr): thermostats 0.3-1.0, mini splits 1.0-1.5, blowers <0.5.
+_MAX_GAIN_MAGNITUDE = delta_temp(3.0)
 
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
@@ -153,7 +153,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     if n_pruned_t:
         pruned_parts.append(f"{n_pruned_t} by |t| < {_MIN_T_STATISTIC:.1f}")
     if n_pruned_mag:
-        pruned_parts.append(f"{n_pruned_mag} by |gain| > {_MAX_GAIN_MAGNITUDE:.1f}°F/hr")
+        pruned_parts.append(f"{n_pruned_mag} by |gain| > {_MAX_GAIN_MAGNITUDE:.1f}{UNIT_SYMBOL}/hr")
     if n_pruned_sign:
         pruned_parts.append(f"{n_pruned_sign} by wrong sign for mode")
     if pruned_parts:
@@ -552,7 +552,7 @@ def predict(
         else:
             solar_vec = base_solar
 
-        cur_temp = state.current_temps.get(sensor_col, 70.0)
+        cur_temp = state.current_temps.get(sensor_col, abs_temp(70.0))
 
         # Pre-compute total effector forcing: (n_scenarios, max_horizon + 1)
         # Vectorized over both scenarios AND timesteps — one slice op per effector

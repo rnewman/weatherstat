@@ -5,6 +5,8 @@ from __future__ import annotations
 from rich.text import Text
 from textual.widgets import DataTable, RichLog, Static
 
+from weatherstat.config import UNIT_SYMBOL
+
 
 class StatusHeader(Static):
     """Top status bar showing system state at a glance."""
@@ -67,7 +69,7 @@ class StatusHeader(Static):
         mode_str = "[bold red]LIVE[/]" if self._live else "[bold green]DRY-RUN[/]"
         profile_str = self._profile.upper()
 
-        out_str = f"{self._outdoor_temp:.0f}°F" if self._outdoor_temp is not None else "?"
+        out_str = f"{self._outdoor_temp:.0f}{UNIT_SYMBOL}" if self._outdoor_temp is not None else "?"
 
         row_k = f"{self._collector_rows / 1000:.0f}K" if self._collector_rows >= 1000 else str(self._collector_rows)
 
@@ -162,12 +164,12 @@ class TemperaturePanel(Static):
                 min_t, plo, phi, max_t = comfort
                 bar = _comfort_bar(temp, min_t, plo, phi, max_t)
                 band_str = f"[{min_t:.0f}-{max_t:.0f}]"
-                line = f"  {label:<22} {temp:>5.1f}°F  {band_str:>8} "
+                line = f"  {label:<22} {temp:>5.1f}{UNIT_SYMBOL}  {band_str:>8} "
                 text = Text.from_markup(line)
                 text.append_text(bar)
                 lines.append(text.markup if hasattr(text, "markup") else str(text))
             else:
-                lines.append(f"  {label:<22} {temp:>5.1f}°F")
+                lines.append(f"  {label:<22} {temp:>5.1f}{UNIT_SYMBOL}")
         self.update("\n".join(lines))
 
 
@@ -210,7 +212,7 @@ class ForecastPanel(Static):
         lines = ["[bold]Forecast[/]", line1]
         if mrt_offset is not None and abs(mrt_offset) > 0.05:
             sign = "+" if mrt_offset > 0 else ""
-            lines.append(f"  MRT offset: {sign}{mrt_offset:.1f}°F")
+            lines.append(f"  MRT offset: {sign}{mrt_offset:.1f}{UNIT_SYMBOL}")
         self.update("\n".join(lines))
 
 
@@ -278,7 +280,7 @@ class EffectorPanel(Static):
 
                 parts = [display_mode]
                 if target is not None:
-                    parts.append(f"({target:.0f}°F)")
+                    parts.append(f"({target:.0f}{UNIT_SYMBOL})")
                 delay = d.get("delay_steps", 0)
                 dur = d.get("duration_steps")
                 if delay:
@@ -387,7 +389,7 @@ class HistoryPanel(DataTable):
             total = f"{row.get('total_cost', 0):.1f}"
             comfort = f"{row.get('comfort_cost', 0):.1f}"
             energy = f"{row.get('energy_cost', 0):.2f}"
-            outdoor = f"{row.get('outdoor_temp', 0):.0f}°F" if row.get("outdoor_temp") else "?"
+            outdoor = f"{row.get('outdoor_temp', 0):.0f}{UNIT_SYMBOL}" if row.get("outdoor_temp") else "?"
             self.add_row(time_str, mode, total, comfort, energy, outdoor)
 
 

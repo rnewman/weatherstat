@@ -400,3 +400,60 @@ class TestConfigDriven:
                 assert isinstance(eff.energy_cost, dict), (
                     f"{eff.name}: binary should have dict energy_cost"
                 )
+
+
+# ── Temperature unit conversion tests ────────────────────────────────────
+
+
+class TestTemperatureUnits:
+    """Verify unit conversion helpers produce correct results."""
+
+    def _make_config(self, unit: str) -> "WeatherstatConfig":
+        from weatherstat.yaml_config import LocationConfig, WeatherstatConfig
+
+        loc = LocationConfig(latitude=0, longitude=0, elevation=0, timezone="UTC", unit=unit)
+        return WeatherstatConfig(
+            location=loc,
+            temp_sensors={},
+            humidity_sensors={},
+            effectors={},
+            state_sensors={},
+            power_sensors={},
+            health_checks=[],
+            windows={},
+            weather_entity="weather.test",
+            constraints=[],
+            notification_target="notify.test",
+        )
+
+    def test_fahrenheit_identity(self) -> None:
+        """Fahrenheit config should return values unchanged."""
+        cfg = self._make_config("F")
+        assert cfg.abs_temp(62) == 62.0
+        assert cfg.delta_temp(5.0) == 5.0
+        assert cfg.delta_scale == 1.0
+        assert cfg.unit_symbol == "°F"
+
+    def test_celsius_abs_temp(self) -> None:
+        """Absolute temp conversion: 32°F = 0°C, 212°F = 100°C."""
+        cfg = self._make_config("C")
+        assert cfg.abs_temp(32) == pytest.approx(0.0)
+        assert cfg.abs_temp(212) == pytest.approx(100.0)
+        assert cfg.abs_temp(62) == pytest.approx(16.667, abs=0.01)
+        assert cfg.abs_temp(78) == pytest.approx(25.556, abs=0.01)
+
+    def test_celsius_delta_temp(self) -> None:
+        """Delta conversion: 9°F delta = 5°C delta."""
+        cfg = self._make_config("C")
+        assert cfg.delta_temp(9) == pytest.approx(5.0)
+        assert cfg.delta_temp(1.0) == pytest.approx(5.0 / 9.0)
+        assert cfg.delta_scale == pytest.approx(5.0 / 9.0)
+        assert cfg.unit_symbol == "°C"
+
+    def test_default_unit_is_fahrenheit(self) -> None:
+        """Config without explicit unit should default to Fahrenheit."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        assert cfg.location.unit == "F"
+        assert cfg.unit_symbol == "°F"

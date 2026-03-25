@@ -21,6 +21,7 @@ class LocationConfig:
     longitude: float
     elevation: float
     timezone: str
+    unit: str = "F"  # "F" or "C"
 
 
 @dataclass(frozen=True)
@@ -197,12 +198,41 @@ class WeatherstatConfig:
     constraints: list[ConstraintSchedule]
     notification_target: str
     default_tau: float = 45.0
+    # Control parameters — optional overrides (in configured unit), None = built-in default
+    setpoint_min: float | None = None  # absolute minimum setpoint (default: 62°F / 17°C)
+    setpoint_max: float | None = None  # absolute maximum setpoint (default: 78°F / 26°C)
+    cautious_offset: float | None = None  # setpoint offset above/below current (default: 2°F / 1.1°C)
+    max_1h_change: float | None = None  # sanity check: max predicted 1h change (default: 5°F / 2.8°C)
+    min_improvement: float | None = None  # min cost improvement to justify HVAC (default: 1°F / 0.6°C)
+    cold_room_override: float | None = None  # force heating when this far below min (default: 1°F / 0.6°C)
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     window_open_offset: tuple[float, float] = (-3.0, 2.0)
+
+    # ── Temperature unit helpers ────────────────────────────────────
+
+    @property
+    def unit_symbol(self) -> str:
+        """Display symbol: '°F' or '°C'."""
+        return "°F" if self.location.unit == "F" else "°C"
+
+    @property
+    def delta_scale(self) -> float:
+        """Multiplier for temperature deltas: 1.0 for °F, 5/9 for °C."""
+        return 1.0 if self.location.unit == "F" else 5.0 / 9.0
+
+    def abs_temp(self, fahrenheit: float) -> float:
+        """Convert an absolute temperature from canonical °F to the configured unit."""
+        if self.location.unit == "F":
+            return fahrenheit
+        return (fahrenheit - 32.0) * 5.0 / 9.0
+
+    def delta_temp(self, fahrenheit_delta: float) -> float:
+        """Convert a temperature delta from canonical °F to the configured unit."""
+        return fahrenheit_delta * self.delta_scale
 
     # ── Derived properties (primary) ─────────────────────────────────
 
@@ -492,6 +522,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         longitude=loc["longitude"],
         elevation=loc["elevation"],
         timezone=loc["timezone"],
+        unit=str(loc.get("unit", "F")).upper(),
     )
 
     # Temperature sensors
@@ -650,6 +681,10 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     defaults = data.get("defaults", {})
     default_tau = float(defaults.get("tau", 45.0))
 
+    def _opt_float(key: str) -> float | None:
+        v = defaults.get(key)
+        return float(v) if v is not None else None
+
     return WeatherstatConfig(
         location=location,
         temp_sensors=temp_sensors,
@@ -663,6 +698,12 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         constraints=constraint_list,
         notification_target=data["notifications"]["target"],
         default_tau=default_tau,
+        setpoint_min=_opt_float("setpoint_min"),
+        setpoint_max=_opt_float("setpoint_max"),
+        cautious_offset=_opt_float("cautious_offset"),
+        max_1h_change=_opt_float("max_1h_change"),
+        min_improvement=_opt_float("min_improvement"),
+        cold_room_override=_opt_float("cold_room_override"),
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
         mrt_correction=mrt_correction,

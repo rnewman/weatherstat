@@ -30,6 +30,7 @@ from weatherstat.config import (
     ADVISORY_STATE_FILE,
     HA_TOKEN,
     HA_URL,
+    UNIT_SYMBOL,
 )
 
 if TYPE_CHECKING:
@@ -186,7 +187,7 @@ def evaluate_window_opportunities(
 
         parts = [f"{action} {window_name} window"]
         if not is_open:
-            parts.append(f"({state.outdoor_temp:.0f}°F outside)")
+            parts.append(f"({state.outdoor_temp:.0f}{UNIT_SYMBOL} outside)")
         if comfort_improvement > 0.01:
             parts.append(f"comfort +{comfort_improvement:.2f}")
         if energy_saving > 0.01:

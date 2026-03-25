@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 
-from weatherstat.config import DATA_DIR
+from weatherstat.config import DATA_DIR, UNIT_SYMBOL, delta_temp
 from weatherstat.extract import load_collector_snapshots
 from weatherstat.yaml_config import load_config
 
@@ -524,7 +524,7 @@ def _preprocess(
 
 # ── Stage 2: Regression per sensor ────────────────────────────────────────
 
-_GAIN_THRESHOLD = 0.05  # °F/hr — below this, gain is negligible
+_GAIN_THRESHOLD = delta_temp(0.05)  # per hour — below this, gain is negligible
 _T_STAT_THRESHOLD = 2.0
 _MIN_REGRESSION_ROWS = 500  # need substantial data for reliable regression
 _MIN_INTERACTION_ROWS = 100  # min co-open rows for window interaction terms
@@ -919,7 +919,7 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
                 print(f"  {sensor.name}: {len(sig_gains)} significant effectors")
                 for g in sig_gains:
                     print(
-                        f"    {g.effector}: {g.gain_f_per_hour:+.3f} °F/hr,"
+                        f"    {g.effector}: {g.gain_f_per_hour:+.3f} {UNIT_SYMBOL}/hr,"
                         f" lag={g.best_lag_minutes:.0f}min, t={g.t_statistic:.1f}"
                     )
 
@@ -1016,7 +1016,7 @@ def print_report(result: SysIdResult) -> None:
                 print(f"    {pair:20s}: β={beta:.6f}  (interaction)")
 
     # Effector x sensor gain matrix
-    print("\n── Effector × Sensor Gain Matrix (°F/hr, delay in parens) ──")
+    print(f"\n── Effector × Sensor Gain Matrix ({UNIT_SYMBOL}/hr, delay in parens) ──")
     sensor_names = [s.name for s in result.sensors]
     eff_names = list(dict.fromkeys(g.effector for g in result.effector_sensor_gains))
 
@@ -1048,7 +1048,7 @@ def print_report(result: SysIdResult) -> None:
         print(row)
 
     # Solar profiles (only sensors with significant solar gain)
-    print("\n── Solar Gain Profiles (°F/hr by hour, significant only) ──")
+    print(f"\n── Solar Gain Profiles ({UNIT_SYMBOL}/hr by hour, significant only) ──")
     solar_by_sensor: dict[str, list[SolarGainProfile]] = {}
     for sg in result.solar_gains:
         solar_by_sensor.setdefault(sg.sensor, []).append(sg)
