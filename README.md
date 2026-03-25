@@ -1,5 +1,7 @@
 # Weatherstat
 
+<img width="1521" height="764" alt="Screenshot 2026-03-24 at 8 27 05 PM" src="https://github.com/user-attachments/assets/425b1223-250a-41db-b931-08cc9fb1c4d8" />
+
 ## Docs
 
 * [Onboarding](docs/onboarding.md)
