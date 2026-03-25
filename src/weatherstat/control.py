@@ -124,7 +124,8 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
                 e.end_hour,
                 RoomComfort(
                     constraint.label,
-                    e.preferred,
+                    e.preferred_lo,
+                    e.preferred_hi,
                     e.min_temp,
                     e.max_temp,
                     e.cold_penalty,
@@ -180,7 +181,8 @@ def adjust_schedules_for_windows(
                 e.end_hour,
                 RoomComfort(
                     e.comfort.label,
-                    e.comfort.preferred,  # preferred unchanged — window doesn't change ideal
+                    e.comfort.preferred_lo,  # preferred unchanged — window doesn't change ideal
+                    e.comfort.preferred_hi,
                     e.comfort.min_temp + min_offset,
                     e.comfort.max_temp + max_offset,
                     e.comfort.cold_penalty,
@@ -231,9 +233,12 @@ def apply_comfort_profile(
     """
     if profile is None:
         return schedules
-    if profile.preferred_offset == 0.0 and profile.min_offset == 0.0 and profile.max_offset == 0.0:
+    no_offsets = profile.preferred_offset == 0.0 and profile.min_offset == 0.0 and profile.max_offset == 0.0
+    if no_offsets and profile.penalty_scale == 1.0 and profile.preferred_widen == 0.0:
         return schedules
 
+    ps = profile.penalty_scale
+    hw = profile.preferred_widen / 2.0  # half-width of band expansion
     adjusted: list[ComfortSchedule] = []
     for schedule in schedules:
         new_entries = tuple(
@@ -242,11 +247,12 @@ def apply_comfort_profile(
                 e.end_hour,
                 RoomComfort(
                     e.comfort.label,
-                    e.comfort.preferred + profile.preferred_offset,
+                    e.comfort.preferred_lo + profile.preferred_offset - hw,
+                    e.comfort.preferred_hi + profile.preferred_offset + hw,
                     e.comfort.min_temp + profile.min_offset,
                     e.comfort.max_temp + profile.max_offset,
-                    e.comfort.cold_penalty,
-                    e.comfort.hot_penalty,
+                    e.comfort.cold_penalty * ps,
+                    e.comfort.hot_penalty * ps,
                 ),
             )
             for e in schedule.entries
@@ -299,7 +305,8 @@ def apply_mrt_correction(
                 e.end_hour,
                 RoomComfort(
                     e.comfort.label,
-                    e.comfort.preferred + sensor_offset,
+                    e.comfort.preferred_lo + sensor_offset,
+                    e.comfort.preferred_hi + sensor_offset,
                     e.comfort.min_temp + sensor_offset,
                     e.comfort.max_temp + sensor_offset,
                     e.comfort.cold_penalty,
@@ -368,11 +375,12 @@ def compute_comfort_cost(
             if pred_temp is None:
                 continue
 
-            # Continuous cost: quadratic deviation from preferred
-            if pred_temp < comfort.preferred:
-                cost += (comfort.preferred - pred_temp) ** 2 * comfort.cold_penalty * weight
-            elif pred_temp > comfort.preferred:
-                cost += (pred_temp - comfort.preferred) ** 2 * comfort.hot_penalty * weight
+            # Continuous cost: quadratic deviation from preferred band.
+            # Zero cost within [preferred_lo, preferred_hi] (dead band).
+            if pred_temp < comfort.preferred_lo:
+                cost += (comfort.preferred_lo - pred_temp) ** 2 * comfort.cold_penalty * weight
+            elif pred_temp > comfort.preferred_hi:
+                cost += (pred_temp - comfort.preferred_hi) ** 2 * comfort.hot_penalty * weight
 
             # Hard rails: steep additional penalty outside min/max
             if pred_temp < comfort.min_temp:
@@ -411,10 +419,10 @@ def compute_comfort_cost_by_sensor(
             if pred_temp is None:
                 continue
 
-            if pred_temp < comfort.preferred:
-                sensor_cost += (comfort.preferred - pred_temp) ** 2 * comfort.cold_penalty * weight
-            elif pred_temp > comfort.preferred:
-                sensor_cost += (pred_temp - comfort.preferred) ** 2 * comfort.hot_penalty * weight
+            if pred_temp < comfort.preferred_lo:
+                sensor_cost += (comfort.preferred_lo - pred_temp) ** 2 * comfort.cold_penalty * weight
+            elif pred_temp > comfort.preferred_hi:
+                sensor_cost += (pred_temp - comfort.preferred_hi) ** 2 * comfort.hot_penalty * weight
 
             if pred_temp < comfort.min_temp:
                 delta = comfort.min_temp - pred_temp
@@ -559,33 +567,48 @@ def _regulating_sweep_options(
     sensor_col = eff.name.removeprefix("mini_split_") + "_temp"
     options: list[EffectorDecision] = [EffectorDecision(eff.name)]
 
-    # Find preferred temperature for this effector's sensor
-    preferred: float | None = None
+    # Find preferred band for this effector's sensor
+    pref_lo: float | None = None
+    pref_hi: float | None = None
     for sched in schedules:
         if sched.sensor == sensor_col:
             comfort = sched.comfort_at(base_hour)
             if comfort is not None:
-                preferred = comfort.preferred
+                pref_lo = comfort.preferred_lo
+                pref_hi = comfort.preferred_hi
             break
 
-    if preferred is None:
+    if pref_lo is None or pref_hi is None:
         return options
 
-    # Derive mode from room temp vs preferred (default heat — safer in winter)
+    # Derive mode and target from room temp vs preferred band.
+    # If room is inside the dead band, no action needed — skip ON option.
     room_temp = (current_temps or {}).get(sensor_col)
-    mode = ("cool" if room_temp > preferred else "heat") if room_temp is not None else "heat"
+    if room_temp is not None and pref_lo <= room_temp <= pref_hi:
+        return options  # room is in the preferred band — effector not needed
+
+    if room_temp is not None:
+        if room_temp > pref_hi:
+            mode = "cool"
+            target = pref_hi  # cool toward upper edge of band
+        else:
+            mode = "heat"
+            target = pref_lo  # heat toward lower edge of band
+    else:
+        mode = "heat"
+        target = pref_lo
 
     # Skip on-option if the effector would be idle: room already past target
     # by more than the proportional band.  Receding horizon (15-min
     # re-evaluation) will add it back when the room actually needs it.
     p_band = eff.proportional_band
     if room_temp is not None:
-        if mode == "heat" and room_temp > preferred + p_band:
+        if mode == "heat" and room_temp > target + p_band:
             return options  # room well above target — effector would be idle
-        if mode == "cool" and room_temp < preferred - p_band:
+        if mode == "cool" and room_temp < target - p_band:
             return options  # room well below target — effector would be idle
 
-    options.append(EffectorDecision(eff.name, mode=mode, target=round(preferred, 1)))
+    options.append(EffectorDecision(eff.name, mode=mode, target=round(target, 1)))
 
     # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
     if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
@@ -1261,6 +1284,10 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             ("max", active_profile.max_offset),
         ]
         offsets = [f"{lbl} {v:+.0f}" for lbl, v in offset_items if v]
+        if active_profile.preferred_widen:
+            offsets.append(f"band ±{active_profile.preferred_widen / 2:.0f}")
+        if active_profile.penalty_scale != 1.0:
+            offsets.append(f"penalty ×{active_profile.penalty_scale:.1f}")
         if offsets:
             parts.append(f"({', '.join(offsets)})")
         print(f"  Comfort:     {' '.join(parts)}")

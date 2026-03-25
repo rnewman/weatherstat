@@ -382,13 +382,14 @@ class WeatherstatApp(App):
 
             # Extract comfort bounds from adjusted schedules
             now_hour = datetime.now().hour
-            comfort: dict[str, tuple[float, float, float]] = {}
+            comfort: dict[str, tuple[float, float, float, float]] = {}
             for s in schedules:
                 c = s.comfort_at(now_hour)
                 if c is not None:
-                    comfort[s.label] = (c.min_temp, c.preferred, c.max_temp)
+                    comfort[s.label] = (c.min_temp, c.preferred_lo, c.preferred_hi, c.max_temp)
 
             self.query_one(TemperaturePanel).set_data(temps, comfort, SENSOR_LABELS)
+            self.query_one(EffectorPanel).set_current_temps(temps)
 
             # Window states
             windows: dict[str, bool] = {}
@@ -584,6 +585,8 @@ class WeatherstatApp(App):
             )
             self._log(f"[profile] Switched to {next_profile}")
             self.call_from_thread(self.query_one(StatusHeader).set_state, profile=next_profile)
+            # Immediately re-render comfort bars with new profile
+            self.call_from_thread(self._refresh_temps)
 
         except Exception as e:
             self._log(f"[profile] [red]Error: {e}[/]")

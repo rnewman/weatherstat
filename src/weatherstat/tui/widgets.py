@@ -84,8 +84,14 @@ class StatusHeader(Static):
         self.update(f"{line1}\n{line2}")
 
 
-def _comfort_bar(current: float, min_t: float, preferred: float, max_t: float, width: int = 16) -> Text:
-    """Render a comfort-position bar showing where temp sits in the band."""
+def _comfort_bar(
+    current: float, min_t: float, pref_lo: float, pref_hi: float, max_t: float, width: int = 16,
+) -> Text:
+    """Render a comfort-position bar showing where temp sits in the band.
+
+    Three zones: outside [min, max] = red, within [min, max] but outside
+    [pref_lo, pref_hi] = yellow/dim green, within preferred band = bright green.
+    """
     margin = 2.0
     lo = min_t - margin
     hi = max_t + margin
@@ -97,6 +103,8 @@ def _comfort_bar(current: float, min_t: float, preferred: float, max_t: float, w
     pos = max(0, min(width - 1, pos))
     min_pos = int((min_t - lo) / rng * width)
     max_pos = int((max_t - lo) / rng * width)
+    plo_pos = int((pref_lo - lo) / rng * width)
+    phi_pos = int((pref_hi - lo) / rng * width)
 
     bar = Text()
     for i in range(width):
@@ -110,10 +118,12 @@ def _comfort_bar(current: float, min_t: float, preferred: float, max_t: float, w
         if i == pos:
             if current < min_t or current > max_t:
                 bar.append(char, style="bold red")
-            elif abs(current - min_t) < 1.0 or abs(current - max_t) < 1.0:
+            elif current < pref_lo or current > pref_hi:
                 bar.append(char, style="bold yellow")
             else:
                 bar.append(char, style="bold green")
+        elif plo_pos <= i <= phi_pos:
+            bar.append(char, style="green")
         elif min_pos <= i <= max_pos:
             bar.append(char, style="dim green")
         else:
@@ -125,16 +135,17 @@ def _comfort_bar(current: float, min_t: float, preferred: float, max_t: float, w
 class TemperaturePanel(Static):
     """Room temperatures with comfort bars."""
 
+    # comfort tuple: (min, pref_lo, pref_hi, max)
     def __init__(self) -> None:
         super().__init__("", classes="panel")
         self._temps: dict[str, float] = {}
-        self._comfort: dict[str, tuple[float, float, float]] = {}  # label -> (min, preferred, max)
+        self._comfort: dict[str, tuple[float, float, float, float]] = {}
         self._labels: dict[str, str] = {}  # sensor_col -> label
 
     def set_data(
         self,
         temps: dict[str, float],
-        comfort: dict[str, tuple[float, float, float]],
+        comfort: dict[str, tuple[float, float, float, float]],
         labels: dict[str, str],
     ) -> None:
         self._temps = temps
@@ -148,8 +159,8 @@ class TemperaturePanel(Static):
             label = self._labels.get(sensor_col, sensor_col.removesuffix("_temp"))
             comfort = self._comfort.get(label)
             if comfort:
-                min_t, pref, max_t = comfort
-                bar = _comfort_bar(temp, min_t, pref, max_t)
+                min_t, plo, phi, max_t = comfort
+                bar = _comfort_bar(temp, min_t, plo, phi, max_t)
                 band_str = f"[{min_t:.0f}-{max_t:.0f}]"
                 line = f"  {label:<22} {temp:>5.1f}°F  {band_str:>8} "
                 text = Text.from_markup(line)
@@ -210,12 +221,17 @@ class EffectorPanel(Static):
         super().__init__("", classes="panel")
         self._decisions: list[dict] = []
         self._command_targets: dict[str, float] = {}
+        self._current_temps: dict[str, float] = {}
         self._costs: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._baseline_cost: float | None = None
         self._overrides: dict[str, str] = {}  # effector_name -> description
 
     def set_overrides(self, overrides: dict[str, str]) -> None:
         self._overrides = overrides
+        self._refresh()
+
+    def set_current_temps(self, temps: dict[str, float]) -> None:
+        self._current_temps = temps
         self._refresh()
 
     def set_data(
@@ -245,9 +261,24 @@ class EffectorPanel(Static):
             if mode == "off":
                 line = f"  {short_name:<18} [dim]OFF[/]"
             else:
-                parts = [f"[bold green]{mode.upper()}[/]"]
+                # Distinguish active heating/cooling from mode-only (standby).
+                # A thermostat in "heat" mode with setpoint below room temp isn't
+                # actually heating — it's on standby as a safety net.
+                room_temp = self._current_temps.get(f"{name}_temp")
+                actively_working = (
+                    target is None
+                    or room_temp is None
+                    or not ((mode == "heat" and target <= room_temp) or (mode == "cool" and target >= room_temp))
+                )
+
+                if actively_working:
+                    display_mode = f"[bold green]{mode.upper()}[/]"
+                else:
+                    display_mode = f"[dim]{mode.upper()}[/]"
+
+                parts = [display_mode]
                 if target is not None:
-                    parts.append(f"-> {target:.0f}°F")
+                    parts.append(f"({target:.0f}°F)")
                 delay = d.get("delay_steps", 0)
                 dur = d.get("duration_steps")
                 if delay:

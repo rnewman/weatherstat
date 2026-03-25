@@ -88,17 +88,19 @@ class WeatherState:
 class RoomComfort:
     """Comfort profile for a single constraint label (sensor).
 
-    preferred: ideal temperature — continuous cost in both directions.
+    preferred_lo/preferred_hi: dead band — zero cost within this range.
+    When equal, behaves as a point target (backward compatible).
     min_temp/max_temp: hard rails with steep additional penalty (10×).
-    cold_penalty/hot_penalty: asymmetric weights for deviation from preferred.
+    cold_penalty/hot_penalty: asymmetric weights for deviation from preferred band.
     """
 
     label: str  # "bedroom", "office", "upstairs", "downstairs"
-    preferred: float  # ideal temperature (°F)
+    preferred_lo: float  # lower edge of preferred band (°F)
+    preferred_hi: float  # upper edge (= preferred_lo for point target)
     min_temp: float  # hard lower bound (°F)
     max_temp: float  # hard upper bound (°F)
-    cold_penalty: float = 2.0  # weight for being below preferred
-    hot_penalty: float = 1.0  # weight for being above preferred
+    cold_penalty: float = 2.0  # weight for being below preferred band
+    hot_penalty: float = 1.0  # weight for being above preferred band
 
 
 @dataclass(frozen=True)

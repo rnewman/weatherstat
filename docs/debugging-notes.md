@@ -179,6 +179,14 @@ Even after noise reduction, the weather control features (ΔT², wind×ΔT, dT_o
 
 During investigation, discovered that `thermostat_downstairs → living_room_climate_temp` had a negative gain (−0.087°F/hr, t=−1.69) that passed the t-stat filter. A negative gain from a heating-only effector is physical nonsense — it says "turning on the heat cools the living room." Added a mode-direction sign filter in `simulator.load_sim_params()`: heating-only effectors (`supported_modes: [heat]`) cannot have negative gains, and cooling-only effectors cannot have positive gains.
 
+### Why this only affects Stage 2
+
+Stage 1 (tau fitting) fits `T(t) = T_out + (T_0 - T_out) × exp(-t/τ)` via `scipy.curve_fit` on **raw temperature curves**, not derivatives. Fitting a smooth model to noisy data is integration-like: noise averages out. Stage 2 differentiates first, then regresses — differentiation amplifies noise. So the two stages have opposite noise sensitivity, and only Stage 2 needed the smoothed derivative.
+
+### Autocorrelation from smoothing
+
+The 35-minute smoothing kernel means adjacent derivative estimates share data, introducing positive autocorrelation. OLS standard errors assume independence, so t-statistics are slightly overstated — the effective sample size is roughly N/3 rather than N. With 11,800 rows this still leaves ~4,000 effective observations, more than enough for a ~50-feature regression. The t-stats of 5–10 would remain well above significance even after correction.
+
 ---
 
 ## Diagnostic Playbook

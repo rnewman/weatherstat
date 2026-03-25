@@ -107,7 +107,8 @@ class WindowConfig:
 class ComfortEntry:
     start_hour: int
     end_hour: int
-    preferred: float  # ideal temperature — continuous cost in both directions
+    preferred_lo: float  # lower edge of preferred dead band
+    preferred_hi: float  # upper edge (= preferred_lo for point target)
     min_temp: float  # hard rail — steep additional penalty below this
     max_temp: float  # hard rail — steep additional penalty above this
     cold_penalty: float = 2.0
@@ -120,12 +121,22 @@ class ComfortProfile:
 
     When active, offsets are added to every schedule entry's preferred/min/max temps.
     An empty profile (all zeros) means "use base schedules unchanged".
+
+    penalty_scale multiplies cold_penalty and hot_penalty. Use < 1.0 to make the
+    optimizer care less about reaching preferred while still respecting hard rails
+    (min/max). With penalty_scale=0.1, the optimizer won't spend energy chasing
+    preferred but will still act when temps approach min/max boundaries.
+
+    preferred_widen expands the preferred point into a dead band: preferred becomes
+    [preferred - widen/2, preferred + widen/2]. Within the band, comfort cost is zero.
     """
 
     name: str
     preferred_offset: float = 0.0
+    preferred_widen: float = 0.0
     min_offset: float = 0.0
     max_offset: float = 0.0
+    penalty_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -575,8 +586,10 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         comfort_profiles[prof_name] = ComfortProfile(
             name=prof_name,
             preferred_offset=float(prof_data.get("preferred_offset", 0.0)),
+            preferred_widen=float(prof_data.get("preferred_widen", 0.0)),
             min_offset=float(prof_data.get("min_offset", 0.0)),
             max_offset=float(prof_data.get("max_offset", 0.0)),
+            penalty_scale=float(prof_data.get("penalty_scale", 1.0)),
         )
 
     # MRT correction (operative temperature adjustment for wall surface effects)
@@ -596,12 +609,17 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             hours = entry["hours"]
             min_t = float(entry["min"])
             max_t = float(entry["max"])
-            # Default preferred to midpoint if not specified (backward compat)
-            preferred = float(entry.get("preferred", (min_t + max_t) / 2))
+            # preferred: float (point target) or [lo, hi] (dead band)
+            pref_raw = entry.get("preferred", (min_t + max_t) / 2)
+            if isinstance(pref_raw, list):
+                pref_lo, pref_hi = float(pref_raw[0]), float(pref_raw[1])
+            else:
+                pref_lo = pref_hi = float(pref_raw)
             entries.append(ComfortEntry(
                 start_hour=hours[0],
                 end_hour=hours[1],
-                preferred=preferred,
+                preferred_lo=pref_lo,
+                preferred_hi=pref_hi,
                 min_temp=min_t,
                 max_temp=max_t,
                 cold_penalty=float(entry.get("cold_penalty", 2.0)),

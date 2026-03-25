@@ -118,7 +118,31 @@ constraints:
 
 Start simple: one 24-hour schedule per room with `preferred`, `min`, and `max`. Refine later.
 
+**`preferred` can be a point or a range.** A point (`preferred: 72`) means the optimizer always gently pushes toward 72°F. A range (`preferred: [71, 73]`) defines a dead band — zero cost anywhere within the range, quadratic cost outside it. Use a small range (±0.5°F) to prevent the optimizer from wasting energy chasing a single degree, or a wider range for rooms you care less about.
+
+**`cold_penalty` and `hot_penalty`** weight how much you care about deviations in each direction. Default: cold=2.0, hot=1.0 (you care twice as much about being too cold). Set `hot_penalty: 0.3` for a room where you don't mind it being warm.
+
 **Not every sensor needs a constraint.** A constraint means "I want the system to actively optimize this sensor." Sensors without constraints are still collected and used by sysid — they just don't drive HVAC decisions.
+
+### Comfort profiles (optional)
+
+Profiles let you shift comfort targets globally — for example, an Away mode that widens the acceptable range:
+
+```yaml
+constraints:
+  comfort_entity: input_select.thermostat_mode  # HA entity controlling active profile
+  profiles:
+    Home: {}                    # base schedules unchanged
+    Away:
+      preferred_offset: 0       # shift preferred band (°F)
+      preferred_widen: 6        # expand preferred into ±3°F dead band
+      min_offset: -2            # lower hard floor by 2°F
+      max_offset: 1             # raise hard ceiling by 1°F
+```
+
+With this config, a bedroom with `preferred: 72, min: 70, max: 74` in Home mode becomes preferred band [69, 75], min=68, max=75 in Away. Any temperature in the dead band has zero cost — the system won't waste energy cooling to 69 only to heat back up later.
+
+`penalty_scale` is also available (multiplies all cold/hot penalties), but `preferred_widen` is usually the right tool — it directly expresses "I don't care where in this range the temperature is."
 
 ### Windows (optional)
 

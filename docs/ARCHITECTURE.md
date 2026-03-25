@@ -156,7 +156,7 @@ Fits all thermal model parameters from observed collector data using a two-stage
 
 The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). Solar and window features are pre-scaled by their standard deviation so the penalty falls proportionally; effector features are left in raw scale for full regularization against confounded gains. T-statistics flag negligible gains (|gain| < 0.05°F/hr AND |t-stat| < 2.0).
 
-**Smoothed derivative:** The dT/dt computation uses a smoothed central difference rather than naive 5-minute intervals. Temperature is first smoothed with a centered rolling mean (default: 15-minute half-window), then differentiated over the smoothed values. This is critical: naive 5-minute central differences amplify sensor noise (~±0.1°F jitter) into ~10°F/hr of derivative noise, drowning effector signals of ~0.3°F/hr. The smoothed derivative reduces noise ~5× while preserving signals on the timescale of effector lags (≥15 min). See `docs/debugging-notes.md` § "Derivative Noise" for the full analysis.
+**Smoothed derivative:** The dT/dt computation uses a smoothed central difference rather than naive 5-minute intervals. Temperature is first smoothed with a centered rolling mean (default: 15-minute half-window), then differentiated over the smoothed values. This is critical: naive 5-minute central differences amplify sensor noise (~±0.1°F jitter) into ~10°F/hr of derivative noise, drowning effector signals of ~0.3°F/hr. The smoothed derivative reduces noise ~5× while preserving signals on the timescale of effector lags (≥15 min). Note: only Stage 2 needs this — Stage 1 (tau fitting) operates on raw temperature curves via `curve_fit`, where noise averages out naturally (integration suppresses noise; differentiation amplifies it). The smoothing introduces mild positive autocorrelation (~35-min kernel), reducing effective sample size by roughly 3×, but this is negligible with 10K+ snapshots. See `docs/debugging-notes.md` § "Derivative Noise" for the full analysis.
 
 **Gain filtering at load time:** The simulator applies additional filters when loading gains from `thermal_params.json`:
 - **t-statistic threshold** (|t| ≥ 1.5): prunes gains that are likely confounded (e.g., bedroom split correlates with other warming sources but doesn't cause it). Without this, OLS attributes correlated warming to whichever effector happens to be active.
@@ -209,16 +209,18 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 
 **Scoring:**
 
-Two-layer comfort cost model:
-1. **Continuous:** Quadratic penalty for any deviation from `preferred` temperature, weighted asymmetrically by `cold_penalty` (below preferred) and `hot_penalty` (above preferred). This gives the optimizer a gradient everywhere — it always prefers temperatures closer to preferred, not just "anywhere in the band."
+Two-layer comfort cost model with dead-band preferred:
+1. **Preferred band (dead band):** `preferred` can be a point (`72`) or a range (`[71, 73]`). Zero cost within the band; quadratic penalty outside it, weighted by `cold_penalty` (below) and `hot_penalty` (above). This prevents the optimizer from wasting energy chasing a single degree — any temperature within the band is equally acceptable.
 2. **Hard rails:** Steep additional penalty (10×) for exceeding `min`/`max` bounds.
 
 ```
 score = sum over (sensors, horizons) of:
-    (T_predicted - preferred)^2 * penalty_weight        # continuous
-  + hard_rail_penalty(T_predicted, min, max)             # steep outside bounds
+    dead_band_cost(T_predicted, preferred_lo, preferred_hi)  # zero inside band
+  + hard_rail_penalty(T_predicted, min, max)                  # steep outside bounds
   + energy_cost(actions, duration)
 ```
+
+**Comfort profiles** (Home/Away) apply global offsets to all schedules: `preferred_offset` shifts the band, `preferred_widen` expands it (±half into a dead band), `min_offset`/`max_offset` shift hard rails, and `penalty_scale` multiplies penalties. A typical Away profile widens the preferred band so the optimizer maintains safety limits without spending energy on optimization within the band.
 
 Window-open states widen the comfort band to avoid fighting ventilation.
 
