@@ -12,27 +12,29 @@
 
 Weatherstat is a physics-based smart climate controller for houses where conventional thermostats don't work well — particularly those with high thermal mass (hydronic floor heating, radiant panels, masonry walls) where the lag between turning on the heat and feeling the warmth is measured in hours, not minutes.
 
+Weatherstat provides fine-grained commands and a comprehensive terminal UI.
+
 I built this because my home's conventional climate system — two thermostats driving hydronic heat (under-floor on one level, in-wall on another), two mini-splits primarily for cooling, and six in-wall blowers with manual two-speed switches, not to mention seemingly countless windows and shades — left my rooms a patchwork of too cold, too hot, and sometimes both in the same day.
 
 Weatherstat started out as an ML experiment: could a decision tree model do a good job of controlling these components?
 
-The answer was no, but it ended up with an [architecture](docs/ARCHITECTURE.md) that could.
+The answer was no, but I ended up with an [architecture](docs/ARCHITECTURE.md) that could.
 
 ## The problems
 
 A conventional thermostat is a reactive control system: it measures the temperature, compares it to a setpoint, and turns the heat on or off. This fails badly in at least four ways.
 
-Firstly, it delivers a poor experience for high-lag systems. Forced-air HVAC systems can respond quite quickly, but consider hydronic floor heating. You set the thermostat to 71°F. The room drops to 70°F. The thermostat calls for heat. Hot water starts flowing through the floor — but the thermal mass of the floor means the room won't warm up for 45–90 minutes. By the time the room reaches 71°F and the thermostat tells the heater to stop heating and pumping water, the floor and system have stored enough heat that the air temperature overshoots to 73°F. The thermostat turns off, but the room keeps warming. Then it cools slowly over hours. By the time it's cold again, the cycle repeats with the same overshoot. The result: wide temperature swings, wasted energy, and the thermostat is always fighting the last war.
+Firstly, it delivers a poor experience for high-lag systems. Forced-air HVAC systems can respond quite quickly, but hydronic floor heating cannot. You set the thermostat to 71°F. The room drops to 70°F. The thermostat calls for heat. Hot water starts flowing through the floor — but the thermal mass of the floor means the room won't warm up for 45–90 minutes. By the time the room reaches 71°F and the thermostat tells the heater to stop heating and pumping water, the floor and system have stored enough heat that, over the next hour, the air temperature overshoots to 73°F. By the time the room is cold again, so is the hydronic system, so the cycle repeats with the same overshoot. The result: wide temperature swings, wasted energy, and the thermostat is always fighting the last war.
 
-Secondly, it ignores insolation. You get up and it's cold, so you set the thermostat to 72°. It begins warming up, finally getting up to temperature around 11am. The hydronic heat system continues to dump heat into the air for a couple more hours… but at this point the sun is fully up and is baking the south-facing windows. By 4 or 5pm, the living room is a toasty 77°. The thermostat will stay off until the living room cools, guaranteeing a cold-start problem again the following morning.
+Secondly, it ignores insolation. You get up and it's cold, so you set the thermostat to 72° — maybe you have it on a schedule. The house begins warming up, finally getting up to temperature around 11am. The hydronic heat system continues to dump heat into the air for a couple more hours… but at this point the sun is fully up and is baking the south-facing windows. By 4 or 5pm, the living room is a toasty 77°. The thermostat will stay off until the living room cools, guaranteeing a cold-start problem again the following morning. If your thermostat had only known that today would be a sunny day, perhaps it would have only heated the basement, keeping the living room at the lowest acceptable temperature with the expectation that the sun would finish the job.
 
-Thirdly, it can't account for windows. At that toasty 77°, the living room could be comfortable with half an hour of ventilation on a cool day — but I won't know until I come upstairs to make dinner. Wouldn't it be nice if my thermostat could tell me when opening or closing a window would make a big (and cheap!) difference?
+Thirdly, it can't account for open windows. At that toasty 77°, the living room could be comfortable with half an hour of ventilation on a cool day — but you won't know until you go upstairs to make dinner. Wouldn't it be nice if your thermostat could tell you when opening or closing a window would make a big (and cheap!) difference?
 
 Fourthly, the typical thermostat has one or two sensors. Unless you have well-tuned central air with well-balanced registers that account for insolation, multiple rooms in a shared zone will end up at different temperatures — a bedroom with an open window might be 10°F cooler on one side of the room than the other. I want to be able to monitor many more than two points in my home, and automatically adjust all of my climate devices to make as many places comfortable as possible.
 
-The fix for the first two of these is to predict the future and act early. If you know the room will be too cold in two hours, start heating now. If you know the slab has enough stored heat, stop early. If you know it's going to be sunny today, don't add heat that the sun will provide.
+The fix for the first two of these is to predict the future and act at the right time. If you know the room will be too cold in an hour, start heating now. If you know the slab will dump another degree or two into the air and you're close to target, stop heating. If you know it's going to be sunny today, don't add heat that the sun will provide for free.
 
-The fix for the second two is to be able to predict and optimize across many sensors and effectors: to explore the space of possible configurations of heating, cooling, windows, etc., to maximize comfort at minimal cost.
+The fix for the second two is to be able to predict and optimize across **many** sensors and effectors: to explore the space of possible configurations of heating, cooling, windows, *etc.*, to maximize comfort at minimal cost.
 
 This prediction and simulation requires a model of how the house actually behaves — how fast it loses heat, how much heat each device delivers, how solar gain and weather affect each room. That's what weatherstat builds.
 
@@ -84,10 +86,11 @@ For every candidate, forward-simulate all sensor temperatures for the next 6 hou
 
 ### 4. Score against comfort and energy
 
-Each simulation produces predicted temperatures at 1, 2, 4, and 6 hours for every sensor. These are scored against comfort schedules — what temperature do you want in each room at each time of day?
+Each simulation produces predicted temperatures at 1, 2, 4, 6, and 12 hours for every sensor. These are scored against comfort schedules — what temperature do you want in each room at each time of day?
 
-The scoring model has two layers:
-- **Continuous:** Quadratic penalty for deviation from your preferred temperature, with asymmetric weights (you might care more about being too cold than too warm).
+The scoring model has three layers:
+- **Dead band:** Zero cost within your preferred range. `preferred` can be a single temperature (point target) or a range like `[70, 73]` — anywhere inside the range is equally good, eliminating wasteful hunting.
+- **Comfort band:** Quadratic penalty for deviation outside the preferred range but within `min`/`max`, with asymmetric weights (you might care more about being too cold than too warm).
 - **Hard rails:** Steep additional penalty (10×) for exceeding minimum/maximum bounds.
 
 Plus an energy cost term for each active effector. The total score is comfort cost + energy cost.
@@ -124,13 +127,13 @@ Comfort constraints define what "comfortable" means for each sensor, varying by 
 - sensor: bedroom_temp
   schedule:
     - { hours: [6, 9], preferred: 71, min: 70, max: 73, cold_penalty: 2.0 }
-    - { hours: [9, 21], preferred: 70, min: 69, max: 75 }
+    - { hours: [9, 21], preferred: [70, 73], min: 69, max: 75 }
     - { hours: [21, 6], preferred: 70, min: 68, max: 72 }
 ```
 
-`preferred` is the ideal temperature — the optimizer gently pushes toward it. `min` and `max` are hard boundaries with steep penalties. `cold_penalty` and `hot_penalty` let you express asymmetric preferences ("I'd rather be 1°F too warm than 1°F too cold in the morning").
+`preferred` is the ideal temperature — either a point (`preferred: 71`) or a range (`preferred: [70, 73]`). A point target means the optimizer always gently pushes toward that value. A range defines a dead band — zero cost anywhere inside, so the system won't waste energy chasing a single degree. `min` and `max` are hard boundaries with steep penalties. `cold_penalty` and `hot_penalty` let you express asymmetric preferences ("I'd rather be 1°F too warm than 1°F too cold in the morning").
 
-**Comfort profiles** (Home, Away) apply offsets to the base schedules — for example, you can configure an Away mode that drops preferred by 3°F and widens the bounds, so your pipes won't freeze but you won't run up a bill heating an empty house.
+**Comfort profiles** (Home, Away) apply offsets to the base schedules. `preferred_widen` expands point targets into dead bands — for example, an Away mode with `preferred_widen: 6` turns `preferred: 71` into a [68, 74] dead band where the system won't act, avoiding wasteful cool-then-heat cycles overnight.
 
 **MRT correction** adjusts comfort targets based on outdoor temperature. When it's cold outside, walls and windows radiate less infrared toward you — you need a warmer air temperature to feel the same comfort. The system automatically raises targets in cold weather and lowers them in warm weather, with per-sensor weights (a room with large exterior-facing windows gets more correction than an interior room).
 
@@ -147,8 +150,8 @@ Open windows dramatically change a room's thermal behavior. The system handles t
 The system is conservative by design:
 
 - **Setpoint clamps** (62–78°F): Never sets a thermostat outside safe bounds.
-- **Hold times**: Minimum 10 minutes between setpoint changes, 2 hours between mini-split mode changes.
-- **Mode hold windows**: No mini-split mode changes during quiet hours (e.g., 10pm–7am), so you're not bothered by clanking vents — only silent target temperature adjustments.
+- **Hold times**: Minimum 10 minutes between setpoint changes.
+- **Mode hold windows**: No mini-split mode changes during configurable quiet hours (e.g., 10pm–7am), so you're not woken by compressor starts — only silent target temperature adjustments.
 - **Cold-room override**: If any sensor drops significantly below its comfort minimum, constrain the sweep to scenarios where the most-coupled trajectory effector (from sysid's coupling matrix) is heating immediately — overriding delay and cost trade-offs.
 - **Minimum improvement threshold**: Don't turn on HVAC unless it improves the score by at least 1.0 units over doing nothing.
 - **Override detection**: If a human manually adjusts a thermostat, respect the override.
@@ -163,16 +166,16 @@ The system needs data to work. Specifically:
 - **Weather forecasts** from Home Assistant's met.no integration provide the outdoor temperature trajectory for forward simulation.
 - **5-minute snapshots** capture the full state of the house: every temperature, every HVAC action, every window state, weather conditions. This is the training data for sysid and the input to control.
 
-The collector runs continuously, writing to a local SQLite database. Historical data extraction (via HA's WebSocket and REST APIs) can bootstrap the model with hourly statistics going back 5–7 months, but the highest-quality data comes from the 5-minute collector.
+The collector runs continuously, writing 5-minute snapshots to a local SQLite database.
 
 ## Architecture
 
 ```
-Home Assistant  ←──WebSocket/REST──→  Collector (TS, 5-min)
+Home Assistant  ←──── REST API ────→  Collector (Python, 5-min)
        ↑                                    │
-       │ service calls                      │ SQLite snapshots
+       │ REST API                           │ SQLite snapshots
        │                                    ↓
-  Executor (TS)                      System Identification
+  Executor (Python)                  System Identification
        ↑                              (sysid, Python)
        │ command JSON                       │
        │                                    │ thermal_params.json
@@ -186,7 +189,7 @@ Home Assistant  ←──WebSocket/REST──→  Collector (TS, 5-min)
        └── Decision log (outcomes)
 ```
 
-The system communicates with Home Assistant via REST API for both reading state (collector) and executing commands (executor). Data flows through SQLite (collector → model) and JSON files (controller → executor).
+The system communicates with Home Assistant via REST API for both reading state (collector) and executing commands (executor). Data flows through SQLite (collector → sysid) and JSON files (controller → executor).
 
 Everything is driven by a single YAML config file that declares what sensors, effectors, windows, and comfort constraints exist. Adding a new device is a config edit — the collector picks it up automatically, sysid fits its parameters when re-run, and the control loop incorporates it into the sweep.
 
@@ -194,6 +197,6 @@ Everything is driven by a single YAML config file that declares what sensors, ef
 
 - **It's not a replacement for climate entities.** It sets thermostat targets and modes; the climate entities still do their own local control. If weatherstat stops running, your thermostats continue working at whatever setpoints were last applied. It is entirely possible for you to build those yourself with relays and Home Assistant, but I chose to keep a layer of redundancy.
 - **It doesn't learn occupancy.** It doesn't know when you're home (unless you tell it via the comfort profile entity). This is intentional — occupancy detection is a different problem. You can use occupancy to drive behavior by flipping the profile.
-- **It's not magic.** Weatherstat cannot tell when you have a window open without a sensor, run a space heater, flip the breaker for your electric heat without turning off the thermostat, etc. Adding or removing heat from the system without being able to tell makes it much harder to extract correct relationships.
+- **It's not magic.** Weatherstat cannot tell when you have a window open without a sensor, run a space heater, flip the breaker for your electric heat without turning off the thermostat, *etc.* Adding or removing heat from the system without being able to tell makes it much harder to extract correct relationships.
 - **It doesn't control non-HVAC devices (yet).** No lights, blinds, or appliances. Only climate entities, fans, and advisory notifications.
-- **It needs Home Assistant.** All sensor data and device control goes through HA's WebSocket and REST APIs.
+- **It needs Home Assistant.** All sensor data and device control goes through HA's REST API.
