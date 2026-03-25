@@ -1675,7 +1675,11 @@ def run_control_loop(live: bool = False) -> None:
 
     while True:
         try:
-            run_control_cycle(live=live)
+            decision = run_control_cycle(live=live)
+            if live and decision:
+                from weatherstat.executor import execute
+
+                execute()
         except Exception as e:
             print(f"[control] Error in control cycle: {e}", file=sys.stderr)
             traceback.print_exc()

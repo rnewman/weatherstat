@@ -45,13 +45,14 @@ just collect          # Run HA state collector (5-min loop, auto-recovery)
 just collect-once     # Collect a single snapshot
 just health           # Check if collector data is fresh
 just sysid            # System identification (fit thermal params from data)
-just control          # Single control cycle (dry-run, physics trajectory sweep)
-just control-loop     # 15-min control loop (dry-run)
-just control-live     # Single control cycle with live execution
-just control-loop-live # Loop control cycle with live execution
+just control          # Single control cycle (dry-run)
+just control --live   # Single cycle with live execution + HA commands
+just control --loop   # 15-min control loop (dry-run)
+just control --live --loop  # Live control loop (production)
 just execute          # Apply latest command JSON to HA
-just execute-force    # Apply ignoring manual overrides
+just execute --force  # Apply ignoring manual overrides
 just tui              # Interactive TUI dashboard
+just tui --live       # TUI starting in live mode
 just comfort          # Comfort performance dashboard (last 7 days)
 just lint             # Lint both packages
 just lint-fix         # Lint and fix both packages

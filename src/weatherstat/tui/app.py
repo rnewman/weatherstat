@@ -81,13 +81,14 @@ class WeatherstatApp(App):
         Binding("s", "run_sysid", "Sysid"),
         Binding("p", "toggle_profile", "Profile"),
         Binding("f", "force_execute", "Force Execute"),
+        Binding("c", "reload_config", "Reload Config"),
         Binding("q", "quit_app", "Quit"),
         Binding("question_mark", "help", "Help"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, live: bool = False) -> None:
         super().__init__()
-        self.live_mode = False
+        self.live_mode = live
         self._cycle_running = False
         self._sysid_running = False
         self._cycle_timer: object | None = None
@@ -200,6 +201,28 @@ class WeatherstatApp(App):
     def action_toggle_profile(self) -> None:
         self._toggle_profile()
 
+    def action_reload_config(self) -> None:
+        """Reload weatherstat.yaml and refresh all config-derived state."""
+        import importlib
+
+        import weatherstat.config
+        import weatherstat.control
+        import weatherstat.extract
+        import weatherstat.yaml_config
+
+        try:
+            importlib.reload(weatherstat.yaml_config)
+            importlib.reload(weatherstat.config)
+            importlib.reload(weatherstat.extract)
+            importlib.reload(weatherstat.control)
+            self._load_mrt_weights()
+            self._refresh_temps()
+            self._log("[config] Reloaded weatherstat.yaml")
+            self.notify("Config reloaded", severity="information")
+        except Exception as e:
+            self._log(f"[config] [red]Reload failed: {e}[/]")
+            self.notify(f"Config reload failed: {e}", severity="error")
+
     def action_quit_app(self) -> None:
         if self.live_mode:
             self.push_screen(
@@ -220,6 +243,7 @@ class WeatherstatApp(App):
             "  L      Toggle Live / Dry-run mode\n"
             "  R      Run control cycle now\n"
             "  F      Force-execute past overrides\n"
+            "  C      Reload weatherstat.yaml\n"
             "  S      Run system identification (sysid)\n"
             "  P      Toggle comfort profile (Home/Away)\n"
             "  Q      Quit\n"

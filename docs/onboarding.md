@@ -217,8 +217,9 @@ The command JSON is written to `~/.weatherstat/predictions/` but not applied.
 Once you're satisfied with the dry-run decisions:
 
 ```bash
-just control-live         # single live cycle
-just control-loop-live    # continuous 15-min loop (production)
+just control --live         # single live cycle
+just control --live --loop  # continuous 15-min loop (production)
+just tui --live             # interactive dashboard in live mode
 ```
 
 This executes the decisions: sets thermostat targets, changes mini-split modes, adjusts fan speeds. The executor checks current HA state before acting (lazy execution — skip if already correct) and detects manual overrides.

@@ -32,46 +32,13 @@ fmt:
 test:
     uv run pytest tests/
 
-# Single control cycle (dry-run, physics trajectory sweep)
-control:
-    uv run python -m weatherstat.control
+# Control cycle (flags: --live, --loop)
+control *ARGS:
+    uv run python -m weatherstat.control {{ARGS}}
 
-# Run control loop (dry-run, 15-min interval)
-control-loop:
-    uv run python -m weatherstat.control --loop
-
-# Single control cycle with live execution
-control-live:
-    uv run python -m weatherstat.control --live
-
-# Live control loop (15-min interval, generates + executes via HA)
-control-loop-live:
-    #!/usr/bin/env bash
-    set -uo pipefail
-    REPO_ROOT="$(git rev-parse --show-toplevel)"
-    echo "[control-loop-live] Starting (15-min interval, Ctrl+C to stop)"
-    while true; do
-        echo ""
-        echo "── Control cycle: $(date) ──"
-        if cd "$REPO_ROOT" && uv run python -m weatherstat.control --live; then
-            cd "$REPO_ROOT"
-            echo "[control-loop-live] Executing command via HA..."
-            uv run python -m weatherstat.executor
-        else
-            cd "$REPO_ROOT"
-            echo "[control-loop-live] Control cycle failed (HA down?), will retry next cycle"
-        fi
-        echo "[control-loop-live] Next cycle in 15 minutes..."
-        sleep 900
-    done
-
-# Execute latest command JSON via HA
-execute:
-    uv run python -m weatherstat.executor
-
-# Execute latest command, ignoring manual overrides
-execute-force:
-    uv run python -m weatherstat.executor --force
+# Execute latest command JSON via HA (flag: --force to ignore overrides)
+execute *ARGS:
+    uv run python -m weatherstat.executor {{ARGS}}
 
 # Discover HA entities and generate starter config
 discover *ARGS:
@@ -82,8 +49,8 @@ sysid *ARGS:
     uv run python -m weatherstat.sysid {{ARGS}}
 
 # Interactive TUI dashboard
-tui:
-    uv run --extra tui python -m weatherstat.tui
+tui *ARGS:
+    uv run --extra tui python -m weatherstat.tui {{ARGS}}
 
 # Comfort performance dashboard (last 7 days by default)
 comfort *ARGS:
