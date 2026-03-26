@@ -34,6 +34,7 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 18. **Unified effector model** (done) — Single `EffectorDecision` type replaces `ThermostatTrajectory`, `BlowerDecision`, `MiniSplitDecision`. `EffectorConfig` with `control_type`/`mode_control`/`depends_on`/`command_keys` replaces per-type config classes. Scenario generation iterates `EFFECTORS` tuple from config with `itertools.product`. No hardcoded device names anywhere. TS executor iterates config dicts dynamically. Effector eligibility gate: pre-sweep check excludes manual-mode effectors that are off or whose state_device is unavailable. Dead code pruned: legacy advisory types, boiler backward-compat, LGBM params, encoding aliases.
 19. **Smoothed derivative & gain recovery** (done) — 5-minute central differences amplified sensor noise (~10°F/hr) drowning thermostat signals (~0.3°F/hr). Smoothed derivative (15-min half-window rolling mean + wider central difference) reduces noise ~5×, recovering thermostat gains from 1/32 surviving to 25/32. Mode-direction sign filter prevents heating-only effectors from having negative gains. Per-sensor cost display bug fixed (key format mismatch). TUI comfort bars now reflect active comfort profile + MRT correction. See `docs/debugging-notes.md` § "Derivative Noise".
 20. **Celsius support & configurable defaults** (done) — `unit: F` or `unit: C` in location block. All hardcoded temperature constants converted via `abs_temp()`/`delta_temp()` from canonical °F at load time. Control thresholds (`setpoint_min`, `setpoint_max`, `cautious_offset`, `max_1h_change`, `min_improvement`, `cold_room_override`) configurable in `defaults:` section. Display formatting uses `UNIT_SYMBOL` throughout. Dead-band preferred range: `preferred` can be a point or `[lo, hi]` range with zero cost inside the band; `preferred_widen` in profiles expands point targets into dead bands.
+21. **Enriched decision logging & faster loops** (done) — Decision log enriched with `active_profile`, `mrt_offsets`, `blocked` columns. `comfort_bounds` now includes `preferred_lo/hi` and `cold/hot_penalty`. Fixed `_compute_actual_comfort_cost` key mismatch bug (was always returning 0.0). Control interval configurable (default 5 min, was 15 min). Sysid split into `fit_sysid()` + `save_sysid_result()` for quality-gated periodic refitting (default hourly in TUI). Comfort plotter uses historical decision bounds (reflects actual profiles/MRT/windows over time) and shows per-sensor control authority (% time system had full control).
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
@@ -48,7 +49,7 @@ just health           # Check if collector data is fresh
 just sysid            # System identification (fit thermal params from data)
 just control          # Single control cycle (dry-run)
 just control --live   # Single cycle with live execution + HA commands
-just control --loop   # 15-min control loop (dry-run)
+just control --loop   # 5-min control loop (dry-run)
 just control --live --loop  # Live control loop (production)
 just execute          # Apply latest command JSON to HA
 just execute --force  # Apply ignoring manual overrides

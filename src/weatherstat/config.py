@@ -119,6 +119,11 @@ ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
 ADVISORY_OPPORTUNITY_THRESHOLD: float = _CFG.advisory.opportunity_threshold
 ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
 
+# ── Intervals ──────────────────────────────────────────────────────────
+
+CONTROL_INTERVAL: int = _CFG.control_interval  # seconds between control cycles
+SYSID_INTERVAL: int = _CFG.sysid_interval  # seconds between automatic sysid (0 = disabled)
+
 # ── Temperature unit helpers ─────────────────────────────────────────────
 
 UNIT_SYMBOL: str = _CFG.unit_symbol

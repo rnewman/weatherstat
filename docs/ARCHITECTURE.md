@@ -90,7 +90,7 @@ The system is organized around four fundamental concepts:
 - `constraints` — per-sensor, time-of-day comfort bands with asymmetric penalty weights (sensor-to-effector coupling derived from sysid coupling matrix)
 - `advisory` — effort costs, quiet hours, cooldown timers
 - `safety` — cooldown timers for infrastructure alerts
-- `defaults` — fallback values (e.g., `tau: 45.0` before sysid has run)
+- `defaults` — fallback values (e.g., `tau: 45.0` before sysid has run), timing intervals (`control_interval`, `sysid_interval`), and optional control thresholds
 
 **Read by:** every other component (via `yaml_config.py`). The loader produces typed configuration objects. Adding a sensor or device to the YAML automatically propagates to collection, prediction, and control.
 
@@ -174,6 +174,8 @@ The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). So
 
 **Output:** `~/.weatherstat/thermal_params.json` — the full coupling matrix, tau fits, and solar profiles. Run via `just sysid`.
 
+**Two-phase API:** `fit_sysid()` generates a `SysIdResult` without writing to disk; `save_sysid_result()` persists it. `run_sysid()` is a convenience wrapper that calls both. The TUI uses the two-phase API with a quality gate (rejects fits with zero taus or zero significant gains) for automatic periodic refitting.
+
 **Dependencies:** numpy, scipy (curve_fit), pandas. No ML frameworks required.
 
 #### 3c. Prediction Interface
@@ -205,7 +207,7 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 
 **Trajectory search:** Effector options are generated per control_type: trajectory effectors get delay × duration grids, regulating effectors get mode + target combinations from comfort schedules, binary effectors get their supported modes. The sweep takes the cartesian product, with dependent effectors constrained by their parent's state. Boiler activity is confirmed via state_gate multiplication in the simulator.
 
-**Receding horizon:** Only the immediate action matters. A trajectory of "delay 2h then heat" means "stay off now." At the next 15-minute cycle, the controller re-evaluates with fresh data and may choose differently.
+**Receding horizon:** Only the immediate action matters. A trajectory of "delay 2h then heat" means "stay off now." At the next cycle (default 5 minutes, configurable via `control_interval`), the controller re-evaluates with fresh data and may choose differently.
 
 **Scoring:**
 
@@ -231,7 +233,7 @@ Window-open states widen the comfort band to avoid fighting ventilation.
 **Physical constraints:**
 - Dependent effectors forced off when their dependency is inactive (e.g., blowers off when thermostat isn't calling for heat).
 - Setpoint clamps (absolute safety bounds: 62–78°F).
-- Hold times: 10-minute minimum between setpoint changes; 2-hour minimum between mini-split mode changes.
+- Hold times: 3-minute minimum between setpoint changes; 2-hour minimum between mini-split mode changes.
 - Mode hold window: per-device configurable hours (e.g., 10pm–7am) during which mini-split mode changes are forbidden — only silent target temperature adjustments are allowed.
 - Cold-sensor override: force immediate zone heating (delay=0) when any sensor is significantly below comfort minimum.
 
@@ -274,7 +276,7 @@ Persistent, energy-aware recommendations for window state changes. Uses the phys
 
 **Lifecycle management:** Opportunities persist across control cycles. New ones are added, still-valid ones kept, expired ones dismissed (including HA persistent notifications). Per-window notification IDs prevent stacking.
 
-**Key design constraint:** The electronic plan does NOT change based on opportunities. The controller commits to the best electronic trajectory given current window states. If the human acts (e.g., opens a window), the next 15-minute cycle re-evaluates and naturally adjusts.
+**Key design constraint:** The electronic plan does NOT change based on opportunities. The controller commits to the best electronic trajectory given current window states. If the human acts (e.g., opens a window), the next control cycle re-evaluates and naturally adjusts.
 
 **Dispatch:**
 - Per-window cooldown timers prevent notification fatigue.
@@ -307,13 +309,17 @@ Records every control decision with full context.
 - Predicted outcomes at each horizon per room.
 - Selected action (setpoints, blowers, mini-splits) and trajectory info.
 - Comfort cost, energy cost, total cost.
+- Active comfort profile name (Home/Away/etc.).
+- Resolved comfort bounds per sensor (min, max, preferred_lo, preferred_hi, cold/hot penalties) — the actual targets after profile offsets, MRT correction, and window adjustments.
+- MRT correction offsets (base offset + per-sensor applied offsets).
+- Blocked effectors (ineligible + physically blocked, with reasons).
 
-**Outcome backfill:** At the start of each control cycle, the system checks whether enough time has elapsed to compare predictions to actual temperatures. For each horizon (1h, 2h, 4h, 6h), it finds the closest collector snapshot and records prediction error. This enables systematic accuracy tracking without a separate process.
+**Outcome backfill:** At the start of each control cycle, the system checks whether enough time has elapsed to compare predictions to actual temperatures. For each horizon (1h, 2h, 4h, 6h), it finds the closest collector snapshot and records prediction error. Retroactive comfort cost uses the full two-layer model (preferred band + hard rails) with the enriched bounds logged at decision time.
 
 **Used by:**
 - Humans debugging decisions ("why did it turn on the heat at 3 AM?").
 - Prediction error analysis: compare predicted vs actual temperatures at each logged horizon.
-- Comfort performance dashboard (`just comfort`) for capacity analysis.
+- Comfort performance dashboard (`just comfort`) for capacity analysis and control authority tracking.
 
 ---
 
@@ -323,13 +329,17 @@ Answers "is the system working as designed?" at a glance. Run via `just comfort`
 
 **Output:** A multi-panel PNG with:
 - **Summary bar:** Per-sensor horizontal stacked bar showing % in comfort band, % too cold (capacity-limited vs control opportunity), % too hot (capacity-limited vs control opportunity).
-- **Temperature traces:** Per-sensor time series with comfort band overlay (green fill = min/max, dashed = preferred), violation shading (red = below min, orange = above max).
+- **Temperature traces:** Per-sensor time series with comfort band overlay (green fill = min/max, dashed/filled = preferred band), violation shading (red = below min, orange = above max), and control authority background tinting (red = all blocked/offline, amber = partially blocked, gray = no decision data).
 - **Outdoor + effector panel:** Outdoor temperature with heating state overlays.
 - **Prediction accuracy** (optional, `--predictions`): Error histogram by horizon with MAE and bias.
 
+**Historical comfort bands:** When decision log data is available, comfort bands are derived from the logged comfort_bounds per decision (reflecting the actual profile, MRT correction, and window adjustments active at the time) rather than the current config. This means the plot accurately shows what the system was targeting, even if profiles or config changed during the period.
+
 **Capacity analysis:** Violations are classified as "capacity exceeded" (all dedicated effectors at max — building physics problem) vs "control opportunity" (dedicated effectors had headroom). Dedicated effectors are identified per sensor: zone thermostat (from coupling matrix) plus any name-matched mini split or blower. Cross-talk gains from effectors that primarily serve other sensors are excluded — the optimizer already balances those trade-offs.
 
-**Console output:** Summary table with per-sensor breakdown and dedicated effector list.
+**Control authority:** Per-sensor tracking of when the system had full control (no relevant effectors blocked or overridden), partial control, or no control (all blocked, system offline, or dry-run mode). Displayed as background tinting on time-series panels and a "Ctrl %" column in the console summary.
+
+**Console output:** Summary table with per-sensor breakdown: % in band, control authority %, capacity/control violation split, and dedicated effector list.
 
 ---
 

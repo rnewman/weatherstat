@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from weatherstat.config import DECISION_LOG_DB, PREDICTION_SENSORS, SNAPSHOTS_DB
+from weatherstat.config import DECISION_LOG_DB, PREDICTION_SENSORS, SENSOR_LABELS, SNAPSHOTS_DB
 
 # Horizon durations in minutes, keyed by the label used in predictions
 HORIZON_MINUTES: dict[str, int] = {"1h": 60, "2h": 120, "4h": 240, "6h": 360}
@@ -65,6 +65,13 @@ def init_db(db_path: Path | None = None) -> Path:
         conn.execute("ALTER TABLE decisions ADD COLUMN effector_decisions TEXT")
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE decisions ADD COLUMN command_targets TEXT")
+    # Schema migration: add decision context columns (enriched logging)
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN active_profile TEXT")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN mrt_offsets TEXT")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN blocked TEXT")
     conn.commit()
     conn.close()
     return path
@@ -77,6 +84,12 @@ def log_decision(
     schedules: list[object],  # list[ComfortSchedule]
     base_hour: int,
     live: bool,
+    *,
+    active_profile: str | None = None,
+    mrt_base_offset: float = 0.0,
+    mrt_weights: dict[str, float] | None = None,
+    ineligible: dict[str, str] | None = None,
+    blocked_effectors: dict[str, str] | None = None,
     db_path: Path | None = None,
 ) -> None:
     """Record a control decision to the decision log.
@@ -128,14 +141,37 @@ def log_decision(
     # Serialize predictions (label -> {horizon -> temp})
     predictions_json = json.dumps(decision.predictions)
 
-    # Serialize comfort bounds at decision time
+    # Serialize comfort bounds at decision time (enriched: includes preferred band + penalties)
     comfort_bounds: dict[str, dict[str, float]] = {}
     for sched in schedules:
         if isinstance(sched, ComfortSchedule):
             c = sched.comfort_at(base_hour)
             if c is not None:
-                comfort_bounds[sched.label] = {"min": c.min_temp, "max": c.max_temp}
+                comfort_bounds[sched.label] = {
+                    "min": c.min_temp,
+                    "max": c.max_temp,
+                    "preferred_lo": c.preferred_lo,
+                    "preferred_hi": c.preferred_hi,
+                    "cold_penalty": c.cold_penalty,
+                    "hot_penalty": c.hot_penalty,
+                }
     comfort_bounds_json = json.dumps(comfort_bounds)
+
+    # MRT offsets: base offset + per-sensor applied offsets
+    mrt_offsets_data: dict[str, float] = {"_base": round(mrt_base_offset, 3)}
+    if mrt_weights and abs(mrt_base_offset) >= 0.05:
+        for sensor_col, weight in mrt_weights.items():
+            label = SENSOR_LABELS.get(sensor_col, sensor_col)
+            mrt_offsets_data[label] = round(mrt_base_offset * weight, 3)
+    mrt_offsets_json = json.dumps(mrt_offsets_data) if abs(mrt_base_offset) >= 0.05 else None
+
+    # Blocked: merge ineligible effectors + physically blocked effectors
+    blocked_data: dict[str, str] = {}
+    if ineligible:
+        blocked_data.update(ineligible)
+    if blocked_effectors:
+        blocked_data.update(blocked_effectors)
+    blocked_json = json.dumps(blocked_data) if blocked_data else None
 
     # Serialize trajectory info (if present)
     trajectory_json = json.dumps(decision.trajectory_info) if decision.trajectory_info else None
@@ -147,8 +183,9 @@ def log_decision(
             timestamp, live, outdoor_temp, outdoor_humidity, wind_speed, weather_condition,
             current_temps, upstairs_heating, downstairs_heating, upstairs_setpoint, downstairs_setpoint,
             blowers, mini_splits, predictions, comfort_cost, energy_cost, total_cost,
-            comfort_bounds, trajectory, outcome_backfilled, effector_decisions, command_targets
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            comfort_bounds, trajectory, outcome_backfilled, effector_decisions, command_targets,
+            active_profile, mrt_offsets, blocked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
         """,
         (
             decision.timestamp,
@@ -172,6 +209,9 @@ def log_decision(
             trajectory_json,
             effector_decisions_json,
             command_targets_json,
+            active_profile,
+            mrt_offsets_json,
+            blocked_json,
         ),
     )
     conn.commit()
@@ -322,20 +362,27 @@ def _compute_actual_comfort_cost(
 ) -> float:
     """Compute retroactive comfort cost from actual temperatures.
 
-    Uses the same quadratic penalty as compute_comfort_cost but with actual temps.
-    Uses default penalty weights (cold=2.0, hot=1.0) since we don't store
-    per-room penalty weights in the decision log.
+    Uses the same two-layer cost model as compute_comfort_cost (control.py):
+    continuous penalty from preferred band + 10× hard rails at min/max.
+
+    Outcomes are keyed by sensor column (e.g. "bedroom_temp");
+    comfort_bounds are keyed by label (e.g. "bedroom"). We map via SENSOR_LABELS.
     """
-    # Horizon weights matching control.py
     horizon_weights = {"1h": 1.0, "2h": 0.9, "4h": 0.7, "6h": 0.5}
     cost = 0.0
 
-    for room, horizons in outcomes.items():
-        bounds = comfort_bounds.get(room)
+    for sensor_col, horizons in outcomes.items():
+        label = SENSOR_LABELS.get(sensor_col, sensor_col)
+        bounds = comfort_bounds.get(label)
         if bounds is None:
             continue
         min_temp = bounds["min"]
         max_temp = bounds["max"]
+        # Enriched bounds (logged after this change); fall back to min/max for old rows
+        pref_lo = bounds.get("preferred_lo", min_temp)
+        pref_hi = bounds.get("preferred_hi", max_temp)
+        cold_pen = bounds.get("cold_penalty", 2.0)
+        hot_pen = bounds.get("hot_penalty", 1.0)
 
         for h_label, data in horizons.items():
             actual = data.get("actual")
@@ -343,10 +390,17 @@ def _compute_actual_comfort_cost(
                 continue
             weight = horizon_weights.get(h_label, 0.5)
 
+            # Continuous cost: quadratic deviation from preferred band
+            if actual < pref_lo:
+                cost += (pref_lo - actual) ** 2 * cold_pen * weight
+            elif actual > pref_hi:
+                cost += (actual - pref_hi) ** 2 * hot_pen * weight
+
+            # Hard rails: steep additional penalty (10×) outside min/max
             if actual < min_temp:
-                cost += (min_temp - actual) ** 2 * 2.0 * weight  # cold_penalty=2.0
+                cost += (min_temp - actual) ** 2 * cold_pen * 10.0 * weight
             elif actual > max_temp:
-                cost += (actual - max_temp) ** 2 * 1.0 * weight  # hot_penalty=1.0
+                cost += (actual - max_temp) ** 2 * hot_pen * 10.0 * weight
 
     return round(cost, 4)
 

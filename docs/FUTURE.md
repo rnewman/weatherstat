@@ -37,7 +37,7 @@ heating/cooling phases within one horizon.
 
 The physics simulator is fast enough; the question is whether the multi-segment
 optimization surface is tractable or whether receding-horizon re-evaluation
-(every 15 min) effectively discovers multi-segment plans through repeated
+(every 5 min) effectively discovers multi-segment plans through repeated
 single-segment decisions.
 
 ---
@@ -74,10 +74,14 @@ already shows error distributions by horizon.
 
 ## Online Learning
 
-Continuously improve thermal model parameters by comparing predictions to
-outcomes. The decision log already records predicted vs actual temperatures
-at each horizon. The next step is automatic parameter adjustment (exponential
-moving averages on gain/delay/tau) when systematic prediction errors appear.
+Sysid now runs automatically in the TUI (default hourly, configurable via
+`sysid_interval`), with a quality gate that rejects bad fits. This handles
+gradual seasonal drift but doesn't yet do incremental parameter updates.
+
+The next step beyond periodic refitting is automatic parameter adjustment
+(exponential moving averages on gain/delay/tau) when systematic prediction
+errors appear. The decision log records predicted vs actual temperatures at
+each horizon, providing the data for this.
 
 The comfort dashboard shows a consistent warm bias (+0.15 to +0.30°F,
 increasing with horizon) — this likely represents underestimated heat loss

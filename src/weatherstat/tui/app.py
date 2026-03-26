@@ -15,6 +15,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Static, TabbedContent, TabPane
 
+from weatherstat.config import CONTROL_INTERVAL, SYSID_INTERVAL
 from weatherstat.tui.widgets import (
     AccuracyPanel,
     EffectorPanel,
@@ -32,7 +33,6 @@ from weatherstat.tui.widgets import (
 # Intervals
 MONITOR_INTERVAL = 30  # seconds
 SNAPSHOT_INTERVAL = 300  # 5 minutes
-CONTROL_INTERVAL = 900  # 15 minutes
 SYSID_TIMEOUT = 300  # 5 minutes
 
 
@@ -92,6 +92,7 @@ class WeatherstatApp(App):
         self._cycle_running = False
         self._sysid_running = False
         self._cycle_timer: object | None = None
+        self._sysid_timer: object | None = None
         self._next_cycle_at: datetime | None = None
 
         # Latest decision (from control cycle)
@@ -128,11 +129,13 @@ class WeatherstatApp(App):
 
     def on_mount(self) -> None:
         self._log("Weatherstat TUI starting...")
+        self._log(f"  Control interval: {CONTROL_INTERVAL}s, Sysid interval: {SYSID_INTERVAL}s")
         self._load_initial_state()
         self._collect_snapshot()  # initial snapshot
         self.set_interval(MONITOR_INTERVAL, self._monitor_tick)
         self.set_interval(SNAPSHOT_INTERVAL, self._collect_snapshot)
         self._schedule_next_cycle()
+        self._schedule_sysid()
 
     # ── Tab switching ───────────────────────────────────────────────────────
 
@@ -468,6 +471,20 @@ class WeatherstatApp(App):
             self._run_control_cycle()
         self._schedule_next_cycle()
 
+    # ── Periodic sysid ────────────────────────────────────────────────────
+
+    def _schedule_sysid(self) -> None:
+        """Schedule periodic sysid if configured (interval > 0)."""
+        if SYSID_INTERVAL <= 0:
+            return
+        self._sysid_timer = self.set_timer(SYSID_INTERVAL, self._auto_sysid)
+
+    def _auto_sysid(self) -> None:
+        if not self._sysid_running:
+            self._log("[sysid] Periodic sysid starting...")
+            self._run_sysid()
+        self._schedule_sysid()
+
     @work(thread=True)
     def _run_control_cycle(self) -> None:
         self._cycle_running = True
@@ -560,11 +577,25 @@ class WeatherstatApp(App):
 
         buf = io.StringIO()
         try:
-            from weatherstat.sysid import run_sysid
+            from weatherstat.sysid import fit_sysid, save_sysid_result
 
             with contextlib.redirect_stdout(buf):
-                result = run_sysid()
-            self._log(f"[sysid] Complete. {result.n_snapshots} snapshots, {len(result.fitted_taus)} sensors fitted.")
+                result = fit_sysid()
+
+            # Quality gate: reject obviously bad fits
+            n_taus = len(result.fitted_taus)
+            n_gains = sum(1 for g in result.effector_sensor_gains if not g.negligible)
+            if n_taus == 0:
+                self._log("[sysid] [red]Rejected: no sensors fitted[/]")
+            elif n_gains == 0:
+                self._log("[sysid] [red]Rejected: no significant gains found[/]")
+            else:
+                with contextlib.redirect_stdout(buf):
+                    save_sysid_result(result)
+                self._log(
+                    f"[sysid] Complete. {result.n_snapshots} snapshots,"
+                    f" {n_taus} sensors, {n_gains} gains."
+                )
         except Exception as e:
             self._log(f"[sysid] [red]Error: {e}[/]")
             self._log(traceback.format_exc())

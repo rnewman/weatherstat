@@ -860,7 +860,39 @@ def _compute_mrt_weights(
 
 
 def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdResult:
-    """Run full system identification pipeline."""
+    """Run full system identification pipeline: fit + write.
+
+    Convenience wrapper around fit_sysid() + save_sysid_result().
+    """
+    result = fit_sysid(verbose=verbose)
+    save_sysid_result(result, output_path)
+    return result
+
+
+def save_sysid_result(result: SysIdResult, output_path: Path | None = None) -> Path:
+    """Write a SysIdResult to disk as JSON.
+
+    Returns the path written to.
+    """
+    out = output_path or DATA_DIR / "thermal_params.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def _serialize(obj: object) -> object:
+        if hasattr(obj, "__dataclass_fields__"):
+            return asdict(obj)  # type: ignore[arg-type]
+        raise TypeError(f"Not serializable: {type(obj)}")
+
+    with open(out, "w") as f:
+        json.dump(asdict(result), f, indent=2, default=_serialize)
+    print(f"\nResults written to {out}")
+    return out
+
+
+def fit_sysid(verbose: bool = False) -> SysIdResult:
+    """Run system identification and return the result without writing to disk.
+
+    Use save_sysid_result() to persist.
+    """
     print("Loading collector snapshots...")
     df = load_collector_snapshots()
     print(f"  {len(df)} snapshots loaded")
@@ -945,7 +977,7 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
     constrained_sensors = [c.sensor for c in _CFG.constraints]
     mrt_weights = _compute_mrt_weights(all_solar, constrained_sensors)
 
-    result = SysIdResult(
+    return SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
         data_start=data_start,
         data_end=data_end,
@@ -958,21 +990,6 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
         state_gates=state_gates,
         mrt_weights=mrt_weights,
     )
-
-    # Save output
-    out = output_path or DATA_DIR / "thermal_params.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    def _serialize(obj: object) -> object:
-        if hasattr(obj, "__dataclass_fields__"):
-            return asdict(obj)  # type: ignore[arg-type]
-        raise TypeError(f"Not serializable: {type(obj)}")
-
-    with open(out, "w") as f:
-        json.dump(asdict(result), f, indent=2, default=_serialize)
-    print(f"\nResults written to {out}")
-
-    return result
 
 
 # ── Report printing ───────────────────────────────────────────────────────

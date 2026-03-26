@@ -205,6 +205,8 @@ class WeatherstatConfig:
     max_1h_change: float | None = None  # sanity check: max predicted 1h change (default: 5°F / 2.8°C)
     min_improvement: float | None = None  # min cost improvement to justify HVAC (default: 1°F / 0.6°C)
     cold_room_override: float | None = None  # force heating when this far below min (default: 1°F / 0.6°C)
+    control_interval: int = 300  # seconds between control cycles (default: 5 min)
+    sysid_interval: int = 3600  # seconds between automatic sysid runs (default: 1 hour, 0 = disabled)
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
@@ -685,6 +687,10 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         v = defaults.get(key)
         return float(v) if v is not None else None
 
+    def _opt_int(key: str, default: int) -> int:
+        v = defaults.get(key)
+        return int(v) if v is not None else default
+
     return WeatherstatConfig(
         location=location,
         temp_sensors=temp_sensors,
@@ -704,6 +710,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         max_1h_change=_opt_float("max_1h_change"),
         min_improvement=_opt_float("min_improvement"),
         cold_room_override=_opt_float("cold_room_override"),
+        control_interval=_opt_int("control_interval", 300),
+        sysid_interval=_opt_int("sysid_interval", 3600),
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
         mrt_correction=mrt_correction,

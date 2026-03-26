@@ -251,3 +251,5 @@ defaults:
   # max_1h_change: 5         # sanity check: max predicted 1h change
   # min_improvement: 1       # min cost improvement to justify turning on HVAC
   # cold_room_override: 1    # force heating when this far below comfort min
+  # control_interval: 300    # seconds between control cycles (default: 300 = 5 min)
+  # sysid_interval: 3600     # seconds between automatic sysid runs (default: 3600 = 1 hr, 0 = disabled)

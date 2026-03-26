@@ -1,7 +1,7 @@
 """Control policy — comfort-optimizing HVAC selection.
 
 Receding-horizon controller: "what HVAC settings maximize comfort over the next 6 hours?"
-Re-evaluated every 15 minutes. Physics-based trajectory sweep using forward simulation.
+Re-evaluated every control_interval (default 5 min). Physics-based trajectory sweep using forward simulation.
 
 Config-driven effector list: thermostats (trajectory on/off with delay x duration grid),
 blowers (binary modes), mini-splits (regulating with target temperatures). Adding a device
@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 
 from weatherstat.config import (
+    CONTROL_INTERVAL,
     CONTROL_STATE_FILE,
     EFFECTOR_MAP,
     EFFECTORS,
@@ -65,7 +66,7 @@ ABSOLUTE_MAX = _CFG.setpoint_max if _CFG.setpoint_max is not None else abs_temp(
 
 # Minimum hold time before changing setpoints (seconds).
 # Must be less than LOOP_INTERVAL_SECONDS so every cycle produces a fresh decision.
-MIN_HOLD_SECONDS = 10 * 60  # 10 minutes
+MIN_HOLD_SECONDS = 3 * 60  # 3 minutes (shorter than default 5-min control interval)
 
 # Maximum data staleness before refusing to execute (seconds)
 MAX_STALE_SECONDS = 15 * 60  # 15 minutes
@@ -93,8 +94,8 @@ MIN_IMPROVEMENT = _CFG.min_improvement if _CFG.min_improvement is not None else 
 # predict rooms warming without HVAC (because training data is all HVAC-on).
 COLD_ROOM_OVERRIDE = _CFG.cold_room_override if _CFG.cold_room_override is not None else delta_temp(1.0)
 
-# Control loop interval
-LOOP_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+# Control loop interval (from config, default 5 min)
+LOOP_INTERVAL_SECONDS = CONTROL_INTERVAL
 
 # Horizons used for control (subset of HORIZONS_5MIN, skip 12h for control)
 CONTROL_HORIZONS = [12, 24, 48, 72]
@@ -751,13 +752,16 @@ def sweep_scenarios_physics(
     prev_state: ControlState | None = None,
     solar_fractions: list[float] | None = None,
     ineligible_effectors: set[str] | None = None,
-) -> tuple[ControlDecision, Scenario]:
+) -> tuple[ControlDecision, Scenario, dict[str, str]]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
     Trajectory effectors are evaluated over a delay x duration grid.
     Regulating effectors use comfort-derived targets.
     Binary effectors sweep supported modes.
     Ineligible effectors are fixed to off.
+
+    Returns (decision, winning_scenario, blocked_dict) where blocked_dict
+    maps effector name to reason for any physically blocked effectors.
     """
     from weatherstat.simulator import HouseState, SimParams, predict
 
@@ -774,6 +778,7 @@ def sweep_scenarios_physics(
     )
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
+    blocked_dict: dict[str, str] = {}  # effector_name -> reason (returned to caller)
 
     # ── Physical constraints: block trajectory effectors at/above comfort max ──
     blocked_effectors: set[str] = set()
@@ -786,7 +791,9 @@ def sweep_scenarios_physics(
         eff_max = _comfort_max(eff.temp_col, schedules, base_hour)
         if eff_temp >= eff_max:
             blocked_effectors.add(eff.name)
-            blocked_reasons.append(f"{eff.name} at/above max ({eff_temp:.1f}{UNIT_SYMBOL} >= {eff_max:.0f}{UNIT_SYMBOL})")
+            reason = f"at/above max ({eff_temp:.1f}{UNIT_SYMBOL} >= {eff_max:.0f}{UNIT_SYMBOL})"
+            blocked_dict[eff.name] = reason
+            blocked_reasons.append(f"{eff.name} {reason}")
 
     if blocked_effectors:
         scenarios = [
@@ -951,7 +958,7 @@ def sweep_scenarios_physics(
         predictions=sensor_preds,
         trajectory_info=trajectory_info,
     )
-    return decision, scenario
+    return decision, scenario, blocked_dict
 
 
 # ── State persistence ─────────────────────────────────────────────────────
@@ -1388,7 +1395,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     )
     print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
     t0 = time.monotonic()
-    decision, winning_scenario = sweep_scenarios_physics(
+    decision, winning_scenario, blocked_dict = sweep_scenarios_physics(
         current_temps,
         outdoor,
         forecast_temp_list,
@@ -1724,7 +1731,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Log decision for outcome tracking
     from weatherstat.decision_log import log_decision
 
-    log_decision(decision, current_temps, latest, schedules, base_hour, live)
+    log_decision(
+        decision, current_temps, latest, schedules, base_hour, live,
+        active_profile=active_profile.name if active_profile else None,
+        mrt_base_offset=mrt_offset,
+        mrt_weights=_mrt_weights,
+        ineligible=ineligible,
+        blocked_effectors=blocked_dict,
+    )
     print("  Decision logged")
 
     if live:

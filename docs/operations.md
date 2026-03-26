@@ -63,11 +63,10 @@ just sysid --output custom_path.json  # custom output path
 
 ### When to rerun
 
-- After accumulating significantly more collector data (monthly)
-- After physical changes (new insulation, window replacement, new HVAC device)
-- Seasonally — spring/summer solar profiles differ from winter
+- **Automatically:** The TUI runs sysid periodically (default: hourly, configurable via `sysid_interval` in the `defaults` section). A quality gate rejects bad fits (zero taus or zero significant gains), so the existing params are preserved if the new fit is worse.
+- **Manually:** After physical changes (new insulation, window replacement, new HVAC device) or seasonally — spring/summer solar profiles differ from winter.
 
-Sysid uses all available collector data. More data = tighter parameter estimates.
+Sysid uses all available collector data. More data = tighter parameter estimates. The two-phase API (`fit_sysid()` + `save_sysid_result()`) allows callers to validate before writing.
 
 ## 3. Control loop
 
@@ -78,29 +77,31 @@ modes), it forward-simulates sensor temperatures over a 6-hour horizon and
 selects the scenario that minimizes comfort cost + energy cost (~5,000–15,000
 scenarios).
 
-Re-evaluated every 15 minutes (receding horizon — only the immediate action
-is executed, then re-planned with fresh data).
+Re-evaluated every 5 minutes by default (configurable via `control_interval` in
+the `defaults` section). Receding horizon — only the immediate action is
+executed, then re-planned with fresh data.
 
 ### Dry-run (default — no changes to HA)
 
 ```bash
 just control           # single cycle, prints decision + writes command JSON
-just control-loop      # 15-min loop, writes command JSON but doesn't execute
+just control --loop    # 5-min loop, writes command JSON but doesn't execute
 ```
 
 ### Live execution
 
 ```bash
-just control-live      # single cycle, writes command JSON AND saves state
+just control --live    # single cycle, writes command JSON AND saves state
 just execute           # apply the latest command_*.json to HA
-just execute-force     # apply ignoring manual overrides
+just execute --force   # apply ignoring manual overrides
 ```
 
 For continuous operation:
 
 ```bash
-just control-loop-live # 15-min loop: control cycle + execute via HA
-just tui               # interactive dashboard: monitor, control, execute (recommended)
+just control --live --loop  # 5-min loop: control cycle + execute via HA
+just tui                   # interactive dashboard: monitor, control, execute (recommended)
+just tui --live            # TUI starting in live mode
 ```
 
 The control module writes `~/.weatherstat/predictions/command_YYYYMMDD_HHMMSS.json`.
@@ -110,8 +111,8 @@ detection (respects manual changes for 30 minutes).
 
 ### Safety rails
 
-- Setpoints clamped to [62, 78]°F (absolute bounds)
-- 10-minute minimum hold time between thermostat setpoint changes
+- Setpoints clamped to [62, 78]°F (absolute bounds, configurable)
+- 3-minute minimum hold time between thermostat setpoint changes
 - 2-hour minimum hold time between mini-split mode changes
 - Per-device mode hold window (e.g., 10pm–7am): no mini-split mode changes during quiet hours, only target temperature adjustments
 - Refuses to execute if data is >15 minutes stale
@@ -128,9 +129,11 @@ quadratic from preferred + 10× steep penalty outside min/max.
 ### Decision logging
 
 Every control cycle logs its decision to `~/.weatherstat/decision_log.db` (SQLite):
-inputs, predictions, action chosen, and trajectory info. Outcomes are backfilled
+inputs, predictions, action chosen, trajectory info, active comfort profile,
+MRT correction offsets, blocked/ineligible effectors, and full resolved comfort
+bounds (min, max, preferred band, penalty weights). Outcomes are backfilled
 automatically by comparing predictions to actual temperatures from subsequent
-snapshots.
+snapshots, using the enriched bounds for accurate retroactive cost computation.
 
 ```bash
 sqlite3 ~/.weatherstat/decision_log.db "SELECT timestamp, comfort_cost, energy_cost, trajectory FROM decisions ORDER BY timestamp DESC LIMIT 10;"
@@ -152,13 +155,22 @@ just comfort -o report.png       # custom output path
 **Summary bar:** Per-sensor stacked bar showing % in comfort band, % too cold
 (capacity exceeded vs control opportunity), % too hot (same breakdown).
 
+**Historical comfort bands:** Uses logged comfort_bounds from the decision log,
+so bands reflect the actual comfort profile, MRT correction, and window
+adjustments active at each point in time (not just the current config).
+
 **Capacity analysis:** Violations are classified by whether the sensor's
 dedicated effectors (zone thermostat + name-matched mini split/blower) were
 already at maximum. "Capacity exceeded" = building physics limitation.
 "Control opportunity" = the system had headroom it didn't use.
 
-**Console output:** Summary table with per-sensor breakdown and dedicated
-effector list.
+**Control authority:** Per-sensor tracking of when the system had full control
+vs blocked/overridden/offline. Background tinting on time-series panels and a
+"Ctrl %" column in the console summary.
+
+**Console output:** Summary table with per-sensor breakdown: in band %,
+control authority %, capacity/control violation split, and dedicated effector
+list.
 
 ## Typical Workflow
 
@@ -175,13 +187,14 @@ just sysid -v
 
 # Start dry-run control loop
 just control                 # single cycle to inspect output
-just control-loop            # watch decisions over time
+just control --loop          # watch decisions over time
 
 # When confident: go live
-just control-live            # single cycle to test
-just execute                 # apply to HA
+just control --live          # single cycle to test
+just tui --live              # interactive dashboard in live mode (recommended)
 
-# Ongoing: refit parameters as data accumulates
+# Sysid runs automatically in the TUI (hourly, with quality gate).
+# Manually refit after physical changes:
 just sysid
 ```
 

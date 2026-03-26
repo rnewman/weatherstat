@@ -163,6 +163,8 @@ The `defaults` section also accepts optional control thresholds (in configured u
 - **`max_1h_change`**: Flag predictions with 1-hour changes larger than this. Default: 5°F (2.8°C).
 - **`min_improvement`**: Minimum cost improvement over all-off to justify running HVAC. Default: 1°F (0.6°C).
 - **`cold_room_override`**: Force zone heating when a room is this far below comfort min. Default: 1°F (0.6°C).
+- **`control_interval`**: Seconds between control cycles. Default: 300 (5 min).
+- **`sysid_interval`**: Seconds between automatic sysid runs in the TUI. Default: 3600 (1 hour). Set to 0 to disable.
 
 ## 6. Verify the config
 
@@ -230,8 +232,8 @@ Once you're satisfied with the dry-run decisions:
 
 ```bash
 just control --live         # single live cycle
-just control --live --loop  # continuous 15-min loop (production)
-just tui --live             # interactive dashboard in live mode
+just control --live --loop  # continuous 5-min loop (production)
+just tui --live             # interactive dashboard in live mode (recommended)
 ```
 
 This executes the decisions: sets thermostat targets, changes mini-split modes, adjusts fan speeds. The executor checks current HA state before acting (lazy execution — skip if already correct) and detects manual overrides.

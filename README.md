@@ -72,7 +72,7 @@ The system doesn't assume or configure these parameters. It *learns* them from y
 
 ## What the system does
 
-Every 15 minutes (configurable), weatherstat runs a control cycle:
+Every 5 minutes (configurable), weatherstat runs a control cycle:
 
 ### 1. Read the current state
 
@@ -99,7 +99,7 @@ Plus an energy cost term for each active effector. The total score is comfort co
 
 ### 5. Pick the best plan and execute
 
-Select the plan with the lowest total cost. But only execute the *immediate* action — this is the **receding horizon** principle. A plan that says "wait 2 hours then heat" means "stay off right now." In 15 minutes, the controller re-evaluates with fresh data and may choose differently. The future part of the plan is never committed; it's just context for choosing the right action now.
+Select the plan with the lowest total cost. But only execute the *immediate* action — this is the **receding horizon** principle. A plan that says "wait 2 hours then heat" means "stay off right now." In 5 minutes, the controller re-evaluates with fresh data and may choose differently. The future part of the plan is never committed; it's just context for choosing the right action now.
 
 ### 6. Explain why
 
@@ -152,7 +152,7 @@ Open windows dramatically change a room's thermal behavior. The system handles t
 The system is conservative by design:
 
 - **Setpoint clamps** (62–78°F): Never sets a thermostat outside safe bounds.
-- **Hold times**: Minimum 10 minutes between setpoint changes.
+- **Hold times**: Minimum 3 minutes between setpoint changes.
 - **Mode hold windows**: No mini-split mode changes during configurable quiet hours (e.g., 10pm–7am), so you're not woken by compressor starts — only silent target temperature adjustments.
 - **Cold-room override**: If any sensor drops significantly below its comfort minimum, constrain the sweep to scenarios where the most-coupled trajectory effector (from sysid's coupling matrix) is heating immediately — overriding delay and cost trade-offs.
 - **Minimum improvement threshold**: Don't turn on HVAC unless it improves the score by at least 1.0 units over doing nothing.

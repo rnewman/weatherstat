@@ -114,7 +114,7 @@ def load_decisions(days: int) -> pd.DataFrame:
 def load_comfort_schedules(cfg) -> dict[str, list[dict]]:
     """Load comfort schedules from config.
 
-    Returns: {label: [{start_hour, end_hour, min, max, preferred}, ...]}
+    Returns: {label: [{start_hour, end_hour, min, max, preferred_lo, preferred_hi}, ...]}
     """
     schedules: dict[str, list[dict]] = {}
     for constraint in cfg.constraints:
@@ -124,7 +124,8 @@ def load_comfort_schedules(cfg) -> dict[str, list[dict]]:
                 "end_hour": e.end_hour,
                 "min": e.min_temp,
                 "max": e.max_temp,
-                "preferred": e.preferred,
+                "preferred_lo": e.preferred_lo,
+                "preferred_hi": e.preferred_hi,
             }
             for e in constraint.entries
         ]
@@ -147,20 +148,94 @@ def comfort_bounds_at_hour(schedule: list[dict], hour: int) -> dict | None:
 def compute_comfort_bands(
     timestamps: pd.Series,
     schedule: list[dict],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute min/max/preferred arrays aligned to timestamps."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute min/max/preferred_lo/preferred_hi arrays aligned to timestamps."""
     n = len(timestamps)
     mins = np.full(n, np.nan)
     maxs = np.full(n, np.nan)
-    prefs = np.full(n, np.nan)
+    pref_los = np.full(n, np.nan)
+    pref_his = np.full(n, np.nan)
     for i, ts in enumerate(timestamps):
         local = ts.astimezone(LOCAL_TZ)
         bounds = comfort_bounds_at_hour(schedule, local.hour)
         if bounds:
             mins[i] = bounds["min"]
             maxs[i] = bounds["max"]
-            prefs[i] = bounds["preferred"]
-    return mins, maxs, prefs
+            pref_los[i] = bounds["preferred_lo"]
+            pref_his[i] = bounds["preferred_hi"]
+    return mins, maxs, pref_los, pref_his
+
+
+def compute_comfort_bands_from_decisions(
+    timestamps: pd.Series,
+    label: str,
+    decisions: pd.DataFrame,
+    fallback_schedule: list[dict],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute comfort bands using logged decision comfort_bounds.
+
+    For each sensor timestamp, uses the comfort_bounds from the nearest
+    preceding decision. This reflects the actual profile, MRT correction,
+    and window adjustments that were active at the time.
+
+    Falls back to config-based schedule for timestamps before the first
+    decision or when decision data lacks enriched fields.
+    """
+    n = len(timestamps)
+    mins = np.full(n, np.nan)
+    maxs = np.full(n, np.nan)
+    pref_los = np.full(n, np.nan)
+    pref_his = np.full(n, np.nan)
+
+    # Parse comfort_bounds from decisions
+    decision_times: list[datetime] = []
+    decision_bounds: list[dict[str, float] | None] = []
+    for _, row in decisions.iterrows():
+        cb_json = row.get("comfort_bounds")
+        if not cb_json or pd.isna(cb_json):
+            continue
+        cb = json.loads(cb_json)
+        bounds = cb.get(label)
+        if bounds:
+            decision_times.append(row["timestamp"])
+            decision_bounds.append(bounds)
+
+    if not decision_times:
+        return compute_comfort_bands(timestamps, fallback_schedule)
+
+    # Convert to tz-naive UTC for searchsorted (numpy doesn't support tz-aware)
+    dt_arr = np.array(
+        [t.tz_convert("UTC").tz_localize(None) for t in decision_times],
+        dtype="datetime64[ns]",
+    )
+    ts_arr = timestamps.dt.tz_convert("UTC").dt.tz_localize(None).values
+
+    # For each timestamp, find the most recent preceding decision
+    indices = np.searchsorted(dt_arr, ts_arr, side="right") - 1
+
+    for i in range(n):
+        idx = indices[i]
+        if idx < 0:
+            # Before first decision — use config-based schedule
+            local = timestamps.iloc[i].astimezone(LOCAL_TZ)
+            fb = comfort_bounds_at_hour(fallback_schedule, local.hour)
+            if fb:
+                mins[i] = fb["min"]
+                maxs[i] = fb["max"]
+                pref_los[i] = fb["preferred_lo"]
+                pref_his[i] = fb["preferred_hi"]
+            continue
+
+        bounds = decision_bounds[idx]
+        if bounds is None:
+            continue
+        mins[i] = bounds["min"]
+        maxs[i] = bounds["max"]
+        # Enriched bounds (preferred_lo/hi); fall back to min/max for old decisions
+        pref_los[i] = bounds.get("preferred_lo", bounds["min"])
+        pref_his[i] = bounds.get("preferred_hi", bounds["max"])
+
+    return mins, maxs, pref_los, pref_his
 
 
 # ── Capacity analysis ─────────────────────────────────────────────────────
@@ -277,6 +352,87 @@ def compute_capacity_utilization(
     return results
 
 
+# ── Control authority ─────────────────────────────────────────────────────
+
+
+def compute_control_authority(
+    timestamps: pd.Series,
+    label: str,
+    decisions: pd.DataFrame,
+    dedicated_effectors: dict[str, list[str]],
+) -> np.ndarray:
+    """Compute per-timestamp control authority for a sensor.
+
+    Returns an array aligned to `timestamps` with values:
+      1.0 = full control (no relevant effectors blocked)
+      0.5 = partial (some dedicated effectors blocked)
+      0.0 = no control (all dedicated effectors blocked, or system not running)
+      NaN = no decision data for this timestamp
+
+    Uses the `blocked` column from the decision log and the `live` flag.
+    """
+    n = len(timestamps)
+    authority = np.full(n, np.nan)
+
+    effs = dedicated_effectors.get(label, [])
+    if not effs:
+        # No dedicated effectors — can't assess authority
+        return authority
+
+    # Parse blocked sets from decisions
+    decision_times: list[datetime] = []
+    decision_authority: list[float] = []
+    for _, row in decisions.iterrows():
+        blocked_json = row.get("blocked")
+        blocked: set[str] = set()
+        if blocked_json and not pd.isna(blocked_json):
+            blocked = set(json.loads(blocked_json).keys())
+
+        # If not live, system wasn't acting
+        is_live = bool(row.get("live", 0))
+        if not is_live:
+            decision_times.append(row["timestamp"])
+            decision_authority.append(0.0)
+            continue
+
+        blocked_count = sum(1 for e in effs if e in blocked)
+        if blocked_count == len(effs):
+            auth = 0.0
+        elif blocked_count > 0:
+            auth = 0.5
+        else:
+            auth = 1.0
+
+        decision_times.append(row["timestamp"])
+        decision_authority.append(auth)
+
+    if not decision_times:
+        return authority
+
+    dt_arr = np.array(
+        [t.tz_convert("UTC").tz_localize(None) for t in decision_times],
+        dtype="datetime64[ns]",
+    )
+    ts_arr = timestamps.dt.tz_convert("UTC").dt.tz_localize(None).values
+    auth_arr = np.array(decision_authority)
+
+    # Map each timestamp to the most recent preceding decision
+    indices = np.searchsorted(dt_arr, ts_arr, side="right") - 1
+
+    # Decisions older than 20 min are stale (loop is 15 min)
+    stale_ns = np.timedelta64(20, "m")
+    for i in range(n):
+        idx = indices[i]
+        if idx < 0:
+            continue
+        age = ts_arr[i] - dt_arr[idx]
+        if age <= stale_ns:
+            authority[i] = auth_arr[idx]
+        # else: leave as NaN (gap in decisions = system not running)
+
+    return authority
+
+
 # ── Statistics ────────────────────────────────────────────────────────────
 
 
@@ -382,7 +538,7 @@ def plot_comfort(
     dedicated_effectors = build_sensor_dedicated_effectors(cfg, params)
     capacity_data = compute_capacity_utilization(decisions, dedicated_effectors) if not decisions.empty else {}
 
-    labels = [l for l in SENSOR_ORDER if l in schedules]
+    labels = [lab for lab in SENSOR_ORDER if lab in schedules]
 
     # Layout: summary row + sensor panels + outdoor + optional prediction
     n_sensor_panels = len(labels)
@@ -407,7 +563,7 @@ def plot_comfort(
     # ── Summary panel ──
     ax_summary = axes[0]
     _draw_summary(ax_summary, labels, sensors_df, label_to_sensor, schedules,
-                  timestamps, capacity_data, days)
+                  timestamps, capacity_data, days, decisions=decisions)
 
     # ── Per-sensor comfort panels ──
     all_stats: dict[str, dict] = {}
@@ -425,11 +581,23 @@ def plot_comfort(
         temps = sensors_df[sensor_col].values.astype(float)
         temps[temps < 40.0] = np.nan  # filter bogus sensor readings
 
-        mins, maxs, prefs = compute_comfort_bands(timestamps, schedule)
+        # Use historical decision data for bands when available
+        if not decisions.empty:
+            mins, maxs, pref_los, pref_his = compute_comfort_bands_from_decisions(
+                timestamps, label, decisions, schedule,
+            )
+        else:
+            mins, maxs, pref_los, pref_his = compute_comfort_bands(timestamps, schedule)
 
-        # Comfort band fill and preferred line
+        # Comfort band fill and preferred line/band
         ax.fill_between(timestamps, mins, maxs, alpha=0.12, color="#4CAF50")
-        ax.plot(timestamps, prefs, color="#4CAF50", linewidth=0.7, alpha=0.5, linestyle="--")
+        has_band = np.any(pref_los != pref_his)
+        if has_band:
+            ax.fill_between(timestamps, pref_los, pref_his, alpha=0.18, color="#4CAF50")
+            ax.plot(timestamps, pref_los, color="#4CAF50", linewidth=0.7, alpha=0.5, linestyle="--")
+            ax.plot(timestamps, pref_his, color="#4CAF50", linewidth=0.7, alpha=0.5, linestyle="--")
+        else:
+            ax.plot(timestamps, pref_los, color="#4CAF50", linewidth=0.7, alpha=0.5, linestyle="--")
 
         # Temperature trace
         ax.plot(timestamps, temps, color="#1976D2", linewidth=0.8, alpha=0.85)
@@ -446,16 +614,44 @@ def plot_comfort(
 
         stats = compute_stats(temps, mins, maxs)
         cap_stats = compute_capacity_stats(capacity_data.get(label, []))
-        all_stats[label] = {**stats, **cap_stats}
 
-        # Annotation: in-band % + capacity breakdown
+        # Control authority strip along the bottom of the panel
+        authority = compute_control_authority(
+            timestamps, label, decisions, dedicated_effectors,
+        ) if not decisions.empty else np.full(len(timestamps), np.nan)
+        pct_controlled = np.nanmean(authority == 1.0) * 100 if np.any(~np.isnan(authority)) else np.nan
+
+        all_stats[label] = {**stats, **cap_stats, "pct_controlled": pct_controlled}
+
+        # Draw authority strip: thin colored bar at the very bottom of each panel.
+        # Uses axes transform so it stays at 0-3% of panel height regardless of y scale.
+        if np.any(~np.isnan(authority)):
+            no_ctrl = authority == 0.0
+            partial_ctrl = authority == 0.5
+            no_data = np.isnan(authority)
+            if no_ctrl.any():
+                ax.fill_between(timestamps, 0, 0.03, where=no_ctrl,
+                                transform=ax.get_xaxis_transform(),
+                                alpha=0.7, color="#F44336", zorder=5, linewidth=0)
+            if partial_ctrl.any():
+                ax.fill_between(timestamps, 0, 0.03, where=partial_ctrl,
+                                transform=ax.get_xaxis_transform(),
+                                alpha=0.7, color="#FF9800", zorder=5, linewidth=0)
+            if no_data.any():
+                ax.fill_between(timestamps, 0, 0.03, where=no_data,
+                                transform=ax.get_xaxis_transform(),
+                                alpha=0.5, color="#9E9E9E", zorder=5, linewidth=0)
+
+        # Annotation: in-band % + capacity breakdown + control authority
         parts = [f"{stats['pct_in_band']:.0f}% in band"]
+        if not np.isnan(pct_controlled) and pct_controlled < 99.5:
+            parts.append(f"ctrl: {pct_controlled:.0f}%")
         if cap_stats["cold_total"] > 0:
             pct_cap = 100 * cap_stats["cold_capacity"] / cap_stats["cold_total"]
-            parts.append(f"cold: {pct_cap:.0f}% capacity-limited")
+            parts.append(f"cold: {pct_cap:.0f}% cap-limited")
         if cap_stats["hot_total"] > 0:
             pct_cap = 100 * cap_stats["hot_capacity"] / cap_stats["hot_total"]
-            parts.append(f"hot: {pct_cap:.0f}% capacity-limited")
+            parts.append(f"hot: {pct_cap:.0f}% cap-limited")
         ax.text(
             0.01, 0.93, "  |  ".join(parts),
             transform=ax.transAxes, fontsize=7.5, verticalalignment="top",
@@ -564,6 +760,7 @@ def plot_comfort(
 
 def _draw_summary(
     ax, labels, sensors_df, label_to_sensor, schedules, timestamps, capacity_data, days,
+    decisions=None,
 ):
     """Draw the top summary bar: per-sensor horizontal stacked bars."""
     ax.set_xlim(0, 100)
@@ -591,7 +788,12 @@ def _draw_summary(
 
         temps = sensors_df[sensor_col].values.astype(float)
         temps[temps < 40.0] = np.nan
-        mins, maxs, _prefs = compute_comfort_bands(timestamps, schedule)
+        if decisions is not None and not decisions.empty:
+            mins, maxs, _pref_los, _pref_his = compute_comfort_bands_from_decisions(
+                timestamps, label, decisions, schedule,
+            )
+        else:
+            mins, maxs, _pref_los, _pref_his = compute_comfort_bands(timestamps, schedule)
 
         valid = ~np.isnan(temps) & ~np.isnan(mins)
         if valid.sum() == 0:
@@ -674,18 +876,19 @@ def _print_summary(labels: list[str], all_stats: dict[str, dict],
                     dedicated_effectors: dict[str, list[str]], days: int):
     """Print console summary table."""
     overall_in = np.mean([s.get("pct_in_band", 0) for s in all_stats.values()]) if all_stats else 0
-    print(f"\n{'='*90}")
+    print(f"\n{'='*98}")
     print(f"  Comfort Performance — last {days} days — avg {overall_in:.0f}% in band")
-    print(f"{'='*90}")
-    print(f"{'Sensor':<20} {'In Band':>8} {'Cold':>6} {'(cap)':>6} {'(ctrl)':>6} "
+    print(f"{'='*98}")
+    print(f"{'Sensor':<20} {'In Band':>8} {'Ctrl':>5} {'Cold':>6} {'(cap)':>6} {'(ctrl)':>6} "
           f"{'Hot':>6} {'(cap)':>6} {'(ctrl)':>6}  {'Dedicated Effectors'}")
-    print("-" * 90)
+    print("-" * 98)
 
     for label in labels:
         s = all_stats.get(label, {})
         pct_in = s.get("pct_in_band", 0)
         pct_below = s.get("pct_below", 0)
         pct_above = s.get("pct_above", 0)
+        pct_ctrl = s.get("pct_controlled", float("nan"))
 
         cold_total = s.get("cold_total", 0)
         cold_cap = s.get("cold_capacity", 0)
@@ -697,18 +900,20 @@ def _print_summary(labels: list[str], all_stats: dict[str, dict],
         def _frac(num, den):
             return f"{100*num/den:.0f}%" if den > 0 else "-"
 
+        ctrl_str = f"{pct_ctrl:.0f}%" if not np.isnan(pct_ctrl) else "-"
         effs = dedicated_effectors.get(label, [])
         eff_str = ", ".join(e.replace("thermostat_", "t:").replace("mini_split_", "ms:").replace("blower_", "bl:")
                            for e in effs) if effs else "(cross-talk only)"
 
         print(
-            f"{label:<20} {pct_in:>7.0f}% {pct_below:>5.1f}% "
+            f"{label:<20} {pct_in:>7.0f}% {ctrl_str:>5} {pct_below:>5.1f}% "
             f"{_frac(cold_cap, cold_total):>6} {_frac(cold_ctrl, cold_total):>6} "
             f"{pct_above:>5.1f}% {_frac(hot_cap, hot_total):>6} {_frac(hot_ctrl, hot_total):>6}"
             f"  {eff_str}"
         )
 
-    print(f"\n  cap = dedicated effectors at max  |  ctrl = dedicated effectors had headroom")
+    print("\n  cap = dedicated effectors at max  |  ctrl = dedicated effectors had headroom"
+          "  |  Ctrl = % time with full control authority")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────

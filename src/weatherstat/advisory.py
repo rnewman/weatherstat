@@ -162,7 +162,7 @@ def evaluate_window_opportunities(
             continue
 
         # Re-sweep: find best HVAC plan with toggled window
-        resweep_decision, _resweep_scenario = sweep_scenarios_physics(
+        resweep_decision, _resweep_scenario, _ = sweep_scenarios_physics(
             current_temps=state.current_temps,
             outdoor_temp=state.outdoor_temp,
             forecast_temps=state.forecast_temps,
