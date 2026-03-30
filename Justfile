@@ -56,6 +56,14 @@ tui *ARGS:
 comfort *ARGS:
     uv run python ./scripts/plot_comfort.py {{ARGS}}
 
+# Debug inspector (subcommands: temps, gains, taus, decisions, opportunities, snapshots, comfort)
+debug *ARGS:
+    uv run python ./scripts/debug_state.py {{ARGS}}
+
+# Replay a window opportunity evaluation (args: <timestamp> <window_name>)
+replay *ARGS:
+    uv run python ./scripts/replay_opportunity.py {{ARGS}}
+
 # Verify live config parses correctly
 verify:
     #!/usr/bin/env bash
