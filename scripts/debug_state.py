@@ -2,14 +2,17 @@
 """Weatherstat debug inspector.
 
 Usage:
-    python scripts/debug_state.py                  # full status summary
-    python scripts/debug_state.py temps             # current temperatures + comfort
-    python scripts/debug_state.py gains [SENSOR]    # sysid gains (optionally filtered)
-    python scripts/debug_state.py taus              # tau models + window betas
-    python scripts/debug_state.py decisions [N]     # last N decisions (default 5)
-    python scripts/debug_state.py opportunities     # advisory state
-    python scripts/debug_state.py snapshots         # snapshot DB stats
-    python scripts/debug_state.py comfort [SENSOR]  # comfort schedules (optionally filtered)
+    python scripts/debug_state.py                       # full status summary
+    python scripts/debug_state.py temps                  # current temperatures + comfort
+    python scripts/debug_state.py gains [SENSOR]         # sysid gains (optionally filtered)
+    python scripts/debug_state.py taus                   # tau models + window betas
+    python scripts/debug_state.py decisions [N]          # last N decisions (default 5)
+    python scripts/debug_state.py opportunities          # advisory state
+    python scripts/debug_state.py snapshots              # snapshot DB stats
+    python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
+
+    --bundle <dir>   Point at a debug bundle instead of the live data directory.
+                     Example: python scripts/debug_state.py --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 temps
 
 All output is plain text, suitable for piping to Claude or other tools.
 """
@@ -19,16 +22,49 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-DATA_DIR = Path.home() / ".weatherstat"
-THERMAL_PARAMS = DATA_DIR / "thermal_params.json"
-DECISION_LOG = DATA_DIR / "decision_log.db"
-SNAPSHOTS_DB = DATA_DIR / "snapshots" / "snapshots.db"
-CONTROL_STATE = DATA_DIR / "control_state.json"
-EXECUTOR_STATE = DATA_DIR / "executor_state.json"
-ADVISORY_STATE = DATA_DIR / "advisory_state.json"
+# ── Paths (overridden by --bundle) ───────────────────────────────────────
+
+def _default_data_dir() -> Path:
+    import os
+    return Path(os.environ.get("WEATHERSTAT_DATA_DIR", Path.home() / ".weatherstat"))
+
+
+_data_dir = _default_data_dir()
+
+
+def _paths() -> dict[str, Path]:
+    """Return all data paths relative to the active data directory."""
+    d = _data_dir
+    return {
+        "thermal_params": d / "thermal_params.json",
+        "decision_log": d / "decision_log.db",
+        "snapshots_db": d / "snapshots" / "snapshots.db",
+        "control_state": d / "control_state.json",
+        "advisory_state": d / "advisory_state.json",
+        "config": d / "weatherstat.yaml",
+        "decisions_json": d / "decisions.json",  # bundle format
+    }
+
+
+def _set_bundle(bundle_dir: Path) -> None:
+    """Redirect all paths to a bundle directory."""
+    global _data_dir
+    _data_dir = bundle_dir
+
+    # Bundles store snapshots.db at the top level; ensure the expected
+    # subdirectory path also works.
+    snap_subdir = bundle_dir / "snapshots"
+    snap_subdir.mkdir(exist_ok=True)
+    top_db = bundle_dir / "snapshots.db"
+    sub_db = snap_subdir / "snapshots.db"
+    if top_db.exists() and not sub_db.exists():
+        import shutil
+        shutil.copy2(top_db, sub_db)
+
+    print(f"[bundle] Using {bundle_dir}\n")
 
 
 def _load_json(path: Path) -> dict | None:
@@ -45,8 +81,8 @@ def _ago(ts_str: str | None) -> str:
     try:
         dt = datetime.fromisoformat(ts_str)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - dt
+            dt = dt.replace(tzinfo=UTC)
+        delta = datetime.now(UTC) - dt
         secs = int(delta.total_seconds())
         if secs < 60:
             return f"{secs}s ago"
@@ -64,7 +100,8 @@ def _ago(ts_str: str | None) -> str:
 
 def cmd_temps() -> None:
     """Current temperatures from latest snapshot + comfort bounds from latest decision."""
-    conn = sqlite3.connect(str(SNAPSHOTS_DB))
+    p = _paths()
+    conn = sqlite3.connect(str(p["snapshots_db"]))
     row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
     ts = row[0] if row else None
     print(f"Latest snapshot: {ts} ({_ago(ts)})")
@@ -81,18 +118,7 @@ def cmd_temps() -> None:
 
     # Load comfort bounds from latest decision
     bounds: dict[str, dict] = {}
-    if DECISION_LOG.exists():
-        dconn = sqlite3.connect(str(DECISION_LOG))
-        drow = dconn.execute(
-            "SELECT comfort_bounds, active_profile, mrt_offsets FROM decisions ORDER BY timestamp DESC LIMIT 1"
-        ).fetchone()
-        if drow and drow[0]:
-            bounds = json.loads(drow[0])
-            profile = drow[1] or "?"
-            mrt = json.loads(drow[2]) if drow[2] else {}
-            mrt_base = mrt.get("_base", 0)
-            print(f"Profile: {profile}  MRT base: {mrt_base:+.1f}°F")
-        dconn.close()
+    bounds = _load_comfort_bounds(p)
 
     print()
     print(f"  {'Sensor':<30} {'Temp':>6}  {'Min':>5} {'Pref':>9} {'Max':>5}  Status")
@@ -135,9 +161,43 @@ def cmd_temps() -> None:
         print(f"  {name:<30} {temp:6.1f}  {cmin_str:>5} {pref_str:>9} {cmax_str:>5}  {status}")
 
 
+def _load_comfort_bounds(p: dict[str, Path]) -> dict[str, dict]:
+    """Load comfort bounds from decision log (SQLite) or decisions.json (bundle)."""
+    # Try SQLite decision log first
+    if p["decision_log"].exists():
+        dconn = sqlite3.connect(str(p["decision_log"]))
+        drow = dconn.execute(
+            "SELECT comfort_bounds, active_profile, mrt_offsets FROM decisions ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        dconn.close()
+        if drow and drow[0]:
+            bounds = json.loads(drow[0])
+            profile = drow[1] or "?"
+            mrt = json.loads(drow[2]) if drow[2] else {}
+            mrt_base = mrt.get("_base", 0)
+            print(f"Profile: {profile}  MRT base: {mrt_base:+.1f}°F")
+            return bounds
+
+    # Fall back to decisions.json (bundle format)
+    if p["decisions_json"].exists():
+        with open(p["decisions_json"]) as f:
+            decisions = json.load(f)
+        if decisions:
+            # Last decision in the list is closest to target time
+            last = decisions[-1]
+            bounds = last.get("comfort_bounds", {})
+            profile = last.get("active_profile", "?")
+            mrt = last.get("mrt_offsets", {})
+            mrt_base = mrt.get("_base", 0) if isinstance(mrt, dict) else 0
+            print(f"Profile: {profile}  MRT base: {mrt_base:+.1f}°F")
+            return bounds
+
+    return {}
+
+
 def cmd_gains(sensor_filter: str | None = None) -> None:
     """Show sysid effector→sensor gains."""
-    params = _load_json(THERMAL_PARAMS)
+    params = _load_json(_paths()["thermal_params"])
     if not params:
         print("No thermal_params.json found.")
         return
@@ -170,7 +230,7 @@ def cmd_gains(sensor_filter: str | None = None) -> None:
 
 def cmd_taus() -> None:
     """Show tau models and window betas."""
-    params = _load_json(THERMAL_PARAMS)
+    params = _load_json(_paths()["thermal_params"])
     if not params:
         print("No thermal_params.json found.")
         return
@@ -201,37 +261,60 @@ def cmd_taus() -> None:
 
 def cmd_decisions(n: int = 5) -> None:
     """Show recent decisions."""
-    if not DECISION_LOG.exists():
-        print("No decision_log.db found.")
+    p = _paths()
+
+    # Try SQLite first, then bundle JSON
+    decisions_data: list[dict] = []
+
+    if p["decision_log"].exists():
+        conn = sqlite3.connect(str(p["decision_log"]))
+        rows = conn.execute(
+            """SELECT timestamp, live, comfort_cost, energy_cost,
+                      trajectory, active_profile, blocked,
+                      current_temps,
+                      actual_comfort_cost, outcome_backfilled,
+                      effector_decisions
+               FROM decisions ORDER BY timestamp DESC LIMIT ?""",
+            (n,),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            ts, live, cc, ec, traj, profile, blocked_json, temps_json, actual_cc, backfilled, eff_json = row
+            decisions_data.append({
+                "timestamp": ts, "live": live, "comfort_cost": cc, "energy_cost": ec,
+                "active_profile": profile, "blocked": json.loads(blocked_json) if blocked_json else {},
+                "current_temps": json.loads(temps_json) if temps_json else {},
+                "actual_comfort_cost": actual_cc, "outcome_backfilled": backfilled,
+                "effector_decisions": json.loads(eff_json) if eff_json else [],
+            })
+    elif p["decisions_json"].exists():
+        with open(p["decisions_json"]) as f:
+            all_decisions = json.load(f)
+        # Take last N
+        decisions_data = all_decisions[-n:]
+
+    if not decisions_data:
+        print("No decisions found.")
         return
 
-    conn = sqlite3.connect(str(DECISION_LOG))
-    rows = conn.execute(
-        """SELECT timestamp, live, comfort_cost, energy_cost,
-                  trajectory, active_profile, blocked,
-                  current_temps,
-                  actual_comfort_cost, outcome_backfilled,
-                  effector_decisions
-           FROM decisions ORDER BY timestamp DESC LIMIT ?""",
-        (n,),
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        print("No decisions logged.")
-        return
-
-    for row in rows:
-        ts, live, cc, ec, traj, profile, blocked_json, temps_json, actual_cc, backfilled, eff_json = row
+    for d in decisions_data:
+        ts = d.get("timestamp", "?")
+        live = d.get("live", False)
+        cc = d.get("comfort_cost", 0)
+        ec = d.get("energy_cost", 0)
+        profile = d.get("active_profile", "?")
         mode = "LIVE" if live else "DRY"
         print(f"─── {ts}  [{mode}]  profile={profile or '?'} ───")
         print(f"  Cost: comfort={cc:.1f}  energy={ec:.3f}  total={cc + ec:.1f}")
+
+        actual_cc = d.get("actual_comfort_cost")
+        backfilled = d.get("outcome_backfilled")
         if backfilled and actual_cc is not None:
             print(f"  Actual comfort cost: {actual_cc:.1f}")
 
         # Effector decisions
-        if eff_json:
-            effs = json.loads(eff_json)
+        effs = d.get("effector_decisions", [])
+        if effs:
             parts = []
             for e in effs:
                 name = e.get("name", "?")
@@ -244,8 +327,8 @@ def cmd_decisions(n: int = 5) -> None:
             print(f"  Effectors: {', '.join(parts)}")
 
         # Current temps (brief)
-        if temps_json:
-            temps = json.loads(temps_json)
+        temps = d.get("current_temps", {})
+        if temps:
             temp_parts = []
             for k, v in sorted(temps.items()):
                 if "_temp" in k:
@@ -254,24 +337,23 @@ def cmd_decisions(n: int = 5) -> None:
             print(f"  Temps: {', '.join(temp_parts)}")
 
         # Blocked
-        if blocked_json:
-            blocked = json.loads(blocked_json)
-            if blocked:
-                print(f"  Blocked: {blocked}")
+        blocked = d.get("blocked", {})
+        if blocked:
+            print(f"  Blocked: {blocked}")
 
         print()
 
 
 def cmd_opportunities() -> None:
     """Show advisory state."""
-    state = _load_json(ADVISORY_STATE)
+    state = _load_json(_paths()["advisory_state"])
     if not state:
         print("No advisory_state.json found.")
         return
 
     active = state.get("active", {})
     cooldowns = state.get("cooldowns", {})
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
 
     print("Active opportunities:")
     if active:
@@ -293,11 +375,12 @@ def cmd_opportunities() -> None:
 
 def cmd_snapshots() -> None:
     """Snapshot DB stats."""
-    if not SNAPSHOTS_DB.exists():
+    p = _paths()
+    if not p["snapshots_db"].exists():
         print("No snapshots.db found.")
         return
 
-    conn = sqlite3.connect(str(SNAPSHOTS_DB))
+    conn = sqlite3.connect(str(p["snapshots_db"]))
     row = conn.execute(
         "SELECT COUNT(DISTINCT timestamp), MIN(timestamp), MAX(timestamp) FROM readings"
     ).fetchone()
@@ -318,7 +401,11 @@ def cmd_snapshots() -> None:
 
 def cmd_comfort(sensor_filter: str | None = None) -> None:
     """Show comfort schedules from config."""
-    # Import here to use the config loader
+    # If pointing at a bundle, set WEATHERSTAT_DATA_DIR so load_config finds the right YAML
+    import os
+    if _data_dir != _default_data_dir():
+        os.environ["WEATHERSTAT_DATA_DIR"] = str(_data_dir)
+
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from weatherstat.yaml_config import load_config
 
@@ -341,6 +428,7 @@ def cmd_comfort(sensor_filter: str | None = None) -> None:
 
 def cmd_summary() -> None:
     """Full status summary."""
+    p = _paths()
     print("=== Weatherstat Debug Summary ===\n")
 
     # Snapshots
@@ -348,7 +436,7 @@ def cmd_summary() -> None:
     print()
 
     # Sysid
-    params = _load_json(THERMAL_PARAMS)
+    params = _load_json(p["thermal_params"])
     if params:
         print(f"Sysid: {params.get('timestamp', '?')} ({_ago(params.get('timestamp'))})")
         n_taus = len(params.get("fitted_taus", []))
@@ -357,7 +445,7 @@ def cmd_summary() -> None:
     print()
 
     # Control state
-    cs = _load_json(CONTROL_STATE)
+    cs = _load_json(p["control_state"])
     if cs:
         print(f"Control state: {_ago(cs.get('last_decision_time'))}")
         if cs.get("setpoints"):
@@ -389,14 +477,24 @@ COMMANDS = {
 }
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args:
+    argv = sys.argv[1:]
+
+    # Extract --bundle flag
+    if "--bundle" in argv:
+        idx = argv.index("--bundle")
+        if idx + 1 >= len(argv):
+            print("--bundle requires a directory argument")
+            sys.exit(1)
+        _set_bundle(Path(argv[idx + 1]))
+        argv = argv[:idx] + argv[idx + 2:]
+
+    if not argv:
         cmd_summary()
-    elif args[0] in COMMANDS:
-        COMMANDS[args[0]](args[1:])
-    elif args[0] in ("-h", "--help"):
+    elif argv[0] in COMMANDS:
+        COMMANDS[argv[0]](argv[1:])
+    elif argv[0] in ("-h", "--help"):
         print(__doc__)
     else:
-        print(f"Unknown command: {args[0]}")
+        print(f"Unknown command: {argv[0]}")
         print(__doc__)
         sys.exit(1)

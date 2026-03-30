@@ -9,7 +9,8 @@ When the user asks to debug, inspect, or understand the current state of the wea
 
 ## Available subcommands
 
-Run these via `just debug <subcommand>` or `uv run python scripts/debug_state.py <subcommand>`:
+Run these via `just debug <subcommand>` or `uv run python scripts/debug_state.py <subcommand>`.
+Add `--bundle <dir>` to inspect a point-in-time bundle instead of the live system:
 
 | Subcommand | What it shows |
 |-----------|---------------|
@@ -28,6 +29,16 @@ Run these via `just debug <subcommand>` or `uv run python scripts/debug_state.py
 2. If the user argument `$ARGUMENTS` is provided, pass it as the subcommand: `just debug $ARGUMENTS`
 3. Present the output and interpret it in context of the user's question.
 4. For deeper investigation (e.g., "why did this opportunity fire?"), combine multiple subcommands.
+
+## Bundles
+
+To inspect a point-in-time bundle:
+```
+just debug --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 temps
+just debug --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 decisions 5
+```
+
+Create bundles with `just bundle <timestamp>`, list with `just bundle --list`, replay with `just bundle --replay <dir>`.
 
 ## Common investigation patterns
 
