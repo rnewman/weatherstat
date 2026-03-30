@@ -1679,7 +1679,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # ── Window opportunities (persistent, energy-aware) ──
     from weatherstat.advisory import evaluate_window_opportunities, process_opportunities
 
-    original_schedules = default_comfort_schedules()
     opp_state = _HS(
         current_temps=current_temps,
         outdoor_temp=outdoor,
@@ -1689,13 +1688,16 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
     )
+    # Pass the same adjusted schedules used for the winning sweep, so the
+    # re-sweep's comfort cost is comparable to winning_comfort_cost.
+    # Using raw schedules would inflate the benefit by the MRT/profile delta.
     window_opportunities = evaluate_window_opportunities(
         opp_state,
         winning_scenario,
         winning_comfort_cost=decision.comfort_cost,
         winning_energy_cost=decision.energy_cost,
         sim_params=sim_params,
-        schedules=original_schedules,
+        schedules=schedules,
         base_hour=base_hour,
         prev_state=prev_state,
         current_temps=current_temps,
