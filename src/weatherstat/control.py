@@ -270,6 +270,9 @@ def apply_mrt_correction(
     outdoor_temp: float,
     mrt_config: MrtCorrectionConfig | None,
     mrt_weights: dict[str, float] | None = None,
+    solar_elevation_gains: dict[str, float] | None = None,
+    current_solar_elev: float = 0.0,
+    current_solar_fraction: float = 0.0,
 ) -> tuple[list[ComfortSchedule], float]:
     """Adjust comfort targets for mean radiant temperature effects.
 
@@ -277,32 +280,56 @@ def apply_mrt_correction(
     the air temperature reading. This shifts comfort targets up when it's cold
     outside to compensate, and down when warm walls make the air feel warmer.
 
-    Per-sensor weights modulate the global offset: a weight of 0.5 halves the
-    correction (e.g., sun-facing room where solar gain warms surfaces), while
-    a weight of 2.0 doubles it (e.g., north-facing room with cold walls).
+    Sun streaming through windows heats interior surfaces, raising MRT above
+    what outdoor temp alone suggests. Per sensor, the effective outdoor temp
+    is increased by the current solar forcing × solar_response, reducing the
+    cold-wall correction on sunny days while preserving it on cloudy days.
+
+    Per-sensor mrt_weights (from YAML) still apply as a multiplier on the
+    final offset for manual adjustments (e.g., rooms with unusual window area).
 
     Args:
         schedules: Comfort schedules for all constrained sensors.
         outdoor_temp: Current outdoor temperature (in configured unit).
         mrt_config: Correction parameters, or None to skip.
         mrt_weights: Per-sensor column → weight multiplier (default 1.0).
+        solar_elevation_gains: Per-sensor β_solar from sysid.
+        current_solar_elev: sin⁺(elevation) right now (0 at night, ~0.7 at noon).
+        current_solar_fraction: Weather condition fraction (1.0=sunny, 0.15=cloudy).
 
     Returns:
-        (adjusted_schedules, base_offset). Base offset before per-sensor weighting.
+        (adjusted_schedules, base_offset). Base offset is from raw outdoor temp
+        (before per-sensor solar adjustment).
     """
     if mrt_config is None:
         return schedules, 0.0
 
+    # Base offset from outdoor temp only (reported for logging)
     raw_offset = mrt_config.alpha * (mrt_config.reference_temp - outdoor_temp)
-    offset = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_offset))
+    base_offset = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_offset))
 
-    if abs(offset) < 0.05:
+    # Fast path: no correction needed when at reference temp and no solar forcing
+    if abs(base_offset) < 0.05 and current_solar_elev * current_solar_fraction < 0.001:
         return schedules, 0.0
 
     adjusted: list[ComfortSchedule] = []
     for schedule in schedules:
+        # Per-sensor solar wall warming raises effective outdoor temp
+        solar_gain = (solar_elevation_gains or {}).get(schedule.sensor, 0.0)
+        solar_wall_warming = solar_gain * current_solar_elev * current_solar_fraction * mrt_config.solar_response
+        effective_outdoor = outdoor_temp + solar_wall_warming
+
+        raw_sensor_offset = mrt_config.alpha * (mrt_config.reference_temp - effective_outdoor)
+        sensor_offset = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_sensor_offset))
+
+        # Manual weight from YAML (for non-solar adjustments like window area)
         weight = (mrt_weights or {}).get(schedule.sensor, 1.0)
-        sensor_offset = offset * weight
+        sensor_offset *= weight
+
+        if abs(sensor_offset) < 0.05:
+            adjusted.append(schedule)
+            continue
+
         new_entries = tuple(
             ComfortScheduleEntry(
                 e.start_hour,
@@ -320,7 +347,7 @@ def apply_mrt_correction(
             for e in schedule.entries
         )
         adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
-    return adjusted, offset
+    return adjusted, base_offset
 
 
 def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
@@ -1336,23 +1363,27 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     sim_params = load_sim_params()
 
-    # MRT correction: adjust targets for cold/warm wall surface effects
-    # Merge configured weights (from YAML) with derived weights (from sysid solar profiles).
-    # Configured weight takes priority if explicitly set (!= 1.0).
+    # MRT correction: adjust targets for cold/warm wall surface effects.
+    # Dynamic: solar wall warming reduces the cold-wall correction on sunny days.
+    # Manual mrt_weight from YAML still applies as a multiplier.
+    from weatherstat.weather import condition_to_solar_fraction as _csf
+    from weatherstat.weather import solar_sin_elevation as _sse
+
     _out_valid = out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
     _mrt_outdoor = float(out_temp) if _out_valid else abs_temp(50.0)
-    _mrt_weights = {
-        c.sensor: (c.mrt_weight if c.mrt_weight != 1.0 else sim_params.mrt_weights.get(c.sensor, 1.0))
-        for c in _CFG.constraints
-    }
-    schedules, mrt_offset = apply_mrt_correction(schedules, _mrt_outdoor, _CFG.mrt_correction, _mrt_weights)
+    _mrt_weights = {c.sensor: c.mrt_weight for c in _CFG.constraints if c.mrt_weight != 1.0}
+    _mrt_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
+    _mrt_solar_frac = _csf(_mrt_cond)
+    _mrt_solar_elev = _sse(_CFG.location.latitude, _CFG.location.longitude, datetime.now(UTC))
+    schedules, mrt_offset = apply_mrt_correction(
+        schedules, _mrt_outdoor, _CFG.mrt_correction, _mrt_weights or None,
+        solar_elevation_gains=sim_params.solar_elevation_gains,
+        current_solar_elev=_mrt_solar_elev,
+        current_solar_fraction=_mrt_solar_frac,
+    )
     if abs(mrt_offset) >= 0.05:
-        _varying = {SENSOR_LABELS.get(s, s): w for s, w in _mrt_weights.items() if w != 1.0}
-        if _varying:
-            _wparts = ", ".join(f"{lbl}={w:.1f}" for lbl, w in _varying.items())
-            print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} base (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL}), weights: {_wparts}")
-        else:
-            print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL})")
+        _solar_note = f", solar sin⁺={_mrt_solar_elev:.2f}×{_mrt_solar_frac:.0%}" if _mrt_solar_elev > 0 else ""
+        print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} base (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL}{_solar_note})")
     window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
     constraint_labels = {c.label for c in _CFG.constraints}
     schedules = adjust_schedules_for_windows(

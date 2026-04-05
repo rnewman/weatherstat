@@ -814,42 +814,6 @@ def _fit_sensor_model(
 # ── Derived MRT weights ──────────────────────────────────────────────────
 
 
-def _compute_mrt_weights(
-    solar_elevation_gains: dict[str, float],
-    constrained_sensors: list[str],
-) -> dict[str, float]:
-    """Derive per-sensor MRT weights from solar elevation gains.
-
-    Sensors with high solar gain get weight < 1 (less MRT correction
-    needed because sun warms surfaces). Sensors with zero solar gain get
-    weight > 1 (cold surfaces dominate, more MRT correction needed).
-
-    Weight is centered around 1.0: sensor at mean solar → 1.0.
-    Clamped to [0.3, 2.0].
-    """
-    # Filter to constrained sensors with positive gains
-    totals: dict[str, float] = {}
-    for sensor in constrained_sensors:
-        gain = solar_elevation_gains.get(sensor, 0.0)
-        if gain > 0:
-            totals[sensor] = gain
-
-    nonzero = [v for v in totals.values() if v > 0]
-    if not nonzero:
-        return {}
-
-    mean_solar = sum(nonzero) / len(nonzero)
-
-    weights: dict[str, float] = {}
-    for sensor in constrained_sensors:
-        total = totals.get(sensor, 0.0)
-        ratio = total / mean_solar if mean_solar > 0 else 0.0
-        raw_weight = 2.0 - ratio
-        weights[sensor] = max(0.3, min(2.0, raw_weight))
-
-    return weights
-
-
 # ── Main pipeline ─────────────────────────────────────────────────────────
 
 
@@ -971,9 +935,9 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     for col, scfg in _CFG.state_sensors.items():
         state_gates[col] = StateGate(column=col, encoding=scfg.encoding)
 
-    # Derive per-sensor MRT weights from solar elevation gains
-    constrained_sensors = [c.sensor for c in _CFG.constraints]
-    mrt_weights = _compute_mrt_weights(solar_elevation_gains, constrained_sensors)
+    # MRT weights: no longer derived from solar gains — the MRT correction
+    # now uses solar_elevation_gains dynamically (per current sun state).
+    # Static mrt_weights are only set via manual YAML config, not sysid.
 
     return SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
@@ -987,7 +951,6 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
         solar_gains=[],  # legacy per-hour format, empty for elevation-based fits
         solar_elevation_gains=solar_elevation_gains,
         state_gates=state_gates,
-        mrt_weights=mrt_weights,
     )
 
 
@@ -1088,14 +1051,6 @@ def print_report(result: SysIdResult) -> None:
                     f"    {p.hour_of_day:2d}:00  {p.gain_f_per_hour:+.3f} ±{p.std_error:.3f}"
                     f"  t={p.t_statistic:5.1f} {marker} {bar}"
                 )
-
-    # MRT weights (derived from solar profiles)
-    if result.mrt_weights:
-        print("\n── Derived MRT Weights (per-sensor, from solar gain) ──")
-        for sensor_name, weight in sorted(result.mrt_weights.items()):
-            label = sensor_name.removeprefix("thermostat_").removesuffix("_temp")
-            bar = "◀" if weight < 1.0 else ("▶" if weight > 1.0 else "=")
-            print(f"  {label:<25s}  {weight:.2f}  {bar}")
 
     # Effector activity summary
     print("\n── Effector Activity Summary ──")

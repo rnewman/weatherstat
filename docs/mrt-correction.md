@@ -104,10 +104,10 @@ representative of current wall state than any forecast.
 
 1. **Manual** (`mrt_weight` in YAML constraint schedule): explicit
    override for rooms where you know the solar exposure. Default 1.0.
-2. **Derived** (from sysid solar gain profiles): sensors with high
-   daytime solar gains get lower weight (sun warms surfaces, reducing
-   MRT correction need), sensors with zero solar gains get higher
-   weight. Stored in `thermal_params.json` as `mrt_weights`.
+2. **Derived** (from sysid solar elevation gains): sensors with high
+   solar gain coefficients get lower weight (sun warms surfaces,
+   reducing MRT correction need), sensors with zero solar gains get
+   higher weight. Stored in `thermal_params.json` as `mrt_weights`.
 
 Priority: manual weight wins if set != 1.0, otherwise derived weight
 is used. If neither is set, weight defaults to 1.0.

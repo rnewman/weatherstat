@@ -142,18 +142,26 @@ class ComfortProfile:
 
 @dataclass(frozen=True)
 class MrtCorrectionConfig:
-    """Outdoor-temp-based correction for mean radiant temperature effects.
+    """Correction for mean radiant temperature effects on perceived comfort.
 
     Cold exterior walls and windows lower the mean radiant temperature (MRT),
     making a room feel colder than the air temperature reads. This correction
     raises comfort targets when it's cold outside and lowers them when warm.
 
-    offset = clamp(alpha * (reference_temp - outdoor_temp), -max_offset, +max_offset)
+    Sun streaming through windows heats interior surfaces, raising MRT above
+    what outdoor temp alone suggests. The solar_response parameter controls
+    how much the current solar forcing reduces the cold-wall correction.
+
+    Per sensor:
+      solar_warming = β_solar(sensor) × sin⁺(elevation) × solar_fraction × solar_response
+      effective_outdoor = outdoor_temp + solar_warming
+      offset = clamp(alpha × (reference_temp - effective_outdoor), -max_offset, +max_offset)
     """
 
     alpha: float  # °F comfort shift per °F outdoor deviation from reference
     reference_temp: float  # outdoor temp at which current comfort targets feel right (°F)
     max_offset: float  # cap on correction magnitude (°F)
+    solar_response: float = 2.0  # hours-equivalent: how much solar forcing raises effective outdoor
 
 
 @dataclass(frozen=True)
@@ -631,6 +639,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         alpha=float(mrt_data["alpha"]),
         reference_temp=float(mrt_data["reference_temp"]),
         max_offset=float(mrt_data.get("max_offset", 3.0)),
+        solar_response=float(mrt_data.get("solar_response", 2.0)),
     ) if mrt_data else None
 
     constraint_list: list[ConstraintSchedule] = []

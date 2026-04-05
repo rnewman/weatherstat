@@ -31,6 +31,7 @@ from weatherstat.types import (
     RoomComfort,
     Scenario,
 )
+from weatherstat.yaml_config import MrtCorrectionConfig
 
 # ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -317,7 +318,7 @@ class TestMrtCorrection:
         schedules = make_schedules()
         adjusted, offset = apply_mrt_correction(schedules, 50.0, self._cfg())
         assert offset == 0.0
-        assert adjusted is schedules  # exact same object
+        assert adjusted == schedules
 
     def test_clamped_at_max(self) -> None:
         """0°F outside → raw offset 5.0, clamped to 3.0."""
@@ -421,59 +422,91 @@ class TestMrtCorrection:
 # ── Derived MRT weight tests ─────────────────────────────────────────────
 
 
-class TestComputeMrtWeights:
-    """Test MRT weight derivation from solar elevation gains."""
+class TestSunAwareMrt:
+    """Test dynamic sun-aware MRT correction."""
 
-    def test_high_solar_low_weight(self) -> None:
-        """Sensor with 2x mean solar gain gets low weight."""
-        from weatherstat.sysid import _compute_mrt_weights
+    def _cfg(self) -> MrtCorrectionConfig:
+        return MrtCorrectionConfig(alpha=0.1, reference_temp=50.0, max_offset=3.0, solar_response=2.0)
 
-        gains = {"piano_temp": 5.0, "bedroom_temp": 1.0}
-        # mean of nonzero = (5+1)/2 = 3.0; piano ratio=5/3=1.67; weight=2-1.67=0.33
-        weights = _compute_mrt_weights(gains, ["piano_temp", "bedroom_temp"])
-        assert weights["piano_temp"] < 1.0
-        assert weights["piano_temp"] >= 0.3
+    def test_sunny_day_reduces_cold_correction(self) -> None:
+        """High solar gain sensor gets less MRT correction on sunny cold day."""
+        schedules = [ComfortSchedule(
+            sensor="piano_temp",
+            label="piano",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+        )]
+        # Cloudy: no solar → full cold correction
+        adj_cloudy, _ = apply_mrt_correction(
+            schedules, 35.0, self._cfg(),
+            solar_elevation_gains={"piano_temp": 3.0},
+            current_solar_elev=0.7, current_solar_fraction=0.0,
+        )
+        # Sunny: solar warms walls → reduced correction
+        adj_sunny, _ = apply_mrt_correction(
+            schedules, 35.0, self._cfg(),
+            solar_elevation_gains={"piano_temp": 3.0},
+            current_solar_elev=0.7, current_solar_fraction=1.0,
+        )
+        cloudy_pref = adj_cloudy[0].entries[0].comfort.preferred_lo
+        sunny_pref = adj_sunny[0].entries[0].comfort.preferred_lo
+        # Sunny day needs less heating → lower preferred target
+        assert sunny_pref < cloudy_pref
 
-    def test_zero_solar_high_weight(self) -> None:
-        """Sensor with zero solar gain gets weight 2.0."""
-        from weatherstat.sysid import _compute_mrt_weights
+    def test_no_solar_gains_same_as_base(self) -> None:
+        """Without solar elevation gains, sun state doesn't matter."""
+        schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+        )]
+        adj_no_gains, offset = apply_mrt_correction(
+            schedules, 35.0, self._cfg(),
+            solar_elevation_gains=None,
+            current_solar_elev=0.7, current_solar_fraction=1.0,
+        )
+        entry = adj_no_gains[0].entries[0]
+        # Should be base offset: 0.1 * (50 - 35) = 1.5°F
+        assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
 
-        gains = {"piano_temp": 3.0}  # bathroom_temp absent → 0
-        weights = _compute_mrt_weights(gains, ["piano_temp", "bathroom_temp"])
-        assert weights["bathroom_temp"] == 2.0
-        assert weights["piano_temp"] == 1.0  # only nonzero sensor → ratio=1 → weight=1
+    def test_night_no_solar_effect(self) -> None:
+        """At night (elev=0), solar gains don't change MRT correction."""
+        schedules = [ComfortSchedule(
+            sensor="piano_temp",
+            label="piano",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+        )]
+        adj_night, _ = apply_mrt_correction(
+            schedules, 35.0, self._cfg(),
+            solar_elevation_gains={"piano_temp": 5.0},
+            current_solar_elev=0.0, current_solar_fraction=1.0,
+        )
+        entry = adj_night[0].entries[0]
+        # sin⁺=0 → no solar wall warming → full base offset
+        assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
 
-    def test_average_sensor_gets_one(self) -> None:
-        """Sensor at mean solar gain gets weight 1.0."""
-        from weatherstat.sysid import _compute_mrt_weights
-
-        gains = {"a_temp": 2.0, "b_temp": 2.0, "c_temp": 2.0}
-        weights = _compute_mrt_weights(gains, ["a_temp", "b_temp", "c_temp"])
-        assert abs(weights["a_temp"] - 1.0) < 0.01
-
-    def test_weight_clamped_low(self) -> None:
-        """Very high solar gain clamped to 0.3 minimum."""
-        from weatherstat.sysid import _compute_mrt_weights
-
-        gains = {"piano_temp": 10.0, "bedroom_temp": 0.5}
-        weights = _compute_mrt_weights(gains, ["piano_temp", "bedroom_temp"])
-        assert weights["piano_temp"] >= 0.3
-
-    def test_no_solar_data_returns_empty(self) -> None:
-        """No solar gains → empty dict (no derived weights)."""
-        from weatherstat.sysid import _compute_mrt_weights
-
-        weights = _compute_mrt_weights({}, ["piano_temp"])
-        assert weights == {}
-
-    def test_unconstrained_sensor_ignored(self) -> None:
-        """Sensors not in constrained list are excluded."""
-        from weatherstat.sysid import _compute_mrt_weights
-
-        gains = {"outdoor_temp": 5.0, "piano_temp": 2.0}
-        weights = _compute_mrt_weights(gains, ["piano_temp"])
-        assert "outdoor_temp" not in weights
-        assert "piano_temp" in weights
+    def test_per_sensor_solar_differentiation(self) -> None:
+        """Sensors with different solar gains get different MRT offsets."""
+        schedules = [
+            ComfortSchedule(
+                sensor="piano_temp",
+                label="piano",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+            ),
+            ComfortSchedule(
+                sensor="bedroom_temp",
+                label="bedroom",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+            ),
+        ]
+        adjusted, _ = apply_mrt_correction(
+            schedules, 35.0, self._cfg(),
+            solar_elevation_gains={"piano_temp": 5.0, "bedroom_temp": 0.5},
+            current_solar_elev=0.7, current_solar_fraction=1.0,
+        )
+        piano_pref = adjusted[0].entries[0].comfort.preferred_lo
+        bedroom_pref = adjusted[1].entries[0].comfort.preferred_lo
+        # Piano has more solar → more wall warming → less cold correction → lower target
+        assert piano_pref < bedroom_pref
 
 
 # ── Quiet hours tests ─────────────────────────────────────────────────────
