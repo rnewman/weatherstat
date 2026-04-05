@@ -400,6 +400,7 @@ class WeatherstatApp(App):
                 self.query_one(StatusHeader).set_state(outdoor_temp=outdoor_temp)
 
             # Sun-aware MRT correction using outdoor temp + current solar state
+            mrt_per_sensor: dict[str, float] = {}
             if outdoor_temp is not None and cfg.mrt_correction:
                 from weatherstat.weather import condition_to_solar_fraction as _csf
                 from weatherstat.weather import solar_sin_elevation as _sse
@@ -410,7 +411,7 @@ class WeatherstatApp(App):
                 # Use current weather condition for solar fraction
                 _condition = values.get("weather_condition", "")
                 _solar_frac = _csf(_condition) if _condition else 0.5
-                schedules, _mrt_offset = apply_mrt_correction(
+                schedules, _mrt_offset, mrt_per_sensor = apply_mrt_correction(
                     schedules, outdoor_temp, cfg.mrt_correction,
                     mrt_weights or None,
                     solar_elevation_gains=self._solar_elevation_gains_cache or None,
@@ -426,7 +427,10 @@ class WeatherstatApp(App):
                 if c is not None:
                     comfort[s.label] = (c.min_temp, c.preferred_lo, c.preferred_hi, c.max_temp)
 
-            self.query_one(TemperaturePanel).set_data(temps, comfort, SENSOR_LABELS)
+            self.query_one(TemperaturePanel).set_data(
+                temps, comfort, SENSOR_LABELS,
+                mrt_offsets=mrt_per_sensor or None,
+            )
             self.query_one(EffectorPanel).set_current_temps(temps)
 
             # Window states

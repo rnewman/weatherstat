@@ -273,7 +273,7 @@ def apply_mrt_correction(
     solar_elevation_gains: dict[str, float] | None = None,
     current_solar_elev: float = 0.0,
     current_solar_fraction: float = 0.0,
-) -> tuple[list[ComfortSchedule], float]:
+) -> tuple[list[ComfortSchedule], float, dict[str, float]]:
     """Adjust comfort targets for mean radiant temperature effects.
 
     Cold exterior surfaces (walls, windows) lower operative temperature below
@@ -298,11 +298,12 @@ def apply_mrt_correction(
         current_solar_fraction: Weather condition fraction (1.0=sunny, 0.15=cloudy).
 
     Returns:
-        (adjusted_schedules, base_offset). Base offset is from raw outdoor temp
-        (before per-sensor solar adjustment).
+        (adjusted_schedules, base_offset, per_sensor_offsets). Base offset is
+        from raw outdoor temp (before per-sensor solar adjustment).
+        per_sensor_offsets maps sensor column → applied offset (after solar + weight).
     """
     if mrt_config is None:
-        return schedules, 0.0
+        return schedules, 0.0, {}
 
     # Base offset from outdoor temp only (reported for logging)
     raw_offset = mrt_config.alpha * (mrt_config.reference_temp - outdoor_temp)
@@ -310,9 +311,10 @@ def apply_mrt_correction(
 
     # Fast path: no correction needed when at reference temp and no solar forcing
     if abs(base_offset) < 0.05 and current_solar_elev * current_solar_fraction < 0.001:
-        return schedules, 0.0
+        return schedules, 0.0, {}
 
     adjusted: list[ComfortSchedule] = []
+    per_sensor_offsets: dict[str, float] = {}
     for schedule in schedules:
         # Per-sensor solar wall warming raises effective outdoor temp
         solar_gain = (solar_elevation_gains or {}).get(schedule.sensor, 0.0)
@@ -325,6 +327,8 @@ def apply_mrt_correction(
         # Manual weight from YAML (for non-solar adjustments like window area)
         weight = (mrt_weights or {}).get(schedule.sensor, 1.0)
         sensor_offset *= weight
+
+        per_sensor_offsets[schedule.sensor] = sensor_offset
 
         if abs(sensor_offset) < 0.05:
             adjusted.append(schedule)
@@ -347,7 +351,7 @@ def apply_mrt_correction(
             for e in schedule.entries
         )
         adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
-    return adjusted, base_offset
+    return adjusted, base_offset, per_sensor_offsets
 
 
 def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
@@ -1375,7 +1379,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     _mrt_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
     _mrt_solar_frac = _csf(_mrt_cond)
     _mrt_solar_elev = _sse(_CFG.location.latitude, _CFG.location.longitude, datetime.now(UTC))
-    schedules, mrt_offset = apply_mrt_correction(
+    schedules, mrt_offset, _mrt_per_sensor = apply_mrt_correction(
         schedules, _mrt_outdoor, _CFG.mrt_correction, _mrt_weights or None,
         solar_elevation_gains=sim_params.solar_elevation_gains,
         current_solar_elev=_mrt_solar_elev,

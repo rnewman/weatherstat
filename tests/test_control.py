@@ -294,7 +294,7 @@ class TestMrtCorrection:
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adjusted, offset = apply_mrt_correction(schedules, 35.0, self._cfg())
+        adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
         assert abs(offset - 1.5) < 0.01
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
@@ -308,7 +308,7 @@ class TestMrtCorrection:
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adjusted, offset = apply_mrt_correction(schedules, 80.0, self._cfg())
+        adjusted, offset, _ = apply_mrt_correction(schedules, 80.0, self._cfg())
         assert abs(offset - (-3.0)) < 0.01  # clamped
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 69.0) < 0.01
@@ -316,7 +316,7 @@ class TestMrtCorrection:
     def test_at_reference_no_change(self) -> None:
         """Outdoor = reference → no correction."""
         schedules = make_schedules()
-        adjusted, offset = apply_mrt_correction(schedules, 50.0, self._cfg())
+        adjusted, offset, _ = apply_mrt_correction(schedules, 50.0, self._cfg())
         assert offset == 0.0
         assert adjusted == schedules
 
@@ -327,7 +327,7 @@ class TestMrtCorrection:
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adjusted, offset = apply_mrt_correction(schedules, 0.0, self._cfg())
+        adjusted, offset, _ = apply_mrt_correction(schedules, 0.0, self._cfg())
         assert abs(offset - 3.0) < 0.01
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 75.0) < 0.01
@@ -335,7 +335,7 @@ class TestMrtCorrection:
     def test_none_config_no_change(self) -> None:
         """mrt_config=None → schedules returned unchanged."""
         schedules = make_schedules()
-        adjusted, offset = apply_mrt_correction(schedules, 35.0, None)
+        adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, None)
         assert offset == 0.0
         assert adjusted is schedules
 
@@ -346,7 +346,7 @@ class TestMrtCorrection:
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 3.0, 0.5)),),
         )]
-        adjusted, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
+        adjusted, _, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
         entry = adjusted[0].entries[0]
         assert entry.comfort.cold_penalty == 3.0
         assert entry.comfort.hot_penalty == 0.5
@@ -359,13 +359,14 @@ class TestMrtCorrection:
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
         )]
         # Base offset: 0.1 * (50 - 35) = 1.5°F; weighted: 1.5 * 0.5 = 0.75°F
-        adjusted, base_offset = apply_mrt_correction(
+        adjusted, base_offset, per_sensor = apply_mrt_correction(
             schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.5},
         )
         assert abs(base_offset - 1.5) < 0.01
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 72.75) < 0.01
         assert abs(entry.comfort.min_temp - 70.75) < 0.01
+        assert abs(per_sensor["piano_temp"] - 0.75) < 0.01
 
     def test_mrt_weight_zero_no_adjustment(self) -> None:
         """Per-sensor weight=0.0 suppresses MRT correction for that sensor."""
@@ -374,10 +375,11 @@ class TestMrtCorrection:
             label="piano",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adjusted, base_offset = apply_mrt_correction(
+        adjusted, base_offset, per_sensor = apply_mrt_correction(
             schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.0},
         )
         assert abs(base_offset - 1.5) < 0.01
+        assert abs(per_sensor["piano_temp"]) < 0.01  # weight=0 → zero offset
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 72.0) < 0.01  # unchanged
 
@@ -396,7 +398,7 @@ class TestMrtCorrection:
             ),
         ]
         # Base offset: 1.5°F; piano×0.5=0.75, bathroom×1.5=2.25
-        adjusted, _ = apply_mrt_correction(
+        adjusted, _, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.5, "bathroom_temp": 1.5},
         )
         piano_pref = adjusted[0].entries[0].comfort.preferred_lo
@@ -411,8 +413,8 @@ class TestMrtCorrection:
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adj_none, off_none = apply_mrt_correction(schedules, 35.0, self._cfg())
-        adj_ones, off_ones = apply_mrt_correction(
+        adj_none, off_none, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
+        adj_ones, off_ones, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(), mrt_weights={"bedroom": 1.0},
         )
         assert off_none == off_ones
@@ -436,13 +438,13 @@ class TestSunAwareMrt:
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
         )]
         # Cloudy: no solar → full cold correction
-        adj_cloudy, _ = apply_mrt_correction(
+        adj_cloudy, _, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
             solar_elevation_gains={"piano_temp": 3.0},
             current_solar_elev=0.7, current_solar_fraction=0.0,
         )
         # Sunny: solar warms walls → reduced correction
-        adj_sunny, _ = apply_mrt_correction(
+        adj_sunny, _, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
             solar_elevation_gains={"piano_temp": 3.0},
             current_solar_elev=0.7, current_solar_fraction=1.0,
@@ -459,7 +461,7 @@ class TestSunAwareMrt:
             label="bedroom",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adj_no_gains, offset = apply_mrt_correction(
+        adj_no_gains, offset, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
             solar_elevation_gains=None,
             current_solar_elev=0.7, current_solar_fraction=1.0,
@@ -475,7 +477,7 @@ class TestSunAwareMrt:
             label="piano",
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
         )]
-        adj_night, _ = apply_mrt_correction(
+        adj_night, _, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
             solar_elevation_gains={"piano_temp": 5.0},
             current_solar_elev=0.0, current_solar_fraction=1.0,
@@ -498,7 +500,7 @@ class TestSunAwareMrt:
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
             ),
         ]
-        adjusted, _ = apply_mrt_correction(
+        adjusted, _, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
             solar_elevation_gains={"piano_temp": 5.0, "bedroom_temp": 0.5},
             current_solar_elev=0.7, current_solar_fraction=1.0,
