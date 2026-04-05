@@ -218,7 +218,6 @@ class WeatherstatApp(App):
             importlib.reload(weatherstat.config)
             importlib.reload(weatherstat.extract)
             importlib.reload(weatherstat.control)
-            self._load_mrt_weights()
             self._refresh_temps()
             self._log("[config] Reloaded weatherstat.yaml")
             self.notify("Config reloaded", severity="information")
