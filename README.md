@@ -55,9 +55,9 @@ Weatherstat uses a grey-box model: the structure comes from physics, the paramet
 The physics is Newton's law of cooling with additional forcing terms:
 
 ```
-dT/dt = (T_outdoor - T) / tau           # envelope heat loss/gain
-      + Σ gain × activity(t - lag)      # heating/cooling from each effector
-      + solar(hour) × solar_fraction    # solar gain by time of day
+dT/dt = (T_outdoor - T) / tau                      # envelope heat loss/gain
+      + Σ gain × activity(t - lag)                 # heating/cooling from each effector
+      + β_solar × sin⁺(elevation) × solar_fraction # solar gain (seasonal + hourly)
 ```
 
 **Tau** (τ) is the thermal time constant of the building envelope — how many hours it takes to lose 63% of the indoor-outdoor temperature difference if you turned off all heating. A well-insulated house might have τ = 40–60 hours. A drafty one might be 10–20. Opening a window dramatically reduces τ.
@@ -66,9 +66,9 @@ dT/dt = (T_outdoor - T) / tau           # envelope heat loss/gain
 
 **Lag** is the delay between turning on an effector and seeing its effect. Forced air: 5–15 minutes. Mini-split: 10–20 minutes. Hydronic floor heat: 45–90 minutes. This is the fundamental parameter that makes high-lag systems hard to control reactively.
 
-**Solar gain** varies by room and hour of day — a south-facing room gets significant warming from 10am to 3pm on a sunny day; a north-facing room gets almost none.
+**Solar gain** varies by room, time of day, and season. The model computes the sun's elevation angle analytically from latitude, longitude, and time, so it automatically predicts stronger solar heating in summer (higher sun) than winter (lower sun). A south-facing room with large windows will have a higher solar coefficient than a north-facing one. The weather condition (sunny vs cloudy) modulates the solar forcing.
 
-The system doesn't assume or configure these parameters. It *learns* them from your data through **system identification** (sysid): fit τ from (typically overnight) cooling curves when the heating is off, then fit gains, lags, and solar profiles from the residuals using regression. The more data you collect, the better the model gets.
+The system doesn't assume or configure these parameters. It *learns* them from your data through **system identification** (sysid): fit τ from (typically overnight) cooling curves when the heating is off, then fit gains, lags, and solar coefficients from the residuals using regression. The more data you collect, the better the model gets.
 
 ## What the system does
 

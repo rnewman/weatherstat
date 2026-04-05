@@ -20,7 +20,7 @@ import json
 import sys
 import time
 import traceback
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -779,6 +779,7 @@ def sweep_scenarios_physics(
     prev_state: ControlState | None = None,
     solar_fractions: list[float] | None = None,
     ineligible_effectors: set[str] | None = None,
+    solar_elevations: list[float] | None = None,
 ) -> tuple[ControlDecision, Scenario, dict[str, str]]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -851,6 +852,7 @@ def sweep_scenarios_physics(
         hour_of_day=hour_of_day,
         recent_history=recent_history,
         solar_fractions=solar_fractions or [],
+        solar_elevations=solar_elevations or [],
     )
     target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
     target_idx = {t: j for j, t in enumerate(target_names)}
@@ -1364,8 +1366,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         print(f"  Comfort adjusted for open windows: {', '.join(sorted(labels_with_open))}")
     recent_hist = extract_recent_history(df_raw, sim_params)
 
-    # Build forecast temp list and solar fractions for simulator
-    from weatherstat.weather import condition_to_solar_fraction
+    # Build forecast temp list, solar fractions, and solar elevations for simulator
+    from weatherstat.weather import condition_to_solar_fraction, solar_sin_elevation
 
     forecast_temp_list: list[float] = []
     solar_fractions: list[float] = []
@@ -1392,6 +1394,16 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 solar_fractions.append(solar_fractions[-1])
 
     fractional_hour = base_hour + local_now.minute / 60.0
+
+    # Precompute sin+(elevation) at each 5-min step for the prediction horizon
+    lat = _CFG.location.latitude
+    lon = _CFG.location.longitude
+    now_utc = datetime.now(UTC)
+    max_steps = max(CONTROL_HORIZONS)
+    solar_elevations: list[float] = [
+        solar_sin_elevation(lat, lon, now_utc + timedelta(minutes=5 * step))
+        for step in range(1, max_steps + 1)
+    ]
 
     # Load previous state for mode hold enforcement
     prev_state = load_control_state()
@@ -1437,6 +1449,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         prev_state,
         solar_fractions,
         ineligible_effectors,
+        solar_elevations,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
@@ -1455,6 +1468,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
+        solar_elevations=solar_elevations,
     )
 
     # All-off baseline
@@ -1716,6 +1730,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
+        solar_elevations=solar_elevations,
     )
     # Pass the same adjusted schedules used for the winning sweep, so the
     # re-sweep's comfort cost is comparable to winning_comfort_cost.

@@ -175,6 +175,9 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
         values["outdoor_humidity"] = str(attrs.get("humidity", 0))
         values["wind_speed"] = str(attrs.get("wind_speed", 0))
         values["weather_condition"] = weather.get("state", "unknown")
+        cc = attrs.get("cloud_coverage")
+        if cc is not None:
+            values["cloud_coverage"] = str(cc)
     else:
         values["met_outdoor_temp"] = "0"
         values["outdoor_humidity"] = "0"
@@ -237,11 +240,14 @@ def _inject_forecast(values: dict[str, str], forecast: list[dict]) -> None:
         entry = _find_closest(h)
         values[f"forecast_temp_{h}h"] = str(entry.get("temperature", 0)) if entry else "0"
 
-    # Condition and wind at key horizons
+    # Condition, wind, and cloud coverage at key horizons
     for h in (1, 2, 4, 6, 12):
         entry = _find_closest(h)
         values[f"forecast_condition_{h}h"] = entry.get("condition", "") if entry else ""
         values[f"forecast_wind_{h}h"] = str(entry.get("wind_speed", 0)) if entry else "0"
+        cc = entry.get("cloud_coverage") if entry else None
+        if cc is not None:
+            values[f"forecast_cloud_{h}h"] = str(cc)
 
 
 # ── Timestamp rounding ──────────────────────────────────────────────────────

@@ -74,7 +74,8 @@ def test_synthetic_params_well_formed(sim_params: SimParams) -> None:
     assert len(sim_params.effectors) > 0
     assert len(sim_params.taus) > 0
     assert len(sim_params.gains) > 0
-    assert len(sim_params.solar) > 0
+    # Elevation-based solar gains (new format) or legacy per-hour solar
+    assert len(sim_params.solar_elevation_gains) > 0 or len(sim_params.solar) > 0
 
 
 def test_tau_values_reasonable(sim_params: SimParams) -> None:
@@ -423,3 +424,67 @@ def test_regulating_off_same_as_all_off(sim_params: SimParams) -> None:
     targets, preds = predict(_make_state(), [_all_off(), off_split], sim_params, [12, 72])
     # All predictions should be identical
     np.testing.assert_allclose(preds[0], preds[1], atol=0.01)
+
+
+# ── Solar elevation tests ──────────────────────────────────────────────────
+
+
+def test_solar_elevation_basic() -> None:
+    """Solar elevation computes reasonable values for Seattle."""
+    from datetime import UTC, datetime
+
+    from weatherstat.weather import solar_elevation, solar_sin_elevation
+
+    lat, lon = 47.66, -122.40
+    # April noon (solar noon ~ 20:10 UTC for Seattle)
+    noon_apr = datetime(2026, 4, 5, 20, 10, tzinfo=UTC)
+    elev = solar_elevation(lat, lon, noon_apr)
+    assert 45 < elev < 52, f"April noon should be ~48°, got {elev:.1f}°"
+
+    # Night
+    night = datetime(2026, 4, 5, 10, 0, tzinfo=UTC)
+    assert solar_sin_elevation(lat, lon, night) == 0.0
+
+    # Seasonal: summer noon > spring noon > winter noon
+    noon_feb = datetime(2026, 2, 15, 20, 10, tzinfo=UTC)
+    noon_jun = datetime(2026, 6, 21, 20, 10, tzinfo=UTC)
+    assert solar_elevation(lat, lon, noon_feb) < solar_elevation(lat, lon, noon_apr)
+    assert solar_elevation(lat, lon, noon_apr) < solar_elevation(lat, lon, noon_jun)
+
+
+def test_elevation_solar_warms_during_day(sim_params: SimParams) -> None:
+    """Elevation-based solar gains should produce warmer daytime predictions."""
+    # State at noon with solar elevations (daytime)
+    n_steps = 72  # 6 hours
+    sin_elevations_day = [0.7] * n_steps  # high sun
+    sin_elevations_night = [0.0] * n_steps  # no sun
+
+    state_day = _make_state(hour=12.0)
+    state_day = HouseState(
+        current_temps=state_day.current_temps,
+        outdoor_temp=state_day.outdoor_temp,
+        forecast_temps=state_day.forecast_temps,
+        window_states=state_day.window_states,
+        hour_of_day=12.0,
+        solar_fractions=[1.0] * 13,  # sunny
+        solar_elevations=sin_elevations_day,
+    )
+    state_night = HouseState(
+        current_temps=state_day.current_temps,
+        outdoor_temp=state_day.outdoor_temp,
+        forecast_temps=state_day.forecast_temps,
+        window_states=state_day.window_states,
+        hour_of_day=0.0,
+        solar_fractions=[0.0] * 13,
+        solar_elevations=sin_elevations_night,
+    )
+
+    targets_d, preds_d = predict(state_day, [_all_off()], sim_params, [72])
+    targets_n, preds_n = predict(state_night, [_all_off()], sim_params, [72])
+
+    # Day predictions should be warmer than night for sensors with solar gain
+    for i, name in enumerate(targets_d):
+        if "piano_temp" in name:
+            assert preds_d[0, i] > preds_n[0, i], (
+                f"Piano should be warmer during day: day={preds_d[0, i]:.1f} night={preds_n[0, i]:.1f}"
+            )

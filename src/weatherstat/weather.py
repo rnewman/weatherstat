@@ -6,6 +6,9 @@ ensuring training and inference use the same source — no feature skew.
 
 from __future__ import annotations
 
+import math
+from datetime import datetime
+
 from weatherstat.types import WeatherCondition
 
 # Map all met.no weather conditions to numeric codes for ML features.
@@ -59,3 +62,43 @@ def encode_weather_condition(condition: str) -> int:
     return CONDITION_CODES.get(condition, CONDITION_CODES[WeatherCondition.UNKNOWN])
 
 
+def solar_elevation(lat_deg: float, lon_deg: float, dt: datetime) -> float:
+    """Solar elevation angle in degrees for a given location and UTC time.
+
+    Uses the standard astronomical formula with Spencer (1971) declination.
+    Accuracy ~1° — sufficient for thermal modeling since the per-sensor
+    regression coefficient absorbs systematic error.
+
+    Args:
+        lat_deg: Latitude in degrees (positive north).
+        lon_deg: Longitude in degrees (positive east).
+        dt: UTC-aware datetime.
+
+    Returns:
+        Elevation angle in degrees. Negative means sun is below horizon.
+    """
+    day_of_year = dt.timetuple().tm_yday
+    declination = 23.45 * math.sin(math.radians(360.0 / 365.0 * (day_of_year - 81)))
+
+    # Solar hour angle: UTC hour + longitude correction
+    utc_hour = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+    solar_hour = utc_hour + lon_deg / 15.0
+    hour_angle = 15.0 * (solar_hour - 12.0)
+
+    lat_r = math.radians(lat_deg)
+    dec_r = math.radians(declination)
+    ha_r = math.radians(hour_angle)
+    sin_elev = math.sin(lat_r) * math.sin(dec_r) + math.cos(lat_r) * math.cos(dec_r) * math.cos(ha_r)
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+
+def solar_sin_elevation(lat_deg: float, lon_deg: float, dt: datetime) -> float:
+    """max(0, sin(elevation)) — the solar forcing feature for regression.
+
+    Returns 0 when the sun is below the horizon, otherwise sin(elevation)
+    which is proportional to the horizontal-surface irradiance (Lambert's
+    cosine law). For a complex house, the per-sensor regression coefficient
+    absorbs the effective geometry.
+    """
+    elev = solar_elevation(lat_deg, lon_deg, dt)
+    return max(0.0, math.sin(math.radians(elev)))

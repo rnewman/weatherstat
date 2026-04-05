@@ -12,10 +12,55 @@ will face new challenges in summer:
   important for rooms without them.
 - Auto mode (heat_cool) may be needed in shoulder seasons where the room
   needs heating in the morning and cooling in the afternoon.
-- Solar gain profiles will change significantly — sysid needs spring/summer
-  data to fit accurate seasonal profiles.
 - Window advisory logic should recommend opening windows for free cooling
   more aggressively when outdoor temp is below indoor but above comfort min.
+
+---
+
+## Irradiance-Based Solar Model
+
+**Status:** Data collection started 2026-04-05. Elevation-based model deployed
+2026-04-05 as an intermediate step (see below).
+
+**Intermediate step (done):** The per-hour model (11 coefficients per sensor,
+hours 7–17) was replaced by an elevation-based model: one coefficient per
+sensor × `sin⁺(solar_elevation)` × weather-conditioned fraction. Solar
+elevation is computed analytically from lat/lon/time — no external data needed.
+This captures seasonal variation (Feb noon ~30°, Apr ~48°, Jun ~66° at Seattle)
+and hour-of-day variation in a single continuous feature. The old model
+underpredicted spring solar gain by ~35% because winter-fitted coefficients had
+no way to increase with sun angle. Cloud coverage (0–100%) is now collected in
+the snapshot data alongside the discrete weather condition, for future use as a
+continuous solar fraction.
+
+**What the elevation model doesn't capture:** directionality. A west-facing
+room heats more in afternoon than morning at the same elevation. The irradiance
+model (below) will handle this with per-plane coefficients.
+
+**Data collection:** forecast.solar HA integration provides irradiance
+forecasts for 5 planes (horizontal + 4 cardinal walls) at hourly resolution.
+Power sensors (`solar_power_{horizontal,south,west,east,north}`) are
+collected every 5 minutes in the EAV table.
+
+**Target model:** Replace the single elevation coefficient per sensor with
+a small number of irradiance gain coefficients per sensor. Each sensor's
+solar forcing becomes a linear combination of the 5 plane irradiances:
+
+    solar_gain(sensor, t) = Σ_plane β(sensor, plane) × irradiance(plane, t)
+
+Sysid fits β coefficients from regression against temperature derivatives.
+The compound geometry of the house (windows facing multiple directions, roof
+pitch, glass vs wall, shading) is captured in the β values — no physical
+modeling of individual surfaces needed.
+
+**Prerequisites:** Weeks to months of irradiance + temperature data to fit
+reliable β coefficients across different weather conditions and sun angles.
+
+**Benefit:** The irradiance signal naturally encodes sun altitude (seasonal),
+hour of day, cloud cover, and orientation — all in one W/m² number per plane.
+The elevation model already handles seasonal + hourly variation; the irradiance
+model adds directional resolution and replaces the coarse weather-condition
+fraction with actual measured energy.
 
 ---
 
@@ -91,13 +136,14 @@ increasing with horizon) — this likely represents underestimated heat loss
 
 ## Sweep Scalability
 
-Batch prediction gives ~30ms per sweep (~7,400 scenarios with 2 trajectory
-effectors). The unified effector model generates scenarios as the cartesian
-product of per-effector options, so count grows as `|options|^N_independent`.
+Batch prediction gives ~160ms per sweep (~14K scenarios). The unified effector
+model generates scenarios as the cartesian product of per-effector options,
+so count grows as `|options|^N_independent`.
 
-**Current:** 2 trajectory (8 each) × 2 regulating (7 each) × 2 binary (3 each)
-= 8² × 7² × 3² ≈ 28K scenarios (pruned to ~7,400 by dependency constraints).
-Adding a 3rd trajectory effector: ~225K scenarios, ~1s sweep.
+**Current:** 2 trajectory (8 each) × 2 regulating (up to 6 each with
+gains-aware multi-target sweep) × 3 binary (3 each) ≈ 14–16K scenarios
+(pruned by dependency constraints and idle suppression).
+Adding a 3rd trajectory effector: ~100K+ scenarios, ~1s sweep.
 
 **Future approaches (in priority order):**
 - **Trajectory grid reduction** — Coarser delay/duration grid for N>2

@@ -74,11 +74,12 @@ class SimParams:
 
     taus: dict[str, TauModel]  # sensor -> TauModel
     gains: dict[tuple[str, str], tuple[float, float]]  # (effector, sensor) -> (gain_f/hr, lag_min)
-    solar: dict[tuple[str, int], float]  # (sensor, hour) -> gain_f/hr
+    solar: dict[tuple[str, int], float]  # (sensor, hour) -> gain_f/hr (legacy per-hour)
     sensors: list[str]  # sensor names with params
     effectors: list[dict]  # raw effector dicts (name, encoding, device_type)
     state_gates: dict[str, StateGateInfo] = field(default_factory=dict)  # gate_name -> info
     mrt_weights: dict[str, float] = field(default_factory=dict)  # sensor -> derived MRT weight
+    solar_elevation_gains: dict[str, float] = field(default_factory=dict)  # sensor -> gain per sin(elev)×frac
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,9 @@ class HouseState:
     # Per-hour solar fractions [now, h+1, h+2, ...] from weather conditions.
     # Index 0 = current hour, index 1 = next hour, etc.
     # Empty list → default to 1.0 (full sun).
+    solar_elevations: list[float] = field(default_factory=list)
+    # sin+(elevation) at each 5-min step [step1, step2, ...] for the prediction
+    # horizon. Precomputed from lat/lon/time. Empty → fall back to per-hour solar.
 
 
 def load_sim_params(path: Path | None = None) -> SimParams:
@@ -159,9 +163,10 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     if pruned_parts:
         print(f"  [sim] Pruned gains: {', '.join(pruned_parts)}")
 
-    # Solar lookup
+    # Solar lookup: elevation-based gains (preferred) and legacy per-hour
+    solar_elevation_gains = {str(k): float(v) for k, v in data.get("solar_elevation_gains", {}).items()}
     solar: dict[tuple[str, int], float] = {}
-    for sg in data["solar_gains"]:
+    for sg in data.get("solar_gains", []):
         solar[(sg["sensor"], sg["hour_of_day"])] = sg["gain_f_per_hour"]
 
     sensors = [s["name"] for s in data["sensors"]]
@@ -185,6 +190,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         effectors=data["effectors"],
         state_gates=state_gates,
         mrt_weights=mrt_weights,
+        solar_elevation_gains=solar_elevation_gains,
     )
 
 
@@ -241,6 +247,8 @@ def simulate_sensor(
     start_hour: float,
     n_steps: int,
     solar_fractions: list[float] | None = None,
+    solar_elev_gain: float = 0.0,
+    solar_elevations: list[float] | None = None,
 ) -> list[float]:
     """Euler-integrate temperature for one sensor under one scenario.
 
@@ -254,11 +262,14 @@ def simulate_sensor(
         effector_timelines: effector_name -> full timeline (history + future).
             Timeline index `history_len` corresponds to t=0.
         gains: effector_name -> (gain_f_per_hour, lag_minutes) for this sensor.
-        solar_profile: hour_of_day -> gain_f_per_hour for this sensor.
+        solar_profile: hour_of_day -> gain_f_per_hour for this sensor (legacy).
         start_hour: Fractional hour of day at t=0.
         n_steps: Number of 5-min steps to simulate.
         solar_fractions: Per-hour solar fractions [now, h+1, h+2, ...].
             Index 0 = current hour. None or empty → 1.0 (full sun).
+        solar_elev_gain: Elevation-based solar gain coefficient for this sensor.
+        solar_elevations: sin+(elevation) at each 5-min step. If provided with
+            solar_elev_gain > 0, uses elevation model instead of per-hour profile.
 
     Returns:
         Temperature at each step [t+1, t+2, ..., t+n_steps].
@@ -297,13 +308,24 @@ def simulate_sensor(
                 activity = timeline[-1]  # clamp to last known
             dTdt += gain * activity
 
-        # Solar gain (modulated by weather-condition solar fraction)
-        current_hour = int((start_hour + hours_from_start) % 24)
-        solar_gain = solar_profile.get(current_hour, 0.0)
-        if solar_gain != 0.0 and solar_fractions:
-            hour_idx = min(int(hours_from_start), len(solar_fractions) - 1)
-            solar_gain *= solar_fractions[max(0, hour_idx)]
-        dTdt += solar_gain
+        # Solar gain
+        if solar_elev_gain != 0.0 and solar_elevations:
+            # Elevation-based: gain × sin+(elevation) × condition_fraction
+            elev_idx = min(step - 1, len(solar_elevations) - 1)
+            sin_elev = solar_elevations[max(0, elev_idx)]
+            sf = 1.0
+            if solar_fractions:
+                hour_idx = min(int(hours_from_start), len(solar_fractions) - 1)
+                sf = solar_fractions[max(0, hour_idx)]
+            dTdt += solar_elev_gain * sin_elev * sf
+        else:
+            # Legacy per-hour profile
+            current_hour = int((start_hour + hours_from_start) % 24)
+            solar_gain = solar_profile.get(current_hour, 0.0)
+            if solar_gain != 0.0 and solar_fractions:
+                hour_idx = min(int(hours_from_start), len(solar_fractions) - 1)
+                solar_gain *= solar_fractions[max(0, hour_idx)]
+            dTdt += solar_gain
 
         # Euler step
         t = t + _DT_HOURS * dTdt
@@ -531,26 +553,42 @@ def predict(
             if sens == sensor_col:
                 sensor_gains[eff] = (gain, lag)
 
-        # Solar profile for this sensor
-        solar: dict[int, float] = {}
-        for (sens, hour), gain in params.solar.items():
-            if sens == sensor_col:
-                solar[hour] = gain
-
-        base_solar = np.array([
-            solar.get(int((state.hour_of_day + step * _DT_HOURS) % 24), 0.0)
-            for step in range(1, max_horizon + 1)
-        ])
-        # Modulate by weather-condition solar fractions (if provided)
-        if state.solar_fractions:
-            sf = state.solar_fractions
-            sf_vec = np.array([
-                sf[min(int(step * _DT_HOURS), len(sf) - 1)]
+        # Solar forcing for this sensor
+        elev_gain = params.solar_elevation_gains.get(sensor_col, 0.0)
+        if elev_gain != 0.0 and state.solar_elevations:
+            # Elevation-based: gain × sin+(elev) × condition_fraction per step
+            elev_arr = np.array([
+                state.solar_elevations[min(step - 1, len(state.solar_elevations) - 1)]
                 for step in range(1, max_horizon + 1)
             ])
-            solar_vec = base_solar * sf_vec
+            if state.solar_fractions:
+                sf = state.solar_fractions
+                sf_vec = np.array([
+                    sf[min(int(step * _DT_HOURS), len(sf) - 1)]
+                    for step in range(1, max_horizon + 1)
+                ])
+                solar_vec = elev_gain * elev_arr * sf_vec
+            else:
+                solar_vec = elev_gain * elev_arr
         else:
-            solar_vec = base_solar
+            # Legacy per-hour solar profile
+            solar: dict[int, float] = {}
+            for (sens, hour), gain in params.solar.items():
+                if sens == sensor_col:
+                    solar[hour] = gain
+            base_solar = np.array([
+                solar.get(int((state.hour_of_day + step * _DT_HOURS) % 24), 0.0)
+                for step in range(1, max_horizon + 1)
+            ])
+            if state.solar_fractions:
+                sf = state.solar_fractions
+                sf_vec = np.array([
+                    sf[min(int(step * _DT_HOURS), len(sf) - 1)]
+                    for step in range(1, max_horizon + 1)
+                ])
+                solar_vec = base_solar * sf_vec
+            else:
+                solar_vec = base_solar
 
         cur_temp = state.current_temps.get(sensor_col, abs_temp(70.0))
 

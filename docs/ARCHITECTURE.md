@@ -106,7 +106,7 @@ Periodically sample the full state of the house and persist it for training and 
 - Runs every 5 minutes.
 - Reads all monitored entities from HA via REST API (`GET /api/states`).
 - Extracts values using config-driven column definitions (temperature attributes, HVAC actions/modes/targets, window states, weather conditions).
-- Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`) from HA's met.no integration via service call.
+- Captures weather forecast snapshots (`forecast_temp_{1..12}h`, `forecast_condition_{1,2,4,6,12}h`, `forecast_wind_{1,2,4,6,12}h`, `forecast_cloud_{1,2,4,6,12}h`) from HA's met.no integration via service call. Current `cloud_coverage` (0–100%) is also stored from the weather entity attributes.
 - Deduplicates by rounding timestamps to the snapshot interval.
 - Writes to SQLite (`~/.weatherstat/snapshots/snapshots.db`) in EAV format: `readings` table with `(timestamp, name, value)` triples. No schema changes needed to add sensors.
 
@@ -126,14 +126,15 @@ Forward-simulates room temperatures by Euler-integrating the thermal dynamics of
 
 ```
 dT/dt = (T_outdoor - T) / tau
-        + Σ gain_e * activity_e(t - lag_e)     # effector heating, delayed
-        + solar(hour_of_day) * solar_fraction   # solar gain, weather-modulated
+        + Σ gain_e * activity_e(t - lag_e)                 # effector heating, delayed
+        + β_solar(sensor) × sin⁺(elevation) × SF           # solar gain (elevation-based)
+        + Σ β_solar(sensor, plane) × irradiance(plane, t)  # solar gain (future: irradiance)
 ```
 
 Where:
 - `tau` is the effective envelope time constant, computed from `TauModel`: `1/tau_eff = 1/tau_base + Σ β_w × open_w + Σ β_{ww'} × open_w × open_w'`
 - Each effector `e` contributes a gain (°F/hr per activity unit) delayed by its fitted lag
-- Solar gain is a per-sensor, per-hour profile from sysid, modulated by a weather-conditioned solar fraction (sunny=1.0, cloudy=0.15, clear-night=0.0, etc.)
+- Solar gain uses an elevation-based model: one `β_solar` per sensor × `sin⁺(solar_elevation)` × weather-conditioned solar fraction (sunny=1.0, cloudy=0.15, etc.). Solar elevation is computed analytically from latitude, longitude, and time — no external data needed. `sin⁺(elevation)` naturally captures both hour-of-day variation (low at sunrise/sunset, high at noon) and seasonal variation (winter noon ~30° at Seattle, April ~48°, summer ~66°). This replaced the prior per-hour model (11 coefficients per sensor, hours 7–17) which had no seasonal awareness — coefficients fitted from winter data underpredicted spring solar gain by ~35%. The per-sensor regression coefficient absorbs compound house geometry (window orientations, roof pitch, glass vs wall). **Planned next step:** per-sensor irradiance gain coefficients fitted against 5-plane irradiance data (horizontal + 4 cardinal walls) from forecast.solar, which will also capture directionality (e.g., west rooms warm more in afternoon). Data collection started 2026-04-05; see `docs/FUTURE.md` § "Irradiance-Based Solar Model"
 
 **Effector control types** (property of each effector, not separate code categories):
 - **Trajectory:** Pre-computed binary activity from delay/duration parameters. Used for slow-twitch effectors (e.g., hydronic thermostats with 45-75 min lag).
@@ -152,7 +153,7 @@ Fits all thermal model parameters from observed collector data using a two-stage
 
 **Stage 1 — Tau fitting (scipy `curve_fit`):** For each temperature sensor, selects all nighttime (10pm–6am) periods where all HVAC effectors are off AND all windows are closed (sealed envelope). Fits Newton cooling (`T(t) = T_out + (T_0 - T_out) * exp(-t/tau)`) via nonlinear least squares on each contiguous segment. Multiple segments → weighted median → `tau_base` (sealed envelope time constant).
 
-**Stage 2 — Effector gains, solar profiles, and window effects (ridge regression):** With tau_base fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on: lagged effector activity (coarse time bins capturing delay), hour-of-day indicators (solar gain), weather control features (ΔT², wind×ΔT, dT_outdoor/dt), per-window `window_state × (T_out - T)` features (cooling rate when open), and window pair interactions (cross-breeze effects). One regression per sensor.
+**Stage 2 — Effector gains, solar, and window effects (ridge regression):** With tau_base fitted, computes Newton residuals at every timestep (`dT/dt_observed - dT/dt_newton`). These residuals are explained by a linear regression on: lagged effector activity (coarse time bins capturing delay), a solar elevation feature (`sin⁺(elevation) × weather_fraction` — one continuous feature replacing the prior 11 per-hour indicators), weather control features (ΔT², wind×ΔT, dT_outdoor/dt), per-window `window_state × (T_out - T)` features (cooling rate when open), and window pair interactions (cross-breeze effects). One regression per sensor.
 
 The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). Solar and window features are pre-scaled by their standard deviation so the penalty falls proportionally; effector features are left in raw scale for full regularization against confounded gains. T-statistics flag negligible gains (|gain| < 0.05°F/hr AND |t-stat| < 2.0).
 
@@ -166,13 +167,13 @@ The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). So
 
 **What it extracts:**
 - **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.
-- **Solar gain profiles**: per-sensor, per-hour-of-day gain coefficients.
+- **Solar elevation gains**: per-sensor `β_solar` coefficient (°F/hr per unit sin(elevation)×fraction). One value per sensor replaces the prior 11 per-hour coefficients.
 - **Tau per sensor**: `tau_base` (sealed envelope time constant).
 - **Window coupling coefficients**: per-window `β_w` (additional cooling rate when window is open) and cross-breeze interaction terms `β_{ww'}`. The simulator computes effective tau as `1 / (1/tau_base + Σ β_w × open_w + Σ β_{ww'} × open_w × open_w')`.
 
 **Config-driven:** Effectors and sensors enumerated from `weatherstat.yaml`. Adding a device or sensor = YAML edit + rerun.
 
-**Output:** `~/.weatherstat/thermal_params.json` — the full coupling matrix, tau fits, and solar profiles. Run via `just sysid`.
+**Output:** `~/.weatherstat/thermal_params.json` — the full coupling matrix, tau fits, and solar elevation gains. Run via `just sysid`.
 
 **Two-phase API:** `fit_sysid()` generates a `SysIdResult` without writing to disk; `save_sysid_result()` persists it. `run_sysid()` is a convenience wrapper that calls both. The TUI uses the two-phase API with a quality gate (rejects fits with zero taus or zero significant gains) for automatic periodic refitting.
 
@@ -205,7 +206,7 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 5. Select the trajectory with the best score.
 6. Emit electronic commands for the executor.
 
-**Trajectory search:** Effector options are generated per control_type: trajectory effectors get delay × duration grids, regulating effectors get mode + target combinations from comfort schedules, binary effectors get their supported modes. The sweep takes the cartesian product, with dependent effectors constrained by their parent's state. Boiler activity is confirmed via state_gate multiplication in the simulator.
+**Trajectory search:** Effector options are generated per control_type: trajectory effectors get delay × duration grids, regulating effectors get gains-aware mode + target combinations (heat targets from affected sensors' `pref_lo`, cool targets from `pref_hi`, with idle suppression when the highest-gain sensor is already past target), binary effectors get their supported modes. The sweep takes the cartesian product, with dependent effectors constrained by their parent's state. Boiler activity is confirmed via state_gate multiplication in the simulator.
 
 **Receding horizon:** Only the immediate action matters. A trajectory of "delay 2h then heat" means "stay off now." At the next cycle (default 5 minutes, configurable via `control_interval`), the controller re-evaluates with fresh data and may choose differently.
 

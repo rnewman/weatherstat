@@ -59,7 +59,7 @@ just sysid --output custom_path.json  # custom output path
 **What it produces** (`~/.weatherstat/thermal_params.json`):
 - `TauModel` per sensor — `tau_base` (sealed envelope time constant) plus per-window `window_betas` (additional cooling rate when open) and cross-breeze `interaction_betas`
 - Effector × sensor gain matrix — heating rate (°F/hr) and delay (minutes) for each (device, sensor) pair
-- Solar gain profiles — per-sensor, per-hour-of-day gain coefficients
+- Solar elevation gains — per-sensor `β_solar` coefficient (°F/hr per unit sin(elevation)×fraction), automatically seasonal
 
 ### When to rerun
 

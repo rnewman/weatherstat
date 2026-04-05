@@ -125,7 +125,8 @@ class SysIdResult:
     sensors: list[SensorSpec]
     fitted_taus: list[FittedTau]
     effector_sensor_gains: list[EffectorSensorGain]
-    solar_gains: list[SolarGainProfile]
+    solar_gains: list[SolarGainProfile]  # legacy per-hour (empty for new fits)
+    solar_elevation_gains: dict[str, float] = field(default_factory=dict)  # sensor -> gain
     state_gates: dict[str, StateGate] = field(default_factory=dict)
     mrt_weights: dict[str, float] = field(default_factory=dict)
 
@@ -508,16 +509,18 @@ def _preprocess(
                 count += 1
             df[f"_lag_{eff.name}_{label}"] = lagged_sum / max(count, 1)
 
-    # Weather-conditioned solar features (hours 7-17).
-    # Each feature = (is_hour_H) × solar_fraction, so the regression learns
-    # the gain per unit of clear sky at each hour. On a cloudy day the feature
-    # is 0.15 instead of 1.0; on a sunny day it's 1.0.
-    from weatherstat.weather import condition_to_solar_fraction
+    # Solar elevation feature: sin⁺(elevation) × condition_fraction.
+    # Replaces per-hour binary indicators with a continuous feature that
+    # captures both hour-of-day and seasonal variation. sin(elevation) is
+    # proportional to horizontal irradiance (Lambert's cosine law); the
+    # per-sensor regression coefficient absorbs the house geometry.
+    from weatherstat.weather import condition_to_solar_fraction, solar_sin_elevation
 
     solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3) if "weather_condition" in df.columns else pd.Series(0.3, index=df.index)
 
-    for h in range(7, 18):
-        df[f"_solar_h{h}"] = ((df["_local_hour"] == h).astype(float) * solar_frac)
+    lat = _CFG.location.latitude
+    lon = _CFG.location.longitude
+    df["_solar_elev"] = df["_ts"].apply(lambda dt: solar_sin_elevation(lat, lon, dt)) * solar_frac
 
     return df
 
@@ -571,10 +574,11 @@ def _fit_sensor_model(
     effectors: list[EffectorSpec],
     tau_base: float,
     verbose: bool = False,
-) -> tuple[list[EffectorSensorGain], list[SolarGainProfile], dict[str, float], dict[str, float]]:
+) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float]]:
     """Stage 2: Fit regression for one sensor.
 
-    Returns (gains, solar_profiles, window_betas, interaction_betas).
+    Returns (gains, solar_elev_gain, solar_elev_t, window_betas, interaction_betas).
+    solar_elev_gain is °F/hr per unit sin(elevation)×solar_fraction.
     Window betas are per-window additional cooling rate coefficients,
     learned as regression coefficients on window_state × (T_out - T).
     """
@@ -582,9 +586,9 @@ def _fit_sensor_model(
     dTdt_col = f"_dTdt_{sensor.name}"
 
     if temp_col not in df.columns or dTdt_col not in df.columns:
-        return [], [], {}, {}
+        return [], 0.0, 0.0, {}, {}
     if "_outdoor_best" not in df.columns:
-        return [], [], {}, {}
+        return [], 0.0, 0.0, {}, {}
 
     outdoor = df["_outdoor_best"].values
     sensor_temp = df[temp_col].values
@@ -659,13 +663,11 @@ def _fit_sensor_model(
                 feature_cols.append(co_open.astype(float) * delta_t)
                 interaction_feature_names.append(f"{w1}+{w2}")
 
-    # Solar hour indicators
+    # Solar elevation feature (single continuous feature per sensor)
     solar_start = len(feature_names)
-    for h in range(7, 18):
-        col_name = f"_solar_h{h}"
-        if col_name in df.columns:
-            feature_names.append(col_name)
-            feature_cols.append(df[col_name].values.astype(float))
+    if "_solar_elev" in df.columns:
+        feature_names.append("_solar_elev")
+        feature_cols.append(df["_solar_elev"].values.astype(float))
     if not feature_cols:
         return [], [], {}, {}
 
@@ -689,7 +691,7 @@ def _fit_sensor_model(
             )
             for e in effectors
         ]
-        return gains, [], {}, {}
+        return gains, 0.0, 0.0, {}, {}
 
     # Selectively standardized ridge regularization.
     # OLS on observational HVAC data produces confounded gains: heating
@@ -796,52 +798,45 @@ def _fit_sensor_model(
             if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
                 interaction_betas[pair_name] = round(b, 6)
 
-    # Extract solar profile
-    solar_profiles: list[SolarGainProfile] = []
-    for i, h in enumerate(range(7, 18)):
-        idx = solar_start + i
-        if idx < len(beta):
-            solar_profiles.append(SolarGainProfile(
-                sensor=sensor.name,
-                hour_of_day=h,
-                gain_f_per_hour=round(float(beta[idx]), 4),
-                std_error=round(float(se[idx]), 4) if not np.isnan(se[idx]) else 0.0,
-                t_statistic=round(float(t_stats[idx]), 2),
-            ))
+    # Extract solar elevation gain (single coefficient per sensor)
+    solar_elev_gain: float = 0.0
+    solar_elev_t: float = 0.0
+    if solar_start < len(beta):
+        solar_elev_gain = round(float(beta[solar_start]), 4)
+        solar_elev_t = round(float(t_stats[solar_start]), 2)
+        if verbose:
+            solar_se = round(float(se[solar_start]), 4) if not np.isnan(se[solar_start]) else 0.0
+            print(f"    solar_elev: β={solar_elev_gain:.4f}, se={solar_se:.4f}, t={solar_elev_t:.1f}")
 
-    return gains, solar_profiles, window_betas, interaction_betas
+    return gains, solar_elev_gain, solar_elev_t, window_betas, interaction_betas
 
 
 # ── Derived MRT weights ──────────────────────────────────────────────────
 
 
 def _compute_mrt_weights(
-    solar_gains: list[SolarGainProfile],
+    solar_elevation_gains: dict[str, float],
     constrained_sensors: list[str],
 ) -> dict[str, float]:
-    """Derive per-sensor MRT weights from solar gain profiles.
+    """Derive per-sensor MRT weights from solar elevation gains.
 
-    Sensors with high total daily solar gain get weight < 1 (less MRT correction
-    needed because sun warms surfaces). Sensors with zero solar gain get weight > 1
-    (cold surfaces dominate, more MRT correction needed).
+    Sensors with high solar gain get weight < 1 (less MRT correction
+    needed because sun warms surfaces). Sensors with zero solar gain get
+    weight > 1 (cold surfaces dominate, more MRT correction needed).
 
     Weight is centered around 1.0: sensor at mean solar → 1.0.
     Clamped to [0.3, 2.0].
     """
-    # Sum significant solar gains per sensor (hours 7-17)
+    # Filter to constrained sensors with positive gains
     totals: dict[str, float] = {}
-    for sg in solar_gains:
-        if sg.sensor not in constrained_sensors:
-            continue
-        if abs(sg.t_statistic) < _T_STAT_THRESHOLD:
-            continue
-        if sg.gain_f_per_hour > 0:  # only positive (warming) solar gains
-            totals[sg.sensor] = totals.get(sg.sensor, 0.0) + sg.gain_f_per_hour
+    for sensor in constrained_sensors:
+        gain = solar_elevation_gains.get(sensor, 0.0)
+        if gain > 0:
+            totals[sensor] = gain
 
-    # Mean across sensors with nonzero gain
     nonzero = [v for v in totals.values() if v > 0]
     if not nonzero:
-        return {}  # no solar data → no derived weights
+        return {}
 
     mean_solar = sum(nonzero) / len(nonzero)
 
@@ -849,7 +844,6 @@ def _compute_mrt_weights(
     for sensor in constrained_sensors:
         total = totals.get(sensor, 0.0)
         ratio = total / mean_solar if mean_solar > 0 else 0.0
-        # Invert: high solar → low weight, zero solar → high weight
         raw_weight = 2.0 - ratio
         weights[sensor] = max(0.3, min(2.0, raw_weight))
 
@@ -931,15 +925,19 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     # Stage 2: Regression per sensor (effector gains, solar, window effects)
     print("\n── Stage 2: Fitting effector gains, solar, and window effects ──")
     all_gains: list[EffectorSensorGain] = []
-    all_solar: list[SolarGainProfile] = []
+    solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
     all_window_betas: dict[str, dict[str, float]] = {}  # sensor -> {window -> beta}
     all_interaction_betas: dict[str, dict[str, float]] = {}  # sensor -> {"w1+w2" -> beta}
 
     for sensor in sensors:
         tau_base = tau_lookup.get(sensor.name, sensor.yaml_tau_base)
-        gains, solar, win_betas, int_betas = _fit_sensor_model(df, sensor, effectors, tau_base, verbose)
+        gains, solar_elev_gain, solar_elev_t, win_betas, int_betas = _fit_sensor_model(
+            df, sensor, effectors, tau_base, verbose,
+        )
         all_gains.extend(gains)
-        all_solar.extend(solar)
+        if solar_elev_gain != 0.0:
+            solar_elevation_gains[sensor.name] = solar_elev_gain
+            print(f"  {sensor.name}: solar_elev β={solar_elev_gain:+.3f}, t={solar_elev_t:.1f}")
         if win_betas:
             all_window_betas[sensor.name] = win_betas
         if int_betas:
@@ -973,9 +971,9 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     for col, scfg in _CFG.state_sensors.items():
         state_gates[col] = StateGate(column=col, encoding=scfg.encoding)
 
-    # Derive per-sensor MRT weights from solar gain profiles
+    # Derive per-sensor MRT weights from solar elevation gains
     constrained_sensors = [c.sensor for c in _CFG.constraints]
-    mrt_weights = _compute_mrt_weights(all_solar, constrained_sensors)
+    mrt_weights = _compute_mrt_weights(solar_elevation_gains, constrained_sensors)
 
     return SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
@@ -986,7 +984,8 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
         sensors=sensors,
         fitted_taus=fitted_taus,
         effector_sensor_gains=all_gains,
-        solar_gains=all_solar,
+        solar_gains=[],  # legacy per-hour format, empty for elevation-based fits
+        solar_elevation_gains=solar_elevation_gains,
         state_gates=state_gates,
         mrt_weights=mrt_weights,
     )
@@ -1064,24 +1063,31 @@ def print_report(result: SysIdResult) -> None:
                 row += f"  {cell:>14s}"
         print(row)
 
-    # Solar profiles (only sensors with significant solar gain)
-    print(f"\n── Solar Gain Profiles ({UNIT_SYMBOL}/hr by hour, significant only) ──")
-    solar_by_sensor: dict[str, list[SolarGainProfile]] = {}
-    for sg in result.solar_gains:
-        solar_by_sensor.setdefault(sg.sensor, []).append(sg)
+    # Solar elevation gains
+    if result.solar_elevation_gains:
+        print(f"\n── Solar Elevation Gains ({UNIT_SYMBOL}/hr per unit sin(elev)×fraction) ──")
+        for sensor_name, gain in sorted(result.solar_elevation_gains.items(), key=lambda x: -x[1]):
+            bar = "█" * max(0, int(gain * 3))
+            print(f"  {sensor_name:<30s}  {gain:+.3f}  {bar}")
 
-    for sensor_name, profiles in solar_by_sensor.items():
-        sig = [p for p in profiles if abs(p.t_statistic) >= _T_STAT_THRESHOLD]
-        if not sig:
-            continue
-        print(f"\n  {sensor_name}:")
-        for p in sorted(profiles, key=lambda x: x.hour_of_day):
-            marker = "*" if abs(p.t_statistic) >= _T_STAT_THRESHOLD else " "
-            bar = "█" * max(0, int(p.gain_f_per_hour * 10))
-            print(
-                f"    {p.hour_of_day:2d}:00  {p.gain_f_per_hour:+.3f} ±{p.std_error:.3f}"
-                f"  t={p.t_statistic:5.1f} {marker} {bar}"
-            )
+    # Legacy per-hour solar profiles (for old fits loaded from disk)
+    if result.solar_gains:
+        print(f"\n── Solar Gain Profiles (legacy per-hour, {UNIT_SYMBOL}/hr) ──")
+        solar_by_sensor: dict[str, list[SolarGainProfile]] = {}
+        for sg in result.solar_gains:
+            solar_by_sensor.setdefault(sg.sensor, []).append(sg)
+        for sensor_name, profiles in solar_by_sensor.items():
+            sig = [p for p in profiles if abs(p.t_statistic) >= _T_STAT_THRESHOLD]
+            if not sig:
+                continue
+            print(f"\n  {sensor_name}:")
+            for p in sorted(profiles, key=lambda x: x.hour_of_day):
+                marker = "*" if abs(p.t_statistic) >= _T_STAT_THRESHOLD else " "
+                bar = "█" * max(0, int(p.gain_f_per_hour * 10))
+                print(
+                    f"    {p.hour_of_day:2d}:00  {p.gain_f_per_hour:+.3f} ±{p.std_error:.3f}"
+                    f"  t={p.t_statistic:5.1f} {marker} {bar}"
+                )
 
     # MRT weights (derived from solar profiles)
     if result.mrt_weights:
