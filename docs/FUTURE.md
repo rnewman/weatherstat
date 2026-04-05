@@ -64,6 +64,105 @@ fraction with actual measured energy.
 
 ---
 
+## Accumulated Wall Heat for MRT Correction
+
+**Problem:** The current MRT correction uses instantaneous solar forcing
+(`sin⁺(elev) × weather_fraction`) to estimate wall surface temperature.
+But wall temperature is the integral of energy flux over time — a thermal
+capacitor, not a resistor. The same solar angle produces very different
+wall temperatures at 9am vs 3pm:
+
+| Time | Solar elev | Outdoor | Exterior wall | Interior wall | MRT correction needed |
+|------|-----------|---------|---------------|---------------|----------------------|
+| 9am  | 35°       | 42°F    | ~42°F (cold from night) | ~62°F | Large (cold walls) |
+| 3pm  | 35°       | 50°F    | ~75°F (6h of sun) | ~72°F | Small or negative (warm walls) |
+
+Our current model sees the same solar angle and similar outdoor temp at
+both times, producing similar MRT corrections. But the 9am walls are cold
+(need more heating) and the 3pm walls are warm (need less). The error is
+asymmetric: we under-correct cold mornings and over-correct warm
+afternoons.
+
+**Subtlety — double counting:** The air temperature sensor already
+captures much of the accumulated solar heating. A room that's had hours
+of sun reads high 70s, and the control system responds to that reading
+directly. The MRT correction is only for the *residual* — the perceived
+comfort difference between air temperature and operative temperature
+caused by warm/cold surfaces radiating more/less IR. This residual is
+real (you feel warmer near a sun-heated wall even if the air temp is the
+same), but it's smaller than the total wall heating effect. Getting the
+magnitude right requires separating "wall warmth that raised the air
+temp" from "wall warmth that raises perceived comfort above air temp."
+
+**Model:** Replace the instantaneous solar term in the MRT correction with
+an exponential moving average of solar forcing:
+
+```
+accumulated_solar(t) = Σᵢ sin⁺(elev(t - i·Δt)) × SF(t - i·Δt) × exp(-i·Δt / τ_wall) × Δt
+```
+
+where `τ_wall` is the wall thermal time constant (estimated 3–6 hours for
+typical residential walls — much shorter than the air time constants sysid
+fits, because this is surface temperature, not through-wall conduction).
+
+The effective outdoor temperature becomes:
+
+```
+effective_outdoor = outdoor + β_solar × accumulated_solar × solar_response
+```
+
+instead of the current:
+
+```
+effective_outdoor = outdoor + β_solar × sin⁺(elev) × SF × solar_response
+```
+
+**Behavior:**
+- **Morning:** accumulated_solar is low (sun just rose, little energy
+  stored) → full cold-wall correction → system heats more aggressively.
+  Matches lived experience that the house feels coldest first thing.
+- **Afternoon:** accumulated_solar is high (hours of solar energy in
+  walls) → reduced correction → system backs off. Matches lived
+  experience that late afternoon feels warmest.
+- **After sunset:** accumulated_solar decays exponentially → correction
+  gradually increases as walls cool. Captures the evening cool-down.
+- **Cloudy day after sunny morning:** accumulated_solar reflects the
+  morning sun even though current SF is low. Walls don't forget.
+
+**Implementation path:**
+
+1. At MRT correction time, read recent `weather_condition` values from the
+   collector (last ~4×τ_wall hours). Compute historical `sin⁺(elev)` for
+   each timestamp analytically (no data dependency — just lat/lon/time).
+2. Weight by exponential decay with time constant `τ_wall`.
+3. Pass the scalar `accumulated_solar` to `apply_mrt_correction` in place
+   of (or alongside) the instantaneous `current_solar_elev × SF`.
+4. Add `tau_wall` as a configurable parameter in `MrtCorrectionConfig`
+   (default ~4 hours).
+
+The collector data read is the main new dependency — currently MRT
+correction is a pure function of current conditions. The control loop
+already has snapshot access nearby (`latest_snapshot_values`), but we'd
+need a lookback query. `_load_from_readings()` with a time filter is
+straightforward.
+
+**Calibration challenge:** The `solar_response` scaling factor would need
+re-tuning after switching from instantaneous to accumulated solar, since
+accumulated values are larger (sum vs single sample) and have different
+units (energy-like vs power-like). The τ_wall parameter itself could
+potentially be learned from data — if we observe systematic morning
+under-heating and afternoon over-heating in the decision log residuals,
+the optimal τ_wall minimizes that pattern.
+
+**Priority:** Medium. The magnitude of the instantaneous→accumulated
+error is estimated at 0.3–1.0°F in MRT correction, primarily affecting
+the first and last hours of the solar day. Worth implementing when the
+morning cold-wall issue becomes noticeable in comfort metrics, or when
+the irradiance model (above) provides better per-plane solar data that
+makes the accumulated model more accurate.
+
+---
+
 ## Additional Blower Automation
 
 More blowers in the hydronic circuit would improve heat distribution to
