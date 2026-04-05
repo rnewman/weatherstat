@@ -654,40 +654,74 @@ class TestRegulatingSweepOptions:
             entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", preferred, preferred, min_t, max_t)),),
         )]
 
+    @staticmethod
+    def _bedroom_gains() -> dict[tuple[str, str], tuple[float, float]]:
+        return {("mini_split_bedroom", "bedroom_temp"): (0.732, 10.0)}
+
     def test_sweep_options_include_off(self) -> None:
         """Off should always be an option."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 68.0})
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(), current_temps={"bedroom_temp": 68.0},
+        )
         assert any(o.mode == "off" for o in options)
 
     def test_sweep_options_preferred_target(self) -> None:
-        """Should generate off + preferred target."""
+        """Should generate heat and/or cool options targeting affected sensor prefs."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 68.0})
-        assert len(options) == 2  # off + preferred
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(), current_temps={"bedroom_temp": 68.0},
+        )
         active = [o for o in options if o.mode != "off"]
-        assert len(active) == 1
-        assert active[0].target == 70.0  # preferred = midpoint of 68-72
+        assert len(active) >= 1
+        # Room is cold — heat@pref_lo should be offered
+        assert any(o.mode == "heat" and o.target == 70.0 for o in active)
 
     def test_sweep_mode_heat_when_cold(self) -> None:
-        """Mode should be 'heat' when room temp is below preferred."""
+        """Heat should be offered when room temp is below preferred."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 68.0})
-        active = [o for o in options if o.mode != "off"]
-        assert all(o.mode == "heat" for o in active)
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(), current_temps={"bedroom_temp": 68.0},
+        )
+        assert any(o.mode == "heat" for o in options)
 
     def test_sweep_mode_cool_when_hot(self) -> None:
-        """Mode should be 'cool' when room temp is above preferred."""
+        """Cool should be offered when room temp is above preferred."""
         eff = self._bedroom_eff()
-        options = _regulating_sweep_options(eff, self._bedroom_schedule(), 12, current_temps={"bedroom_temp": 72.0})
-        active = [o for o in options if o.mode != "off"]
-        assert all(o.mode == "cool" for o in active)
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(), current_temps={"bedroom_temp": 72.0},
+        )
+        assert any(o.mode == "cool" for o in options)
+
+    def test_sweep_idle_suppression_prunes_heat_when_hot(self) -> None:
+        """Heat option should be pruned when room is well above target."""
+        eff = self._bedroom_eff()
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(), current_temps={"bedroom_temp": 72.0},
+        )
+        # Room is 2°F above pref_lo=70 and p_band=1.0, so heat@70 is idle-suppressed
+        assert not any(o.mode == "heat" for o in options)
 
     def test_sweep_no_schedule_returns_off_only(self) -> None:
         """No matching schedule -> only off option."""
         options = _regulating_sweep_options(self._bedroom_eff(), [], 12)
         assert len(options) == 1
         assert options[0].mode == "off"
+
+    def test_sweep_fallback_without_gains(self) -> None:
+        """Without gains, falls back to naming convention for sensor lookup."""
+        eff = self._bedroom_eff()
+        options = _regulating_sweep_options(
+            eff, self._bedroom_schedule(), 12,
+            current_temps={"bedroom_temp": 68.0},
+        )
+        # Should still find bedroom_temp via naming convention
+        assert any(o.mode == "heat" for o in options)
 
 
 # ── Mode hold window tests ──────────────────────────────────────────
@@ -711,6 +745,10 @@ class TestModeHoldWindow:
         assert _in_hold_window(7, (22, 7)) is False
         assert _in_hold_window(12, (22, 7)) is False
 
+    @staticmethod
+    def _bedroom_gains() -> dict[tuple[str, str], tuple[float, float]]:
+        return {("mini_split_bedroom", "bedroom_temp"): (0.732, 10.0)}
+
     def test_mode_locked_during_hold_window(self) -> None:
         """During hold window, options are filtered to current mode."""
         from datetime import UTC, datetime
@@ -724,7 +762,9 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         # Hour 23 is inside bedroom's hold window [22, 7]
         options = _regulating_sweep_options(
-            eff, self._bedroom_schedule(), 23, prev_state, current_temps={"bedroom_temp": 68.0},
+            eff, self._bedroom_schedule(), 23,
+            gains=self._bedroom_gains(), prev_state=prev_state,
+            current_temps={"bedroom_temp": 68.0},
         )
         # All options should be "heat" (current mode)
         assert all(o.mode == "heat" for o in options)
@@ -743,7 +783,9 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         # Hour 12 is outside hold window — mode should be unlocked
         options = _regulating_sweep_options(
-            eff, self._bedroom_schedule(), 12, prev_state, current_temps={"bedroom_temp": 68.0},
+            eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(), prev_state=prev_state,
+            current_temps={"bedroom_temp": 68.0},
         )
         assert any(o.mode == "off" for o in options)
 
@@ -752,6 +794,7 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         options = _regulating_sweep_options(
             eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(),
             current_temps={"bedroom_temp": 73.0},  # 3 deg F above preferred 70
         )
         # Room is above preferred — cool mode should be offered
@@ -762,6 +805,7 @@ class TestModeHoldWindow:
         eff = EFFECTOR_MAP["mini_split_bedroom"]
         options = _regulating_sweep_options(
             eff, self._bedroom_schedule(), 12,
+            gains=self._bedroom_gains(),
             current_temps={"bedroom_temp": 70.5},  # within proportional_band of preferred 70
         )
         # Room is 0.5 deg F above preferred — should get cool option

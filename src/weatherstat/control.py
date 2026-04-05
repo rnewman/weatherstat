@@ -545,74 +545,99 @@ def _cautious_setpoint(current_temp: float, heating: bool, comfort_min: float = 
 # ── Scenario generation & sweep ──────────────────────────────────────────
 
 
+def _dedup_targets(targets: list[float], tol: float = 0.5) -> list[float]:
+    """Deduplicate sorted targets within tolerance, keeping one per cluster."""
+    result: list[float] = []
+    for t in sorted(set(targets)):
+        if not result or abs(t - result[-1]) > tol:
+            result.append(t)
+    return result
+
+
 def _regulating_sweep_options(
     eff: object,
     schedules: list[ComfortSchedule],
     base_hour: int,
+    gains: dict[tuple[str, str], tuple[float, float]] | None = None,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
 ) -> list[EffectorDecision]:
-    """Generate sweep options for a regulating effector: off + preferred target.
+    """Generate sweep options for a regulating effector from all affected sensors.
 
-    Target is the preferred temperature from the comfort schedule.
-    Mode is derived from room temp vs preferred: if the room is above
-    preferred, cool; if below, heat.  Outdoor temp does not enter — it
-    influences trajectories via the simulator, not mode intent.
-    During mode hold windows, mode is locked to current.
-    If the room is already past target by more than the proportional band,
-    the effector would be idle — skip the on option and let receding horizon
-    re-evaluate when the room actually needs it.
+    Instead of deriving mode/target from one sensor, we:
+    1. Find all constrained sensors this effector has meaningful sysid gain on.
+    2. Collect their preferred temps (pref_lo for heat targets, pref_hi for cool).
+    3. Generate off + heat@each_pref_lo + cool@each_pref_hi.
+    4. Idle suppression prunes options where the effector would be inactive
+       (room already past target by more than the proportional band).
+    5. Mode hold window locks to previous mode during quiet hours.
+
+    The trajectory sweep scores every surviving option across ALL sensors,
+    so the optimizer picks whichever mode/target minimizes total comfort cost.
     """
     from weatherstat.config import EffectorConfig
 
     assert isinstance(eff, EffectorConfig)
-    # Sensor column for comfort schedule lookup
-    # Convention: "mini_split_bedroom" serves sensor "bedroom_temp"
-    sensor_col = eff.name.removeprefix("mini_split_") + "_temp"
     options: list[EffectorDecision] = [EffectorDecision(eff.name)]
+    temps = current_temps or {}
 
-    # Find preferred band for this effector's sensor
-    pref_lo: float | None = None
-    pref_hi: float | None = None
-    for sched in schedules:
-        if sched.sensor == sensor_col:
-            comfort = sched.comfort_at(base_hour)
-            if comfort is not None:
-                pref_lo = comfort.preferred_lo
-                pref_hi = comfort.preferred_hi
-            break
+    # ── Find constrained sensors this effector affects ──
+    schedule_sensors = {s.sensor for s in schedules}
+    affected_sensors: list[str] = []
+    if gains:
+        for (eff_name, sensor_name), (gain, _lag) in gains.items():
+            if eff_name == eff.name and gain != 0 and sensor_name in schedule_sensors:
+                affected_sensors.append(sensor_name)
+    # Fallback: naming convention (backward compat for tests without gains)
+    if not affected_sensors:
+        fallback = eff.name.removeprefix("mini_split_") + "_temp"
+        if fallback in schedule_sensors:
+            affected_sensors = [fallback]
 
-    if pref_lo is None or pref_hi is None:
+    # ── Collect preferred temps from all affected sensors ──
+    heat_targets: list[float] = []  # pref_lo values
+    cool_targets: list[float] = []  # pref_hi values
+    for sensor_col in affected_sensors:
+        for sched in schedules:
+            if sched.sensor == sensor_col:
+                comfort = sched.comfort_at(base_hour)
+                if comfort is not None:
+                    heat_targets.append(comfort.preferred_lo)
+                    cool_targets.append(comfort.preferred_hi)
+                break
+
+    if not heat_targets and not cool_targets:
         return options
 
-    # Derive mode and target from room temp vs preferred band.
-    # If room is inside the dead band, no action needed — skip ON option.
-    room_temp = (current_temps or {}).get(sensor_col)
-    if room_temp is not None and pref_lo <= room_temp <= pref_hi:
-        return options  # room is in the preferred band — effector not needed
+    heat_targets = _dedup_targets(heat_targets)
+    cool_targets = _dedup_targets(cool_targets)
 
-    if room_temp is not None:
-        if room_temp > pref_hi:
-            mode = "cool"
-            target = pref_hi  # cool toward upper edge of band
-        else:
-            mode = "heat"
-            target = pref_lo  # heat toward lower edge of band
-    else:
-        mode = "heat"
-        target = pref_lo
+    # ── Reference temp for idle suppression: highest-gain sensor with data ──
+    ref_temp: float | None = None
+    if gains:
+        best_gain = 0.0
+        for (eff_name, sensor_name), (gain, _lag) in gains.items():
+            if eff_name == eff.name and abs(gain) > best_gain and sensor_name in temps:
+                best_gain = abs(gain)
+                ref_temp = temps[sensor_name]
+    if ref_temp is None:
+        # Fallback: naming convention sensor
+        fallback = eff.name.removeprefix("mini_split_") + "_temp"
+        ref_temp = temps.get(fallback)
 
-    # Skip on-option if the effector would be idle: room already past target
-    # by more than the proportional band.  Receding horizon (15-min
-    # re-evaluation) will add it back when the room actually needs it.
     p_band = eff.proportional_band
-    if room_temp is not None:
-        if mode == "heat" and room_temp > target + p_band:
-            return options  # room well above target — effector would be idle
-        if mode == "cool" and room_temp < target - p_band:
-            return options  # room well below target — effector would be idle
 
-    options.append(EffectorDecision(eff.name, mode=mode, target=round(target, 1)))
+    # ── Generate options per supported mode ──
+    for mode in eff.supported_modes:
+        targets = heat_targets if mode == "heat" else cool_targets if mode == "cool" else []
+        for target in targets:
+            # Idle suppression: skip if effector would be idle
+            if ref_temp is not None:
+                if mode == "heat" and ref_temp > target + p_band:
+                    continue
+                if mode == "cool" and ref_temp < target - p_band:
+                    continue
+            options.append(EffectorDecision(eff.name, mode=mode, target=round(target, 1)))
 
     # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
     if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
@@ -639,6 +664,7 @@ def generate_trajectory_scenarios(
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
     ineligible_effectors: set[str] | None = None,
+    gains: dict[tuple[str, str], tuple[float, float]] | None = None,
 ) -> list[Scenario]:
     """Generate trajectory scenarios for physics sweep.
 
@@ -687,6 +713,7 @@ def generate_trajectory_scenarios(
                     eff,
                     schedules,
                     base_hour,
+                    gains,
                     prev_state,
                     current_temps,
                 )
@@ -775,6 +802,7 @@ def sweep_scenarios_physics(
         prev_state,
         current_temps,
         _ineligible,
+        gains=sim_params.gains,
     )
     pre_count = len(scenarios)
     blocked_reasons: list[str] = []
@@ -1391,6 +1419,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             prev_state,
             current_temps,
             ineligible_effectors,
+            gains=sim_params.gains,
         )
     )
     print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
