@@ -701,7 +701,7 @@ def _format_age(td: timedelta) -> str:
     """Format a timedelta as a human-readable age string."""
     total_seconds = int(td.total_seconds())
     if total_seconds < 0:
-        return "future?"
+        return "<1s"  # rounding can push timestamp slightly ahead of now
     if total_seconds < 60:
         return f"{total_seconds}s"
     minutes = total_seconds // 60
