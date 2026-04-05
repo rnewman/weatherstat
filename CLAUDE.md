@@ -78,6 +78,8 @@ just test             # Test both packages
 - All source files use explicit types — full type hints in Python
 - Temperature unit configurable via `unit` in weatherstat.yaml location block (F or C). Built-in defaults are canonical °F, converted at load time via `abs_temp()`/`delta_temp()`. All runtime values are in the configured unit.
 - Snapshot column names use snake_case
+- **TUI is the primary interface.** Any change to control logic, comfort schedules, MRT correction, sysid output, or display data must also be reflected in `src/weatherstat/tui/app.py`. The TUI reads temperatures, applies comfort profiles + MRT correction, and displays effector state independently from the control loop. If you change how something is computed in control.py, check whether app.py computes the same thing for display.
+- **No silent exceptions in the TUI.** Every `except Exception` must log the error via `self._log()` with the exception message. Critical paths (temp refresh, control cycle, sysid) should also log `traceback.format_exc()`. The only exception is `_log()` itself (can't log a logging failure).
 
 ## Data Directory
 

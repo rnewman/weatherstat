@@ -59,17 +59,40 @@ vs 71.7°F on a hot day — a 2.2°F perceived difference.
 ## The Correction
 
 We use outdoor temperature as a proxy for the MRT offset, since we
-don't have surface temperature sensors:
+don't have surface temperature sensors. The correction is **sun-aware**:
+current solar forcing raises the effective outdoor temperature per sensor,
+reducing cold-wall correction on sunny days while preserving it on cloudy
+days and at night.
+
+Per sensor, the effective outdoor temperature is:
 
 ```
-offset = clamp(alpha × (reference_temp - outdoor_temp), -max_offset, +max_offset)
+effective_outdoor = outdoor_temp + β_solar(sensor) × sin⁺(elev) × weather_fraction × solar_response
+```
+
+where:
+- `β_solar(sensor)` is the sysid-fitted solar elevation gain for this
+  sensor (higher for rooms with large south/west windows)
+- `sin⁺(elev)` is max(0, sin(solar_elevation)) — 0 at night, ~0.7 at
+  noon in Seattle
+- `weather_fraction` is the condition-derived solar fraction (1.0 sunny,
+  0.15 overcast)
+- `solar_response` is a tunable scale factor (default 2.0) mapping the
+  air-temperature solar gain to wall-surface MRT effect
+
+Then the MRT offset is:
+
+```
+offset = clamp(alpha × (reference_temp - effective_outdoor), -max_offset, +max_offset) × mrt_weight
 ```
 
 This shifts all comfort targets (preferred, min, max) uniformly:
-- **Cold day**: offset is positive → targets rise → the system heats
-  more aggressively to compensate for cold walls
-- **Hot day**: offset is negative → targets drop → less heating needed
-  because warm walls contribute to comfort
+- **Cold cloudy day**: effective_outdoor ≈ outdoor (no solar warming) →
+  full cold-wall correction
+- **Cold sunny day**: effective_outdoor > outdoor → reduced correction
+  (sun heats interior surfaces through windows)
+- **Night**: sin⁺(elev) = 0 → effective_outdoor = outdoor → same as
+  temperature-only correction
 - **Reference temp**: zero correction — this is the outdoor temperature
   at which the comfort schedule values were tuned to feel right
 
@@ -80,6 +103,7 @@ This shifts all comfort targets (preferred, min, max) uniformly:
 | `alpha`          | 0.1     | °F of comfort shift per °F of outdoor deviation |
 | `reference_temp` | 50      | Outdoor temp where current targets feel right (°F) |
 | `max_offset`     | 3.0     | Maximum correction magnitude (°F) |
+| `solar_response` | 2.0     | Scale factor: solar air-temp gain → MRT surface effect |
 
 ### Tuning
 
@@ -91,6 +115,10 @@ This shifts all comfort targets (preferred, min, max) uniformly:
   in winter at ~45–55°F), 50°F is a reasonable starting point.
 - **`max_offset`**: Caps extreme corrections. At alpha=0.1, this caps
   at ±30°F outdoor deviation from reference. 3°F is conservative.
+- **`solar_response`**: How much the sysid solar gain translates to
+  MRT surface warming. At 2.0, a sensor with β_solar=3.0 on a sunny
+  noon (sin⁺≈0.7, SF=1.0) gets +4.2°F added to effective outdoor temp.
+  Increase if sunny cold days still feel too cold despite the correction.
 
 ## Design Choices
 
@@ -99,18 +127,20 @@ Even if the forecast says it'll warm from 35°F to 55°F in 6 hours, the
 walls won't catch up for much longer. The current outdoor temp is more
 representative of current wall state than any forecast.
 
-**Why not per-room?** Actually, it is per-room now. Each sensor gets a
-`mrt_weight` multiplier that scales the global offset. Two sources:
+**Why sun-aware?** A sunny 35°F day and a cloudy 35°F day produce
+very different interior surface temperatures. Sun streaming through
+windows heats walls, floors, and furniture — raising MRT well above
+what outdoor air temperature alone would predict. The greenhouse
+effect through glass is the dominant factor in surface temperature
+variation at a given outdoor temp. Without the solar adjustment, the
+system would over-correct (heat too aggressively) on sunny cold days.
 
-1. **Manual** (`mrt_weight` in YAML constraint schedule): explicit
-   override for rooms where you know the solar exposure. Default 1.0.
-2. **Derived** (from sysid solar elevation gains): sensors with high
-   solar gain coefficients get lower weight (sun warms surfaces,
-   reducing MRT correction need), sensors with zero solar gains get
-   higher weight. Stored in `thermal_params.json` as `mrt_weights`.
-
-Priority: manual weight wins if set != 1.0, otherwise derived weight
-is used. If neither is set, weight defaults to 1.0.
+**Per-room differentiation:** The correction is naturally per-sensor
+because `β_solar` varies by sensor — rooms with large south-facing
+windows (high sysid solar gain) get more solar MRT relief than
+interior rooms (low or zero solar gain). Additionally, each sensor
+can have a manual `mrt_weight` multiplier in the YAML constraint
+schedule (default 1.0) for non-solar adjustments.
 
 **Why shift all targets uniformly?** The min/max bounds are comfort
 limits, not safety limits. If 71°F feels like 69.5°F on a cold day,

@@ -100,9 +100,9 @@ class WeatherstatApp(App):
         self._baseline_cost: float | None = None
         self._overrides: dict[str, str] = {}  # effector_name -> description
 
-        # MRT weights from sysid (loaded once at startup, refreshed after sysid runs)
-        self._mrt_weights_cache: dict[str, float] = {}
-        self._load_mrt_weights()
+        # Solar elevation gains from sysid (for sun-aware MRT correction)
+        self._solar_elevation_gains_cache: dict[str, float] = {}
+        self._load_solar_elevation_gains()
 
     def compose(self) -> ComposeResult:
         yield StatusHeader()
@@ -262,17 +262,17 @@ class WeatherstatApp(App):
         self._load_control_state()
         self._refresh_history()
 
-    def _load_mrt_weights(self) -> None:
-        """Load sysid-derived MRT weights from thermal_params.json."""
+    def _load_solar_elevation_gains(self) -> None:
+        """Load sysid solar elevation gains from thermal_params.json."""
         from weatherstat.config import DATA_DIR
 
         params_file = DATA_DIR / "thermal_params.json"
         if params_file.exists():
             try:
                 data = json.loads(params_file.read_text())
-                self._mrt_weights_cache = data.get("mrt_weights", {})
-            except Exception:
-                pass
+                self._solar_elevation_gains_cache = data.get("solar_elevation_gains", {})
+            except Exception as e:
+                self._log(f"[config] [red]Failed to load solar gains: {e}[/]")
 
     def _load_sysid_status(self) -> None:
         from weatherstat.config import DATA_DIR
@@ -286,8 +286,8 @@ class WeatherstatApp(App):
                     dt = datetime.fromisoformat(ts)
                     age = datetime.now(UTC) - dt.replace(tzinfo=UTC) if dt.tzinfo is None else datetime.now(UTC) - dt
                     self.query_one(StatusHeader).set_state(sysid_age=_format_age(age))
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"[config] [red]Failed to load sysid status: {e}[/]")
 
     def _load_control_state(self) -> None:
         """Load effector state + opportunities from state files (startup only)."""
@@ -305,8 +305,8 @@ class WeatherstatApp(App):
                     decisions=decisions,
                     command_targets=setpoints,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"[config] [red]Failed to load control state: {e}[/]")
         self._load_opportunities()
 
     def _load_opportunities(self) -> None:
@@ -318,8 +318,8 @@ class WeatherstatApp(App):
                 data = json.loads(ADVISORY_STATE_FILE.read_text())
                 active = data.get("active", {})
                 self.query_one(OpportunityPanel).set_data(list(active.values()))
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"[config] [red]Failed to load opportunities: {e}[/]")
 
     # ── Collector (5-min) ─────────────────────────────────────────────────
 
@@ -331,6 +331,7 @@ class WeatherstatApp(App):
             collect_once(log=self._log)
         except Exception as e:
             self._log(f"[collector] [red]Error: {e}[/]")
+            self._log(traceback.format_exc())
 
     # ── Monitor timer (30s) ─────────────────────────────────────────────────
 
@@ -351,8 +352,8 @@ class WeatherstatApp(App):
                 header.set_state(collector_age=_format_age(age), collector_rows=count)
             else:
                 header.set_state(collector_age="no data", collector_rows=0)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f"[collector] [red]Snapshot status error: {e}[/]")
 
     def _refresh_temps(self) -> None:
         try:
@@ -398,17 +399,23 @@ class WeatherstatApp(App):
             if outdoor_temp is not None:
                 self.query_one(StatusHeader).set_state(outdoor_temp=outdoor_temp)
 
-            # MRT correction using outdoor temp and sysid-derived weights
+            # Sun-aware MRT correction using outdoor temp + current solar state
             if outdoor_temp is not None and cfg.mrt_correction:
-                mrt_weights: dict[str, float] = {}
-                for c in cfg.constraints:
-                    w = c.mrt_weight
-                    if w == 1.0:
-                        # Use sysid-derived weight if available
-                        w = self._mrt_weights_cache.get(c.sensor, 1.0)
-                    mrt_weights[c.sensor] = w
+                from weatherstat.weather import condition_to_solar_fraction as _csf
+                from weatherstat.weather import solar_sin_elevation as _sse
+
+                mrt_weights = {c.sensor: c.mrt_weight for c in cfg.constraints if c.mrt_weight != 1.0}
+                _now_utc = datetime.now(UTC)
+                _solar_elev = _sse(cfg.location.latitude, cfg.location.longitude, _now_utc)
+                # Use current weather condition for solar fraction
+                _condition = values.get("weather_condition", "")
+                _solar_frac = _csf(_condition) if _condition else 0.5
                 schedules, _mrt_offset = apply_mrt_correction(
-                    schedules, outdoor_temp, cfg.mrt_correction, mrt_weights
+                    schedules, outdoor_temp, cfg.mrt_correction,
+                    mrt_weights or None,
+                    solar_elevation_gains=self._solar_elevation_gains_cache or None,
+                    current_solar_elev=_solar_elev,
+                    current_solar_fraction=_solar_frac,
                 )
 
             # Extract comfort bounds from adjusted schedules
@@ -441,7 +448,8 @@ class WeatherstatApp(App):
             self.query_one(ForecastPanel).set_data(forecasts, condition)
 
         except Exception as e:
-            self._log(f"[monitor] Error refreshing temps: {e}")
+            self._log(f"[monitor] [red]Error refreshing temps: {e}[/]")
+            self._log(traceback.format_exc())
 
     def _update_header(self) -> None:
         header = self.query_one(StatusHeader)
@@ -454,8 +462,8 @@ class WeatherstatApp(App):
             from weatherstat.config import TIMEZONE
 
             header.set_state(local_tz=TIMEZONE)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f"[config] [red]Timezone load error: {e}[/]")
 
     # ── Control cycle worker ────────────────────────────────────────────────
 
@@ -606,7 +614,7 @@ class WeatherstatApp(App):
                 self._log(f"[sysid] {line}")
 
         self._sysid_running = False
-        self._load_mrt_weights()  # refresh sysid-derived MRT weights
+        self._load_solar_elevation_gains()  # refresh sysid solar gains
         self.call_from_thread(self.query_one(StatusHeader).set_state, sysid_running=False)
         self.call_from_thread(self._load_sysid_status)
 
@@ -652,6 +660,7 @@ class WeatherstatApp(App):
 
         except Exception as e:
             self._log(f"[profile] [red]Error: {e}[/]")
+            self._log(traceback.format_exc())
 
     # ── History tab ─────────────────────────────────────────────────────────
 
@@ -667,7 +676,8 @@ class WeatherstatApp(App):
             summary = accuracy_summary(hours=24)
             self.query_one(AccuracyPanel).set_data(summary)
         except Exception as e:
-            self._log(f"[history] Error: {e}")
+            self._log(f"[history] [red]Error: {e}[/]")
+            self._log(traceback.format_exc())
 
     # ── Logging ─────────────────────────────────────────────────────────────
 
