@@ -263,6 +263,7 @@ class TestSimulatorDependencyGating:
             forecast_temps=[outdoor] * 12,
             window_states={},
             hour_of_day=hour,
+            solar_elevations=[0.0] * 72,
         )
 
     def test_blower_with_thermostat_warms_more(self, sim_params) -> None:

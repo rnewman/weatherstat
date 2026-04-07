@@ -98,10 +98,30 @@ class PowerSensorConfig:
     entity_id: str
 
 
+def window_display(name: str) -> tuple[str, str]:
+    """Return (label, kind) for a window/door name.
+
+    'door_basement' → ('basement', 'door'); 'family_room' → ('family room', 'window').
+    """
+    if name.startswith("door_"):
+        return name.removeprefix("door_").replace("_", " "), "door"
+    return name.replace("_", " "), "window"
+
+
 @dataclass(frozen=True)
 class WindowConfig:
-    name: str  # "basement", "family_room", etc.
+    name: str  # "basement", "family_room", "door_basement", etc.
     entity_id: str
+
+    @property
+    def kind(self) -> str:
+        """'door' if name starts with 'door_', else 'window'."""
+        return window_display(self.name)[1]
+
+    @property
+    def label(self) -> str:
+        """Human-readable label: 'door_basement' → 'basement', 'family_room' → 'family room'."""
+        return window_display(self.name)[0]
 
 
 @dataclass(frozen=True)

@@ -106,6 +106,13 @@ class HouseState:
     # sin+(elevation) at each 5-min step [step1, step2, ...] for the prediction
     # horizon. Precomputed from lat/lon/time. Empty → fall back to per-hour solar.
 
+    def __post_init__(self) -> None:
+        if not self.solar_elevations:
+            raise ValueError(
+                "HouseState requires solar_elevations (sin⁺(elev) at 5-min steps). "
+                "Pass an all-zeros list for nighttime or test scenarios."
+            )
+
 
 def load_sim_params(path: Path | None = None) -> SimParams:
     """Load sysid parameters from thermal_params.json."""

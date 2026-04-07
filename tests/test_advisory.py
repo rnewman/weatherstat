@@ -53,6 +53,7 @@ def sim_params():
         solar=params.solar,
         sensors=params.sensors,
         effectors=params.effectors,
+        solar_elevation_gains=params.solar_elevation_gains,
     )
 
 
@@ -82,6 +83,94 @@ def _make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSche
     for label, entries in overrides.items():
         defaults[label] = ComfortSchedule(sensor=f"{label}_temp", label=label, entries=tuple(entries))
     return list(defaults.values())
+
+
+# ── Solar elevation regression test ──────────────────────────────────────
+#
+# Regression test for the bug where evaluate_window_opportunities dropped
+# solar_elevations when constructing the toggled HouseState, causing the
+# simulator to fall back from elevation-based solar (significant gains) to
+# the empty legacy per-hour model.  Every window toggle appeared to cool
+# rooms down, producing spurious opportunities.
+
+
+class TestSolarElevationNotDropped:
+    """Toggling a no-beta window must not change predictions when solar is active."""
+
+    def test_no_beta_window_zero_benefit(self) -> None:
+        """Window with no sysid beta on any sensor produces zero comfort benefit.
+
+        Minimal unit test: two sensors, one window (no betas), solar_elevation_gains
+        present. Toggling the window must not change predictions.
+        """
+        from weatherstat.control import CONTROL_HORIZONS, HORIZON_WEIGHTS, compute_comfort_cost
+        from weatherstat.simulator import HouseState, SimParams, TauModel, predict
+        from weatherstat.types import ComfortSchedule, ComfortScheduleEntry, RoomComfort
+
+        # Two sensors, no window betas, significant solar elevation gains
+        sensors = ["room_a_temp", "room_b_temp"]
+        params = SimParams(
+            taus={s: TauModel(tau_base=45.0) for s in sensors},
+            gains={},
+            solar={},
+            sensors=sensors,
+            effectors=[],
+            solar_elevation_gains={"room_a_temp": 3.0, "room_b_temp": 2.0},
+        )
+
+        # Daytime solar elevations (simulating sunny afternoon)
+        n_steps = max(CONTROL_HORIZONS)
+        solar_elevs = [0.6] * n_steps  # constant for simplicity
+
+        temps = {"room_a_temp": 74.0, "room_b_temp": 73.0}
+        state = HouseState(
+            current_temps=temps,
+            outdoor_temp=60.0,
+            forecast_temps=[60.0] * 12,
+            window_states={"fake_window": False},
+            hour_of_day=14.0,
+            solar_fractions=[1.0] * 12,
+            solar_elevations=solar_elevs,
+        )
+
+        scenario = Scenario(effectors={})
+
+        # Baseline prediction
+        target_names, baseline_preds = predict(state, [scenario], params, CONTROL_HORIZONS)
+        baseline_dict = {t: float(baseline_preds[0, j]) for j, t in enumerate(target_names)}
+
+        # Toggled prediction — same state except window open
+        toggled_state = HouseState(
+            current_temps=temps,
+            outdoor_temp=60.0,
+            forecast_temps=[60.0] * 12,
+            window_states={"fake_window": True},
+            hour_of_day=14.0,
+            solar_fractions=[1.0] * 12,
+            solar_elevations=solar_elevs,  # critical: must be preserved
+        )
+        _, toggled_preds = predict(toggled_state, [scenario], params, CONTROL_HORIZONS)
+        toggled_dict = {t: float(toggled_preds[0, j]) for j, t in enumerate(target_names)}
+
+        # With no window betas, predictions must be identical
+        for key in baseline_dict:
+            assert baseline_dict[key] == pytest.approx(toggled_dict[key], abs=1e-6), (
+                f"Prediction for {key} changed when toggling no-beta window: "
+                f"{baseline_dict[key]:.4f} → {toggled_dict[key]:.4f}"
+            )
+
+    def test_house_state_requires_solar_elevations(self) -> None:
+        """HouseState raises ValueError if solar_elevations is empty."""
+        from weatherstat.simulator import HouseState
+
+        with pytest.raises(ValueError, match="solar_elevations"):
+            HouseState(
+                current_temps={"x": 70.0},
+                outdoor_temp=60.0,
+                forecast_temps=[60.0],
+                window_states={},
+                hour_of_day=12.0,
+            )
 
 
 # ── Opportunity state tests ──────────────────────────────────────────────

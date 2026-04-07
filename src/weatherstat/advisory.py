@@ -150,6 +150,7 @@ def evaluate_window_opportunities(
             hour_of_day=state.hour_of_day,
             recent_history=state.recent_history,
             solar_fractions=state.solar_fractions,
+            solar_elevations=state.solar_elevations,
         )
 
         # Quick check: comfort improvement with same HVAC plan
@@ -174,6 +175,7 @@ def evaluate_window_opportunities(
             base_hour=base_hour,
             prev_state=prev_state,
             solar_fractions=state.solar_fractions,
+            solar_elevations=state.solar_elevations,
         )
 
         comfort_improvement = (winning_comfort_cost - resweep_decision.comfort_cost) / cost_norm
@@ -185,7 +187,8 @@ def evaluate_window_opportunities(
 
         action = "Open" if not is_open else "Close"
 
-        parts = [f"{action} {window_name} window"]
+        win_cfg = cfg.windows[window_name]
+        parts = [f"{action} {win_cfg.label} {win_cfg.kind}"]
         if not is_open:
             parts.append(f"({state.outdoor_temp:.0f}{UNIT_SYMBOL} outside)")
         if comfort_improvement > 0.01:
@@ -285,7 +288,11 @@ def dismiss_ha_notification(
 # ── Opportunity lifecycle ────────────────────────────────────────────────
 
 
-def _notification_tag(window: str) -> str:
+_ROLLUP_TAG = "weatherstat_opportunities"
+
+
+def _legacy_notification_tag(window: str) -> str:
+    """Per-window tag from pre-rollup era — used only for dismissing old notifications."""
     return f"weatherstat_opportunity_{window}"
 
 
@@ -297,10 +304,15 @@ def process_opportunities(
 ) -> tuple[list[WindowOpportunity], list[str]]:
     """Manage opportunity lifecycle: add/keep/remove, dispatch notifications.
 
+    Notifications are rolled up into a single push per control cycle listing
+    all new opportunities.  Dismissed windows clear any legacy per-window
+    notification tags (transition from pre-rollup format).
+
     Returns:
         (active_opportunities, dismissed_windows).
     """
     from weatherstat.types import WindowOpportunity
+    from weatherstat.yaml_config import window_display
 
     opp_state = OpportunityState.load()
     now_iso = datetime.now(UTC).isoformat()
@@ -317,6 +329,7 @@ def process_opportunities(
     curr_active: dict[str, dict] = {}
     active_list: list[WindowOpportunity] = []
     dismissed: list[str] = []
+    newly_notified: list[WindowOpportunity] = []
 
     print("\n[opportunities] Evaluating window opportunities...")
 
@@ -344,13 +357,6 @@ def process_opportunities(
 
         notified = was_notified or should_notify
 
-        if should_notify and live:
-            tag = _notification_tag(window)
-            title = f"{opp.action.title()} {window} window"
-            send_ha_notification(title, opp.message, tag, notification_target)
-            opp_state.cooldowns[cooldown_key] = now_ts
-            print(f"  → Notified: {title}")
-
         active_opp = WindowOpportunity(
             window=opp.window,
             action=opp.action,
@@ -364,17 +370,46 @@ def process_opportunities(
         active_list.append(active_opp)
         curr_active[window] = asdict(active_opp)
 
-        status = "active" if was_active else "new"
-        print(f"  {opp.action.title()} {window}: benefit={opp.total_benefit:.2f} [{status}]")
+        if should_notify:
+            opp_state.cooldowns[cooldown_key] = now_ts
+            newly_notified.append(active_opp)
 
-    # Dismiss expired opportunities
+        status = "active" if was_active else "new"
+        label, kind = window_display(window)
+        print(f"  {opp.action.title()} {label} {kind}: benefit={opp.total_benefit:.2f} [{status}]")
+
+    # Dismiss expired opportunities (+ legacy per-window tags from pre-rollup)
     for window in prev_active - set(candidates.keys()):
         prev_data = opp_state.active[window]
         if prev_data.get("notified", False) and live:
-            tag = _notification_tag(window)
-            dismiss_ha_notification(tag, notification_target)
-            print(f"  Dismissed: {window}")
+            dismiss_ha_notification(_legacy_notification_tag(window), notification_target)
+        label, kind = window_display(window)
+        print(f"  Dismissed: {label} {kind}")
         dismissed.append(window)
+
+    # Send single rolled-up notification for all newly notified opportunities
+    if newly_notified and live:
+        lines: list[str] = []
+        for opp in newly_notified:
+            label, kind = window_display(opp.window)
+            line = f"{opp.action.title()} {label} {kind}"
+            parts: list[str] = []
+            if opp.comfort_improvement > 0.01:
+                parts.append(f"comfort +{opp.comfort_improvement:.2f}")
+            if opp.energy_saving > 0.01:
+                parts.append(f"energy +{opp.energy_saving:.3f}")
+            if parts:
+                line += f" ({', '.join(parts)})"
+            lines.append(line)
+
+        title = "Free cooling"
+        body = "\n".join(lines)
+        send_ha_notification(title, body, _ROLLUP_TAG, notification_target)
+        print(f"  → Notified ({len(newly_notified)} opportunities)")
+
+    # If nothing is active and something was previously notified, dismiss the rollup
+    if not curr_active and prev_active and live:
+        dismiss_ha_notification(_ROLLUP_TAG, notification_target)
 
     opp_state.active = curr_active
     if live:

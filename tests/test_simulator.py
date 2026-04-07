@@ -63,6 +63,7 @@ def _make_state(
         forecast_temps=[outdoor] * 12,
         window_states={},
         hour_of_day=hour,
+        solar_elevations=[0.0] * 72,
     )
 
 

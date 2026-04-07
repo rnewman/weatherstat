@@ -428,6 +428,17 @@ def replay_bundle(bundle_dir: Path) -> None:
     print("=" * 60)
     print("SWEEP RESULT")
     print("=" * 60)
+    from weatherstat.control import CONTROL_HORIZONS
+    from weatherstat.weather import solar_sin_elevation
+
+    lat = cfg.location.latitude
+    lon = cfg.location.longitude
+    max_steps = max(CONTROL_HORIZONS)
+    solar_elevations = [
+        solar_sin_elevation(lat, lon, target_dt + timedelta(minutes=5 * step))
+        for step in range(1, max_steps + 1)
+    ]
+
     decision, scenario, blocked = sweep_scenarios_physics(
         current_temps=current_temps,
         outdoor_temp=outdoor,
@@ -440,6 +451,7 @@ def replay_bundle(bundle_dir: Path) -> None:
         base_hour=base_hour,
         prev_state=prev_state,
         solar_fractions=solar_fractions,
+        solar_elevations=solar_elevations,
     )
 
     print(f"  Comfort: {decision.comfort_cost:.1f}  Energy: {decision.energy_cost:.3f}")

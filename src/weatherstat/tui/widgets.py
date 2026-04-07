@@ -350,6 +350,8 @@ class OpportunityPanel(Static):
         super().__init__("", classes="panel")
 
     def set_data(self, opportunities: list[dict]) -> None:
+        from weatherstat.yaml_config import window_display
+
         lines: list[str] = ["[bold]Opportunities[/]"]
         if not opportunities:
             lines.append("  (none)")
@@ -358,7 +360,8 @@ class OpportunityPanel(Static):
                 window = opp.get("window", "?")
                 action = opp.get("action", "?")
                 benefit = opp.get("total_benefit", 0)
-                lines.append(f"  [yellow]{action} {window}[/] (benefit: {benefit:.2f})")
+                label, kind = window_display(window)
+                lines.append(f"  [yellow]{action} {label} {kind}[/] (benefit: {benefit:.2f})")
         self.update("\n".join(lines))
 
 

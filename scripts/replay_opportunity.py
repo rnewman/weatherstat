@@ -141,7 +141,11 @@ def _utc_to_local_hour(timestamp: str, tz_offset_hours: int = -7) -> int:
 
 def replay(timestamp: str, window_name: str) -> None:
     """Replay opportunity evaluation."""
-    load_config()  # ensure config is loaded (cached singleton)
+    from datetime import UTC, datetime, timedelta
+
+    from weatherstat.weather import solar_sin_elevation
+
+    cfg = load_config()
     sim_params = load_sim_params()
     schedules = default_comfort_schedules()
 
@@ -152,6 +156,16 @@ def replay(timestamp: str, window_name: str) -> None:
     current_temps, outdoor_temp, weather = _load_decision_state(timestamp)
     window_states, forecast_temps = _load_snapshot_context(timestamp)
     base_hour = _utc_to_local_hour(timestamp)
+
+    # Compute solar elevations at the decision timestamp
+    dt = datetime.fromisoformat(timestamp)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    max_steps = max(CONTROL_HORIZONS)
+    solar_elevations = [
+        solar_sin_elevation(cfg.location.latitude, cfg.location.longitude, dt + timedelta(minutes=5 * step))
+        for step in range(1, max_steps + 1)
+    ]
 
     print(f"Outdoor: {outdoor_temp:.1f}°F  Weather: {weather}  Local hour: {base_hour}")
     open_windows = [k for k, v in sorted(window_states.items()) if v]
@@ -197,6 +211,7 @@ def replay(timestamp: str, window_name: str) -> None:
         base_hour=base_hour,
         prev_state=prev_state,
         solar_fractions=None,
+        solar_elevations=solar_elevations,
     )
     print(f"  Comfort: {d1.comfort_cost:.1f}  Energy: {d1.energy_cost:.3f}  Total: {d1.comfort_cost + d1.energy_cost:.1f}")
     print("  Effectors:")
@@ -229,6 +244,7 @@ def replay(timestamp: str, window_name: str) -> None:
         base_hour=base_hour,
         prev_state=prev_state,
         solar_fractions=None,
+        solar_elevations=solar_elevations,
     )
     print(f"  Comfort: {d2.comfort_cost:.1f}  Energy: {d2.energy_cost:.3f}  Total: {d2.comfort_cost + d2.energy_cost:.1f}")
     print("  Effectors:")

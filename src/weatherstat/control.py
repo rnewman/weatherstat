@@ -810,7 +810,8 @@ def sweep_scenarios_physics(
     prev_state: ControlState | None = None,
     solar_fractions: list[float] | None = None,
     ineligible_effectors: set[str] | None = None,
-    solar_elevations: list[float] | None = None,
+    *,
+    solar_elevations: list[float],
 ) -> tuple[ControlDecision, Scenario, dict[str, str]]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -883,7 +884,7 @@ def sweep_scenarios_physics(
         hour_of_day=hour_of_day,
         recent_history=recent_history,
         solar_fractions=solar_fractions or [],
-        solar_elevations=solar_elevations or [],
+        solar_elevations=solar_elevations,
     )
     target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
     target_idx = {t: j for j, t in enumerate(target_names)}
@@ -1286,7 +1287,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     window_cols = _CFG.window_display_map
     open_windows = [wlabel for col, wlabel in window_cols.items() if bool(latest.get(col, False))]
     if open_windows:
-        print(f"  Windows:     {', '.join(open_windows)} open")
+        from weatherstat.yaml_config import window_display
+        labels = [f"{label} {kind}" for label, kind in (window_display(w) for w in open_windows)]
+        print(f"  Windows:     {', '.join(labels)} open")
     else:
         print("  Windows:     all closed")
     # Show other prediction sensors (not trajectory effectors)
@@ -1398,7 +1401,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     )
     labels_with_open = {wn for wn, ws in window_states_dict.items() if ws and wn in constraint_labels}
     if labels_with_open:
-        print(f"  Comfort adjusted for open windows: {', '.join(sorted(labels_with_open))}")
+        from weatherstat.yaml_config import window_display
+        open_labels = [f"{label} {kind}" for label, kind in (window_display(w) for w in sorted(labels_with_open))]
+        print(f"  Comfort adjusted for open: {', '.join(open_labels)}")
     recent_hist = extract_recent_history(df_raw, sim_params)
 
     # Build forecast temp list, solar fractions, and solar elevations for simulator
@@ -1484,7 +1489,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         prev_state,
         solar_fractions,
         ineligible_effectors,
-        solar_elevations,
+        solar_elevations=solar_elevations,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
