@@ -159,6 +159,19 @@ class TestSolarElevationNotDropped:
                 f"{baseline_dict[key]:.4f} → {toggled_dict[key]:.4f}"
             )
 
+    def test_house_state_requires_solar_fractions(self) -> None:
+        """HouseState raises ValueError if solar_fractions is empty."""
+        from weatherstat.simulator import HouseState
+
+        with pytest.raises(ValueError, match="solar_fractions"):
+            HouseState(
+                current_temps={"x": 70.0},
+                outdoor_temp=60.0,
+                forecast_temps=[60.0],
+                window_states={},
+                hour_of_day=12.0,
+            )
+
     def test_house_state_requires_solar_elevations(self) -> None:
         """HouseState raises ValueError if solar_elevations is empty."""
         from weatherstat.simulator import HouseState
@@ -170,6 +183,7 @@ class TestSolarElevationNotDropped:
                 forecast_temps=[60.0],
                 window_states={},
                 hour_of_day=12.0,
+                solar_fractions=[1.0],
             )
 
 

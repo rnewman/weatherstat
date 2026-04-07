@@ -263,6 +263,7 @@ class TestSimulatorDependencyGating:
             forecast_temps=[outdoor] * 12,
             window_states={},
             hour_of_day=hour,
+            solar_fractions=[0.0] * 12,
             solar_elevations=[0.0] * 72,
         )
 

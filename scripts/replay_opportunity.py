@@ -46,7 +46,7 @@ def _load_decision_state(timestamp: str) -> tuple[dict[str, float], float, str]:
     return json.loads(row[0]), row[1], row[2] or "unknown"
 
 
-def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]]:
+def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float], list[float]]:
     """Load window states and forecast temps from the nearest snapshot.
 
     Decision timestamps end in fractional seconds; snapshot timestamps are on
@@ -78,6 +78,8 @@ def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]
             wname = name.removeprefix("window_").removesuffix("_open")
             window_states[wname] = val == "1"
 
+    from weatherstat.weather import condition_to_solar_fraction
+
     forecast_dict: dict[int, float] = {}
     for h in range(1, 13):
         key = f"forecast_temp_{h}h"
@@ -93,7 +95,14 @@ def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]
         else:
             break  # stop at first gap
 
-    return window_states, forecast_temps
+    # Solar fractions from weather conditions
+    current_condition = snap.get("weather_condition", "unknown")
+    solar_fractions: list[float] = [condition_to_solar_fraction(str(current_condition))]
+    for h in range(1, 13):
+        fc = snap.get(f"forecast_condition_{h}h", "unknown")
+        solar_fractions.append(condition_to_solar_fraction(str(fc)))
+
+    return window_states, forecast_temps, solar_fractions
 
 
 def _reconstruct_prev_state(timestamp: str) -> ControlState | None:
@@ -154,7 +163,7 @@ def replay(timestamp: str, window_name: str) -> None:
 
     # Load state
     current_temps, outdoor_temp, weather = _load_decision_state(timestamp)
-    window_states, forecast_temps = _load_snapshot_context(timestamp)
+    window_states, forecast_temps, solar_fractions = _load_snapshot_context(timestamp)
     base_hour = _utc_to_local_hour(timestamp)
 
     # Compute solar elevations at the decision timestamp
@@ -210,7 +219,7 @@ def replay(timestamp: str, window_name: str) -> None:
         schedules=schedules,
         base_hour=base_hour,
         prev_state=prev_state,
-        solar_fractions=None,
+        solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
     )
     print(f"  Comfort: {d1.comfort_cost:.1f}  Energy: {d1.energy_cost:.3f}  Total: {d1.comfort_cost + d1.energy_cost:.1f}")
@@ -243,7 +252,7 @@ def replay(timestamp: str, window_name: str) -> None:
         schedules=schedules,
         base_hour=base_hour,
         prev_state=prev_state,
-        solar_fractions=None,
+        solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
     )
     print(f"  Comfort: {d2.comfort_cost:.1f}  Energy: {d2.energy_cost:.3f}  Total: {d2.comfort_cost + d2.energy_cost:.1f}")

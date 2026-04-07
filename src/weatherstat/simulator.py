@@ -101,12 +101,16 @@ class HouseState:
     solar_fractions: list[float] = field(default_factory=list)
     # Per-hour solar fractions [now, h+1, h+2, ...] from weather conditions.
     # Index 0 = current hour, index 1 = next hour, etc.
-    # Empty list → default to 1.0 (full sun).
     solar_elevations: list[float] = field(default_factory=list)
     # sin+(elevation) at each 5-min step [step1, step2, ...] for the prediction
-    # horizon. Precomputed from lat/lon/time. Empty → fall back to per-hour solar.
+    # horizon. Precomputed from lat/lon/time.
 
     def __post_init__(self) -> None:
+        if not self.solar_fractions:
+            raise ValueError(
+                "HouseState requires solar_fractions (per-hour cloud attenuation). "
+                "Pass an all-zeros list for nighttime or test scenarios."
+            )
         if not self.solar_elevations:
             raise ValueError(
                 "HouseState requires solar_elevations (sin⁺(elev) at 5-min steps). "

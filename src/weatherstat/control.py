@@ -808,9 +808,9 @@ def sweep_scenarios_physics(
     schedules: list[ComfortSchedule],
     base_hour: int,
     prev_state: ControlState | None = None,
-    solar_fractions: list[float] | None = None,
     ineligible_effectors: set[str] | None = None,
     *,
+    solar_fractions: list[float],
     solar_elevations: list[float],
 ) -> tuple[ControlDecision, Scenario, dict[str, str]]:
     """Sweep trajectory scenarios using physics simulator predictions.
@@ -883,7 +883,7 @@ def sweep_scenarios_physics(
         window_states=window_states,
         hour_of_day=hour_of_day,
         recent_history=recent_history,
-        solar_fractions=solar_fractions or [],
+        solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
     )
     target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
@@ -1487,8 +1487,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         schedules,
         base_hour,
         prev_state,
-        solar_fractions,
         ineligible_effectors,
+        solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
@@ -1784,7 +1784,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         schedules=schedules,
         base_hour=base_hour,
         prev_state=prev_state,
-        current_temps=current_temps,
     )
     active_opps, dismissed_windows = process_opportunities(
         window_opportunities,

@@ -63,6 +63,7 @@ def _make_state(
         forecast_temps=[outdoor] * 12,
         window_states={},
         hour_of_day=hour,
+        solar_fractions=[0.0] * 12,
         solar_elevations=[0.0] * 72,
     )
 
@@ -127,6 +128,36 @@ def test_outdoor_at_exact_hour() -> None:
 def test_outdoor_at_beyond_forecast() -> None:
     # 5 hours ahead with only 2 forecast entries -> clamp to last
     assert _outdoor_at(42.0, [40.0, 38.0], 5.0) == 38.0
+
+
+def test_empty_forecast_uses_constant_outdoor(sim_params: SimParams) -> None:
+    """Empty forecast_temps degrades to constant outdoor temp, not crash or wrong results.
+
+    With empty forecast, _outdoor_at returns current outdoor for all horizons.
+    Predictions should still converge toward outdoor temp.
+    """
+    outdoor = 42.0
+    state_with_forecast = _make_state(outdoor=outdoor)
+    state_no_forecast = HouseState(
+        current_temps=state_with_forecast.current_temps,
+        outdoor_temp=outdoor,
+        forecast_temps=[],  # empty forecast
+        window_states={},
+        hour_of_day=14.5,
+        solar_fractions=[0.0] * 12,
+        solar_elevations=[0.0] * 72,
+    )
+
+    _, preds_with = predict(state_with_forecast, [_all_off()], sim_params, [12, 72])
+    _, preds_no = predict(state_no_forecast, [_all_off()], sim_params, [12, 72])
+
+    # Both should produce valid predictions (no NaN, no crash)
+    assert not np.any(np.isnan(preds_with))
+    assert not np.any(np.isnan(preds_no))
+
+    # With constant-outdoor forecast (42°F), both should give same results
+    # since _make_state uses [outdoor] * 12 which is already constant
+    np.testing.assert_allclose(preds_with, preds_no, atol=0.01)
 
 
 # ── build_activity_timeline ──────────────────────────────────────────────

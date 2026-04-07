@@ -98,7 +98,6 @@ def evaluate_window_opportunities(
     schedules: list[ComfortSchedule],
     base_hour: int,
     prev_state: ControlState | None = None,
-    current_temps: dict[str, float] | None = None,
 ) -> list[WindowOpportunity]:
     """Evaluate window toggles for comfort and energy savings.
 
