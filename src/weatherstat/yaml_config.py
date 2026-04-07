@@ -79,6 +79,11 @@ class HealthCheck:
     expected_state: str | None = None  # alert if state != this (for binary/enum entities)
     severity: str = "warning"
     message: str = ""
+    # Optional condition: only evaluate this check when another entity is in a
+    # given state for at least ``when_for_minutes`` minutes.
+    when_entity: str | None = None
+    when_state: str | None = None
+    when_for_minutes: float = 0
 
 
 @dataclass(frozen=True)
@@ -619,6 +624,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     # ── Health checks (standalone section) ────────────────────────────
     health_checks: list[HealthCheck] = []
     for hc_name, hc in data.get("health", {}).items():
+        when = hc.get("when", {})
         health_checks.append(HealthCheck(
             name=hc_name,
             entity_id=hc["entity"],
@@ -627,6 +633,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             expected_state=str(hc["expected_state"]) if "expected_state" in hc else None,
             severity=hc.get("severity", "warning"),
             message=hc.get("message", ""),
+            when_entity=when.get("entity"),
+            when_state=str(when["state"]) if "state" in when else None,
+            when_for_minutes=float(when.get("for_minutes", 0)),
         ))
 
     # ── Windows ──────────────────────────────────────────────────────

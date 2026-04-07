@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import requests
@@ -125,8 +126,51 @@ def check_device_health() -> list[SafetyAlert]:
     return alerts
 
 
+def _check_when_condition(check: HealthCheck) -> bool:
+    """Return True if the check's ``when`` condition is satisfied (or absent).
+
+    Fetches the conditioning entity from HA.  The condition passes when:
+    1. The entity's current state matches ``when_state``, AND
+    2. It has been in that state for at least ``when_for_minutes`` (compared
+       against the ``last_changed`` timestamp in the HA state response).
+    """
+    if check.when_entity is None:
+        return True  # no condition — always evaluate
+
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.get(
+        f"{HA_URL}/api/states/{check.when_entity}",
+        headers=headers,
+        timeout=5,
+    )
+    if resp.status_code != 200:
+        return False  # can't verify condition — skip the check
+
+    when_data = resp.json()
+    if when_data.get("state", "") != check.when_state:
+        return False
+
+    if check.when_for_minutes > 0:
+        last_changed = when_data.get("last_changed", "")
+        if not last_changed:
+            return False
+        changed_at = datetime.fromisoformat(last_changed)
+        elapsed_min = (datetime.now(timezone.utc) - changed_at).total_seconds() / 60
+        if elapsed_min < check.when_for_minutes:
+            return False
+
+    return True
+
+
 def _check_health_threshold(check: HealthCheck) -> SafetyAlert | None:
     """Fetch an entity from HA and compare against configured thresholds."""
+    # Evaluate optional precondition first.
+    if not _check_when_condition(check):
+        return None
+
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
         "Content-Type": "application/json",

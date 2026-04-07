@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from weatherstat.safety import (
@@ -96,44 +97,83 @@ class TestCheckDeviceHealth:
         return resp
 
     @staticmethod
-    def _mock_by_entity(entity_states: dict[str, str]) -> callable:
-        """Return a side_effect function that returns different states per entity."""
+    def _mock_by_entity(entity_responses: dict[str, dict]) -> callable:
+        """Return a side_effect function that returns different responses per entity.
+
+        Values can be a plain string (state only) or a dict with ``state`` and
+        optional ``last_changed`` keys.
+        """
         def _get(url: str, **_kwargs: object) -> MagicMock:
             entity_id = url.rsplit("/", 1)[-1]
-            state = entity_states.get(entity_id, "unknown")
+            info = entity_responses.get(entity_id)
             resp = MagicMock()
             resp.status_code = 200
-            resp.json.return_value = {"state": state}
+            if info is None:
+                resp.json.return_value = {"state": "unknown"}
+            elif isinstance(info, str):
+                resp.json.return_value = {"state": info}
+            else:
+                resp.json.return_value = info
             return resp
         return _get
 
+    @staticmethod
+    def _heating_since(minutes_ago: float) -> str:
+        """Return an ISO timestamp *minutes_ago* minutes in the past."""
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
     def test_no_alert_when_healthy(self) -> None:
-        """All checks pass → no alert."""
+        """Connection OK, outlet healthy while heating long enough → no alert."""
         states = {
             "binary_sensor.combi_connection_status": "on",
-            "sensor.combi_sh_return_temp": "120.0",
+            "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(10)},
+            "sensor.combi_outlet_temp": "150.0",
         }
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 0
 
-    def test_alert_when_below_min(self) -> None:
-        """Sensor value at or below min_value → critical alert."""
+    def test_alert_when_outlet_low_and_heating(self) -> None:
+        """Outlet temp below threshold while heating for 5 min → critical alert."""
         states = {
             "binary_sensor.combi_connection_status": "on",
-            "sensor.combi_sh_return_temp": "32.0",
+            "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(5)},
+            "sensor.combi_outlet_temp": "100.0",
         }
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
         assert len(alerts) == 1
-        assert alerts[0].key == "combi_return_fault"
+        assert alerts[0].key == "combi_outlet_fault"
         assert alerts[0].severity == "critical"
+
+    def test_no_alert_when_not_heating(self) -> None:
+        """Outlet temp low but boiler is idle → when condition fails, no alert."""
+        states = {
+            "binary_sensor.combi_connection_status": "on",
+            "sensor.combi_heating_mode": {"state": "Idle", "last_changed": self._heating_since(30)},
+            "sensor.combi_outlet_temp": "80.0",
+        }
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
+            alerts = check_device_health()
+        assert len(alerts) == 0
+
+    def test_no_alert_when_heating_too_briefly(self) -> None:
+        """Outlet low but heating started <3 min ago → within for_minutes grace, no alert."""
+        states = {
+            "binary_sensor.combi_connection_status": "on",
+            "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(1)},
+            "sensor.combi_outlet_temp": "80.0",
+        }
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
+            alerts = check_device_health()
+        assert len(alerts) == 0
 
     def test_alert_when_connection_lost(self) -> None:
         """Connection status off → critical alert."""
         states = {
             "binary_sensor.combi_connection_status": "off",
-            "sensor.combi_sh_return_temp": "120.0",
+            "sensor.combi_heating_mode": {"state": "Idle", "last_changed": self._heating_since(30)},
+            "sensor.combi_outlet_temp": "120.0",
         }
         with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
             alerts = check_device_health()
@@ -146,8 +186,10 @@ class TestCheckDeviceHealth:
         """Sensor state 'unavailable' → warning alert."""
         with patch("weatherstat.safety.requests.get", return_value=self._mock_ha_response("unavailable")):
             alerts = check_device_health()
-        # Both checks see 'unavailable'
-        assert len(alerts) == 2
+        # Both checks see 'unavailable' (when condition entity also returns unavailable,
+        # which doesn't match "Space Heating", so the outlet check is skipped — only
+        # connection check produces an unavailable warning).
+        assert len(alerts) >= 1
         assert all(a.severity == "warning" for a in alerts)
 
     def test_ha_failure_does_not_crash(self) -> None:

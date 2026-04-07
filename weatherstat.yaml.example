@@ -141,11 +141,15 @@ health:
     expected_state: "on"
     severity: critical
     message: "Combi boiler connection lost"
-  combi_return:
-    entity: sensor.combi_sh_return_temp
-    min_value: 33
+  combi_outlet:
+    entity: sensor.combi_outlet_temp
+    min_value: 120
     severity: critical
-    message: "Boiler return temp too low"
+    message: "Boiler outlet temp too low while heating — check for flame failure"
+    when:
+      entity: sensor.combi_heating_mode
+      state: "Space Heating"
+      for_minutes: 3
 
 # ── Windows ─────────────────────────────────────────────────────────────
 # Binary sensors for windows and doors. Sysid learns per-window thermal
