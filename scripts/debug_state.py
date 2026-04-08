@@ -10,6 +10,7 @@ Usage:
     python scripts/debug_state.py opportunities          # advisory state
     python scripts/debug_state.py snapshots              # snapshot DB stats
     python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
+    python scripts/debug_state.py why [EFFECTOR]          # explain why active effectors are on
 
     --bundle <dir>   Point at a debug bundle instead of the live data directory.
                      Example: python scripts/debug_state.py --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 temps
@@ -19,6 +20,7 @@ All output is plain text, suitable for piping to Claude or other tools.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import sys
@@ -399,6 +401,133 @@ def cmd_snapshots() -> None:
     print(f"  Last:  {ts_max} ({_ago(ts_max)})")
 
 
+def cmd_why(effector_filter: str | None = None) -> None:
+    """Explain why each active effector is on: gains, affected sensors, current temps, predictions."""
+    p = _paths()
+    params = _load_json(p["thermal_params"])
+    cs = _load_json(p["control_state"])
+    if not params or not cs:
+        print("Missing thermal_params.json or control_state.json.")
+        return
+
+    # Load current temps from latest snapshot
+    conn = sqlite3.connect(str(p["snapshots_db"]))
+    row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
+    ts = row[0] if row else None
+    current_temps: dict[str, float] = {}
+    if ts:
+        for name, value in conn.execute(
+            "SELECT name, value FROM readings WHERE timestamp = ? AND name LIKE '%_temp'", (ts,)
+        ).fetchall():
+            with contextlib.suppress(ValueError, TypeError):
+                current_temps[name] = float(value)
+    conn.close()
+
+    # Load comfort bounds + predictions from latest decision
+    bounds: dict[str, dict] = {}
+    predictions: dict[str, dict] = {}
+    if p["decision_log"].exists():
+        dconn = sqlite3.connect(str(p["decision_log"]))
+        drow = dconn.execute(
+            "SELECT comfort_bounds, predictions, comfort_cost FROM decisions ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        dconn.close()
+        if drow:
+            bounds = json.loads(drow[0]) if drow[0] else {}
+            predictions = json.loads(drow[1]) if drow[1] else {}
+
+    # Index gains by effector
+    gains_by_effector: dict[str, list[dict]] = {}
+    for g in params.get("effector_sensor_gains", []):
+        gains_by_effector.setdefault(g["effector"], []).append(g)
+
+    # Active effectors from control state
+    modes = cs.get("modes", {})
+    active = {k: v for k, v in modes.items() if v != "off"}
+    if effector_filter:
+        active = {k: v for k, v in active.items() if effector_filter.lower() in k.lower()}
+
+    if not active:
+        print("No active effectors" + (f" matching '{effector_filter}'" if effector_filter else "") + ".")
+        return
+
+    for eff_name, mode in sorted(active.items()):
+        target = cs.get("setpoints", {}).get(eff_name)
+        target_str = f" @ {target}°F" if target is not None else ""
+        print(f"━━━ {eff_name} = {mode}{target_str} ━━━")
+
+        gains = gains_by_effector.get(eff_name, [])
+        sig_gains = [g for g in gains if not g.get("negligible", True)]
+
+        if not sig_gains:
+            print("  No significant sysid gains — effector has no modeled effect.")
+            print()
+            continue
+
+        # Sort by absolute gain magnitude
+        sig_gains.sort(key=lambda g: abs(g.get("gain_f_per_hour", 0)), reverse=True)
+
+        print(f"  Significant gains ({len(sig_gains)}):")
+        for g in sig_gains:
+            sensor = g["sensor"]
+            gain = g.get("gain_f_per_hour", 0)
+            t_stat = g.get("t_statistic", 0)
+            temp = current_temps.get(sensor)
+            label = sensor.replace("_temp", "")
+            b = bounds.get(label, {})
+
+            # Comfort status
+            status = ""
+            flags = []
+            if temp is not None and b:
+                cmin = b.get("min")
+                cmax = b.get("max")
+                plo = b.get("preferred_lo")
+                phi = b.get("preferred_hi")
+                if cmin is not None and cmax is not None:
+                    if temp > float(cmax):
+                        status = f"HOT ({temp - float(cmax):+.1f})"
+                    elif temp < float(cmin):
+                        status = f"COLD ({float(cmin) - temp:+.1f})"
+                    elif plo is not None and temp < float(plo):
+                        status = "below pref"
+                    elif phi is not None and temp > float(phi):
+                        status = "above pref"
+                    else:
+                        status = "in band"
+
+                    # Flag contradictions
+                    if temp > float(cmax) and gain > 0:
+                        flags.append("⚠ HEATING AN ALREADY-HOT SENSOR")
+                    elif temp < float(cmin) and gain < 0:
+                        flags.append("⚠ COOLING AN ALREADY-COLD SENSOR")
+
+            # Flag nonsensical gains
+            if sensor == "outdoor_temp":
+                flags.append("⚠ NONSENSICAL: indoor effector → outdoor temp")
+            if abs(gain) > 1.0 and "bookshelf" not in eff_name:
+                flags.append(f"⚠ IMPLAUSIBLE MAGNITUDE ({gain:+.2f}°F/hr)")
+
+            temp_str = f"{temp:.1f}°F" if temp is not None else "n/a"
+            gain_dir = "warms" if gain > 0 else "cools"
+            print(f"    {sensor:<30} {gain:+.4f}°F/hr ({gain_dir})  t={t_stat:.2f}  now={temp_str}  [{status}]")
+            for flag in flags:
+                print(f"      {flag}")
+
+        # Show predictions for affected constrained sensors
+        constrained_sensors = {g["sensor"] for g in sig_gains if g["sensor"].replace("_temp", "") in bounds}
+        if constrained_sensors and predictions:
+            print("  Predicted trajectories (with current plan):")
+            for sensor in sorted(constrained_sensors):
+                preds = predictions.get(sensor, {})
+                if preds:
+                    parts = [f"{h}={v:.1f}" for h, v in preds.items()]
+                    temp = current_temps.get(sensor, 0)
+                    print(f"    {sensor:<30} now={temp:.1f}  {', '.join(parts)}")
+
+        print()
+
+
 def cmd_comfort(sensor_filter: str | None = None) -> None:
     """Show comfort schedules from config."""
     # If pointing at a bundle, set WEATHERSTAT_DATA_DIR so load_config finds the right YAML
@@ -474,6 +603,7 @@ COMMANDS = {
     "opportunities": lambda args: cmd_opportunities(),
     "snapshots": lambda args: cmd_snapshots(),
     "comfort": lambda args: cmd_comfort(args[0] if args else None),
+    "why": lambda args: cmd_why(args[0] if args else None),
 }
 
 if __name__ == "__main__":
