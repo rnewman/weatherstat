@@ -26,8 +26,8 @@ _MIN_T_STATISTIC = 1.5
 
 # Maximum plausible gain magnitude (per hour, in configured unit). Gains larger
 # than this are almost certainly confounded or from a sensor near a vent/register.
-# Typical real gains (°F/hr): thermostats 0.3-1.0, mini splits 1.0-1.5, blowers <0.5.
-_MAX_GAIN_MAGNITUDE = delta_temp(3.0)
+# Typical real gains (°F/hr): thermostats 0.3-1.0, mini splits 1.0-1.5, blowers 0.1-0.5.
+_MAX_GAIN_MAGNITUDE = delta_temp(2.0)
 
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
@@ -135,20 +135,19 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         )
 
     # Gain lookup: filter by negligible flag, t-statistic significance,
-    # physical plausibility (gain magnitude), and mode-direction consistency
-    # (heating-only effectors can't have negative gains).
+    # and mode-direction consistency (heating-only effectors can't have
+    # negative gains). Gains exceeding _MAX_GAIN_MAGNITUDE are clamped
+    # rather than pruned — a large gain may be real but exaggerated due
+    # to sparse data or multicollinearity.
     gains: dict[tuple[str, str], tuple[float, float]] = {}
     n_pruned_t = 0
-    n_pruned_mag = 0
+    n_clamped_mag = 0
     n_pruned_sign = 0
     for g in data["effector_sensor_gains"]:
         if g["negligible"]:
             continue
         if abs(g.get("t_statistic", 999)) < _MIN_T_STATISTIC:
             n_pruned_t += 1
-            continue
-        if abs(g["gain_f_per_hour"]) > _MAX_GAIN_MAGNITUDE:
-            n_pruned_mag += 1
             continue
         # Mode-direction filter: a heating-only effector can't cool (negative gain),
         # and a cooling-only effector can't heat (positive gain). Confounded OLS
@@ -163,16 +162,21 @@ def load_sim_params(path: Path | None = None) -> SimParams:
             if "cool" in modes and "heat" not in modes and gain_val > 0:
                 n_pruned_sign += 1
                 continue
-        gains[(g["effector"], g["sensor"])] = (g["gain_f_per_hour"], g["best_lag_minutes"])
-    pruned_parts: list[str] = []
+        # Clamp magnitude to plausible range (preserve direction)
+        gain_val = g["gain_f_per_hour"]
+        if abs(gain_val) > _MAX_GAIN_MAGNITUDE:
+            gain_val = _MAX_GAIN_MAGNITUDE if gain_val > 0 else -_MAX_GAIN_MAGNITUDE
+            n_clamped_mag += 1
+        gains[(g["effector"], g["sensor"])] = (gain_val, g["best_lag_minutes"])
+    filter_parts: list[str] = []
     if n_pruned_t:
-        pruned_parts.append(f"{n_pruned_t} by |t| < {_MIN_T_STATISTIC:.1f}")
-    if n_pruned_mag:
-        pruned_parts.append(f"{n_pruned_mag} by |gain| > {_MAX_GAIN_MAGNITUDE:.1f}{UNIT_SYMBOL}/hr")
+        filter_parts.append(f"{n_pruned_t} pruned by |t| < {_MIN_T_STATISTIC:.1f}")
+    if n_clamped_mag:
+        filter_parts.append(f"{n_clamped_mag} clamped to ±{_MAX_GAIN_MAGNITUDE:.1f}{UNIT_SYMBOL}/hr")
     if n_pruned_sign:
-        pruned_parts.append(f"{n_pruned_sign} by wrong sign for mode")
-    if pruned_parts:
-        print(f"  [sim] Pruned gains: {', '.join(pruned_parts)}")
+        filter_parts.append(f"{n_pruned_sign} pruned by wrong sign for mode")
+    if filter_parts:
+        print(f"  [sim] Gain filters: {', '.join(filter_parts)}")
 
     # Solar lookup: elevation-based gains (preferred) and legacy per-hour
     solar_elevation_gains = {str(k): float(v) for k, v in data.get("solar_elevation_gains", {}).items()}

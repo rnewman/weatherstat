@@ -209,14 +209,20 @@ def _enumerate_effectors() -> list[EffectorSpec]:
 def _enumerate_sensors() -> list[SensorSpec]:
     """Build sensor list from YAML config.
 
+    Only includes sensors that have comfort constraints (optimization targets).
+    Unconstrained sensors (outdoor, basement, aggregates, etc.) are collected
+    but not regressed — their gains would be unused by control and are a source
+    of confounded coefficients.
+
     Tau uses defaults.tau as the initial guess for curve_fit. Sysid fits
     the actual value from data. Window effects are learned in Stage 2
     regression — no configured window→sensor mapping needed.
     """
+    constrained = set(_CFG.prediction_sensors)
     sensors: list[SensorSpec] = []
 
     for col_name in _CFG.temp_sensors:
-        if _CFG.temp_sensors[col_name].role == "outdoor":
+        if col_name not in constrained:
             continue
 
         sensors.append(SensorSpec(
