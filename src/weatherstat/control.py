@@ -74,13 +74,17 @@ MAX_STALE_SECONDS = 15 * 60  # 15 minutes
 # Maximum predicted 1h temperature change before logging warning
 MAX_1H_CHANGE = _CFG.max_1h_change if _CFG.max_1h_change is not None else delta_temp(5.0)
 
-# Horizon weights: nearer predictions matter more, model is more accurate
+# Horizon weights: sigmoid decay reflecting prediction confidence.
+# High confidence at 1h (physics is inertial), rapid drop through 2-4h
+# as gain errors, forecast errors, and window state assumptions compound,
+# then floors out. Inflection at 3h, steepness k=1.2.
+# Prevents expensive decisions driven by uncertain 6h predictions.
 HORIZON_WEIGHTS: dict[int, float] = {
-    12: 1.0,  # 1h
-    24: 0.9,  # 2h
-    48: 0.7,  # 4h
-    72: 0.5,  # 6h
-    144: 0.3,  # 12h (low weight — far out, less reliable)
+    12: 1.0,   # 1h — high confidence
+    24: 0.83,  # 2h — starting to decay
+    48: 0.36,  # 4h — past the inflection
+    72: 0.09,  # 6h — low confidence, mostly noise
+    144: 0.01, # 12h — negligible
 }
 
 # Minimum cost improvement over all-off required to justify active HVAC.
