@@ -225,6 +225,8 @@ environment:
   #   kind: shade
   #   default_state: open
   #   active_state: "closed"          # HA "closed" = shade lowered (non-default)
+  #   value_type: continuous           # 0.0–1.0 position (default: binary 0/1)
+  #   storage: sparse                  # only write on change (default: sampled every tick)
   #   advisory: true
 
 weather:

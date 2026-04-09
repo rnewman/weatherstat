@@ -206,6 +206,8 @@ class EnvironmentEntryConfig:
     default_state: str   # "closed" or "open" — what the system considers normal
     active_state: str    # HA state string when non-default (e.g., "on", "closed")
     advisory: bool = False  # True = included in advisory sweep
+    value_type: str = "binary"  # "binary" (0/1) or "continuous" (0.0–1.0)
+    storage: str = "sampled"  # "sampled" = every 5-min tick; "sparse" = only on change
 
     @property
     def label(self) -> str:

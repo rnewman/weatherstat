@@ -679,7 +679,7 @@ def _fit_sensor_model(
     adv_state_arrays: dict[str, np.ndarray] = {}  # device_name -> state array (for reuse)
     for wc in existing_adv_cols:
         dev_name = env_col_to_name[wc]
-        state_arr = df[wc].fillna(False).values.astype(float)
+        state_arr = df[wc].astype("float64").fillna(0.0).values
         n_active = int(state_arr.sum())
         if n_active < _MIN_ACTIVE_ROWS:
             if verbose:

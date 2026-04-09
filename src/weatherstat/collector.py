@@ -199,8 +199,19 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
     # 7. Environment factors (windows, doors, shades, etc.)
     for _name, env_cfg in _CFG.environment.items():
         entity = states.get(env_cfg.entity_id)
-        is_active = entity is not None and entity.get("state") == env_cfg.active_state
-        values[env_cfg.column] = "1" if is_active else "0"
+        if env_cfg.value_type == "continuous":
+            # Continuous position: 0.0 (closed/lowered) to 1.0 (open/raised)
+            pos = 0.0
+            if entity is not None:
+                raw_pos = entity.get("attributes", {}).get("current_position")
+                if raw_pos is not None:
+                    pos = round(float(raw_pos) / 100.0, 2)
+                elif entity.get("state") == "open":
+                    pos = 1.0
+            values[env_cfg.column] = str(pos)
+        else:
+            is_active = entity is not None and entity.get("state") == env_cfg.active_state
+            values[env_cfg.column] = "1" if is_active else "0"
 
     # 8. Per-room temperature sensors (non-thermostat, non-outdoor)
     for col, sensor_cfg in _CFG.temp_sensors.items():
@@ -287,8 +298,27 @@ def _close_db() -> None:
 
 
 def _write_readings(timestamp: str, values: dict[str, str]) -> None:
-    """Write snapshot values to the EAV readings table."""
+    """Write snapshot values to the EAV readings table.
+
+    Sparse-storage columns are only written when the value changes.
+    This relies on forward-fill in the load path (extract.py).
+    """
     db = _get_db()
+
+    # Sparse storage: skip unchanged values.  Find each column's most recent
+    # value independently — sparse columns won't exist at every timestamp.
+    sparse_cols = {cfg.column for cfg in _CFG.environment.values() if cfg.storage == "sparse"}
+    if sparse_cols:
+        for col in sparse_cols:
+            if col not in values:
+                continue
+            row = db.execute(
+                "SELECT value FROM readings WHERE name = ? AND timestamp < ? ORDER BY timestamp DESC LIMIT 1",
+                (col, timestamp),
+            ).fetchone()
+            if row is not None and row[0] == values[col]:
+                del values[col]
+
     rows = [(timestamp, name, value) for name, value in values.items()]
     db.executemany("INSERT OR IGNORE INTO readings (timestamp, name, value) VALUES (?, ?, ?)", rows)
     db.commit()

@@ -430,7 +430,12 @@ class WeatherstatConfig:
 
     @property
     def environment_bool_columns(self) -> list[str]:
-        """Environment columns that need bool normalization."""
+        """Environment columns that need bool normalization (binary only)."""
+        return [cfg.column for cfg in self.environment.values() if cfg.value_type == "binary"]
+
+    @property
+    def environment_columns(self) -> list[str]:
+        """All environment columns (for forward-fill after sparse load)."""
         return [cfg.column for cfg in self.environment.values()]
 
     @property
@@ -512,7 +517,7 @@ class WeatherstatConfig:
             defs.append((col, "REAL"))
         # Environment factors (windows, doors, shades, etc.)
         for cfg in self.environment.values():
-            defs.append((cfg.column, "INTEGER"))
+            defs.append((cfg.column, "REAL" if cfg.value_type == "continuous" else "INTEGER"))
         # Per-room temps (aggregate and individual)
         for col in self.temp_sensors:
             if col != self.outdoor_sensor and not col.startswith("thermostat_"):
@@ -639,6 +644,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             default_state=env_data.get("default_state", "closed"),
             active_state=str(env_data["active_state"]),
             advisory=bool(env_data.get("advisory", False)),
+            value_type=env_data.get("value_type", "binary"),
+            storage=env_data.get("storage", "sampled"),
         )
 
     # ── Constraints ──────────────────────────────────────────────────

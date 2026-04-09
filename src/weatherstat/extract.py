@@ -304,6 +304,12 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
     df = _load_from_readings(conn)
     conn.close()
 
+    # Forward-fill environment columns: sparse storage means only state
+    # changes are written, so fill gaps with the last known value.
+    env_cols = [c for c in _CFG.environment_columns if c in df.columns]
+    if env_cols:
+        df[env_cols] = df[env_cols].ffill()
+
     for col in _CFG.environment_bool_columns:
         if col in df.columns:
             # Use nullable boolean to preserve NaN (sensor didn't exist yet)
