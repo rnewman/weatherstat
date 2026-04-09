@@ -597,7 +597,7 @@ class WeatherstatApp(App):
             from weatherstat.sysid import fit_sysid, save_sysid_result
 
             with contextlib.redirect_stdout(buf):
-                result = fit_sysid()
+                result, diagnostics = fit_sysid()
 
             # Quality gate: reject obviously bad fits
             n_taus = len(result.fitted_taus)
@@ -608,7 +608,7 @@ class WeatherstatApp(App):
                 self._log("[sysid] [red]Rejected: no significant gains found[/]")
             else:
                 with contextlib.redirect_stdout(buf):
-                    save_sysid_result(result)
+                    save_sysid_result(result, sensor_diagnostics=diagnostics)
                 self._log(
                     f"[sysid] Complete. {result.n_snapshots} snapshots,"
                     f" {n_taus} sensors, {n_gains} gains."

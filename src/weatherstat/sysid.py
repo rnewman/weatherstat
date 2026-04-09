@@ -23,6 +23,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,9 @@ from scipy.optimize import curve_fit
 from weatherstat.config import DATA_DIR, UNIT_SYMBOL, delta_temp
 from weatherstat.extract import load_collector_snapshots
 from weatherstat.yaml_config import load_config
+
+if TYPE_CHECKING:
+    from weatherstat.validate import RegressionDiagnostics
 
 _CFG = load_config()
 
@@ -82,6 +86,7 @@ class FittedTau:
     tau_base: float
     n_segments: int
     environment_tau_betas: dict[str, float] = field(default_factory=dict)
+
 
 
 @dataclass(frozen=True)
@@ -236,8 +241,13 @@ def _enumerate_sensors() -> list[SensorSpec]:
 # ── Stage 1: Fit tau per sensor ───────────────────────────────────────────
 
 _MIN_SEGMENT_STEPS = 12  # 1 hour at 5-min intervals
-_NIGHTTIME_START_HOUR = 22  # 10pm local
-_NIGHTTIME_END_HOUR = 6  # 6am local
+# Maximum solar elevation (degrees) for tau segment qualification.
+# Below this threshold, solar gain is negligible and Newton cooling
+# dominates. 5° captures civil twilight and the brief period after
+# sunrise / before sunset when the sun is too low to heat the house.
+# At Seattle (47.7°N), this adds ~1-2 hours per day vs the old
+# nighttime-only approach (which used 10pm-6am hardcoded hours).
+_MAX_SOLAR_ELEV_FOR_TAU = 5.0
 
 
 def _fit_tau_curve(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> float | None:
@@ -260,20 +270,29 @@ def _find_uncontrolled_segments(
     effectors: list[EffectorSpec],
     sensor: SensorSpec,
 ) -> list[pd.DataFrame]:
-    """Find contiguous nighttime segments with no active HVAC control.
+    """Find contiguous low-solar segments with no active HVAC control.
 
     These segments show passive convergence toward outdoor temperature —
     cooling when indoors is warmer, warming when outdoors is warmer.
     The exponential time constant (tau) is symmetric either way.
 
-    Requires all HVAC effectors to be off. Window/door states must be
-    constant within each segment (no transitions) but need not all be closed.
-    The fitted tau includes whatever window effects are present; Stage 2
-    regression decomposes them via window×ΔT features.
+    Qualifying rows: solar elevation < 5° (negligible solar gain) AND all
+    HVAC effectors off. This replaces the old nighttime-only approach
+    (10pm-6am), gaining ~1-2 hours per day from twilight periods and
+    adapting automatically to season and latitude.
+
+    Window/door states must be constant within each segment (no transitions)
+    but need not all be closed. The fitted tau includes whatever window
+    effects are present; Stage 2 regression decomposes them.
     """
-    # Identify nighttime rows
-    local_hour = df["_local_hour"]
-    is_night = (local_hour >= _NIGHTTIME_START_HOUR) | (local_hour < _NIGHTTIME_END_HOUR)
+    # Identify low-solar rows: sun below threshold elevation.
+    # Replaces hardcoded nighttime hours — adapts to season and latitude.
+    if "_solar_elev_deg" in df.columns:
+        is_dark = df["_solar_elev_deg"] < _MAX_SOLAR_ELEV_FOR_TAU
+    else:
+        # Fallback if preprocessing didn't compute elevation (e.g., tests)
+        local_hour = df["_local_hour"]
+        is_dark = (local_hour >= 22) | (local_hour < 6)
 
     # Identify all-HVAC-off rows
     all_off = pd.Series(True, index=df.index)
@@ -284,7 +303,7 @@ def _find_uncontrolled_segments(
         if enc_col in df.columns:
             all_off &= df[enc_col] == 0.0
 
-    mask = is_night & all_off
+    mask = is_dark & all_off
 
     # Drop rows where this sensor's temp is NaN
     temp_col = sensor.temp_column
@@ -331,7 +350,7 @@ def _fit_tau(
     sensors: list[SensorSpec],
     verbose: bool = False,
 ) -> list[FittedTau]:
-    """Stage 1: Fit tau per sensor from uncontrolled overnight segments.
+    """Stage 1: Fit tau per sensor from uncontrolled low-solar segments.
 
     Uses segments with stable window state (no transitions). The fitted
     tau includes any window effects present; Stage 2 decomposes them.
@@ -350,7 +369,7 @@ def _fit_tau(
             ))
             continue
 
-        # Fit tau from each sealed segment
+        # Fit tau from each segment
         fitted_taus: list[tuple[float, int]] = []  # (tau, segment_length)
         for seg_df in segments:
             t_hours = (seg_df["_ts"] - seg_df["_ts"].iloc[0]).dt.total_seconds().values / 3600.0
@@ -514,17 +533,19 @@ def _preprocess(
                 count += 1
             df[f"_lag_{eff.name}_{label}"] = lagged_sum / max(count, 1)
 
-    # Solar elevation feature: sin⁺(elevation) × condition_fraction.
-    # Replaces per-hour binary indicators with a continuous feature that
-    # captures both hour-of-day and seasonal variation. sin(elevation) is
-    # proportional to horizontal irradiance (Lambert's cosine law); the
-    # per-sensor regression coefficient absorbs the house geometry.
-    from weatherstat.weather import condition_to_solar_fraction, solar_sin_elevation
-
-    solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3) if "weather_condition" in df.columns else pd.Series(0.3, index=df.index)
+    # Solar elevation: raw degrees (for tau segment selection) and
+    # sin⁺(elevation) × condition_fraction (for regression feature).
+    from weatherstat.weather import condition_to_solar_fraction, solar_elevation, solar_sin_elevation
 
     lat = _CFG.location.latitude
     lon = _CFG.location.longitude
+
+    # Raw elevation in degrees — used by _find_uncontrolled_segments() to
+    # replace hardcoded nighttime hours. Negative = sun below horizon.
+    df["_solar_elev_deg"] = df["_ts"].apply(lambda dt: solar_elevation(lat, lon, dt))
+
+    # Regression feature: sin⁺(elevation) × weather condition fraction.
+    solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3) if "weather_condition" in df.columns else pd.Series(0.3, index=df.index)
     df["_solar_elev"] = df["_ts"].apply(lambda dt: solar_sin_elevation(lat, lon, dt)) * solar_frac
 
     return df
@@ -578,23 +599,24 @@ def _fit_sensor_model(
     effectors: list[EffectorSpec],
     tau_base: float,
     verbose: bool = False,
-) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float]]:
+) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float], RegressionDiagnostics | None]:
     """Stage 2: Fit regression for one sensor.
 
     Returns (gains, solar_elev_gain, solar_elev_t, environment_tau_betas,
-    environment_solar_betas).
+    environment_solar_betas, diagnostics).
     solar_elev_gain is °F/hr per unit sin(elevation)×solar_fraction.
     Advisory tau betas are per-device additional cooling rate coefficients,
     learned as regression coefficients on advisory_state × (T_out - T).
     Advisory solar betas model how advisory state modulates solar gain.
+    diagnostics is None for early returns (missing columns, insufficient data).
     """
     temp_col = sensor.temp_column
     dTdt_col = f"_dTdt_{sensor.name}"
 
     if temp_col not in df.columns or dTdt_col not in df.columns:
-        return [], 0.0, 0.0, {}, {}, {}
+        return [], 0.0, 0.0, {}, {}, None
     if "_outdoor_best" not in df.columns:
-        return [], 0.0, 0.0, {}, {}, {}
+        return [], 0.0, 0.0, {}, {}, None
 
     outdoor = df["_outdoor_best"].values
     sensor_temp = df[temp_col].values
@@ -645,6 +667,9 @@ def _fit_sensor_model(
 
     # Environment factor × ΔT features: state × (T_outdoor - T_sensor)
     # The coefficient β gives the additional cooling/heating rate when active.
+    # Skip devices with too few active rows — near-zero-variance columns blow up
+    # the condition number and the coefficient can't be reliably estimated anyway.
+    _MIN_ACTIVE_ROWS = 50  # ~4h of 5-min data
     env_col_to_name = {cfg.column: name for name, cfg in _CFG.environment.items()}
     all_adv_cols = [cfg.column for cfg in _CFG.environment.values()]
     existing_adv_cols = [c for c in all_adv_cols if c in df.columns]
@@ -655,6 +680,11 @@ def _fit_sensor_model(
     for wc in existing_adv_cols:
         dev_name = env_col_to_name[wc]
         state_arr = df[wc].fillna(False).values.astype(float)
+        n_active = int(state_arr.sum())
+        if n_active < _MIN_ACTIVE_ROWS:
+            if verbose:
+                print(f"    advisory_tau {dev_name}: skipped ({n_active} active rows < {_MIN_ACTIVE_ROWS})")
+            continue
         adv_state_arrays[dev_name] = state_arr
         feature_names.append(f"_adv_tau_{dev_name}")
         feature_cols.append(state_arr * delta_t)
@@ -686,7 +716,7 @@ def _fit_sensor_model(
             adv_solar_feature_names.append(dev_name)
 
     if not feature_cols:
-        return [], 0.0, 0.0, {}, {}, {}
+        return [], 0.0, 0.0, {}, {}, None
 
     X = np.column_stack(feature_cols)
 
@@ -708,7 +738,7 @@ def _fit_sensor_model(
             )
             for e in effectors
         ]
-        return gains, 0.0, 0.0, {}, {}
+        return gains, 0.0, 0.0, {}, {}, None
 
     # Selectively standardized ridge regularization.
     # OLS on observational HVAC data produces confounded gains: heating
@@ -750,13 +780,14 @@ def _fit_sensor_model(
 
     t_stats = np.where(se > 0, beta / se, 0.0)
 
-    # Per-sensor regression diagnostics (VIF, holdout, condition number)
+    # Per-sensor regression diagnostics (R², DW, VIF, holdout, bootstrap stability)
     from weatherstat.validate import validate_sysid_regression
 
-    reg_issues = validate_sysid_regression(
-        sensor.name, X, y, feature_names, scale, lam, cond, beta,
+    diagnostics = validate_sysid_regression(
+        sensor.name, X, y, feature_names, scale, lam, beta, resid,
     )
-    for issue in reg_issues:
+    bootstrap_cvs = diagnostics.bootstrap_cvs
+    for issue in diagnostics.issues:
         prefix = "ERROR" if issue.severity.value == "error" else "WARNING"
         print(f"  {prefix} [{sensor.name}]: {issue.message}")
 
@@ -804,28 +835,51 @@ def _fit_sensor_model(
     # Extract advisory tau betas
     # β > 0 is physical (device increases heat exchange rate when active).
     # β < 0 is unphysical for window-type devices — flag as zero.
+    # Only warn about bootstrap instability for features we actually keep.
+    n_unstable_kept = 0
     environment_tau_betas: dict[str, float] = {}
     for i, dev_name in enumerate(adv_tau_feature_names):
         idx = adv_tau_feature_start + i
+        feature_key = f"_adv_tau_{dev_name}"
+        cv = bootstrap_cvs.get(feature_key)
         if idx < len(beta):
             b = float(beta[idx])
             t = float(t_stats[idx])
+            cv_str = f", CV={cv:.1f}" if cv is not None else ""
             if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
+                stable = cv is None or cv <= 1.0
+                tag = "stable" if stable else "UNSTABLE"
                 environment_tau_betas[dev_name] = round(b, 6)
+                if not stable:
+                    n_unstable_kept += 1
+                    print(f"  WARNING [{sensor.name}]: advisory_tau {dev_name} kept but unstable (CV={cv:.1f})")
+                if verbose:
+                    print(f"    advisory_tau {dev_name}: β={b:.6f}, t={t:.1f}{cv_str} → kept ({tag})")
             elif verbose:
-                print(f"    advisory_tau {dev_name}: β={b:.6f}, t={t:.1f} (dropped)")
+                reason = "β≤0" if b <= 0 else f"|t|={abs(t):.1f}<{_T_STAT_THRESHOLD}"
+                print(f"    advisory_tau {dev_name}: β={b:.6f}, t={t:.1f}{cv_str} → dropped ({reason})")
 
     # Extract advisory × solar betas (how advisory state modulates solar gain)
     environment_solar_betas: dict[str, float] = {}
     for i, dev_name in enumerate(adv_solar_feature_names):
         idx = adv_solar_feature_start + i
+        feature_key = f"_adv_solar_{dev_name}"
+        cv = bootstrap_cvs.get(feature_key)
         if idx < len(beta):
             b = float(beta[idx])
             t = float(t_stats[idx])
+            cv_str = f", CV={cv:.1f}" if cv is not None else ""
             if abs(t) >= _T_STAT_THRESHOLD:
+                stable = cv is None or cv <= 1.0
+                tag = "stable" if stable else "UNSTABLE"
                 environment_solar_betas[dev_name] = round(b, 4)
+                if not stable:
+                    n_unstable_kept += 1
+                    print(f"  WARNING [{sensor.name}]: advisory_solar {dev_name} kept but unstable (CV={cv:.1f})")
+                if verbose:
+                    print(f"    advisory_solar {dev_name}: β={b:.6f}, t={t:.1f}{cv_str} → kept ({tag})")
             elif verbose:
-                print(f"    advisory_solar {dev_name}: β={b:.6f}, t={t:.1f} (dropped)")
+                print(f"    advisory_solar {dev_name}: β={b:.6f}, t={t:.1f}{cv_str} → dropped (|t|<{_T_STAT_THRESHOLD})")
 
     # Extract solar elevation gain (single coefficient per sensor)
     solar_elev_gain: float = 0.0
@@ -837,7 +891,7 @@ def _fit_sensor_model(
             solar_se = round(float(se[solar_start]), 4) if not np.isnan(se[solar_start]) else 0.0
             print(f"    solar_elev: β={solar_elev_gain:.4f}, se={solar_se:.4f}, t={solar_elev_t:.1f}")
 
-    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_solar_betas
+    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_solar_betas, diagnostics
 
 
 # ── Derived MRT weights ──────────────────────────────────────────────────
@@ -846,26 +900,36 @@ def _fit_sensor_model(
 # ── Main pipeline ─────────────────────────────────────────────────────────
 
 
-def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdResult:
+def run_sysid(output_path: Path | None = None, verbose: bool = False) -> tuple[SysIdResult, dict]:
     """Run full system identification pipeline: fit + write.
 
     Convenience wrapper around fit_sysid() + save_sysid_result().
+    Returns (result, diagnostics) for caller use.
     """
-    result = fit_sysid(verbose=verbose)
-    save_sysid_result(result, output_path)
-    return result
+    result, diagnostics = fit_sysid(verbose=verbose)
+    save_sysid_result(result, output_path, sensor_diagnostics=diagnostics)
+    return result, diagnostics
 
 
-def save_sysid_result(result: SysIdResult, output_path: Path | None = None) -> Path:
+def save_sysid_result(
+    result: SysIdResult,
+    output_path: Path | None = None,
+    sensor_diagnostics: dict[str, RegressionDiagnostics] | None = None,
+) -> Path:
     """Write a SysIdResult to disk as JSON.
 
-    Runs validate_sysid_result() before writing. Errors are printed
-    but do NOT block saving — the caller (TUI quality gate) decides
-    whether to use the result.
+    Runs validate_sysid_result() before writing. Prints health summary
+    with per-sensor grades and gain stability comparison.
+    Errors are printed but do NOT block saving — the caller (TUI quality
+    gate) decides whether to use the result.
 
     Returns the path written to.
     """
-    from weatherstat.validate import format_issues, has_errors, validate_sysid_result
+    from weatherstat.validate import (
+        format_issues,
+        has_errors,
+        validate_sysid_result,
+    )
 
     issues = validate_sysid_result(result)
     if issues:
@@ -888,8 +952,139 @@ def save_sysid_result(result: SysIdResult, output_path: Path | None = None) -> P
     return out
 
 
-def fit_sysid(verbose: bool = False) -> SysIdResult:
-    """Run system identification and return the result without writing to disk.
+def _print_health_summary(
+    result: SysIdResult,
+    sensor_diagnostics: dict[str, RegressionDiagnostics],
+    output_path: Path | None = None,
+) -> None:
+    """Compute and print per-sensor health grades + gain stability."""
+    from weatherstat.validate import (
+        SensorHealth,
+        compute_sensor_health,
+        format_health_summary,
+    )
+
+    # Build per-sensor gain counts
+    sensor_gain_counts: dict[str, int] = {}
+    for g in result.effector_sensor_gains:
+        if not g.negligible:
+            sensor_gain_counts[g.sensor] = sensor_gain_counts.get(g.sensor, 0) + 1
+
+    # Build tau segment lookup and advisory beta counts
+    tau_lookup: dict[str, int] = {}
+    adv_beta_counts: dict[str, int] = {}
+    for ft in result.fitted_taus:
+        tau_lookup[ft.sensor] = ft.n_segments
+        adv_beta_counts[ft.sensor] = len(ft.environment_tau_betas)
+
+    n_effectors = len(result.effectors)
+
+    # Compute n_unstable_kept per sensor from diagnostics + kept betas
+    def _count_unstable(sensor_name: str, diag: RegressionDiagnostics) -> int:
+        n = 0
+        ft = next((f for f in result.fitted_taus if f.sensor == sensor_name), None)
+        if ft:
+            for dev_name in ft.environment_tau_betas:
+                cv = diag.bootstrap_cvs.get(f"_adv_tau_{dev_name}")
+                if cv is not None and cv > 1.0:
+                    n += 1
+        # Check solar betas
+        for dev_name, sensor_betas in result.environment_solar_betas.items():
+            if sensor_name in sensor_betas:
+                cv = diag.bootstrap_cvs.get(f"_adv_solar_{dev_name}")
+                if cv is not None and cv > 1.0:
+                    n += 1
+        return n
+
+    # Per-sensor validation errors
+    from weatherstat.validate import validate_sysid_result
+    post_issues = validate_sysid_result(result)
+    sensor_has_errors: dict[str, bool] = {}
+    for issue in post_issues:
+        if issue.severity.value == "error" and issue.sensor:
+            sensor_has_errors[issue.sensor] = True
+
+    healths: list[SensorHealth] = []
+    for sensor in result.sensors:
+        diag = sensor_diagnostics.get(sensor.name)
+        r2 = diag.r_squared if diag else 0.0
+        dw = diag.durbin_watson if diag else 0.0
+        holdout = diag.holdout_degradation if diag else None
+        n_unstable = _count_unstable(sensor.name, diag) if diag else 0
+        # Also count regression-level errors (VIF errors)
+        reg_errors = any(i.severity.value == "error" for i in diag.issues) if diag else False
+
+        health = compute_sensor_health(
+            sensor.name,
+            r_squared=r2,
+            durbin_watson=dw,
+            n_segments=tau_lookup.get(sensor.name, 0),
+            n_gains=sensor_gain_counts.get(sensor.name, 0),
+            n_effectors=n_effectors,
+            n_advisory_betas=adv_beta_counts.get(sensor.name, 0),
+            n_unstable_kept=n_unstable,
+            holdout_degradation=holdout,
+            has_validation_errors=sensor_has_errors.get(sensor.name, False) or reg_errors,
+        )
+        healths.append(health)
+
+    # Gain stability: compare with previous thermal_params.json
+    gain_changes = _compute_gain_drift(result, output_path)
+
+    print(format_health_summary(healths, gain_changes))
+
+
+def _compute_gain_drift(
+    result: SysIdResult,
+    output_path: Path | None = None,
+) -> dict[tuple[str, str], tuple[float, float]]:
+    """Compare current gains with previous thermal_params.json.
+
+    Returns {(effector, sensor): (old_gain, new_gain)} for gains that
+    changed by >50% and were non-negligible in at least one version.
+    """
+    prev_path = output_path or DATA_DIR / "thermal_params.json"
+    if not prev_path.exists():
+        return {}
+
+    try:
+        with open(prev_path) as f:
+            prev = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    # Build old gain lookup
+    old_gains: dict[tuple[str, str], float] = {}
+    for g in prev.get("effector_sensor_gains", []):
+        if not g.get("negligible", True):
+            old_gains[(g["effector"], g["sensor"])] = g["gain_f_per_hour"]
+
+    # Build new gain lookup
+    new_gains: dict[tuple[str, str], float] = {}
+    for g in result.effector_sensor_gains:
+        if not g.negligible:
+            new_gains[(g.effector, g.sensor)] = g.gain_f_per_hour
+
+    # Find significant changes (>50% change, non-negligible in at least one)
+    changes: dict[tuple[str, str], tuple[float, float]] = {}
+    all_keys = set(old_gains) | set(new_gains)
+    for key in all_keys:
+        old_g = old_gains.get(key, 0.0)
+        new_g = new_gains.get(key, 0.0)
+        if abs(old_g) < 0.05 and abs(new_g) < 0.05:
+            continue  # both negligible
+        if abs(old_g) > 1e-6:
+            pct_change = abs(new_g - old_g) / abs(old_g)
+        else:
+            pct_change = float("inf") if abs(new_g) > 0.05 else 0.0
+        if pct_change > 0.5:
+            changes[key] = (old_g, new_g)
+
+    return changes
+
+
+def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionDiagnostics]]:
+    """Run system identification and return the result + per-sensor diagnostics.
 
     Use save_sysid_result() to persist.
     """
@@ -934,13 +1129,16 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
     all_adv_tau_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
     all_adv_solar_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
+    sensor_diagnostics: dict[str, RegressionDiagnostics] = {}  # for health summary
 
     for sensor in sensors:
         tau_base = tau_lookup.get(sensor.name, sensor.yaml_tau_base)
-        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_solar_b = _fit_sensor_model(
+        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_solar_b, diag = _fit_sensor_model(
             df, sensor, effectors, tau_base, verbose,
         )
         all_gains.extend(gains)
+        if diag is not None:
+            sensor_diagnostics[sensor.name] = diag
         if solar_elev_gain != 0.0:
             solar_elevation_gains[sensor.name] = solar_elev_gain
             print(f"  {sensor.name}: solar_elev β={solar_elev_gain:+.3f}, t={solar_elev_t:.1f}")
@@ -985,7 +1183,7 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     # now uses solar_elevation_gains dynamically (per current sun state).
     # Static mrt_weights are only set via manual YAML config, not sysid.
 
-    return SysIdResult(
+    sysid_result = SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
         data_start=data_start,
         data_end=data_end,
@@ -999,6 +1197,7 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
         state_gates=state_gates,
         environment_solar_betas=environment_solar_betas,
     )
+    return sysid_result, sensor_diagnostics
 
 
 # ── Report printing ───────────────────────────────────────────────────────
@@ -1121,8 +1320,10 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
-    result = run_sysid(output_path=args.output, verbose=args.verbose)
+    result, diagnostics = run_sysid(output_path=args.output, verbose=args.verbose)
     print_report(result)
+    if diagnostics:
+        _print_health_summary(result, diagnostics, args.output)
 
 
 if __name__ == "__main__":
