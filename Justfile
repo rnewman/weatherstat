@@ -19,7 +19,7 @@ health:
 
 # Lint Python
 lint:
-    uv run ruff check src/
+    uv run ruff check src/ tests/
 
 lint-fix:
     uv run ruff check --fix src/ tests/
@@ -31,6 +31,10 @@ fmt:
 # Test Python
 test:
     uv run pytest tests/
+
+# Quick validation smoke test (sysid diagnostics + prediction envelope)
+validate:
+    uv run pytest tests/test_validate.py -q
 
 # Control cycle (flags: --live, --loop)
 control *ARGS:

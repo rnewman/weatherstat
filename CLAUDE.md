@@ -40,7 +40,8 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 24. **Sun-aware MRT correction** (done) — MRT correction now uses current solar state to differentiate sunny vs cloudy days at the same outdoor temp. Per-sensor effective outdoor temp: `effective_outdoor = outdoor + β_solar × sin⁺(elev) × weather_fraction × solar_response`. High-solar-gain rooms (e.g., piano with large windows) get less cold-wall correction on sunny days because sun streaming through windows heats interior surfaces. `solar_response` configurable in MRT config (default 2.0). Static sysid-derived `mrt_weights` removed — dynamic solar calculation replaces them. Manual `mrt_weight` in YAML constraint schedules still applies as a multiplier for non-solar overrides.
 25. **Advisory effectors in trajectory sweep** (done) — Generalized windows (and space heaters, blinds, vent fans) into "advisory effectors": user-operated devices the system observes, models in physics, sweeps in trajectory search, but only advises on (notifications, not commands). Three planning layers from a single sweep: reasonable (user cooperates at optimal time → drives HVAC), worst-case (user does nothing → backup breach detection + defensive HVAC), proactive (activate default-state devices → "open window for 2h"). Three-tier comfort bounds: `preferred` (dead band), `acceptable` (normal cost), `backup` (worst-case hedge). Per-step advisory timelines in simulator enable mid-horizon transitions. `AdvisoryDecision` with `return_step` enables two-transition proactive advice. Combinatorics management: coarsening at >50K scenarios, hold-all fallback at >100K. Fast path: scalar tau when no advisory effects exist. Advisory entries marked with `advisory: true` in `environment:` config. Advisory recommendations persisted to state file for TUI display.
 26. **Two-stage advisory sweep & configurable penalties** (done) — When advisory combinatorics exceed the hard cap (e.g., 5 open windows × 5 options = 3,125 advisory combos × ~14K HVAC = 43.75M), split into two stages: Stage 1 scores HVAC-only scenarios (scalar tau fast path), selects top-K cheapest plans; Stage 2 crosses top-K with advisory product (per-step tau dynamics), extracts planning layers. K auto-computed: `max(MIN_K=10, 50K / n_advisory_combos)`. Coarsening fallback reduces options to [hold, best action] per device. `_cross_with_advisory()` helper centralizes advisory×HVAC product crossing. `_HARD_RAIL_MULTIPLIER` configurable via `defaults.hard_rail_multiplier` (default 3.0, was hardcoded 10.0). Debug tool: `just debug advisory` shows environment states, compound tau effects per sensor, advisory betas.
-27. **Unified environment config** (done) — Replaced separate `windows:` and `advisory_effectors:` YAML sections with a single `environment:` section. Each entry is an `EnvironmentEntryConfig` with `name`, `entity_id`, `column`, `kind` (window/door/shade/vent/heater), `default_state`, `active_state`, and optional `advisory: true`. Kind-specific action verbs (close/open, lower/raise, turn off/on) for display and notifications. Column names from config (`cfg.column`) instead of hardcoded `window_{name}_open`. `advisory_states` renamed to `environment_states` throughout. `WindowPanel` renamed to `EnvironmentPanel`, `window_display()` to `environment_display()`. Dead code `any_window_open` removed.
+27. **Unified environment config** (done) — Replaced separate `windows:` and `advisory_effectors:` YAML sections with a single `environment:` section. Each entry is an `EnvironmentEntryConfig` with `name`, `entity_id`, `column`, `kind` (window/door/shade/vent/heater), `default_state`, `active_state`, and optional `advisory: true`. Kind-specific action verbs (close/open, lower/raise, turn off/on) for display and notifications. Column names from config (`cfg.column`) instead of hardcoded `window_{name}_open`. `environment_states` throughout (renamed from `advisory_states`). `EnvironmentPanel` (renamed from `WindowPanel`), `environment_display()` (renamed from `window_display()`). Dead code `any_window_open` removed. Solar interaction features (`environment_solar_betas`) restricted to `kind: shade` only — windows/doors/vents/heaters affect tau (already modeled), not solar gain magnitude.
+28. **Sysid & prediction validation** (done) — `src/weatherstat/validate.py`: two-layer automated validation. Layer 1 (sysid diagnostics): VIF for advisory/solar features (warning >10, error >50), design matrix condition number (warning >1e5, error >1e7), holdout RMSE degradation (warning >20% worse than in-sample), environment tau/solar beta magnitude bounds. Runs inline during `_fit_sensor_model()` and `save_sysid_result()`. Layer 2 (prediction envelope): absolute temperature bounds [35°F, 100°F], rate of change ≤8°F/hr, scenario spread >30°F. Integrated into `check_prediction_sanity()` in control.py. Both return `list[ValidationIssue]` with `Severity.WARNING`/`ERROR`. Test suite: `tests/test_validate.py` (24 tests).
 
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
@@ -69,9 +70,10 @@ just debug taus       # Tau models + advisory betas
 just debug why        # Explain why active effectors are on
 just debug advisory   # Advisory states + compound tau effects
 just debug decisions  # Recent decision log
-just lint             # Lint both packages
-just lint-fix         # Lint and fix both packages
-just test             # Test both packages
+just lint             # Lint src + tests
+just lint-fix         # Lint and fix src + tests
+just test             # Run full test suite
+just validate         # Quick sysid + prediction validation smoke test
 ```
 
 ## Key Documentation
@@ -81,6 +83,7 @@ just test             # Test both packages
 - System identification: `src/weatherstat/sysid.py`
 - Collector: `src/weatherstat/collector.py`
 - Executor: `src/weatherstat/executor.py`
+- Validation: `src/weatherstat/validate.py` (sysid diagnostics + prediction envelope)
 
 ## Conventions
 
@@ -90,6 +93,8 @@ just test             # Test both packages
 - Snapshot column names use snake_case
 - **TUI is the primary interface.** Any change to control logic, comfort schedules, MRT correction, sysid output, or display data must also be reflected in `src/weatherstat/tui/app.py`. The TUI reads temperatures, applies comfort profiles + MRT correction, and displays effector state independently from the control loop. If you change how something is computed in control.py, check whether app.py computes the same thing for display.
 - **No silent exceptions in the TUI.** Every `except Exception` must log the error via `self._log()` with the exception message. Critical paths (temp refresh, control cycle, sysid) should also log `traceback.format_exc()`. The only exception is `_log()` itself (can't log a logging failure).
+- **Validation after sysid and prediction changes.** Any change to sysid regression (new features, changed regularization, feature engineering) must pass existing `test_validate.py` tests — especially VIF and holdout RMSE checks. New sysid features should be tested for collinearity (VIF <10 for advisory/solar features). Any change to simulator or control predictions must pass prediction envelope tests (absolute bounds, rate limits). Run `just validate` as a quick smoke test after sysid or prediction changes.
+- **Use Just for all commands.** Run `just test`, `just lint`, `just validate`, etc. — not raw `uv run` commands. The Justfile is the canonical interface for all development tasks. Keep the CLAUDE.md Commands section in sync with the Justfile.
 
 ## Data Directory
 
