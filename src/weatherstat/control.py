@@ -744,9 +744,6 @@ def _advisory_has_effect(
     for tau_model in sim_params.taus.values():
         if device in tau_model.environment_tau_betas:
             return True
-        for pair_key in tau_model.environment_interaction_betas:
-            if device in pair_key.split("+"):
-                return True
 
     # Check gains (advisory device as effector)
     for (eff_name, _sensor), (_gain, _lag) in sim_params.gains.items():
@@ -1534,9 +1531,17 @@ def check_data_freshness(df: pd.DataFrame) -> bool:
 def check_prediction_sanity(
     decision: ControlDecision,
     current_temps: dict[str, float],
+    outdoor_temp: float | None = None,
 ) -> bool:
-    """Return True if 1h predictions look reasonable for all sensors."""
+    """Return True if predictions look reasonable for all sensors.
+
+    Checks:
+    1. 1h prediction magnitude (existing MAX_1H_CHANGE check)
+    2. Prediction envelope (absolute range, rate of change) via validate.py
+    """
     safe = True
+
+    # Check 1: 1h prediction magnitude (original check)
     for sensor_col, preds in decision.predictions.items():
         pred_1h = preds.get("1h")
         current = current_temps.get(sensor_col)
@@ -1546,6 +1551,42 @@ def check_prediction_sanity(
             label = SENSOR_LABELS.get(sensor_col, sensor_col)
             print(f"  WARNING: {label} 1h pred {pred_1h:.1f}{UNIT_SYMBOL} >{MAX_1H_CHANGE}{UNIT_SYMBOL} from current {current:.1f}{UNIT_SYMBOL}")
             safe = False
+
+    # Check 2: Prediction envelope (all horizons, absolute bounds)
+    from weatherstat.validate import _INDOOR_MAX, _INDOOR_MIN, _MAX_RISE_PER_HOUR
+
+    for sensor_col, preds in decision.predictions.items():
+        current = current_temps.get(sensor_col)
+        if current is None:
+            continue
+        label = SENSOR_LABELS.get(sensor_col, sensor_col)
+        for horizon_label, pred_val in preds.items():
+            if pred_val is None:
+                continue
+            # Parse horizon label to hours
+            h_str = horizon_label.rstrip("h")
+            try:
+                hours = float(h_str)
+            except ValueError:
+                continue
+
+            if pred_val > _INDOOR_MAX:
+                print(f"  ERROR: {label} {horizon_label} pred {pred_val:.1f}{UNIT_SYMBOL} exceeds {_INDOOR_MAX:.0f}{UNIT_SYMBOL} ceiling")
+                safe = False
+            elif pred_val < _INDOOR_MIN:
+                print(f"  ERROR: {label} {horizon_label} pred {pred_val:.1f}{UNIT_SYMBOL} below {_INDOOR_MIN:.0f}{UNIT_SYMBOL} floor")
+                safe = False
+
+            # Rate check: max plausible change scales with horizon
+            max_change = _MAX_RISE_PER_HOUR * hours
+            if abs(pred_val - current) > max_change:
+                print(
+                    f"  WARNING: {label} {horizon_label} pred {pred_val:.1f}{UNIT_SYMBOL} is "
+                    f"{abs(pred_val - current):.1f}{UNIT_SYMBOL} from current {current:.1f}{UNIT_SYMBOL} "
+                    f"(max {max_change:.1f}{UNIT_SYMBOL} in {hours:.0f}h)"
+                )
+                safe = False
+
     return safe
 
 

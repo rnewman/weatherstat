@@ -44,7 +44,6 @@ def sim_params():
             augmented_taus[sensor] = TauModel(
                 tau_base=tau_model.tau_base,
                 environment_tau_betas={env_name: 0.02},
-                environment_interaction_betas=tau_model.environment_interaction_betas,
             )
         else:
             augmented_taus[sensor] = tau_model

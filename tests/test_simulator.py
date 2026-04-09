@@ -634,7 +634,6 @@ class TestAdvisoryPredict:
             augmented_taus[sensor] = TauModel(
                 tau_base=tau_model.tau_base,
                 environment_tau_betas={"test_window": 0.03, **tau_model.environment_tau_betas},
-                environment_interaction_betas=tau_model.environment_interaction_betas,
             )
         augmented = SimParams(
             taus=augmented_taus,

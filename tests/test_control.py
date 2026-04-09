@@ -1076,7 +1076,6 @@ class TestAdvisorySweepOptions:
             augmented_taus[sensor] = TauModel(
                 tau_base=tau_model.tau_base,
                 environment_tau_betas={device: 0.02, **tau_model.environment_tau_betas},
-                environment_interaction_betas=tau_model.environment_interaction_betas,
             )
         return SimParams(
             taus=augmented_taus,

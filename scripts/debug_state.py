@@ -246,12 +246,9 @@ def cmd_taus() -> None:
         n = t.get("n_segments", "?")
         print(f"  {t['sensor']:<30} tau={tau:6.1f}h  ({n} segments)")
         tau_betas = t.get("environment_tau_betas", t.get("advisory_tau_betas", t.get("window_betas", {})))
-        int_betas = t.get("environment_interaction_betas", t.get("advisory_interaction_betas", t.get("interaction_betas", {})))
         for dev, beta in sorted(tau_betas.items()):
             eff = 1.0 / (1.0 / tau + beta)
             print(f"    advisory {dev:<20} beta={beta:.6f}  (eff tau={eff:.1f}h)")
-        for pair, beta in sorted(int_betas.items()):
-            print(f"    interact {pair:<20} beta={beta:.6f}")
     print()
 
     # MRT weights
@@ -452,10 +449,6 @@ def cmd_why(effector_filter: str | None = None) -> None:
             for dev, beta in t.get("environment_tau_betas", t.get("advisory_tau_betas", t.get("window_betas", {}))).items():
                 if dev in advisory_active:
                     inv_tau += beta
-            for pair, beta in t.get("environment_interaction_betas", t.get("advisory_interaction_betas", t.get("interaction_betas", {}))).items():
-                parts = pair.split("+")
-                if len(parts) == 2 and all(p.strip() in advisory_active for p in parts):
-                    inv_tau += beta
             tau_eff = 1.0 / inv_tau if inv_tau > 0 else float("inf")
             ratio = tau_eff / tau_base
             if ratio < worst_ratio:
@@ -631,7 +624,6 @@ def cmd_advisory() -> None:
         sensor = t["sensor"]
         tau_base = t["tau_base"]
         tau_betas = t.get("environment_tau_betas", t.get("advisory_tau_betas", t.get("window_betas", {})))
-        int_betas = t.get("environment_interaction_betas", t.get("advisory_interaction_betas", t.get("interaction_betas", {})))
 
         # Sum betas for active devices
         inv_tau = 1.0 / tau_base
@@ -641,11 +633,6 @@ def cmd_advisory() -> None:
                 inv_tau += beta
                 eff = 1.0 / (1.0 / tau_base + beta)
                 contributors.append(f"{dev}(→{eff:.0f}h)")
-        for pair, beta in int_betas.items():
-            parts = pair.split("+")
-            if len(parts) == 2 and all(p.strip() in active for p in parts):
-                inv_tau += beta
-                contributors.append(f"{pair}(interact)")
 
         tau_eff = 1.0 / inv_tau if inv_tau > 0 else float("inf")
         ratio = tau_eff / tau_base

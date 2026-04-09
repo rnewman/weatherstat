@@ -39,23 +39,16 @@ class TauModel:
     tau_base: sealed envelope time constant (hours, all advisories at default).
     environment_tau_betas: per-advisory-effector additional cooling rate coefficient.
         When device is active, effective 1/tau += beta.
-    environment_interaction_betas: pairwise interaction coefficients.
-        When both devices in a pair are active, effective 1/tau += beta.
     """
 
     tau_base: float
     environment_tau_betas: dict[str, float] = field(default_factory=dict)
-    environment_interaction_betas: dict[str, float] = field(default_factory=dict)
 
     def effective_tau(self, environment_states: dict[str, bool]) -> float:
         """Compute effective tau given current environment factor states."""
         inv_tau = 1.0 / self.tau_base
         for dev, beta in self.environment_tau_betas.items():
             if environment_states.get(dev, False):
-                inv_tau += beta
-        for key, beta in self.environment_interaction_betas.items():
-            d1, d2 = key.split("+")
-            if environment_states.get(d1, False) and environment_states.get(d2, False):
                 inv_tau += beta
         return 1.0 / max(inv_tau, 0.01)  # safety floor
 
@@ -131,11 +124,9 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         sensor = ft["sensor"]
         # Backward compat: old files use advisory_tau_betas or window_betas
         tau_betas = ft.get("environment_tau_betas", ft.get("advisory_tau_betas", ft.get("window_betas", {})))
-        int_betas = ft.get("environment_interaction_betas", ft.get("advisory_interaction_betas", ft.get("interaction_betas", {})))
         taus[sensor] = TauModel(
             tau_base=ft["tau_base"],
             environment_tau_betas=tau_betas,
-            environment_interaction_betas=int_betas,
         )
 
     # Gain lookup: filter by negligible flag, t-statistic significance,
@@ -642,7 +633,7 @@ def predict(
         # Per-step tau when advisory timelines modulate this sensor's envelope.
         # Fast path: scalar tau when no advisory transitions affect tau.
         per_step_tau = bool(
-            advisory_future and (tau_model.environment_tau_betas or tau_model.environment_interaction_betas)
+            advisory_future and tau_model.environment_tau_betas
         )
         tau_scalar = 40.0
         tau_matrix: np.ndarray | None = None
@@ -654,19 +645,6 @@ def predict(
                     inv_tau += beta * af
                 elif state.environment_states.get(dev, False):
                     inv_tau += beta  # passive device, constant contribution
-            for pair_key, beta in tau_model.environment_interaction_betas.items():
-                d1, d2 = pair_key.split("+")
-                af1, af2 = advisory_future.get(d1), advisory_future.get(d2)
-                s1 = state.environment_states.get(d1, False)
-                s2 = state.environment_states.get(d2, False)
-                if af1 is not None and af2 is not None:
-                    inv_tau += beta * af1 * af2
-                elif af1 is not None and s2:
-                    inv_tau += beta * af1
-                elif af2 is not None and s1:
-                    inv_tau += beta * af2
-                elif s1 and s2:
-                    inv_tau += beta
             tau_matrix = 1.0 / np.maximum(inv_tau, 0.01)
         else:
             tau_scalar = tau_model.effective_tau(state.environment_states)

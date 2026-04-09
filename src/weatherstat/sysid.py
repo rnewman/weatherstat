@@ -76,14 +76,12 @@ class FittedTau:
     tau_base: sealed envelope time constant (all windows/advisories at default).
     environment_tau_betas: per-advisory-effector additional cooling rate coefficients,
         learned by regression in Stage 2. Keyed by device name.
-    environment_interaction_betas: pairwise interaction coefficients for advisory pairs.
     """
 
     sensor: str
     tau_base: float
     n_segments: int
     environment_tau_betas: dict[str, float] = field(default_factory=dict)
-    environment_interaction_betas: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -537,7 +535,6 @@ def _preprocess(
 _GAIN_THRESHOLD = delta_temp(0.05)  # per hour — below this, gain is negligible
 _T_STAT_THRESHOLD = 2.0
 _MIN_REGRESSION_ROWS = 500  # need substantial data for reliable regression
-_MIN_INTERACTION_ROWS = 100  # min co-open rows for window interaction terms
 
 def _lag_bins(max_lag_minutes: int) -> list[tuple[tuple[int, int], str]]:
     """Derive lag bins from max_lag_minutes.
@@ -581,11 +578,11 @@ def _fit_sensor_model(
     effectors: list[EffectorSpec],
     tau_base: float,
     verbose: bool = False,
-) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float], dict[str, float]]:
+) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float]]:
     """Stage 2: Fit regression for one sensor.
 
     Returns (gains, solar_elev_gain, solar_elev_t, environment_tau_betas,
-    environment_interaction_betas, environment_solar_betas).
+    environment_solar_betas).
     solar_elev_gain is °F/hr per unit sin(elevation)×solar_fraction.
     Advisory tau betas are per-device additional cooling rate coefficients,
     learned as regression coefficients on advisory_state × (T_out - T).
@@ -662,18 +659,6 @@ def _fit_sensor_model(
         feature_names.append(f"_adv_tau_{dev_name}")
         feature_cols.append(state_arr * delta_t)
         adv_tau_feature_names.append(dev_name)
-
-    # Advisory pairwise interaction features: pairs with enough co-active data
-    adv_interaction_start = len(feature_names)
-    adv_interaction_names: list[str] = []  # "d1+d2" in order
-    adv_dev_list = list(adv_state_arrays.keys())
-    for i, d1 in enumerate(adv_dev_list):
-        for d2 in adv_dev_list[i + 1:]:
-            co_active = adv_state_arrays[d1].astype(bool) & adv_state_arrays[d2].astype(bool)
-            if co_active.sum() >= _MIN_INTERACTION_ROWS:
-                feature_names.append(f"_adv_ix_{d1}+{d2}")
-                feature_cols.append(co_active.astype(float) * delta_t)
-                adv_interaction_names.append(f"{d1}+{d2}")
 
     # Solar elevation feature (single continuous feature per sensor)
     solar_start = len(feature_names)
@@ -765,6 +750,16 @@ def _fit_sensor_model(
 
     t_stats = np.where(se > 0, beta / se, 0.0)
 
+    # Per-sensor regression diagnostics (VIF, holdout, condition number)
+    from weatherstat.validate import validate_sysid_regression
+
+    reg_issues = validate_sysid_regression(
+        sensor.name, X, y, feature_names, scale, lam, cond, beta,
+    )
+    for issue in reg_issues:
+        prefix = "ERROR" if issue.severity.value == "error" else "WARNING"
+        print(f"  {prefix} [{sensor.name}]: {issue.message}")
+
     # Report weather control feature coefficients (diagnostic, not stored)
     if verbose:
         for i, fname in enumerate(feature_names):
@@ -820,15 +815,6 @@ def _fit_sensor_model(
             elif verbose:
                 print(f"    advisory_tau {dev_name}: β={b:.6f}, t={t:.1f} (dropped)")
 
-    environment_interaction_betas: dict[str, float] = {}
-    for i, pair_name in enumerate(adv_interaction_names):
-        idx = adv_interaction_start + i
-        if idx < len(beta):
-            b = float(beta[idx])
-            t = float(t_stats[idx])
-            if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
-                environment_interaction_betas[pair_name] = round(b, 6)
-
     # Extract advisory × solar betas (how advisory state modulates solar gain)
     environment_solar_betas: dict[str, float] = {}
     for i, dev_name in enumerate(adv_solar_feature_names):
@@ -851,7 +837,7 @@ def _fit_sensor_model(
             solar_se = round(float(se[solar_start]), 4) if not np.isnan(se[solar_start]) else 0.0
             print(f"    solar_elev: β={solar_elev_gain:.4f}, se={solar_se:.4f}, t={solar_elev_t:.1f}")
 
-    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_interaction_betas, environment_solar_betas
+    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_solar_betas
 
 
 # ── Derived MRT weights ──────────────────────────────────────────────────
@@ -873,8 +859,21 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> SysIdRe
 def save_sysid_result(result: SysIdResult, output_path: Path | None = None) -> Path:
     """Write a SysIdResult to disk as JSON.
 
+    Runs validate_sysid_result() before writing. Errors are printed
+    but do NOT block saving — the caller (TUI quality gate) decides
+    whether to use the result.
+
     Returns the path written to.
     """
+    from weatherstat.validate import format_issues, has_errors, validate_sysid_result
+
+    issues = validate_sysid_result(result)
+    if issues:
+        print("\n── Sysid Validation ──")
+        print(format_issues(issues))
+        if has_errors(issues):
+            print("  ⚠ Errors found — parameters may produce unreliable predictions.")
+
     out = output_path or DATA_DIR / "thermal_params.json"
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -934,12 +933,11 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     all_gains: list[EffectorSensorGain] = []
     solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
     all_adv_tau_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
-    all_adv_interaction_betas: dict[str, dict[str, float]] = {}  # sensor -> {"d1+d2" -> beta}
     all_adv_solar_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
 
     for sensor in sensors:
         tau_base = tau_lookup.get(sensor.name, sensor.yaml_tau_base)
-        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_int_b, adv_solar_b = _fit_sensor_model(
+        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_solar_b = _fit_sensor_model(
             df, sensor, effectors, tau_base, verbose,
         )
         all_gains.extend(gains)
@@ -948,8 +946,6 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
             print(f"  {sensor.name}: solar_elev β={solar_elev_gain:+.3f}, t={solar_elev_t:.1f}")
         if adv_tau_b:
             all_adv_tau_betas[sensor.name] = adv_tau_b
-        if adv_int_b:
-            all_adv_interaction_betas[sensor.name] = adv_int_b
         if adv_solar_b:
             all_adv_solar_betas[sensor.name] = adv_solar_b
 
@@ -966,14 +962,12 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     # Merge advisory tau betas into FittedTau
     for i, ft in enumerate(fitted_taus):
         tau_b = all_adv_tau_betas.get(ft.sensor, {})
-        int_b = all_adv_interaction_betas.get(ft.sensor, {})
-        if tau_b or int_b:
+        if tau_b:
             fitted_taus[i] = FittedTau(
                 sensor=ft.sensor,
                 tau_base=ft.tau_base,
                 n_segments=ft.n_segments,
                 environment_tau_betas=tau_b,
-                environment_interaction_betas=int_b,
             )
 
     # Restructure environment_solar_betas: sensor->{device->beta} → device->{sensor->beta}
@@ -1037,14 +1031,12 @@ def print_report(result: SysIdResult) -> None:
     if any_couplings:
         print("\n── Advisory Tau Couplings (β: additional cooling rate when active) ──")
         for ft in result.fitted_taus:
-            if not ft.environment_tau_betas and not ft.environment_interaction_betas:
+            if not ft.environment_tau_betas:
                 continue
             print(f"\n  {ft.sensor}:")
             for dev, beta in sorted(ft.environment_tau_betas.items()):
                 eff_tau = 1.0 / (1.0 / ft.tau_base + beta) if beta > 0 else ft.tau_base
                 print(f"    {dev:20s}: β={beta:.6f}  (eff tau={eff_tau:.1f}h)")
-            for pair, beta in sorted(ft.environment_interaction_betas.items()):
-                print(f"    {pair:20s}: β={beta:.6f}  (interaction)")
 
     # Advisory solar couplings (if any)
     if result.environment_solar_betas:
