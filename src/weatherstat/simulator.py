@@ -34,28 +34,28 @@ _MAX_GAIN_MAGNITUDE = delta_temp(2.0)
 
 @dataclass(frozen=True)
 class TauModel:
-    """Thermal envelope model with learned window effects.
+    """Thermal envelope model with learned advisory effector effects.
 
-    tau_base: sealed envelope time constant (hours, all windows closed).
-    window_betas: per-window additional cooling rate coefficient.
-        When window is open, effective 1/tau += beta.
-    interaction_betas: cross-breeze coefficients for window pairs.
-        When both windows in a pair are open, effective 1/tau += beta.
+    tau_base: sealed envelope time constant (hours, all advisories at default).
+    environment_tau_betas: per-advisory-effector additional cooling rate coefficient.
+        When device is active, effective 1/tau += beta.
+    environment_interaction_betas: pairwise interaction coefficients.
+        When both devices in a pair are active, effective 1/tau += beta.
     """
 
     tau_base: float
-    window_betas: dict[str, float] = field(default_factory=dict)
-    interaction_betas: dict[str, float] = field(default_factory=dict)
+    environment_tau_betas: dict[str, float] = field(default_factory=dict)
+    environment_interaction_betas: dict[str, float] = field(default_factory=dict)
 
-    def effective_tau(self, window_states: dict[str, bool]) -> float:
-        """Compute effective tau given current window states."""
+    def effective_tau(self, environment_states: dict[str, bool]) -> float:
+        """Compute effective tau given current environment factor states."""
         inv_tau = 1.0 / self.tau_base
-        for win, beta in self.window_betas.items():
-            if window_states.get(win, False):
+        for dev, beta in self.environment_tau_betas.items():
+            if environment_states.get(dev, False):
                 inv_tau += beta
-        for key, beta in self.interaction_betas.items():
-            w1, w2 = key.split("+")
-            if window_states.get(w1, False) and window_states.get(w2, False):
+        for key, beta in self.environment_interaction_betas.items():
+            d1, d2 = key.split("+")
+            if environment_states.get(d1, False) and environment_states.get(d2, False):
                 inv_tau += beta
         return 1.0 / max(inv_tau, 0.01)  # safety floor
 
@@ -80,6 +80,7 @@ class SimParams:
     state_gates: dict[str, StateGateInfo] = field(default_factory=dict)  # gate_name -> info
     mrt_weights: dict[str, float] = field(default_factory=dict)  # sensor -> derived MRT weight
     solar_elevation_gains: dict[str, float] = field(default_factory=dict)  # sensor -> gain per sin(elev)×frac
+    environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,7 @@ class HouseState:
     current_temps: dict[str, float]  # sensor/room name -> temperature (F)
     outdoor_temp: float  # current outdoor temperature (F)
     forecast_temps: list[float]  # hourly outdoor temps [h+1, h+2, ..., h+N]
-    window_states: dict[str, bool]  # window_name -> is_open
+    environment_states: dict[str, bool]  # environment factor name -> is_active (non-default)
     hour_of_day: float  # fractional hour of day (0-23.99)
     recent_history: dict[str, list[float]] = field(default_factory=dict)
     # effector_name -> recent activity values (oldest first)
@@ -128,10 +129,13 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     taus: dict[str, TauModel] = {}
     for ft in data["fitted_taus"]:
         sensor = ft["sensor"]
+        # Backward compat: old files use advisory_tau_betas or window_betas
+        tau_betas = ft.get("environment_tau_betas", ft.get("advisory_tau_betas", ft.get("window_betas", {})))
+        int_betas = ft.get("environment_interaction_betas", ft.get("advisory_interaction_betas", ft.get("interaction_betas", {})))
         taus[sensor] = TauModel(
             tau_base=ft["tau_base"],
-            window_betas=ft.get("window_betas", {}),
-            interaction_betas=ft.get("interaction_betas", {}),
+            environment_tau_betas=tau_betas,
+            environment_interaction_betas=int_betas,
         )
 
     # Gain lookup: filter by negligible flag, t-statistic significance,
@@ -197,6 +201,12 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     # MRT weights (derived from solar gain profiles by sysid)
     mrt_weights = {str(k): float(v) for k, v in data.get("mrt_weights", {}).items()}
 
+    # Environment solar betas (device modulates solar gain for sensor)
+    raw_solar_betas = data.get("environment_solar_betas", data.get("advisory_solar_betas", {}))
+    environment_solar_betas: dict[str, dict[str, float]] = {}
+    for dev, sensor_betas in raw_solar_betas.items():
+        environment_solar_betas[dev] = {str(k): float(v) for k, v in sensor_betas.items()}
+
     return SimParams(
         taus=taus,
         gains=gains,
@@ -206,6 +216,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         state_gates=state_gates,
         mrt_weights=mrt_weights,
         solar_elevation_gains=solar_elevation_gains,
+        environment_solar_betas=environment_solar_betas,
     )
 
 
@@ -273,7 +284,7 @@ def simulate_sensor(
         outdoor_temp: Current outdoor temp (F). Used if no forecast.
         forecast_temps: Hourly outdoor temps [h+1, h+2, ..., h+N].
         tau: Effective envelope time constant (hours), pre-computed from
-            TauModel.effective_tau(window_states).
+            TauModel.effective_tau(environment_states).
         effector_timelines: effector_name -> full timeline (history + future).
             Timeline index `history_len` corresponds to t=0.
         gains: effector_name -> (gain_f_per_hour, lag_minutes) for this sensor.
@@ -497,6 +508,60 @@ def _build_activity_matrices(
     return matrices, regulating
 
 
+def _build_environment_timelines(
+    scenarios: list[Scenario],
+    environment_states: dict[str, bool],
+    n_future: int,
+) -> dict[str, np.ndarray]:
+    """Build per-environment-factor state timelines for all scenarios.
+
+    Returns dict mapping device name -> ndarray of shape
+    (n_scenarios, _HISTORY_STEPS + n_future) with float values
+    (0.0 = default/inactive, 1.0 = active).
+
+    History prefix is constant at the device's current state, enabling
+    lag-based gain lookback.  Future portion reflects AdvisoryDecision
+    transitions: hold keeps current state; close/open flips at
+    transition_step.
+    """
+    all_devices: set[str] = set()
+    for s in scenarios:
+        all_devices.update(s.advisories.keys())
+    if not all_devices:
+        return {}
+
+    n = len(scenarios)
+    n_total = _HISTORY_STEPS + n_future
+
+    timelines: dict[str, np.ndarray] = {}
+    for device in sorted(all_devices):
+        current = 1.0 if environment_states.get(device, False) else 0.0
+        matrix = np.full((n, n_total), current)
+
+        for i, scenario in enumerate(scenarios):
+            adv = scenario.advisories.get(device)
+            if adv is None or adv.action == "hold":
+                continue
+            if adv.action in ("close", "turn_off", "lower"):
+                target = 0.0
+            elif adv.action in ("open", "turn_on", "raise"):
+                target = 1.0
+            else:
+                continue
+            transition_idx = _HISTORY_STEPS + adv.transition_step
+            if transition_idx < n_total:
+                matrix[i, transition_idx:] = target
+            # return_step: device reverts to original state (proactive advice)
+            if adv.return_step is not None:
+                return_idx = _HISTORY_STEPS + adv.return_step
+                if return_idx < n_total:
+                    matrix[i, return_idx:] = current
+
+        timelines[device] = matrix
+
+    return timelines
+
+
 def predict(
     state: HouseState,
     scenarios: list[Scenario],
@@ -544,6 +609,21 @@ def predict(
         scenarios, params, state.recent_history, n_future,
     )
 
+    # Build advisory timelines and merge into activity matrices for gain lookup.
+    # Advisory timelines encode per-step advisory effector state (0/1) for each
+    # scenario, enabling mid-horizon state transitions (e.g., window closes at step 12).
+    has_advisories = any(s.advisories for s in scenarios)
+    advisory_future: dict[str, np.ndarray] = {}
+    if has_advisories:
+        advisory_timelines = _build_environment_timelines(scenarios, state.environment_states, n_future)
+        # Merge so advisory gain effects are picked up by the total_eff computation
+        activity_matrices.update(advisory_timelines)
+        # Pre-extract future portion (steps 1..max_horizon) for tau/solar computation
+        advisory_future = {
+            dev: tl[:, _HISTORY_STEPS + 1:_HISTORY_STEPS + 1 + max_horizon]
+            for dev, tl in advisory_timelines.items()
+        }
+
     # Group targets by sensor for efficient per-sensor simulation
     sensor_targets: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for j, (sc, h) in enumerate(target_info):
@@ -558,9 +638,40 @@ def predict(
     # Simulate each sensor (vectorized across all scenarios)
     for sensor_col, col_targets in sensor_targets.items():
         tau_model = params.taus.get(sensor_col, TauModel(tau_base=40.0))
-        tau = tau_model.effective_tau(state.window_states)
-        if tau <= 0:
-            tau = 40.0
+
+        # Per-step tau when advisory timelines modulate this sensor's envelope.
+        # Fast path: scalar tau when no advisory transitions affect tau.
+        per_step_tau = bool(
+            advisory_future and (tau_model.environment_tau_betas or tau_model.environment_interaction_betas)
+        )
+        tau_scalar = 40.0
+        tau_matrix: np.ndarray | None = None
+        if per_step_tau:
+            inv_tau = np.full((n_scenarios, max_horizon), 1.0 / tau_model.tau_base)
+            for dev, beta in tau_model.environment_tau_betas.items():
+                af = advisory_future.get(dev)
+                if af is not None:
+                    inv_tau += beta * af
+                elif state.environment_states.get(dev, False):
+                    inv_tau += beta  # passive device, constant contribution
+            for pair_key, beta in tau_model.environment_interaction_betas.items():
+                d1, d2 = pair_key.split("+")
+                af1, af2 = advisory_future.get(d1), advisory_future.get(d2)
+                s1 = state.environment_states.get(d1, False)
+                s2 = state.environment_states.get(d2, False)
+                if af1 is not None and af2 is not None:
+                    inv_tau += beta * af1 * af2
+                elif af1 is not None and s2:
+                    inv_tau += beta * af1
+                elif af2 is not None and s1:
+                    inv_tau += beta * af2
+                elif s1 and s2:
+                    inv_tau += beta
+            tau_matrix = 1.0 / np.maximum(inv_tau, 0.01)
+        else:
+            tau_scalar = tau_model.effective_tau(state.environment_states)
+            if tau_scalar <= 0:
+                tau_scalar = 40.0
 
         # Gains for this sensor
         sensor_gains: dict[str, tuple[float, float]] = {}
@@ -605,6 +716,29 @@ def predict(
             else:
                 solar_vec = base_solar
 
+        # Advisory solar modulation: advisory effectors can amplify/attenuate
+        # solar gain (e.g., blinds reduce solar, open window changes airflow).
+        # Multiplicative: solar_vec *= (1 + Σ(beta × timeline)).
+        per_step_solar = False
+        solar_arr: np.ndarray | None = None
+        if advisory_future and params.environment_solar_betas:
+            solar_mod = np.zeros((n_scenarios, max_horizon))
+            has_solar_mod = False
+            for dev, sensor_betas in params.environment_solar_betas.items():
+                beta = sensor_betas.get(sensor_col, 0.0)
+                if beta == 0.0:
+                    continue
+                af = advisory_future.get(dev)
+                if af is not None:
+                    solar_mod += beta * af
+                    has_solar_mod = True
+                elif state.environment_states.get(dev, False):
+                    solar_mod += beta
+                    has_solar_mod = True
+            if has_solar_mod:
+                solar_arr = solar_vec[None, :] * (1.0 + solar_mod)
+                per_step_solar = True
+
         cur_temp = state.current_temps.get(sensor_col, abs_temp(70.0))
 
         # Pre-compute total effector forcing: (n_scenarios, max_horizon + 1)
@@ -645,7 +779,9 @@ def predict(
 
         for step_idx in range(max_horizon):
             step = step_idx + 1
-            dTdt = (outdoor_vec[step_idx] - T) / tau + total_eff[:, step] + solar_vec[step_idx]
+            tau_val = tau_matrix[:, step_idx] if per_step_tau else tau_scalar
+            solar_val = solar_arr[:, step_idx] if per_step_solar else solar_vec[step_idx]
+            dTdt = (outdoor_vec[step_idx] - T) / tau_val + total_eff[:, step] + solar_val
 
             # Regulating effector contributions (proportional to target - current temp)
             for abs_gain, lag_s, p_band, targets, modes in sensor_reg:

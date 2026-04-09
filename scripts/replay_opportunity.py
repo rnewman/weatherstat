@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Replay a window opportunity evaluation at a given decision timestamp.
+"""Replay an environment opportunity evaluation at a given decision timestamp.
 
 Usage:
-    python scripts/replay_opportunity.py <timestamp> <window_name>
+    python scripts/replay_opportunity.py <timestamp> <env_name>
     python scripts/replay_opportunity.py 2026-03-30T10:31:04.928113+00:00 bathroom
 
 Reconstructs the system state from the decision log and snapshot DB,
-then runs both the original sweep and the re-sweep with the window toggled,
-showing the full breakdown of why the opportunity was (or wasn't) generated.
+then runs both the original sweep and the re-sweep with the environment factor
+toggled, showing the full breakdown of why the opportunity was (or wasn't) generated.
 """
 
 from __future__ import annotations
@@ -47,11 +47,16 @@ def _load_decision_state(timestamp: str) -> tuple[dict[str, float], float, str]:
 
 
 def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float], list[float]]:
-    """Load window states and forecast temps from the nearest snapshot.
+    """Load environment states and forecast temps from the nearest snapshot.
 
     Decision timestamps end in fractional seconds; snapshot timestamps are on
     the minute with '.000Z' suffix. We find the closest snapshot <= decision time.
     """
+    cfg = load_config()
+
+    # Build reverse map: column_name -> config_name
+    col_to_name: dict[str, str] = {ecfg.column: ename for ename, ecfg in cfg.environment.items()}
+
     conn = sqlite3.connect(str(SNAPSHOTS_DB))
 
     # Find closest snapshot <= decision time
@@ -72,11 +77,10 @@ def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]
 
     snap = dict(rows)
 
-    window_states: dict[str, bool] = {}
+    environment_states: dict[str, bool] = {}
     for name, val in rows:
-        if name.startswith("window_") and name.endswith("_open"):
-            wname = name.removeprefix("window_").removesuffix("_open")
-            window_states[wname] = val == "1"
+        if name in col_to_name:
+            environment_states[col_to_name[name]] = val == "1"
 
     from weatherstat.weather import condition_to_solar_fraction
 
@@ -102,7 +106,7 @@ def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]
         fc = snap.get(f"forecast_condition_{h}h", "unknown")
         solar_fractions.append(condition_to_solar_fraction(str(fc)))
 
-    return window_states, forecast_temps, solar_fractions
+    return environment_states, forecast_temps, solar_fractions
 
 
 def _reconstruct_prev_state(timestamp: str) -> ControlState | None:
@@ -148,7 +152,7 @@ def _utc_to_local_hour(timestamp: str, tz_offset_hours: int = -7) -> int:
     return (hour_utc + tz_offset_hours) % 24
 
 
-def replay(timestamp: str, window_name: str) -> None:
+def replay(timestamp: str, env_name: str) -> None:
     """Replay opportunity evaluation."""
     from datetime import UTC, datetime, timedelta
 
@@ -158,12 +162,12 @@ def replay(timestamp: str, window_name: str) -> None:
     sim_params = load_sim_params()
     schedules = default_comfort_schedules()
 
-    print(f"Replaying opportunity: {window_name} window at {timestamp}")
+    print(f"Replaying opportunity: {env_name} at {timestamp}")
     print()
 
     # Load state
     current_temps, outdoor_temp, weather = _load_decision_state(timestamp)
-    window_states, forecast_temps, solar_fractions = _load_snapshot_context(timestamp)
+    environment_states, forecast_temps, solar_fractions = _load_snapshot_context(timestamp)
     base_hour = _utc_to_local_hour(timestamp)
 
     # Compute solar elevations at the decision timestamp
@@ -177,8 +181,8 @@ def replay(timestamp: str, window_name: str) -> None:
     ]
 
     print(f"Outdoor: {outdoor_temp:.1f}°F  Weather: {weather}  Local hour: {base_hour}")
-    open_windows = [k for k, v in sorted(window_states.items()) if v]
-    print(f"Windows open: {', '.join(open_windows) if open_windows else 'none'}")
+    active_env = [k for k, v in sorted(environment_states.items()) if v]
+    print(f"Active environment: {', '.join(active_env) if active_env else 'none'}")
     print(f"Forecast: {', '.join(f'{i+1}h={t:.0f}' for i, t in enumerate(forecast_temps))}")
     print()
 
@@ -189,10 +193,10 @@ def replay(timestamp: str, window_name: str) -> None:
             print(f"  {k:<30} {current_temps[k]:6.1f}")
     print()
 
-    # Check window state
-    is_open = window_states.get(window_name, False)
-    action = "Open" if not is_open else "Close"
-    print(f"Window '{window_name}' is currently {'OPEN' if is_open else 'CLOSED'} → proposing to {action}")
+    # Check environment state
+    is_active = environment_states.get(env_name, False)
+    action = "Activate" if not is_active else "Deactivate"
+    print(f"'{env_name}' is currently {'ACTIVE' if is_active else 'DEFAULT'} → proposing to {action}")
     print()
 
     # Reconstruct prev_state from the preceding decision
@@ -206,13 +210,13 @@ def replay(timestamp: str, window_name: str) -> None:
 
     # Original sweep
     print("=" * 60)
-    print("ORIGINAL SWEEP (current window states)")
+    print("ORIGINAL SWEEP (current environment states)")
     print("=" * 60)
-    d1, s1, b1 = sweep_scenarios_physics(
+    d1, s1, b1, _ = sweep_scenarios_physics(
         current_temps=current_temps,
         outdoor_temp=outdoor_temp,
         forecast_temps=forecast_temps,
-        window_states=window_states,
+        environment_states=environment_states,
         sim_params=sim_params,
         hour_of_day=base_hour,
         recent_history=recent_history,
@@ -235,17 +239,17 @@ def replay(timestamp: str, window_name: str) -> None:
     print()
 
     # Toggled sweep
-    toggled = dict(window_states)
-    toggled[window_name] = not is_open
+    toggled = dict(environment_states)
+    toggled[env_name] = not is_active
 
     print("=" * 60)
-    print(f"RE-SWEEP ({action} {window_name} window)")
+    print(f"RE-SWEEP ({action} {env_name})")
     print("=" * 60)
-    d2, s2, b2 = sweep_scenarios_physics(
+    d2, s2, b2, _ = sweep_scenarios_physics(
         current_temps=current_temps,
         outdoor_temp=outdoor_temp,
         forecast_temps=forecast_temps,
-        window_states=toggled,
+        environment_states=toggled,
         sim_params=sim_params,
         hour_of_day=base_hour,
         recent_history=recent_history,
@@ -317,4 +321,4 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
-    replay(sys.argv[1], sys.argv[2])
+    replay(timestamp=sys.argv[1], env_name=sys.argv[2])

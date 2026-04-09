@@ -12,8 +12,12 @@ will face new challenges in summer:
   important for rooms without them.
 - Auto mode (heat_cool) may be needed in shoulder seasons where the room
   needs heating in the morning and cooling in the afternoon.
-- Window advisory logic should recommend opening windows for free cooling
-  more aggressively when outdoor temp is below indoor but above comfort min.
+- ~~Window advisory logic~~ → Done: generalized as "advisory effectors" (Stage 25).
+  Windows, space heaters, blinds, vent fans are swept in the trajectory search
+  alongside HVAC effectors. Three planning layers (reasonable/worst-case/proactive)
+  replace the old per-window re-sweep.
+- Proactive free-cooling advice: advisory sweep evaluates "open this window for
+  2h" scenarios and surfaces them when cost delta is significant.
 
 ---
 

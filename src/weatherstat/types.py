@@ -88,17 +88,23 @@ class WeatherState:
 class RoomComfort:
     """Comfort profile for a single constraint label (sensor).
 
-    preferred_lo/preferred_hi: dead band — zero cost within this range.
-    When equal, behaves as a point target (backward compatible).
-    min_temp/max_temp: hard rails with steep additional penalty (10×).
+    Three-tier comfort bounds:
+    - preferred_lo/preferred_hi: dead band — zero cost within this range.
+      When equal, behaves as a point target (backward compatible).
+    - acceptable_lo/acceptable_hi: normal HVAC action range with steep penalty (configurable, default 3×)
+      outside these bounds. Maps to current min_temp/max_temp semantics.
+    - backup_lo/backup_hi: worst-case hedge — defensive HVAC action when breached.
+      Defaults to acceptable ± backup_margin when not specified.
     cold_penalty/hot_penalty: asymmetric weights for deviation from preferred band.
     """
 
     label: str  # "bedroom", "office", "upstairs", "downstairs"
-    preferred_lo: float  # lower edge of preferred band (°F)
+    preferred_lo: float  # lower edge of preferred band
     preferred_hi: float  # upper edge (= preferred_lo for point target)
-    min_temp: float  # hard lower bound (°F)
-    max_temp: float  # hard upper bound (°F)
+    acceptable_lo: float  # lower acceptable bound (steep penalty below)
+    acceptable_hi: float  # upper acceptable bound (steep penalty above)
+    backup_lo: float  # worst-case lower bound (defensive action below)
+    backup_hi: float  # worst-case upper bound (defensive action above)
     cold_penalty: float = 2.0  # weight for being below preferred band
     hot_penalty: float = 1.0  # weight for being above preferred band
 
@@ -134,17 +140,92 @@ class ComfortSchedule:
 
 
 @dataclass(frozen=True)
-class WindowOpportunity:
-    """A persistent opportunity to improve comfort/energy by toggling a window."""
+class EnvironmentOpportunity:
+    """A persistent opportunity to improve comfort/energy by toggling an environment entry."""
 
-    window: str  # window name
-    action: str  # "open" or "close"
+    entry: str  # environment entry name (e.g., "bedroom", "door_balcony")
+    action: str  # "open", "close", "lower", "raise", "turn_on", "turn_off"
     comfort_improvement: float  # comfort cost reduction
     energy_saving: float  # energy cost reduction from HVAC changes
     total_benefit: float  # comfort_improvement + energy_saving
     message: str  # human-readable description
     first_seen: str = ""  # ISO timestamp when first detected
     notified: bool = False  # whether push notification was sent
+
+
+@dataclass(frozen=True)
+class AdvisoryDecision:
+    """Decision for an advisory effector in a scenario.
+
+    Advisory effectors are user-operated devices (windows, space heaters, blinds)
+    that the system can observe and advise on but not directly control.
+
+    action: "hold" keeps current state. Other values ("close", "open", "turn_off")
+    indicate the advisory transition.
+    transition_step: the 5-min step at which the transition occurs (0 = now).
+    return_step: optional step at which the device returns to its previous state.
+        Used for proactive advice: "open window now, close in 2h" →
+        action="open", transition_step=0, return_step=24.
+    """
+
+    name: str  # "piano_window", "office_heater"
+    action: str = "hold"  # "hold", "close", "open", "turn_off", "turn_on"
+    transition_step: int = 0  # 5-min step at which transition occurs
+    return_step: int | None = None  # 5-min step at which device returns to prior state
+
+
+_ACTION_VERBS: dict[str, tuple[str, str]] = {
+    "window": ("close", "open"),
+    "door": ("close", "open"),
+    "shade": ("lower", "raise"),
+    "vent": ("close", "open"),
+    "heater": ("turn_off", "turn_on"),
+}
+
+_ACTIVE_DESCRIPTIONS: dict[str, str] = {
+    "window": "open",
+    "door": "open",
+    "shade": "lowered",
+    "vent": "open",
+    "heater": "on",
+}
+
+
+@dataclass(frozen=True)
+class EnvironmentEntryConfig:
+    """An observable factor that affects physics (tau, solar, gain) but isn't system-controlled.
+
+    Declared in the `environment` YAML section. Covers windows, doors, shades, vents,
+    space heaters — anything the system observes for physics and optionally advises on.
+    """
+
+    name: str            # config key: "basement", "moss_garden_shade"
+    entity_id: str       # HA entity: "binary_sensor.window_basement_intrusion"
+    column: str          # EAV readings column: "basement_open"
+    kind: str            # "window", "door", "shade" — drives display + action verbs
+    default_state: str   # "closed" or "open" — what the system considers normal
+    active_state: str    # HA state string when non-default (e.g., "on", "closed")
+    advisory: bool = False  # True = included in advisory sweep
+
+    @property
+    def label(self) -> str:
+        """Human-readable label: 'moss_garden_shade' → 'moss garden shade'."""
+        return self.name.replace("_", " ")
+
+    @property
+    def active_description(self) -> str:
+        """State description when non-default: 'open', 'lowered', 'on'."""
+        return _ACTIVE_DESCRIPTIONS.get(self.kind, "active")
+
+    @property
+    def close_action(self) -> str:
+        """Action verb for returning to default state."""
+        return _ACTION_VERBS.get(self.kind, ("close", "open"))[0]
+
+    @property
+    def open_action(self) -> str:
+        """Action verb for leaving default state."""
+        return _ACTION_VERBS.get(self.kind, ("close", "open"))[1]
 
 
 @dataclass(frozen=True)
@@ -176,9 +257,13 @@ class Scenario:
 
     Dependent effectors (e.g., blowers depending on a thermostat) have their
     activity multiplied by the dependency's active mask in the simulator.
+
+    advisories: advisory effector decisions. Empty dict = hold all at current state
+    (backward compatible with pre-advisory code).
     """
 
     effectors: dict[str, EffectorDecision]  # effector_name -> decision
+    advisories: dict[str, AdvisoryDecision] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

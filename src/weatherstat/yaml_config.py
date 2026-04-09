@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 
+from weatherstat.types import EnvironmentEntryConfig
+
 # ── Config dataclasses ────────────────────────────────────────────────────
 
 
@@ -103,30 +105,21 @@ class PowerSensorConfig:
     entity_id: str
 
 
-def window_display(name: str) -> tuple[str, str]:
-    """Return (label, kind) for a window/door name.
+def environment_display(name: str, cfg: EnvironmentEntryConfig | None = None) -> tuple[str, str]:
+    """Return (label, kind) for an environment factor.
 
-    'door_basement' → ('basement', 'door'); 'family_room' → ('family room', 'window').
+    With config: uses config's label and kind directly.
+    Without config (fallback): derives from name — 'door_basement' → ('basement', 'door').
     """
-    if name.startswith("door_"):
-        return name.removeprefix("door_").replace("_", " "), "door"
+    if cfg is not None:
+        return cfg.label, cfg.kind
+    # Fallback for contexts without config (e.g., historical data).
+    # Derive kind from naming convention prefix.
+    for prefix in ("door_", "shade_", "vent_", "heater_"):
+        if name.startswith(prefix):
+            kind = prefix.rstrip("_")
+            return name.removeprefix(prefix).replace("_", " "), kind
     return name.replace("_", " "), "window"
-
-
-@dataclass(frozen=True)
-class WindowConfig:
-    name: str  # "basement", "family_room", "door_basement", etc.
-    entity_id: str
-
-    @property
-    def kind(self) -> str:
-        """'door' if name starts with 'door_', else 'window'."""
-        return window_display(self.name)[1]
-
-    @property
-    def label(self) -> str:
-        """Human-readable label: 'door_basement' → 'basement', 'family_room' → 'family room'."""
-        return window_display(self.name)[0]
 
 
 @dataclass(frozen=True)
@@ -135,8 +128,10 @@ class ComfortEntry:
     end_hour: int
     preferred_lo: float  # lower edge of preferred dead band
     preferred_hi: float  # upper edge (= preferred_lo for point target)
-    min_temp: float  # hard rail — steep additional penalty below this
-    max_temp: float  # hard rail — steep additional penalty above this
+    acceptable_lo: float  # steep penalty below this (was min_temp)
+    acceptable_hi: float  # steep penalty above this (was max_temp)
+    backup_lo: float  # worst-case hedge: defensive action below this
+    backup_hi: float  # worst-case hedge: defensive action above this
     cold_penalty: float = 2.0
     hot_penalty: float = 1.0
 
@@ -145,13 +140,13 @@ class ComfortEntry:
 class ComfortProfile:
     """Offset-based comfort profile applied on top of base schedules.
 
-    When active, offsets are added to every schedule entry's preferred/min/max temps.
+    When active, offsets are added to every schedule entry's preferred/acceptable/backup temps.
     An empty profile (all zeros) means "use base schedules unchanged".
 
     penalty_scale multiplies cold_penalty and hot_penalty. Use < 1.0 to make the
     optimizer care less about reaching preferred while still respecting hard rails
-    (min/max). With penalty_scale=0.1, the optimizer won't spend energy chasing
-    preferred but will still act when temps approach min/max boundaries.
+    (acceptable). With penalty_scale=0.1, the optimizer won't spend energy chasing
+    preferred but will still act when temps approach acceptable boundaries.
 
     preferred_widen expands the preferred point into a dead band: preferred becomes
     [preferred - widen/2, preferred + widen/2]. Within the band, comfort cost is zero.
@@ -160,8 +155,8 @@ class ComfortProfile:
     name: str
     preferred_offset: float = 0.0
     preferred_widen: float = 0.0
-    min_offset: float = 0.0
-    max_offset: float = 0.0
+    min_offset: float = 0.0  # applied to acceptable_lo and backup_lo
+    max_offset: float = 0.0  # applied to acceptable_hi and backup_hi
     penalty_scale: float = 1.0
 
 
@@ -226,7 +221,7 @@ class WeatherstatConfig:
     state_sensors: dict[str, StateSensorConfig]
     power_sensors: dict[str, PowerSensorConfig]
     health_checks: list[HealthCheck]
-    windows: dict[str, WindowConfig]
+    environment: dict[str, EnvironmentEntryConfig]
     weather_entity: str
     constraints: list[ConstraintSchedule]
     notification_target: str
@@ -238,6 +233,8 @@ class WeatherstatConfig:
     max_1h_change: float | None = None  # sanity check: max predicted 1h change (default: 5°F / 2.8°C)
     min_improvement: float | None = None  # min cost improvement to justify HVAC (default: 1°F / 0.6°C)
     cold_room_override: float | None = None  # force heating when this far below min (default: 1°F / 0.6°C)
+    backup_margin: float = 3.0  # backup bounds = acceptable ± this margin (default: 3°F / 1.7°C)
+    hard_rail_multiplier: float | None = None  # penalty multiplier outside acceptable bounds (default: 3.0)
     control_interval: int = 300  # seconds between control cycles (default: 5 min)
     sysid_interval: int = 3600  # seconds between automatic sysid runs (default: 1 hour, 0 = disabled)
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
@@ -245,7 +242,6 @@ class WeatherstatConfig:
     mrt_correction: MrtCorrectionConfig | None = None
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
-    window_open_offset: tuple[float, float] = (-3.0, 2.0)
 
     # ── Temperature unit helpers ────────────────────────────────────
 
@@ -330,19 +326,19 @@ class WeatherstatConfig:
         return result
 
     @property
-    def window_sensors(self) -> list[str]:
-        """Entity IDs for all window sensors."""
-        return [cfg.entity_id for cfg in self.windows.values()]
+    def environment_sensors(self) -> list[str]:
+        """Entity IDs for all environment factor sensors."""
+        return [cfg.entity_id for cfg in self.environment.values()]
 
     @property
-    def window_column_map(self) -> dict[str, str]:
-        """entity_id -> column_name for window sensors."""
-        return {cfg.entity_id: f"window_{name}_open" for name, cfg in self.windows.items()}
+    def environment_column_map(self) -> dict[str, str]:
+        """entity_id -> column_name for environment sensors."""
+        return {cfg.entity_id: cfg.column for cfg in self.environment.values()}
 
     @property
-    def window_display_map(self) -> dict[str, str]:
-        """column_name -> display_name for window sensors."""
-        return {f"window_{name}_open": name for name in self.windows}
+    def advisory_environment(self) -> dict[str, EnvironmentEntryConfig]:
+        """Environment entries with advisory: true — included in advisory sweep."""
+        return {k: v for k, v in self.environment.items() if v.advisory}
 
     @property
     def all_history_entities(self) -> list[str]:
@@ -353,7 +349,7 @@ class WeatherstatConfig:
         ids.extend(self.fan_entities.values())
         ids.extend(self.sensor_entities.values())
         ids.append(self.weather_entity)
-        ids.extend(self.window_sensors)
+        ids.extend(self.environment_sensors)
         return ids
 
     @property
@@ -361,15 +357,14 @@ class WeatherstatConfig:
         """All configured health checks, for generic safety monitoring."""
         return self.health_checks
 
-    def window_columns_for_sensor(self, sensor_name: str) -> list[str]:
-        """Derive window columns that might affect a sensor via naming convention.
+    def environment_columns_for_sensor(self, sensor_name: str) -> list[str]:
+        """Derive environment columns that might affect a sensor via naming convention.
 
-        Until sysid learns per-window coupling (Phase 3), we use names:
-        bedroom_temp → window_bedroom_open (if bedroom window exists).
+        bedroom_temp → bedroom environment entry's column (if it exists).
         """
         label = sensor_name.removeprefix("thermostat_").removesuffix("_temp")
-        if label in self.windows:
-            return [f"window_{label}_open"]
+        if label in self.environment:
+            return [self.environment[label].column]
         return []
 
     # ── Snapshot schema ──────────────────────────────────────────────
@@ -393,7 +388,6 @@ class WeatherstatConfig:
         for col in self.state_sensors:
             cols.add(col)
         cols.add("weather_condition")
-        cols.add("any_window_open")
         return cols
 
     @property
@@ -413,9 +407,8 @@ class WeatherstatConfig:
         for col in self.power_sensors:
             cols.append(col)
         cols.extend(["weather_condition", "wind_speed", "outdoor_humidity", "met_outdoor_temp"])
-        for name in self.windows:
-            cols.append(f"window_{name}_open")
-        cols.append("any_window_open")
+        for cfg in self.environment.values():
+            cols.append(cfg.column)
         return cols
 
     @property
@@ -436,11 +429,9 @@ class WeatherstatConfig:
         return cols
 
     @property
-    def window_bool_columns(self) -> list[str]:
-        """Window columns that need bool normalization."""
-        cols = [f"window_{name}_open" for name in self.windows]
-        cols.append("any_window_open")
-        return cols
+    def environment_bool_columns(self) -> list[str]:
+        """Environment columns that need bool normalization."""
+        return [cfg.column for cfg in self.environment.values()]
 
     @property
     def thermostat_action_columns(self) -> list[str]:
@@ -519,10 +510,9 @@ class WeatherstatConfig:
         ])
         for col in self.humidity_sensors:
             defs.append((col, "REAL"))
-        # Windows
-        for name in self.windows:
-            defs.append((f"window_{name}_open", "INTEGER"))
-        defs.append(("any_window_open", "INTEGER"))
+        # Environment factors (windows, doors, shades, etc.)
+        for cfg in self.environment.values():
+            defs.append((cfg.column, "INTEGER"))
         # Per-room temps (aggregate and individual)
         for col in self.temp_sensors:
             if col != self.outdoor_sensor and not col.startswith("thermostat_"):
@@ -638,15 +628,21 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             when_for_minutes=float(when.get("for_minutes", 0)),
         ))
 
-    # ── Windows ──────────────────────────────────────────────────────
-    windows: dict[str, WindowConfig] = {}
-    for name, win in data["windows"].items():
-        windows[name] = WindowConfig(name=name, entity_id=win["entity_id"])
+    # ── Environment factors (windows, doors, shades, vents, etc.) ──
+    environment: dict[str, EnvironmentEntryConfig] = {}
+    for name, env_data in data.get("environment", {}).items():
+        environment[name] = EnvironmentEntryConfig(
+            name=name,
+            entity_id=env_data["entity_id"],
+            column=env_data["column"],
+            kind=env_data.get("kind", "window"),
+            default_state=env_data.get("default_state", "closed"),
+            active_state=str(env_data["active_state"]),
+            advisory=bool(env_data.get("advisory", False)),
+        )
 
     # ── Constraints ──────────────────────────────────────────────────
     constraints_data = data.get("constraints", {})
-    wo_offset = constraints_data.get("window_open_offset", {"min": -3, "max": 2})
-    window_open_offset = (float(wo_offset["min"]), float(wo_offset["max"]))
 
     # Comfort profiles (home/away mode)
     comfort_entity: str | None = constraints_data.get("comfort_entity")
@@ -671,6 +667,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         solar_response=float(mrt_data.get("solar_response", 2.0)),
     ) if mrt_data else None
 
+    # Backup margin: how much wider backup bounds are than acceptable (default 3°F / 1.7°C)
+    backup_margin = float(data.get("defaults", {}).get("backup_margin", 3.0))
+
     constraint_list: list[ConstraintSchedule] = []
     for sched in constraints_data.get("schedules", []):
         sensor = sched["sensor"]
@@ -678,10 +677,32 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         entries: list[ComfortEntry] = []
         for entry in sched["schedule"]:
             hours = entry["hours"]
-            min_t = float(entry["min"])
-            max_t = float(entry["max"])
+            # Three-tier bounds: acceptable (was min/max), backup (new)
+            # Backward compat: "min"/"max" → acceptable, "acceptable" overrides
+            acc_raw = entry.get("acceptable")
+            if acc_raw is not None:
+                if isinstance(acc_raw, list):
+                    acc_lo, acc_hi = float(acc_raw[0]), float(acc_raw[1])
+                else:
+                    raise ValueError(f"'acceptable' must be [lo, hi], got: {acc_raw}")
+            else:
+                # Backward compat: read from min/max
+                acc_lo = float(entry["min"])
+                acc_hi = float(entry["max"])
+
+            backup_raw = entry.get("backup")
+            if backup_raw is not None:
+                if isinstance(backup_raw, list):
+                    bak_lo, bak_hi = float(backup_raw[0]), float(backup_raw[1])
+                else:
+                    raise ValueError(f"'backup' must be [lo, hi], got: {backup_raw}")
+            else:
+                # Default: acceptable ± backup_margin
+                bak_lo = acc_lo - backup_margin
+                bak_hi = acc_hi + backup_margin
+
             # preferred: float (point target) or [lo, hi] (dead band)
-            pref_raw = entry.get("preferred", (min_t + max_t) / 2)
+            pref_raw = entry.get("preferred", (acc_lo + acc_hi) / 2)
             if isinstance(pref_raw, list):
                 pref_lo, pref_hi = float(pref_raw[0]), float(pref_raw[1])
             else:
@@ -691,8 +712,10 @@ def _parse_config(data: dict) -> WeatherstatConfig:
                 end_hour=hours[1],
                 preferred_lo=pref_lo,
                 preferred_hi=pref_hi,
-                min_temp=min_t,
-                max_temp=max_t,
+                acceptable_lo=acc_lo,
+                acceptable_hi=acc_hi,
+                backup_lo=bak_lo,
+                backup_hi=bak_hi,
                 cold_penalty=float(entry.get("cold_penalty", 2.0)),
                 hot_penalty=float(entry.get("hot_penalty", 1.0)),
             ))
@@ -737,7 +760,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         state_sensors=state_sensors,
         power_sensors=power_sensors,
         health_checks=health_checks,
-        windows=windows,
+        environment=environment,
         weather_entity=data["weather"]["entity_id"],
         constraints=constraint_list,
         notification_target=data["notifications"]["target"],
@@ -748,6 +771,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         max_1h_change=_opt_float("max_1h_change"),
         min_improvement=_opt_float("min_improvement"),
         cold_room_override=_opt_float("cold_room_override"),
+        hard_rail_multiplier=_opt_float("hard_rail_multiplier"),
+        backup_margin=backup_margin,
         control_interval=_opt_int("control_interval", 300),
         sysid_interval=_opt_int("sysid_interval", 3600),
         comfort_entity=comfort_entity,
@@ -755,7 +780,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         mrt_correction=mrt_correction,
         advisory=advisory_config,
         safety=safety_config,
-        window_open_offset=window_open_offset,
     )
 
 

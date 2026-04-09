@@ -180,24 +180,36 @@ class TemperaturePanel(Static):
         self.update("\n".join(lines))
 
 
-class WindowPanel(Static):
-    """Current window states."""
+class EnvironmentPanel(Static):
+    """Current environment factor states (windows, doors, shades, etc.)."""
 
     def __init__(self) -> None:
         super().__init__("", classes="panel")
-        self._windows: dict[str, bool] = {}
+        self._entries: list[tuple[str, str, bool]] = []  # (label, kind, is_active)
 
-    def set_data(self, windows: dict[str, bool]) -> None:
-        self._windows = windows
+    def set_data(self, entries: list[tuple[str, str, bool]]) -> None:
+        self._entries = entries
         self._refresh()
 
     def _refresh(self) -> None:
-        open_windows = [name for name, is_open in self._windows.items() if is_open]
-        if open_windows:
-            text = ", ".join(open_windows)
-            self.update(f"[bold]Windows[/]\n  [yellow]Open: {text}[/]")
+        from collections import defaultdict
+
+        from ..types import _ACTIVE_DESCRIPTIONS
+
+        # Group active entries by their active description (e.g., "open", "lowered")
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for label, kind, is_active in self._entries:
+            if is_active:
+                desc = _ACTIVE_DESCRIPTIONS.get(kind, "active")
+                grouped[desc].append(f"{label} {kind}")
+
+        if grouped:
+            lines = ["[bold]Environment[/]"]
+            for desc, items in grouped.items():
+                lines.append(f"  [yellow]{desc.capitalize()}: {', '.join(items)}[/]")
+            self.update("\n".join(lines))
         else:
-            self.update("[bold]Windows[/]\n  All closed")
+            self.update("[bold]Environment[/]\n  All at default")
 
 
 class ForecastPanel(Static):
@@ -344,24 +356,62 @@ class EffectorPanel(Static):
 
 
 class OpportunityPanel(Static):
-    """Active window opportunities."""
+    """Active window opportunities and advisory recommendations."""
 
     def __init__(self) -> None:
         super().__init__("", classes="panel")
 
-    def set_data(self, opportunities: list[dict]) -> None:
-        from weatherstat.yaml_config import window_display
+    def set_data(
+        self,
+        opportunities: list[dict],
+        recommendations: list[dict] | None = None,
+        warnings: list[dict] | None = None,
+        proactive: list[dict] | None = None,
+    ) -> None:
+        from weatherstat.yaml_config import environment_display, load_config
 
+        _env = load_config().environment
         lines: list[str] = ["[bold]Opportunities[/]"]
-        if not opportunities:
-            lines.append("  (none)")
-        else:
+
+        # Advisory warnings (backup breaches) — most urgent first
+        if warnings:
+            for w in warnings:
+                msg = w.get("message", "?")
+                lines.append(f"  [bold red]{msg}[/]")
+
+        # Advisory recommendations (reasonable layer)
+        if recommendations:
+            for rec in recommendations:
+                dev = rec.get("device", "?")
+                action = rec.get("action", "?")
+                mins = rec.get("in_minutes", 0)
+                delta = rec.get("cost_delta", 0)
+                timing = "now" if mins == 0 else f"in {mins}m"
+                label, kind = environment_display(dev, _env.get(dev))
+                lines.append(f"  [cyan]{action} {label} {kind}[/] {timing} (saving {-delta:+.2f})")
+
+        # Environment opportunities (existing system)
+        if opportunities:
             for opp in opportunities:
-                window = opp.get("window", "?")
+                entry_name = opp.get("entry", opp.get("window", "?"))
                 action = opp.get("action", "?")
                 benefit = opp.get("total_benefit", 0)
-                label, kind = window_display(window)
+                label, kind = environment_display(entry_name, _env.get(entry_name))
                 lines.append(f"  [yellow]{action} {label} {kind}[/] (benefit: {benefit:.2f})")
+
+        # Proactive advice
+        if proactive:
+            for p in proactive:
+                dev = p.get("device", "?")
+                action = p.get("action", "?")
+                delta = p.get("cost_delta", 0)
+                dur = p.get("duration_minutes")
+                dur_str = f" for {dur}m" if dur else ""
+                label, kind = environment_display(dev, _env.get(dev))
+                lines.append(f"  [dim]{action} {label} {kind}{dur_str} ({delta:+.2f})[/]")
+
+        if len(lines) == 1:
+            lines.append("  (none)")
         self.update("\n".join(lines))
 
 

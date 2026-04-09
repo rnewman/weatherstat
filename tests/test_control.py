@@ -9,23 +9,32 @@ from __future__ import annotations
 
 from weatherstat.config import EFFECTOR_MAP, EFFECTORS
 from weatherstat.control import (
+    _ADVISORY_HARD_CAP,
     ABSOLUTE_MAX,
     ABSOLUTE_MIN,
     CONTROL_HORIZONS,
     HORIZON_WEIGHTS,
+    _advisory_combo_count,
+    _advisory_has_effect,
+    _advisory_sweep_options,
     _cautious_setpoint,
+    _cross_with_advisory,
     _in_hold_window,
     _in_quiet_hours,
     _regulating_sweep_options,
-    adjust_schedules_for_windows,
     apply_mrt_correction,
+    classify_advisory_scenario,
     compute_comfort_cost,
     compute_energy_cost,
+    extract_planning_layers,
     generate_trajectory_scenarios,
+    write_command_json,
 )
 from weatherstat.types import (
+    AdvisoryDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
+    ControlDecision,
     ControlState,
     EffectorDecision,
     RoomComfort,
@@ -40,7 +49,7 @@ def make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSched
     """Return default_comfort_schedules() with optional room overrides.
 
     Usage:
-        make_schedules(upstairs=[ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72, 72, 70, 74))])
+        make_schedules(upstairs=[ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72, 72, 70, 74, 67, 77))])
     """
     from weatherstat.control import default_comfort_schedules
 
@@ -59,21 +68,22 @@ class TestComfortCost:
     def test_comfort_cost_continuous_plus_rail(self) -> None:
         """Room at 76F, preferred 72F, max 74F, hot_penalty 2.0.
 
-        Cost = continuous(76-72)^2*2.0*weight + rail(76-74)^2*2.0*10*weight.
+        Cost = continuous(76-72)^2*2.0*weight + rail(76-74)^2*2.0*multiplier*weight.
         """
         schedules = [
             ComfortSchedule(
                 sensor="upstairs_temp",
                 label="upstairs",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72.0, 72.0, 70.0, 74.0, hot_penalty=2.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0, hot_penalty=2.0)),),
             ),
         ]
         predictions = {"upstairs_temp_t+12": 76.0}
         cost = compute_comfort_cost(predictions, schedules, base_hour=12)
 
         w = HORIZON_WEIGHTS[12]
+        from weatherstat.control import _HARD_RAIL_MULTIPLIER
         continuous = (76.0 - 72.0) ** 2 * 2.0 * w  # deviation from preferred
-        rail = (76.0 - 74.0) ** 2 * 2.0 * 10.0 * w  # exceeds hard max
+        rail = (76.0 - 74.0) ** 2 * 2.0 * _HARD_RAIL_MULTIPLIER * w  # exceeds hard max
         expected = continuous + rail
         assert abs(cost - expected) < 0.001
 
@@ -106,7 +116,7 @@ class TestComfortCost:
             ComfortSchedule(
                 sensor="upstairs_temp",
                 label="upstairs",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 71.0, 69.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 71.0, 69.0, 74.0, 66.0, 77.0)),),
             ),
         ]
         predictions = {"upstairs_temp_t+12": 71.0}
@@ -119,7 +129,7 @@ class TestComfortCost:
             ComfortSchedule(
                 sensor="upstairs_temp",
                 label="upstairs",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 71.0, 69.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("upstairs", 71.0, 71.0, 69.0, 74.0, 66.0, 77.0)),),
             ),
         ]
         predictions = {"upstairs_temp_t+12": 73.0}  # in band but above preferred
@@ -140,6 +150,125 @@ class TestComfortCost:
         cost_one = compute_energy_cost(scenario_one)
 
         assert cost_both > cost_one
+
+
+# ── Three-tier comfort bounds tests ──────────────────────────────────────
+
+
+class TestThreeTierComfort:
+    """Test three-tier comfort bounds: preferred, acceptable, backup."""
+
+    def test_config_parses_three_tiers(self) -> None:
+        """Example YAML with min/max produces three-tier ComfortEntry."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        # Bedroom schedule: min=70, max=73 → acceptable_lo=70, acceptable_hi=73, backup = ±3
+        bedroom = next(c for c in cfg.constraints if c.label == "bedroom")
+        entry = bedroom.entries[0]
+        assert entry.acceptable_lo == 70.0
+        assert entry.acceptable_hi == 73.0
+        # Backup defaults from acceptable ± 3
+        assert entry.backup_lo == 67.0
+        assert entry.backup_hi == 76.0
+
+    def test_backup_defaults_from_margin(self) -> None:
+        """When backup is not specified, it defaults to acceptable ± backup_margin."""
+        from weatherstat.yaml_config import load_config
+
+        cfg = load_config()
+        assert cfg.backup_margin == 3.0
+        for constraint in cfg.constraints:
+            for entry in constraint.entries:
+                assert entry.backup_lo == entry.acceptable_lo - cfg.backup_margin
+                assert entry.backup_hi == entry.acceptable_hi + cfg.backup_margin
+
+    def test_default_comfort_schedules_three_tiers(self) -> None:
+        """default_comfort_schedules produces RoomComfort with all three tiers."""
+        from weatherstat.control import default_comfort_schedules
+
+        schedules = default_comfort_schedules()
+        for sched in schedules:
+            for entry in sched.entries:
+                c = entry.comfort
+                assert c.acceptable_lo <= c.preferred_lo
+                assert c.preferred_hi <= c.acceptable_hi
+                assert c.backup_lo <= c.acceptable_lo
+                assert c.acceptable_hi <= c.backup_hi
+
+    def test_acceptable_cost_matches_old_hard_rail(self) -> None:
+        """Temperature outside acceptable produces same cost as old min/max hard rail."""
+        schedules = [
+            ComfortSchedule(
+                sensor="test_temp",
+                label="test",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("test", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
+            ),
+        ]
+        # 68°F is below acceptable_lo (70) by 2°F
+        predictions = {"test_temp_t+12": 68.0}
+        cost = compute_comfort_cost(predictions, schedules, base_hour=12)
+        w = HORIZON_WEIGHTS[12]
+        continuous = (72.0 - 68.0) ** 2 * 2.0 * w  # below preferred
+        rail = (70.0 - 68.0) ** 2 * 2.0 * 3.0 * w  # below acceptable (default multiplier)
+        expected = continuous + rail
+        assert abs(cost - expected) < 0.001
+
+    def test_between_acceptable_and_backup_no_extra_penalty(self) -> None:
+        """Temperature between acceptable and backup has rail penalty but not backup penalty.
+
+        Currently backup is data-only — not used in scoring yet (future advisory sweep).
+        """
+        schedules = [
+            ComfortSchedule(
+                sensor="test_temp",
+                label="test",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("test", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
+            ),
+        ]
+        # 68°F: below acceptable (70) but above backup (67)
+        predictions = {"test_temp_t+12": 68.0}
+        cost = compute_comfort_cost(predictions, schedules, base_hour=12)
+        # Cost should include continuous + acceptable rail only
+        w = HORIZON_WEIGHTS[12]
+        continuous = (72.0 - 68.0) ** 2 * 2.0 * w
+        rail = (70.0 - 68.0) ** 2 * 2.0 * 3.0 * w
+        expected = continuous + rail
+        assert abs(cost - expected) < 0.001
+
+    def test_profile_applies_to_all_tiers(self) -> None:
+        """Comfort profile offsets shift acceptable and backup bounds."""
+        from weatherstat.control import apply_comfort_profile
+        from weatherstat.yaml_config import ComfortProfile
+
+        schedules = [ComfortSchedule(
+            sensor="test_temp",
+            label="test",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("test", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
+        )]
+        profile = ComfortProfile(name="Away", min_offset=-2.0, max_offset=1.0)
+        adjusted = apply_comfort_profile(schedules, profile)
+        c = adjusted[0].entries[0].comfort
+        assert c.acceptable_lo == 68.0  # 70 + (-2)
+        assert c.acceptable_hi == 75.0  # 74 + 1
+        assert c.backup_lo == 65.0  # 67 + (-2)
+        assert c.backup_hi == 78.0  # 77 + 1
+
+    def test_mrt_correction_shifts_all_tiers(self) -> None:
+        """MRT correction shifts all three tiers equally."""
+        schedules = [ComfortSchedule(
+            sensor="bedroom_temp",
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
+        )]
+        cfg = MrtCorrectionConfig(alpha=0.1, reference_temp=50.0, max_offset=3.0)
+        adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, cfg)
+        # Offset = 0.1 × (50 - 35) = 1.5
+        c = adjusted[0].entries[0].comfort
+        assert abs(c.preferred_lo - 73.5) < 0.01
+        assert abs(c.acceptable_lo - 71.5) < 0.01
+        assert abs(c.backup_lo - 68.5) < 0.01
+        assert abs(c.backup_hi - 78.5) < 0.01
 
 
 # ── Cautious setpoint tests ──────────────────────────────────────────────
@@ -178,103 +307,6 @@ class TestCautiousSetpoint:
 # ── Window comfort adjustment tests ─────────────────────────────────────
 
 
-class TestAdjustSchedulesForWindows:
-    """Test comfort schedule adjustment when windows are open."""
-
-    def test_no_open_windows_returns_unchanged(self) -> None:
-        """All windows closed -> schedules unchanged."""
-        from weatherstat.yaml_config import load_config
-
-        cfg = load_config()
-        schedules = make_schedules()
-        window_states = {name: False for name in cfg.windows}
-
-        adjusted = adjust_schedules_for_windows(
-            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
-        )
-        # Same number of schedules, same entries
-        assert len(adjusted) == len(schedules)
-        for orig, adj in zip(schedules, adjusted, strict=True):
-            assert orig is adj  # should be the exact same object
-
-    def test_open_window_widens_comfort_bounds(self) -> None:
-        """Bedroom window open -> bedroom schedule shifted by offset."""
-        from weatherstat.yaml_config import load_config
-
-        cfg = load_config()
-        schedules = make_schedules(
-            bedroom=[
-                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 2.0, 1.0)),
-            ],
-        )
-        window_states = {name: False for name in cfg.windows}
-        window_states["bedroom"] = True
-
-        adjusted = adjust_schedules_for_windows(
-            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
-        )
-
-        bedroom_sched = next(s for s in adjusted if s.label == "bedroom")
-        entry = bedroom_sched.entries[0]
-        assert entry.comfort.min_temp == 67.0  # 70 + (-3)
-        assert entry.comfort.max_temp == 76.0  # 74 + 2
-
-    def test_unrelated_room_not_affected(self) -> None:
-        """Bedroom window open -> upstairs schedule untouched."""
-        from weatherstat.yaml_config import load_config
-
-        cfg = load_config()
-        schedules = make_schedules()
-        window_states = {name: False for name in cfg.windows}
-        window_states["bedroom"] = True
-
-        adjusted = adjust_schedules_for_windows(
-            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
-        )
-
-        upstairs_orig = next(s for s in schedules if s.label == "upstairs")
-        upstairs_adj = next(s for s in adjusted if s.label == "upstairs")
-        assert upstairs_orig is upstairs_adj  # unchanged
-
-    def test_penalties_preserved(self) -> None:
-        """Window adjustment preserves cold_penalty and hot_penalty."""
-        from weatherstat.yaml_config import load_config
-
-        cfg = load_config()
-        schedules = make_schedules(
-            bedroom=[
-                ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 3.0, 0.5)),
-            ],
-        )
-        window_states = {name: False for name in cfg.windows}
-        window_states["bedroom"] = True
-
-        adjusted = adjust_schedules_for_windows(
-            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
-        )
-
-        bedroom_sched = next(s for s in adjusted if s.label == "bedroom")
-        entry = bedroom_sched.entries[0]
-        assert entry.comfort.cold_penalty == 3.0
-        assert entry.comfort.hot_penalty == 0.5
-
-    def test_window_without_constraint_no_effect(self) -> None:
-        """Basement window (no matching constraint) open -> no schedules affected."""
-        from weatherstat.yaml_config import load_config
-
-        cfg = load_config()
-        schedules = make_schedules()
-        window_states = {name: False for name in cfg.windows}
-        window_states["basement"] = True  # basement has rooms=[]
-
-        adjusted = adjust_schedules_for_windows(
-            schedules, window_states, {c.label for c in cfg.constraints}, -3.0, 2.0,
-        )
-
-        for orig, adj in zip(schedules, adjusted, strict=True):
-            assert orig is adj
-
-
 # ── MRT correction tests ──────────────────────────────────────────────────
 
 
@@ -292,21 +324,21 @@ class TestMrtCorrection:
         schedules = [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
         assert abs(offset - 1.5) < 0.01
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
-        assert abs(entry.comfort.min_temp - 71.5) < 0.01
-        assert abs(entry.comfort.max_temp - 75.5) < 0.01
+        assert abs(entry.comfort.acceptable_lo - 71.5) < 0.01
+        assert abs(entry.comfort.acceptable_hi - 75.5) < 0.01
 
     def test_warm_day_lowers_targets(self) -> None:
         """80°F outside, ref=50, alpha=0.1 → clamped to -3.0°F."""
         schedules = [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adjusted, offset, _ = apply_mrt_correction(schedules, 80.0, self._cfg())
         assert abs(offset - (-3.0)) < 0.01  # clamped
@@ -325,7 +357,7 @@ class TestMrtCorrection:
         schedules = [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adjusted, offset, _ = apply_mrt_correction(schedules, 0.0, self._cfg())
         assert abs(offset - 3.0) < 0.01
@@ -344,7 +376,7 @@ class TestMrtCorrection:
         schedules = [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 3.0, 0.5)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0, 3.0, 0.5)),),
         )]
         adjusted, _, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
         entry = adjusted[0].entries[0]
@@ -356,7 +388,7 @@ class TestMrtCorrection:
         schedules = [ComfortSchedule(
             sensor="piano_temp",
             label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         # Base offset: 0.1 * (50 - 35) = 1.5°F; weighted: 1.5 * 0.5 = 0.75°F
         adjusted, base_offset, per_sensor = apply_mrt_correction(
@@ -365,7 +397,7 @@ class TestMrtCorrection:
         assert abs(base_offset - 1.5) < 0.01
         entry = adjusted[0].entries[0]
         assert abs(entry.comfort.preferred_lo - 72.75) < 0.01
-        assert abs(entry.comfort.min_temp - 70.75) < 0.01
+        assert abs(entry.comfort.acceptable_lo - 70.75) < 0.01
         assert abs(per_sensor["piano_temp"] - 0.75) < 0.01
 
     def test_mrt_weight_zero_no_adjustment(self) -> None:
@@ -373,7 +405,7 @@ class TestMrtCorrection:
         schedules = [ComfortSchedule(
             sensor="piano_temp",
             label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adjusted, base_offset, per_sensor = apply_mrt_correction(
             schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.0},
@@ -389,12 +421,12 @@ class TestMrtCorrection:
             ComfortSchedule(
                 sensor="piano_temp",
                 label="piano",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
             ),
             ComfortSchedule(
                 sensor="bathroom_temp",
                 label="bathroom",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bathroom", 72.0, 72.0, 70.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bathroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
             ),
         ]
         # Base offset: 1.5°F; piano×0.5=0.75, bathroom×1.5=2.25
@@ -411,7 +443,7 @@ class TestMrtCorrection:
         schedules = [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adj_none, off_none, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
         adj_ones, off_ones, _ = apply_mrt_correction(
@@ -435,7 +467,7 @@ class TestSunAwareMrt:
         schedules = [ComfortSchedule(
             sensor="piano_temp",
             label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         # Cloudy: no solar → full cold correction
         adj_cloudy, _, _ = apply_mrt_correction(
@@ -459,7 +491,7 @@ class TestSunAwareMrt:
         schedules = [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adj_no_gains, offset, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
@@ -475,7 +507,7 @@ class TestSunAwareMrt:
         schedules = [ComfortSchedule(
             sensor="piano_temp",
             label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
         )]
         adj_night, _, _ = apply_mrt_correction(
             schedules, 35.0, self._cfg(),
@@ -492,12 +524,12 @@ class TestSunAwareMrt:
             ComfortSchedule(
                 sensor="piano_temp",
                 label="piano",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
             ),
             ComfortSchedule(
                 sensor="bedroom_temp",
                 label="bedroom",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
             ),
         ]
         adjusted, _, _ = apply_mrt_correction(
@@ -661,7 +693,7 @@ class TestRegulatingSweepOptions:
         return [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", preferred, preferred, min_t, max_t)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", preferred, preferred, min_t, max_t, min_t - 3.0, max_t + 3.0)),),
         )]
 
     @staticmethod
@@ -744,7 +776,7 @@ class TestModeHoldWindow:
         return [ComfortSchedule(
             sensor="bedroom_temp",
             label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 70.0, 68.0, 72.0)),),
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 70.0, 68.0, 72.0, 65.0, 75.0)),),
         )]
 
     def test_in_hold_window_wraps_midnight(self) -> None:
@@ -862,12 +894,12 @@ class TestTrajectoryWithSchedules:
             ComfortSchedule(
                 sensor="bedroom_temp",
                 label="bedroom",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 70.0, 68.0, 72.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 70.0, 68.0, 72.0, 65.0, 75.0)),),
             ),
             ComfortSchedule(
                 sensor="living_room_temp",
                 label="living_room",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 71.0, 69.0, 74.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 71.0, 69.0, 74.0, 66.0, 77.0)),),
             ),
         ]
         # Room temps below preferred -> heat mode for both splits
@@ -890,7 +922,7 @@ class TestTrajectoryWithSchedules:
             ComfortSchedule(
                 sensor="bedroom_temp",
                 label="bedroom",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 70.0, 68.0, 72.0)),),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 70.0, 68.0, 72.0, 65.0, 75.0)),),
             ),
         ]
         current_temps = {"bedroom_temp": 68.0}
@@ -1026,3 +1058,502 @@ class TestEffectorEligibility:
             for name, ed in s.effectors.items():
                 if EFFECTOR_MAP.get(name) and EFFECTOR_MAP[name].control_type == "binary":
                     assert ed.mode == "off"
+
+
+# ── Advisory sweep tests ─────────────────────────────────────────────────
+
+
+class TestAdvisorySweepOptions:
+    """Test _advisory_sweep_options() and advisory scenario generation."""
+
+    def _make_sim_params_with_advisory(self, device: str):
+        """Create SimParams with a window beta for the given device."""
+        from weatherstat.simulator import SimParams, TauModel, load_sim_params
+
+        base = load_sim_params()
+        augmented_taus = {}
+        for sensor, tau_model in base.taus.items():
+            augmented_taus[sensor] = TauModel(
+                tau_base=tau_model.tau_base,
+                environment_tau_betas={device: 0.02, **tau_model.environment_tau_betas},
+                environment_interaction_betas=tau_model.environment_interaction_betas,
+            )
+        return SimParams(
+            taus=augmented_taus,
+            gains=base.gains,
+            solar=base.solar,
+            sensors=base.sensors,
+            effectors=base.effectors,
+            solar_elevation_gains=base.solar_elevation_gains,
+            environment_solar_betas=base.environment_solar_betas,
+        )
+
+    def test_relevance_filter_skips_unknown_device(self) -> None:
+        """Device with no effects in thermal_params is not relevant."""
+        from weatherstat.simulator import load_sim_params
+
+        sp = load_sim_params()
+        assert not _advisory_has_effect("nonexistent_device", sp)
+
+    def test_relevance_filter_finds_tau_beta(self) -> None:
+        """Device with tau beta is relevant."""
+        sp = self._make_sim_params_with_advisory("test_window")
+        assert _advisory_has_effect("test_window", sp)
+
+    def test_active_device_gets_return_options(self) -> None:
+        """Non-default (active) device gets hold + return-at-various-steps."""
+        sp = self._make_sim_params_with_advisory("piano_window")
+        options = _advisory_sweep_options({"piano_window": True}, sp)
+        assert "piano_window" in options
+        opts = options["piano_window"]
+        # Should have hold + 4 return timings
+        assert len(opts) == 5
+        assert opts[0].action == "hold"
+        assert all(o.action == "close" for o in opts[1:])
+        # Return timings at 0, 12, 24, 36 steps
+        steps = [o.transition_step for o in opts[1:]]
+        assert steps == [0, 12, 24, 36]
+
+    def test_default_device_gets_proactive_options(self) -> None:
+        """Default (inactive) device gets hold + proactive activate-with-return."""
+        sp = self._make_sim_params_with_advisory("piano_window")
+        options = _advisory_sweep_options({"piano_window": False}, sp)
+        assert "piano_window" in options
+        opts = options["piano_window"]
+        # Should have hold + 3 proactive options (skip instant return)
+        assert len(opts) == 4
+        assert opts[0].action == "hold"
+        assert all(o.action == "open" for o in opts[1:])
+        # All activate at step 0, return at 12, 24, 36
+        assert all(o.transition_step == 0 for o in opts[1:])
+        returns = [o.return_step for o in opts[1:]]
+        assert returns == [12, 24, 36]
+
+    def test_irrelevant_device_omitted(self) -> None:
+        """Device with no effects in thermal_params is omitted from options."""
+        from weatherstat.simulator import load_sim_params
+
+        sp = load_sim_params()
+        options = _advisory_sweep_options({"fake_window": True}, sp)
+        assert "fake_window" not in options
+
+    def test_scenario_count_with_advisory(self) -> None:
+        """Advisory options multiply HVAC scenario count."""
+        schedules = make_schedules()
+        sp = self._make_sim_params_with_advisory("test_window")
+
+        base = generate_trajectory_scenarios(schedules, base_hour=12)
+        n_base = len(base)
+
+        advisory_opts = _advisory_sweep_options({"test_window": True}, sp)
+        with_adv = generate_trajectory_scenarios(
+            schedules, base_hour=12, advisory_options=advisory_opts,
+        )
+        n_adv_options = len(advisory_opts["test_window"])
+        assert len(with_adv) == n_base * n_adv_options
+
+    def test_advisory_scenarios_have_advisories(self) -> None:
+        """Generated scenarios with advisory options have advisory decisions."""
+        schedules = make_schedules()
+        sp = self._make_sim_params_with_advisory("test_window")
+        advisory_opts = _advisory_sweep_options({"test_window": True}, sp)
+
+        scenarios = generate_trajectory_scenarios(
+            schedules, base_hour=12, advisory_options=advisory_opts,
+        )
+        # Every scenario should have advisory decisions
+        for s in scenarios:
+            assert "test_window" in s.advisories
+            adv = s.advisories["test_window"]
+            assert adv.action in ("hold", "close")
+
+    def test_no_advisory_options_unchanged(self) -> None:
+        """Empty advisory options produces same scenarios as before."""
+        schedules = make_schedules()
+        base = generate_trajectory_scenarios(schedules, base_hour=12)
+        with_empty = generate_trajectory_scenarios(
+            schedules, base_hour=12, advisory_options={},
+        )
+        assert len(base) == len(with_empty)
+        # Scenarios should have no advisories
+        for s in with_empty:
+            assert not s.advisories
+
+
+class TestTwoStageAdvisorySweep:
+    """Test two-stage advisory sweep helpers and combinatorics."""
+
+    def test_advisory_combo_count(self) -> None:
+        opts = {
+            "a": [AdvisoryDecision("a", action="hold"), AdvisoryDecision("a", action="close", transition_step=0)],
+            "b": [AdvisoryDecision("b", action="hold"), AdvisoryDecision("b", action="close", transition_step=0)],
+        }
+        assert _advisory_combo_count(opts) == 4
+
+    def test_cross_with_advisory_full(self) -> None:
+        """Full product when under cap."""
+        hvac = [Scenario(effectors={}), Scenario(effectors={})]
+        opts = {
+            "w": [AdvisoryDecision("w", action="hold"), AdvisoryDecision("w", action="close", transition_step=12)],
+        }
+        result = _cross_with_advisory(hvac, opts, max_total=100)
+        assert len(result) == 4  # 2 HVAC × 2 advisory
+        for s in result:
+            assert "w" in s.advisories
+
+    def test_cross_with_advisory_coarsens(self) -> None:
+        """Coarsening reduces to hold + instant-return when over cap."""
+        hvac = [Scenario(effectors={})]
+        opts = {
+            "w": [
+                AdvisoryDecision("w", action="hold"),
+                AdvisoryDecision("w", action="close", transition_step=0),
+                AdvisoryDecision("w", action="close", transition_step=12),
+                AdvisoryDecision("w", action="close", transition_step=24),
+            ],
+        }
+        # Cap of 2 forces coarsening: hold + step-0 = 2 options, 1 HVAC × 2 = 2
+        result = _cross_with_advisory(hvac, opts, max_total=2)
+        assert len(result) == 2
+        actions = {s.advisories["w"].action for s in result}
+        assert "hold" in actions
+        steps = {s.advisories["w"].transition_step for s in result if s.advisories["w"].action == "close"}
+        assert steps == {0}  # only instant-return survived
+
+    def test_cross_falls_back_if_still_over_cap(self) -> None:
+        """Falls back to HVAC-only when even coarsened product exceeds cap."""
+        hvac = [Scenario(effectors={})]
+        opts = {
+            "a": [AdvisoryDecision("a", action="hold"), AdvisoryDecision("a", action="close", transition_step=0)],
+            "b": [AdvisoryDecision("b", action="hold"), AdvisoryDecision("b", action="close", transition_step=0)],
+        }
+        # 1 × 4 = 4, cap of 1 → coarsened 1 × 4 still over → fallback
+        result = _cross_with_advisory(hvac, opts, max_total=1)
+        assert len(result) == 1  # HVAC-only returned
+        assert not result[0].advisories
+
+    def test_two_stage_triggers_above_hard_cap(self) -> None:
+        """Verify two-stage triggers: many advisory devices × HVAC > hard cap."""
+        schedules = make_schedules()
+        hvac = generate_trajectory_scenarios(schedules, base_hour=12, advisory_options=None)
+        n_hvac = len(hvac)
+
+        # Simulate 5 devices × 5 options = 3125 combos
+        opts: dict[str, list[AdvisoryDecision]] = {}
+        for i in range(5):
+            name = f"device_{i}"
+            opts[name] = [AdvisoryDecision(name, action="hold")]
+            for step in [0, 12, 24, 36]:
+                opts[name].append(AdvisoryDecision(name, action="close", transition_step=step))
+
+        n_combos = _advisory_combo_count(opts)
+        assert n_combos == 3125
+        assert n_hvac * n_combos > _ADVISORY_HARD_CAP
+
+        # The old code would return HVAC-only (hold-all). The new _cross_with_advisory
+        # with a small max_total coarsens or falls back, but the two-stage logic in
+        # sweep_scenarios_physics handles this by reducing HVAC candidates first.
+        # Here we test that _cross_with_advisory with a reasonable budget works:
+        top_k = hvac[:20]
+        result = _cross_with_advisory(top_k, opts, max_total=100_000)
+        assert len(result) == 20 * 3125  # full product fits in 62.5K
+
+
+class TestClassifyAdvisoryScenario:
+    """Test classify_advisory_scenario()."""
+
+    def test_baseline_no_advisories(self) -> None:
+        s = Scenario(effectors={})
+        assert classify_advisory_scenario(s, {"win": True}) == "baseline"
+
+    def test_reasonable_returns_to_default(self) -> None:
+        s = Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="close", transition_step=12)},
+        )
+        assert classify_advisory_scenario(s, {"win": True}) == "reasonable"
+
+    def test_worst_case_holds_active(self) -> None:
+        s = Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="hold")},
+        )
+        assert classify_advisory_scenario(s, {"win": True}) == "worst_case"
+
+    def test_proactive_activates_default(self) -> None:
+        s = Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=12)},
+        )
+        assert classify_advisory_scenario(s, {"win": False}) == "proactive"
+
+    def test_hold_on_default_is_baseline(self) -> None:
+        """Holding a default-state device is baseline (no change)."""
+        s = Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="hold")},
+        )
+        assert classify_advisory_scenario(s, {"win": False}) == "baseline"
+
+    def test_mixed_active_and_proactive(self) -> None:
+        """Scenario with both return-to-default and proactive is mixed."""
+        s = Scenario(
+            effectors={},
+            advisories={
+                "win1": AdvisoryDecision("win1", action="close", transition_step=0),
+                "win2": AdvisoryDecision("win2", action="open", transition_step=0, return_step=12),
+            },
+        )
+        assert classify_advisory_scenario(s, {"win1": True, "win2": False}) == "mixed"
+
+
+class TestExtractPlanningLayers:
+    """Test extract_planning_layers()."""
+
+    def test_basic_layer_extraction(self) -> None:
+        """Finds best scenario per layer."""
+        environment_states = {"win": True}
+        scenarios = [
+            Scenario(effectors={}),  # 0: baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: worst_case
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),  # 2: reasonable
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=12)}),  # 3: reasonable
+        ]
+        costs = [5.0, 6.0, 3.0, 4.0]
+
+        result = extract_planning_layers(scenarios, costs, environment_states)
+        assert result["baseline_idx"] == 0
+        assert result["baseline_cost"] == 5.0
+        assert result["reasonable_idx"] == 2  # lowest cost reasonable
+        assert result["reasonable_cost"] == 3.0
+        assert result["worst_case_idx"] == 1
+        assert result["worst_case_cost"] == 6.0
+
+    def test_no_non_default_reasonable_falls_back(self) -> None:
+        """When no non-default devices, reasonable = baseline."""
+        scenarios = [
+            Scenario(effectors={}),  # baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # baseline (hold on default)
+        ]
+        costs = [5.0, 4.0]
+
+        result = extract_planning_layers(scenarios, costs, {"win": False})
+        # Both are baseline; second is lower cost
+        assert result["baseline_idx"] == 1
+        assert result["reasonable_idx"] == 1  # falls back to baseline
+
+    def test_proactive_scoring(self) -> None:
+        """Proactive advice shows cost delta vs baseline."""
+        environment_states = {"win": False}
+        scenarios = [
+            Scenario(effectors={}),  # 0: baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: also baseline
+            Scenario(
+                effectors={},
+                advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=12)},
+            ),  # 2: proactive
+            Scenario(
+                effectors={},
+                advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=24)},
+            ),  # 3: proactive (better)
+        ]
+        costs = [5.0, 4.5, 3.5, 3.0]
+
+        result = extract_planning_layers(scenarios, costs, environment_states)
+        assert result["baseline_idx"] == 1  # 4.5 < 5.0
+        assert "win" in result["proactive"]
+        assert result["proactive"]["win"]["idx"] == 3  # best proactive
+        assert result["proactive"]["win"]["cost_delta"] == 3.0 - 4.5  # vs baseline
+
+    def test_backup_breach_detection(self) -> None:
+        """Backup breaches are detected in worst-case scenario."""
+        environment_states = {"win": True}
+        schedules = [
+            ComfortSchedule(
+                sensor="room_temp",
+                label="room",
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort("room", 70, 72, 68, 74, 65, 77)),),
+            ),
+        ]
+        scenarios = [
+            Scenario(effectors={}),  # 0: baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: worst_case
+        ]
+        costs = [5.0, 6.0]
+        # Worst-case predictions breach backup_lo (65)
+        predictions = [
+            {"room_temp_t+72": 66.0},  # baseline: fine
+            {"room_temp_t+72": 63.0},  # worst_case: below backup 65
+        ]
+
+        result = extract_planning_layers(
+            scenarios, costs, environment_states,
+            predictions_per_scenario=predictions,
+            schedules=schedules,
+            base_hour=12,
+        )
+        assert len(result["backup_breaches"]) > 0
+        assert "63.0" in result["backup_breaches"][0]
+        assert "65" in result["backup_breaches"][0]
+
+    def test_enriched_advisories_in_result(self) -> None:
+        """Result includes actual AdvisoryDecision objects for reasonable and proactive layers."""
+        environment_states = {"win_a": True, "win_b": False}
+        scenarios = [
+            Scenario(effectors={}),  # 0: baseline
+            Scenario(effectors={}, advisories={
+                "win_a": AdvisoryDecision("win_a", action="close", transition_step=0),
+            }),  # 1: reasonable
+            Scenario(effectors={}, advisories={
+                "win_a": AdvisoryDecision("win_a", action="hold"),
+            }),  # 2: worst_case
+            Scenario(effectors={}, advisories={
+                "win_b": AdvisoryDecision("win_b", action="open", transition_step=0, return_step=12),
+            }),  # 3: proactive
+        ]
+        costs = [5.0, 3.0, 6.0, 4.0]
+
+        result = extract_planning_layers(scenarios, costs, environment_states)
+
+        # Reasonable advisories
+        assert "reasonable_advisories" in result
+        assert "win_a" in result["reasonable_advisories"]
+        adv = result["reasonable_advisories"]["win_a"]
+        assert adv.action == "close"
+        assert adv.transition_step == 0
+
+        # Proactive advisories
+        assert "proactive_advisories" in result
+        assert "win_b" in result["proactive_advisories"]
+        padv = result["proactive_advisories"]["win_b"]
+        assert padv.action == "open"
+        assert padv.return_step == 12
+
+
+class TestWriteCommandJsonAdvisory:
+    """Test advisory layer data in command JSON output."""
+
+    def _make_decision(self) -> ControlDecision:
+        """Create a minimal ControlDecision for testing."""
+        return ControlDecision(
+            timestamp="2026-04-08T12:00:00+00:00",
+            effectors=(EffectorDecision("thermostat_upstairs", mode="off"),),
+            command_targets={},
+            total_cost=5.0,
+            comfort_cost=4.0,
+            energy_cost=1.0,
+        )
+
+    def test_no_advisory_layers(self, tmp_path: object) -> None:
+        """No advisory fields when advisory_layers is None."""
+        import json as _json
+        from unittest.mock import patch
+
+        decision = self._make_decision()
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            path = write_command_json(decision, advisory_layers=None)
+        data = _json.loads(path.read_text())
+        assert "advisoryRecommendations" not in data
+        assert "advisoryWarnings" not in data
+        assert "proactiveAdvice" not in data
+
+    def test_reasonable_recommendations(self, tmp_path: object) -> None:
+        """Advisory recommendations from reasonable layer appear in JSON."""
+        import json as _json
+        from unittest.mock import patch
+
+        decision = self._make_decision()
+        layers = {
+            "reasonable_advisories": {
+                "piano_window": AdvisoryDecision("piano_window", action="close", transition_step=12),
+            },
+            "reasonable_cost": 3.0,
+            "baseline_cost": 5.0,
+            "backup_breaches": [],
+            "proactive": {},
+            "proactive_advisories": {},
+        }
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            path = write_command_json(decision, advisory_layers=layers)
+        data = _json.loads(path.read_text())
+        assert "advisoryRecommendations" in data
+        recs = data["advisoryRecommendations"]
+        assert len(recs) == 1
+        assert recs[0]["device"] == "piano_window"
+        assert recs[0]["action"] == "close"
+        assert recs[0]["inMinutes"] == 60  # 12 steps × 5 min
+        assert recs[0]["layer"] == "reasonable"
+        assert recs[0]["costDelta"] == -2.0  # 3.0 - 5.0
+
+    def test_backup_breach_warnings(self, tmp_path: object) -> None:
+        """Backup breach warnings appear in JSON."""
+        import json as _json
+        from unittest.mock import patch
+
+        decision = self._make_decision()
+        layers = {
+            "reasonable_advisories": {},
+            "backup_breaches": [
+                "room_temp projected 63.0 at 6h, below backup minimum 65",
+            ],
+            "proactive": {},
+            "proactive_advisories": {},
+        }
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            path = write_command_json(decision, advisory_layers=layers)
+        data = _json.loads(path.read_text())
+        assert "advisoryWarnings" in data
+        assert len(data["advisoryWarnings"]) == 1
+        assert "63.0" in data["advisoryWarnings"][0]["message"]
+        assert data["advisoryWarnings"][0]["layer"] == "worst_case"
+
+    def test_proactive_advice(self, tmp_path: object) -> None:
+        """Proactive advice with duration appears in JSON."""
+        import json as _json
+        from unittest.mock import patch
+
+        decision = self._make_decision()
+        layers = {
+            "reasonable_advisories": {},
+            "backup_breaches": [],
+            "proactive": {
+                "living_room_window": {"idx": 2, "cost_delta": -0.31},
+            },
+            "proactive_advisories": {
+                "living_room_window": AdvisoryDecision(
+                    "living_room_window", action="open", transition_step=0, return_step=24,
+                ),
+            },
+        }
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            path = write_command_json(decision, advisory_layers=layers)
+        data = _json.loads(path.read_text())
+        assert "proactiveAdvice" in data
+        advice = data["proactiveAdvice"]
+        assert len(advice) == 1
+        assert advice[0]["device"] == "living_room_window"
+        assert advice[0]["action"] == "open"
+        assert advice[0]["durationMinutes"] == 120  # (24 - 0) × 5
+        assert advice[0]["costDelta"] == -0.31
+        assert advice[0]["layer"] == "proactive"
+
+    def test_hold_only_advisories_excluded(self, tmp_path: object) -> None:
+        """Hold-only reasonable advisories don't produce recommendations."""
+        import json as _json
+        from unittest.mock import patch
+
+        decision = self._make_decision()
+        layers = {
+            "reasonable_advisories": {
+                "win": AdvisoryDecision("win", action="hold"),
+            },
+            "reasonable_cost": 5.0,
+            "baseline_cost": 5.0,
+            "backup_breaches": [],
+            "proactive": {},
+            "proactive_advisories": {},
+        }
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            path = write_command_json(decision, advisory_layers=layers)
+        data = _json.loads(path.read_text())
+        assert "advisoryRecommendations" not in data

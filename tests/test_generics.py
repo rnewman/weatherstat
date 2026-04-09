@@ -9,7 +9,11 @@ Verifies that the unified effector model handles:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import patch
+
+if TYPE_CHECKING:
+    from weatherstat.yaml_config import WeatherstatConfig
 
 import pytest
 
@@ -261,7 +265,7 @@ class TestSimulatorDependencyGating:
             current_temps=temps,
             outdoor_temp=outdoor,
             forecast_temps=[outdoor] * 12,
-            window_states={},
+            environment_states={},
             hour_of_day=hour,
             solar_fractions=[0.0] * 12,
             solar_elevations=[0.0] * 72,
@@ -410,7 +414,7 @@ class TestConfigDriven:
 class TestTemperatureUnits:
     """Verify unit conversion helpers produce correct results."""
 
-    def _make_config(self, unit: str) -> "WeatherstatConfig":
+    def _make_config(self, unit: str) -> WeatherstatConfig:
         from weatherstat.yaml_config import LocationConfig, WeatherstatConfig
 
         loc = LocationConfig(latitude=0, longitude=0, elevation=0, timezone="UTC", unit=unit)
@@ -422,7 +426,7 @@ class TestTemperatureUnits:
             state_sensors={},
             power_sensors={},
             health_checks=[],
-            windows={},
+            environment={},
             weather_entity="weather.test",
             constraints=[],
             notification_target="notify.test",

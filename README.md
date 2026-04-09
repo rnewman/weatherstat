@@ -84,16 +84,16 @@ Enumerate thousands of possible HVAC actions. For a trajectory effector like a t
 
 ### 3. Simulate each plan
 
-For every candidate, forward-simulate all sensor temperatures for the next 6 hours using the physics model. This uses the fitted parameters (τ, gains, lags, solar profiles), the weather forecast for outdoor temperature, and the current window states. The simulator runs in batch: numpy broadcasts across all scenarios simultaneously, so evaluating 7,000+ plans takes about 30 milliseconds.
+For every candidate, forward-simulate all sensor temperatures for the next 6 hours using the physics model. This uses the fitted parameters (τ, gains, lags, solar profiles), the weather forecast for outdoor temperature, and the current environment states. The simulator runs in batch: numpy broadcasts across all scenarios simultaneously. HVAC-only scenarios use a scalar-tau fast path (~30ms for 7,000+ plans); advisory sweeps with per-step tau dynamics are slower.
 
 ### 4. Score against comfort and energy
 
-Each simulation produces predicted temperatures at 1, 2, 4, 6, and 12 hours for every sensor. These are scored against comfort schedules — what temperature do you want in each room at each time of day?
+Each simulation produces predicted temperatures at 1, 2, 4, and 6 hours for every sensor. These are scored against comfort schedules — what temperature do you want in each room at each time of day?
 
 The scoring model has three layers:
 - **Dead band:** Zero cost within your preferred range. `preferred` can be a single temperature (point target) or a range like `[70, 73]` — anywhere inside the range is equally good, eliminating wasteful hunting.
 - **Comfort band:** Quadratic penalty for deviation outside the preferred range but within `min`/`max`, with asymmetric weights (you might care more about being too cold than too warm).
-- **Hard rails:** Steep additional penalty (10×) for exceeding minimum/maximum bounds.
+- **Hard rails:** Steep additional penalty (configurable, default 3×) for exceeding minimum/maximum bounds.
 
 Plus an energy cost term for each active effector. The total score is comfort cost + energy cost.
 
@@ -119,7 +119,7 @@ Effectors differ in their response characteristics, not in fundamental kind:
 
 ### Dependencies
 
-Some effectors only produce useful output when their dependencies are active. A duct fan blowing air over a hydronic coil is useless unless the thermostat is calling for heat AND the boiler is actually firing — cold air circulation doesn't help. The `depends_on` field declares these physical dependencies (AND gate: all dependencies must be active). The scenario generator prunes impossible combinations, and the simulator gates dependent effector activity by dependency state.
+Some effectors only produce useful output when their dependencies are active. A duct fan blowing air over a hydronic coil is useless unless heat is flowing through the coils — cold air circulation doesn't help. The `depends_on` field declares the parent effector (e.g., a blower depends on its thermostat); the thermostat's `state_device` references a state sensor (e.g., the boiler's heating mode) that gates whether heat is actually being delivered. The scenario generator prunes impossible combinations, and the simulator gates dependent effector activity by dependency state.
 
 ### Comfort schedules and profiles
 
@@ -139,13 +139,13 @@ Comfort constraints define what "comfortable" means for each sensor, varying by 
 
 **MRT correction** adjusts comfort targets based on outdoor temperature. When it's cold outside, walls and windows radiate less infrared toward you — you need a warmer air temperature to feel the same comfort. The system automatically raises targets in cold weather and lowers them in warm weather, with per-sensor weights (a room with large exterior-facing windows gets more correction than an interior room).
 
-### Window effects and opportunities
+### Environment factors and advisories
 
-Open windows dramatically change a room's thermal behavior. The system handles this at two levels:
+Environment factors — windows, doors, shades, vents, space heaters — are observable things that affect the physics of the house but aren't system-controlled. They're all configured in a single `environment:` section with a common schema: entity ID, column name, kind, default state, and the HA state string that signals non-default. The system handles them at two levels:
 
-**In the physics model:** Sysid learns per-window cooling rate coefficients. An open window reduces the effective τ — the room loses heat faster. Cross-breeze interactions (two windows open simultaneously) have their own learned coefficients. The simulator uses the current window state in every prediction.
+**In the physics model:** Sysid learns per-entry thermal coupling coefficients. An open window reduces the effective τ — the room loses heat faster. Cross-breeze interactions (two windows open simultaneously) have their own learned coefficients. A lowered shade reduces solar gain. The simulator uses the current environment state in every prediction.
 
-**In the advisory system:** After choosing the best electronic HVAC plan, the system evaluates whether toggling each window would improve comfort and/or save energy. If opening a window would let you turn off the mini-split and still stay comfortable, that's an energy-saving opportunity. Persistent notifications track these opportunities across control cycles, with cooldown periods to prevent nagging.
+**In the advisory system:** Environment entries marked `advisory: true` are swept alongside HVAC scenarios. The system explores thousands of combinations — hold current state, close in 1 hour, open for 2 hours — and extracts three planning layers: a *reasonable* plan (user cooperates at the optimal time), a *worst-case* plan (user does nothing), and *proactive* suggestions ("open the living room window for 2 hours"). Entries without `advisory: true` still affect physics (tau, solar) but are not explored in the sweep. When many advisory devices are active simultaneously, a two-stage sweep prevents combinatorial explosion: first rank HVAC plans cheaply, then explore advisory options on the top candidates. Persistent notifications track opportunities across control cycles, with cooldown periods to prevent nagging.
 
 ### Safety rails
 
@@ -186,14 +186,14 @@ Home Assistant  ←──── REST API ────→  Collector (Python, 5-m
        │
        ├── Comfort schedules + energy costs
        ├── Scenario sweep (5,000-15,000 plans)
-       ├── Window opportunities (advisory)
+       ├── Advisory recommendations (environment)
        ├── Safety checks (health)
        └── Decision log (outcomes)
 ```
 
 The system communicates with Home Assistant via REST API for both reading state (collector) and executing commands (executor). Data flows through SQLite (collector → sysid) and JSON files (controller → executor).
 
-Everything is driven by a single YAML config file that declares what sensors, effectors, windows, and comfort constraints exist. Adding a new device is a config edit — the collector picks it up automatically, sysid fits its parameters when re-run, and the control loop incorporates it into the sweep.
+Everything is driven by a single YAML config file that declares what sensors, effectors, environment factors, and comfort constraints exist. Adding a new device is a config edit — the collector picks it up automatically, sysid fits its parameters when re-run, and the control loop incorporates it into the sweep.
 
 ## What it doesn't do
 

@@ -60,7 +60,7 @@ comfort *ARGS:
 debug *ARGS:
     uv run python ./scripts/debug_state.py {{ARGS}}
 
-# Replay a window opportunity evaluation (args: <timestamp> <window_name>)
+# Replay an environment opportunity evaluation (args: <timestamp> <env_name>)
 replay *ARGS:
     uv run python ./scripts/replay_opportunity.py {{ARGS}}
 

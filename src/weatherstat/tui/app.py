@@ -19,6 +19,7 @@ from weatherstat.config import CONTROL_INTERVAL, SYSID_INTERVAL
 from weatherstat.tui.widgets import (
     AccuracyPanel,
     EffectorPanel,
+    EnvironmentPanel,
     ForecastPanel,
     HealthPanel,
     HistoryPanel,
@@ -27,7 +28,6 @@ from weatherstat.tui.widgets import (
     PredictionPanel,
     StatusHeader,
     TemperaturePanel,
-    WindowPanel,
 )
 
 # Intervals
@@ -111,7 +111,7 @@ class WeatherstatApp(App):
                 with Horizontal(id="status-grid"):
                     with Vertical(id="left-col"):
                         yield TemperaturePanel()
-                        yield WindowPanel()
+                        yield EnvironmentPanel()
                         yield ForecastPanel()
                     with Vertical(id="right-col"):
                         yield EffectorPanel()
@@ -316,7 +316,12 @@ class WeatherstatApp(App):
             try:
                 data = json.loads(ADVISORY_STATE_FILE.read_text())
                 active = data.get("active", {})
-                self.query_one(OpportunityPanel).set_data(list(active.values()))
+                self.query_one(OpportunityPanel).set_data(
+                    opportunities=list(active.values()),
+                    recommendations=data.get("recommendations"),
+                    warnings=data.get("warnings"),
+                    proactive=data.get("proactive"),
+                )
             except Exception as e:
                 self._log(f"[config] [red]Failed to load opportunities: {e}[/]")
 
@@ -424,7 +429,7 @@ class WeatherstatApp(App):
             for s in schedules:
                 c = s.comfort_at(now_hour)
                 if c is not None:
-                    comfort[s.label] = (c.min_temp, c.preferred_lo, c.preferred_hi, c.max_temp)
+                    comfort[s.label] = (c.acceptable_lo, c.preferred_lo, c.preferred_hi, c.acceptable_hi)
 
             self.query_one(TemperaturePanel).set_data(
                 temps, comfort, SENSOR_LABELS,
@@ -432,13 +437,14 @@ class WeatherstatApp(App):
             )
             self.query_one(EffectorPanel).set_current_temps(temps)
 
-            # Window states
-            windows: dict[str, bool] = {}
-            for col_name, display_name in cfg.window_display_map.items():
-                val = values.get(col_name)
+            # Environment factor states
+            env_entries: list[tuple[str, str, bool]] = []
+            for env_cfg in cfg.environment.values():
+                val = values.get(env_cfg.column)
                 if val is not None:
-                    windows[display_name] = val in ("True", "true", "1", "1.0")
-            self.query_one(WindowPanel).set_data(windows)
+                    is_active = val in ("True", "true", "1", "1.0")
+                    env_entries.append((env_cfg.label, env_cfg.kind, is_active))
+            self.query_one(EnvironmentPanel).set_data(env_entries)
 
             # Forecast
             forecasts: dict[str, float] = {}

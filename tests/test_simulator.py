@@ -15,7 +15,8 @@ from weatherstat.simulator import (
     predict,
     simulate_sensor,
 )
-from weatherstat.types import EffectorDecision, Scenario
+from weatherstat.simulator import _build_environment_timelines as build_advisory_timelines
+from weatherstat.types import AdvisoryDecision, EffectorDecision, Scenario
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -61,7 +62,7 @@ def _make_state(
         current_temps=temps or _CURRENT_TEMPS,
         outdoor_temp=outdoor,
         forecast_temps=[outdoor] * 12,
-        window_states={},
+        environment_states={},
         hour_of_day=hour,
         solar_fractions=[0.0] * 12,
         solar_elevations=[0.0] * 72,
@@ -83,9 +84,9 @@ def test_synthetic_params_well_formed(sim_params: SimParams) -> None:
 def test_tau_values_reasonable(sim_params: SimParams) -> None:
     for sensor, tau_model in sim_params.taus.items():
         assert tau_model.tau_base > 0, f"{sensor} tau_base must be positive"
-        # Window betas should be non-negative (physical constraint)
-        for win, beta in tau_model.window_betas.items():
-            assert beta >= 0, f"{sensor} window {win} beta must be >= 0"
+        # Advisory tau betas should be non-negative (physical constraint)
+        for dev, beta in tau_model.environment_tau_betas.items():
+            assert beta >= 0, f"{sensor} advisory {dev} beta must be >= 0"
 
 
 # ── Integration tests (require live thermal_params.json) ─────────────
@@ -142,7 +143,7 @@ def test_empty_forecast_uses_constant_outdoor(sim_params: SimParams) -> None:
         current_temps=state_with_forecast.current_temps,
         outdoor_temp=outdoor,
         forecast_temps=[],  # empty forecast
-        window_states={},
+        environment_states={},
         hour_of_day=14.5,
         solar_fractions=[0.0] * 12,
         solar_elevations=[0.0] * 72,
@@ -229,7 +230,7 @@ def test_passive_cooling_toward_outdoor() -> None:
 
 def test_ventilated_cools_faster() -> None:
     """Open windows (lower effective tau) should cool faster."""
-    tau_model = TauModel(tau_base=40.0, window_betas={"test_window": 0.04})
+    tau_model = TauModel(tau_base=40.0, environment_tau_betas={"test_window": 0.04})
     kwargs = dict(
         sensor="test", current_temp=70.0, outdoor_temp=42.0,
         forecast_temps=[42.0] * 12,
@@ -496,7 +497,7 @@ def test_elevation_solar_warms_during_day(sim_params: SimParams) -> None:
         current_temps=state_day.current_temps,
         outdoor_temp=state_day.outdoor_temp,
         forecast_temps=state_day.forecast_temps,
-        window_states=state_day.window_states,
+        environment_states=state_day.environment_states,
         hour_of_day=12.0,
         solar_fractions=[1.0] * 13,  # sunny
         solar_elevations=sin_elevations_day,
@@ -505,7 +506,7 @@ def test_elevation_solar_warms_during_day(sim_params: SimParams) -> None:
         current_temps=state_day.current_temps,
         outdoor_temp=state_day.outdoor_temp,
         forecast_temps=state_day.forecast_temps,
-        window_states=state_day.window_states,
+        environment_states=state_day.environment_states,
         hour_of_day=0.0,
         solar_fractions=[0.0] * 13,
         solar_elevations=sin_elevations_night,
@@ -520,3 +521,218 @@ def test_elevation_solar_warms_during_day(sim_params: SimParams) -> None:
             assert preds_d[0, i] > preds_n[0, i], (
                 f"Piano should be warmer during day: day={preds_d[0, i]:.1f} night={preds_n[0, i]:.1f}"
             )
+
+
+# ── Advisory timeline tests ──────────────────────────────────────────────
+
+
+class TestBuildAdvisoryTimelines:
+    """Tests for _build_environment_timelines()."""
+
+    def test_empty_advisories_returns_empty(self) -> None:
+        """No advisory decisions → empty dict."""
+        scenarios = [Scenario(effectors={}), Scenario(effectors={})]
+        result = build_advisory_timelines(scenarios, {"win": True}, n_future=73)
+        assert result == {}
+
+    def test_hold_keeps_current_state(self) -> None:
+        """Hold decision keeps device at current state for all steps."""
+        scenarios = [Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="hold")},
+        )]
+        result = build_advisory_timelines(scenarios, {"win": True}, n_future=10)
+        assert "win" in result
+        # Current state is True → 1.0 everywhere
+        np.testing.assert_array_equal(result["win"][0], 1.0)
+
+    def test_close_transitions_at_step(self) -> None:
+        """Close decision transitions from 1.0 to 0.0 at transition_step."""
+        scenarios = [Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="close", transition_step=5)},
+        )]
+        tl = build_advisory_timelines(scenarios, {"win": True}, n_future=10)
+        arr = tl["win"][0]
+        # History (18 steps) + first 5 future steps = 1.0
+        assert all(arr[i] == 1.0 for i in range(18 + 5))
+        # From step 5 onward = 0.0
+        assert all(arr[i] == 0.0 for i in range(18 + 5, 18 + 10))
+
+    def test_open_transitions_at_step(self) -> None:
+        """Open decision transitions from 0.0 to 1.0 at transition_step."""
+        scenarios = [Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="open", transition_step=3)},
+        )]
+        tl = build_advisory_timelines(scenarios, {"win": False}, n_future=10)
+        arr = tl["win"][0]
+        # History + first 3 future steps = 0.0
+        assert all(arr[i] == 0.0 for i in range(18 + 3))
+        # From step 3 onward = 1.0
+        assert all(arr[i] == 1.0 for i in range(18 + 3, 18 + 10))
+
+    def test_multiple_scenarios_independent(self) -> None:
+        """Each scenario gets its own timeline row."""
+        scenarios = [
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),
+        ]
+        tl = build_advisory_timelines(scenarios, {"win": True}, n_future=10)
+        arr = tl["win"]
+        assert arr.shape == (2, 18 + 10)
+        # Scenario 0: hold at open (1.0 everywhere)
+        np.testing.assert_array_equal(arr[0], 1.0)
+        # Scenario 1: close at step 0 (history=1.0, future=0.0)
+        assert all(arr[1, i] == 1.0 for i in range(18))
+        assert all(arr[1, i] == 0.0 for i in range(18, 28))
+
+    def test_return_step_reverts_to_original(self) -> None:
+        """return_step causes device to revert to original state."""
+        scenarios = [Scenario(
+            effectors={},
+            advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=5)},
+        )]
+        tl = build_advisory_timelines(scenarios, {"win": False}, n_future=10)
+        arr = tl["win"][0]
+        # History: 0.0 (closed)
+        assert all(arr[i] == 0.0 for i in range(18))
+        # Steps 0-4: 1.0 (open)
+        assert all(arr[i] == 1.0 for i in range(18, 18 + 5))
+        # Steps 5+: 0.0 (reverted to original closed state)
+        assert all(arr[i] == 0.0 for i in range(18 + 5, 18 + 10))
+
+    def test_unknown_device_defaults_to_inactive(self) -> None:
+        """Device not in environment_states defaults to 0.0."""
+        scenarios = [Scenario(
+            effectors={},
+            advisories={"heater": AdvisoryDecision("heater", action="turn_on", transition_step=2)},
+        )]
+        tl = build_advisory_timelines(scenarios, {}, n_future=10)
+        arr = tl["heater"][0]
+        # Default is 0.0, turns on at step 2
+        assert all(arr[i] == 0.0 for i in range(18 + 2))
+        assert all(arr[i] == 1.0 for i in range(18 + 2, 18 + 10))
+
+
+# ── Advisory effects in predict() ────────────────────────────────────────
+
+
+class TestAdvisoryPredict:
+    """Tests for advisory effects in the vectorized predict() path."""
+
+    def test_advisory_close_changes_trajectory(self, sim_params: SimParams) -> None:
+        """Advisory close at step 12 produces different predictions than hold.
+
+        With an open window (lower tau → faster cooling toward outdoor),
+        closing it mid-horizon should produce warmer predictions at later
+        horizons compared to holding it open.
+        """
+        # Inject window betas so opening/closing has an effect
+        augmented_taus: dict[str, TauModel] = {}
+        for sensor, tau_model in sim_params.taus.items():
+            augmented_taus[sensor] = TauModel(
+                tau_base=tau_model.tau_base,
+                environment_tau_betas={"test_window": 0.03, **tau_model.environment_tau_betas},
+                environment_interaction_betas=tau_model.environment_interaction_betas,
+            )
+        augmented = SimParams(
+            taus=augmented_taus,
+            gains=sim_params.gains,
+            solar=sim_params.solar,
+            sensors=sim_params.sensors,
+            effectors=sim_params.effectors,
+            solar_elevation_gains=sim_params.solar_elevation_gains,
+            environment_solar_betas=sim_params.environment_solar_betas,
+        )
+
+        state = HouseState(
+            current_temps=_CURRENT_TEMPS,
+            outdoor_temp=42.0,
+            forecast_temps=[42.0] * 12,
+            environment_states={"test_window": True},  # currently open
+            hour_of_day=2.0,
+            solar_fractions=[0.0] * 12,
+            solar_elevations=[0.0] * 72,
+        )
+
+        hold_open = Scenario(
+            effectors={},
+            advisories={"test_window": AdvisoryDecision("test_window", action="hold")},
+        )
+        close_at_12 = Scenario(
+            effectors={},
+            advisories={"test_window": AdvisoryDecision("test_window", action="close", transition_step=12)},
+        )
+
+        targets, preds = predict(state, [hold_open, close_at_12], augmented, [12, 48, 72])
+
+        # At step 12 (1 hour): closing just happened, predictions should be very similar
+        # At step 48 (4 hours) and 72 (6 hours): closed window retains heat → warmer
+        for j, name in enumerate(targets):
+            if "t+72" in name:
+                assert preds[1, j] > preds[0, j], (
+                    f"{name}: closing window should produce warmer 6h prediction "
+                    f"(hold={preds[0, j]:.2f} close={preds[1, j]:.2f})"
+                )
+
+    def test_no_advisory_fast_path_unchanged(self, sim_params: SimParams) -> None:
+        """Scenarios without advisories produce identical results to pre-advisory code.
+
+        This verifies the fast path: when no scenario has advisories, the
+        code uses scalar tau (no per-step matrix overhead).
+        """
+        state = _make_state(hour=2.0)
+        scenarios = [_all_off(), _both_on()]
+        targets, preds = predict(state, scenarios, sim_params, [12, 24, 48, 72])
+
+        # Run again — deterministic, should be identical
+        _, preds2 = predict(state, scenarios, sim_params, [12, 24, 48, 72])
+        np.testing.assert_array_equal(preds, preds2)
+
+        # All-off should cool, both-on should warm
+        for j, name in enumerate(targets):
+            if "upstairs" in name and "t+72" in name:
+                assert preds[1, j] > preds[0, j]
+
+    def test_advisory_solar_modulation(self, sim_params: SimParams) -> None:
+        """Advisory solar betas modulate solar forcing per-scenario.
+
+        A device with negative solar beta (like blinds closing reduces solar)
+        should produce cooler daytime predictions when active.
+        """
+        # Augment sim_params with advisory solar betas for piano_temp
+        augmented = SimParams(
+            taus=sim_params.taus,
+            gains=sim_params.gains,
+            solar=sim_params.solar,
+            sensors=sim_params.sensors,
+            effectors=sim_params.effectors,
+            solar_elevation_gains=sim_params.solar_elevation_gains,
+            environment_solar_betas={"blinds": {"piano_temp": -0.5}},
+        )
+
+        state = HouseState(
+            current_temps=_CURRENT_TEMPS,
+            outdoor_temp=60.0,
+            forecast_temps=[60.0] * 12,
+            environment_states={"blinds": False},
+            hour_of_day=12.0,
+            solar_fractions=[1.0] * 12,
+            solar_elevations=[0.7] * 72,
+        )
+
+        no_blinds = Scenario(effectors={})  # no advisories → blinds stay off
+        close_blinds = Scenario(
+            effectors={},
+            advisories={"blinds": AdvisoryDecision("blinds", action="turn_on", transition_step=0)},
+        )
+
+        targets, preds = predict(state, [no_blinds, close_blinds], augmented, [72])
+        piano_idx = next(j for j, t in enumerate(targets) if "piano_temp_t+72" in t)
+
+        # Blinds active with beta=-0.5 → solar reduced by 50% → cooler
+        assert preds[0, piano_idx] > preds[1, piano_idx], (
+            f"Active blinds should reduce solar warming: "
+            f"no_blinds={preds[0, piano_idx]:.2f} blinds={preds[1, piano_idx]:.2f}"
+        )

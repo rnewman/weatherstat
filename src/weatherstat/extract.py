@@ -27,7 +27,7 @@ CLIMATE_ENTITIES: dict[str, str] = _CFG.climate_entities
 FAN_ENTITIES: dict[str, str] = _CFG.fan_entities
 SENSOR_ENTITIES: dict[str, str] = _CFG.sensor_entities
 WEATHER_ENTITY = _CFG.weather_entity
-WINDOW_SENSORS = _CFG.window_sensors
+ENVIRONMENT_SENSORS = _CFG.environment_sensors
 
 ALL_HISTORY_ENTITIES: list[str] = _CFG.all_history_entities
 
@@ -304,7 +304,7 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
     df = _load_from_readings(conn)
     conn.close()
 
-    for col in _CFG.window_bool_columns:
+    for col in _CFG.environment_bool_columns:
         if col in df.columns:
             # Use nullable boolean to preserve NaN (sensor didn't exist yet)
             # so downstream code can distinguish "closed" from "unknown".
@@ -373,8 +373,8 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
     attr_ids = list(CLIMATE_ENTITIES.values()) + list(FAN_ENTITIES.values()) + [WEATHER_ENTITY]
     attr_history = fetch_history_with_attributes(attr_ids, start, end)
 
-    # Fetch window sensors
-    window_history = fetch_history(WINDOW_SENSORS, start, end)
+    # Fetch environment sensors (windows, doors, shades, etc.)
+    env_history = fetch_history(ENVIRONMENT_SENSORS, start, end)
 
     # Build 5-minute time index
     time_index = pd.date_range(start=start, end=end, freq="5min", tz=UTC)
@@ -430,23 +430,18 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
             s = series[~series.index.duplicated(keep="last")]
             result[col] = s.reindex(time_index, method="ffill")
 
-    # Process window sensors → per-window columns + any_window_open
-    window_column_map = _CFG.window_column_map
-    window_cols_present: list[str] = []
-    for entity_id, col_name in window_column_map.items():
-        records = window_history.get(entity_id, [])
+    # Process environment sensors → per-entry columns
+    for _name, env_cfg in _CFG.environment.items():
+        entity_id = env_cfg.entity_id
+        col_name = env_cfg.column
+        active_state = env_cfg.active_state
+        records = env_history.get(entity_id, [])
         if records:
-            s = _history_to_series(records, value_fn=lambda s: s == "on")
+            s = _history_to_series(records, value_fn=lambda s, _as=active_state: s == _as)
             s = s[~s.index.duplicated(keep="last")]
             result[col_name] = s.reindex(time_index, method="ffill").astype(bool)
-            window_cols_present.append(col_name)
         else:
             result[col_name] = False
-
-    if window_cols_present:
-        result["any_window_open"] = result[window_cols_present].any(axis=1).astype(bool)
-    else:
-        result["any_window_open"] = False
 
     # Finalize
     result = result.reset_index()

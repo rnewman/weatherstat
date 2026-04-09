@@ -151,27 +151,81 @@ health:
       state: "Space Heating"
       for_minutes: 3
 
-# ── Windows ─────────────────────────────────────────────────────────────
-# Binary sensors for windows and doors. Sysid learns per-window thermal
-# coupling from data — you don't need to configure which rooms they affect.
+# ── Environment ─────────────────────────────────────────────────────────
+# Observable factors that affect physics (tau, solar, gain) but aren't
+# system-controlled: windows, doors, shades, vents, space heaters.
+# Sysid learns per-entry thermal coupling from data.
+#
+# column: EAV readings column name (1 = non-default/active, 0 = default)
+# kind: "window", "door", "shade", "vent", "heater" — drives display + action verbs
+# active_state: HA state string when device is in non-default state
+#   binary_sensor: "on" = open; cover: "closed" = shade lowered
+# advisory: true = included in advisory sweep (system recommends actions)
+#   false (default) = physics only (sysid + simulator use it, no advice given)
 
-windows:
+environment:
   basement:
     entity_id: binary_sensor.window_basement_intrusion
+    column: basement_open
+    kind: window
+    default_state: closed
+    active_state: "on"
+    advisory: true
   family_room:
     entity_id: binary_sensor.window_family_room_intrusion
+    column: family_room_open
+    kind: window
+    default_state: closed
+    active_state: "on"
   bedroom:
     entity_id: binary_sensor.window_bedroom_intrusion
+    column: bedroom_open
+    kind: window
+    default_state: closed
+    active_state: "on"
+    advisory: true
   office:
     entity_id: binary_sensor.window_office_window_door_is_open
+    column: office_open
+    kind: window
+    default_state: closed
+    active_state: "on"
+    advisory: true
   kitchen:
     entity_id: binary_sensor.kitchen_window_sensor_intrusion
+    column: kitchen_open
+    kind: window
+    default_state: closed
+    active_state: "on"
+    advisory: true
   piano:
     entity_id: binary_sensor.window_piano_is_open
+    column: piano_open
+    kind: window
+    default_state: closed
+    active_state: "on"
+    advisory: true
   bathroom:
     entity_id: binary_sensor.bathroom_high_window_open
+    column: bathroom_open
+    kind: window
+    default_state: closed
+    active_state: "on"
   living_room:
     entity_id: binary_sensor.living_room_window_is_open
+    column: living_room_open
+    kind: window
+    default_state: closed
+    active_state: "on"
+    advisory: true
+  # Example: cover entities (shades/blinds)
+  # moss_garden_shade:
+  #   entity_id: cover.moss_garden_shade
+  #   column: moss_garden_shade_active
+  #   kind: shade
+  #   default_state: open
+  #   active_state: "closed"          # HA "closed" = shade lowered (non-default)
+  #   advisory: true
 
 weather:
   entity_id: weather.forecast_home   # met.no or other HA weather integration
@@ -196,11 +250,13 @@ constraints:
       preferred_widen: 6   # ±3°F dead band — zero cost within, no wasted HVAC
       min_offset: -3
       max_offset: 2
-  window_open_offset: { min: -1, max: 1 }   # relax bounds when windows are open
   mrt_correction:          # compensate for cold/warm walls (mean radiant temp effect)
     alpha: 0.1             # °F comfort shift per °F outdoor deviation from reference
     reference_temp: 50     # outdoor temp (°F) where current targets feel right
     max_offset: 3.0        # cap correction magnitude (°F)
+  # Three-tier comfort bounds: preferred (dead band), acceptable (HVAC action), backup (defensive hedge).
+  # Old min/max format still works: min → acceptable_lo, max → acceptable_hi, backup = acceptable ± backup_margin.
+  # New format: acceptable: [lo, hi], backup: [lo, hi] (backup defaults to acceptable ± defaults.backup_margin).
   schedules:
     - sensor: thermostat_upstairs_temp
       # mrt_weight: 1.0   # per-sensor multiplier on MRT correction (default 1.0)
@@ -255,5 +311,6 @@ defaults:
   # max_1h_change: 5         # sanity check: max predicted 1h change
   # min_improvement: 1       # min cost improvement to justify turning on HVAC
   # cold_room_override: 1    # force heating when this far below comfort min
+  # backup_margin: 3         # backup bounds = acceptable ± this margin (default: 3°F / 1.7°C)
   # control_interval: 300    # seconds between control cycles (default: 300 = 5 min)
   # sysid_interval: 3600     # seconds between automatic sysid runs (default: 3600 = 1 hr, 0 = disabled)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from weatherstat.safety import (
@@ -120,7 +120,7 @@ class TestCheckDeviceHealth:
     @staticmethod
     def _heating_since(minutes_ago: float) -> str:
         """Return an ISO timestamp *minutes_ago* minutes in the past."""
-        return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+        return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
 
     def test_no_alert_when_healthy(self) -> None:
         """Connection OK, outlet healthy while heating long enough → no alert."""

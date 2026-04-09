@@ -122,8 +122,8 @@ def load_comfort_schedules(cfg) -> dict[str, list[dict]]:
             {
                 "start_hour": e.start_hour,
                 "end_hour": e.end_hour,
-                "min": e.min_temp,
-                "max": e.max_temp,
+                "min": e.acceptable_lo,
+                "max": e.acceptable_hi,
                 "preferred_lo": e.preferred_lo,
                 "preferred_hi": e.preferred_hi,
             }

@@ -57,7 +57,7 @@ just sysid --output custom_path.json  # custom output path
 ```
 
 **What it produces** (`~/.weatherstat/thermal_params.json`):
-- `TauModel` per sensor — `tau_base` (sealed envelope time constant) plus per-window `window_betas` (additional cooling rate when open) and cross-breeze `interaction_betas`
+- `TauModel` per sensor — `tau_base` (sealed envelope time constant) plus per-environment-entry `environment_tau_betas` (additional cooling/warming rate when active) and pairwise `environment_interaction_betas`
 - Effector × sensor gain matrix — heating rate (°F/hr) and delay (minutes) for each (device, sensor) pair
 - Solar elevation gains — per-sensor `β_solar` coefficient (°F/hr per unit sin(elevation)×fraction), automatically seasonal
 
@@ -156,7 +156,7 @@ just comfort -o report.png       # custom output path
 (capacity exceeded vs control opportunity), % too hot (same breakdown).
 
 **Historical comfort bands:** Uses logged comfort_bounds from the decision log,
-so bands reflect the actual comfort profile, MRT correction, and window
+so bands reflect the actual comfort profile, MRT correction, and environment
 adjustments active at each point in time (not just the current config).
 
 **Capacity analysis:** Violations are classified by whether the sensor's
@@ -214,7 +214,7 @@ All runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR
   decision_log.db              # control decision history + outcome tracking
   control_state.json           # last decision state (anti-cycling, mode hold times)
   executor_state.json          # executor override tracking
-  advisory_state.json          # per-window advisory cooldown timestamps
+  advisory_state.json          # per-environment-entry advisory cooldown timestamps
   comfort_*.png                # comfort dashboard output
 ```
 

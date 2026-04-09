@@ -41,6 +41,7 @@ from weatherstat.config import (
 )
 from weatherstat.extract import fetch_recent_history
 from weatherstat.types import (
+    AdvisoryDecision,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
@@ -134,8 +135,10 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
                     constraint.label,
                     e.preferred_lo,
                     e.preferred_hi,
-                    e.min_temp,
-                    e.max_temp,
+                    e.acceptable_lo,
+                    e.acceptable_hi,
+                    e.backup_lo,
+                    e.backup_hi,
                     e.cold_penalty,
                     e.hot_penalty,
                 ),
@@ -144,63 +147,6 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
         )
         schedules.append(ComfortSchedule(sensor=constraint.sensor, label=constraint.label, entries=schedule_entries))
     return schedules
-
-
-def adjust_schedules_for_windows(
-    schedules: list[ComfortSchedule],
-    window_states: dict[str, bool],
-    constraint_labels: set[str],
-    min_offset: float,
-    max_offset: float,
-) -> list[ComfortSchedule]:
-    """Widen comfort bounds for constrained sensors with open windows.
-
-    When a window is open, shift min_temp down and max_temp up for the
-    matching constraint (by naming convention: window "bedroom" affects
-    constraint label "bedroom"). This makes the optimizer less eager to
-    heat/cool a sensor with an open window nearby.
-
-    Args:
-        schedules: Comfort schedules for all constrained sensors.
-        window_states: window_name -> is_open for each window.
-        constraint_labels: Set of all constraint labels.
-        min_offset: Amount to add to min_temp (negative = lower).
-        max_offset: Amount to add to max_temp (positive = higher).
-
-    Returns:
-        New list of ComfortSchedule with adjusted bounds for affected sensors.
-    """
-    # Window name matches constraint label → that window affects that sensor
-    labels_with_open_windows: set[str] = {
-        wname for wname, is_open in window_states.items() if is_open and wname in constraint_labels
-    }
-
-    if not labels_with_open_windows:
-        return schedules
-
-    adjusted: list[ComfortSchedule] = []
-    for schedule in schedules:
-        if schedule.label not in labels_with_open_windows:
-            adjusted.append(schedule)
-            continue
-        new_entries = tuple(
-            ComfortScheduleEntry(
-                e.start_hour,
-                e.end_hour,
-                RoomComfort(
-                    e.comfort.label,
-                    e.comfort.preferred_lo,  # preferred unchanged — window doesn't change ideal
-                    e.comfort.preferred_hi,
-                    e.comfort.min_temp + min_offset,
-                    e.comfort.max_temp + max_offset,
-                    e.comfort.cold_penalty,
-                    e.comfort.hot_penalty,
-                ),
-            )
-            for e in schedule.entries
-        )
-        adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
-    return adjusted
 
 
 def fetch_active_comfort_profile() -> ComfortProfile | None:
@@ -257,8 +203,10 @@ def apply_comfort_profile(
                     e.comfort.label,
                     e.comfort.preferred_lo + profile.preferred_offset - hw,
                     e.comfort.preferred_hi + profile.preferred_offset + hw,
-                    e.comfort.min_temp + profile.min_offset,
-                    e.comfort.max_temp + profile.max_offset,
+                    e.comfort.acceptable_lo + profile.min_offset,
+                    e.comfort.acceptable_hi + profile.max_offset,
+                    e.comfort.backup_lo + profile.min_offset,
+                    e.comfort.backup_hi + profile.max_offset,
                     e.comfort.cold_penalty * ps,
                     e.comfort.hot_penalty * ps,
                 ),
@@ -346,8 +294,10 @@ def apply_mrt_correction(
                     e.comfort.label,
                     e.comfort.preferred_lo + sensor_offset,
                     e.comfort.preferred_hi + sensor_offset,
-                    e.comfort.min_temp + sensor_offset,
-                    e.comfort.max_temp + sensor_offset,
+                    e.comfort.acceptable_lo + sensor_offset,
+                    e.comfort.acceptable_hi + sensor_offset,
+                    e.comfort.backup_lo + sensor_offset,
+                    e.comfort.backup_hi + sensor_offset,
                     e.comfort.cold_penalty,
                     e.comfort.hot_penalty,
                 ),
@@ -371,7 +321,7 @@ def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
 
 # Hard rail multiplier: additional penalty for exceeding min/max bounds.
 # Applied on top of the continuous preferred-based cost.
-_HARD_RAIL_MULTIPLIER = 10.0
+_HARD_RAIL_MULTIPLIER = float(_CFG.hard_rail_multiplier) if _CFG.hard_rail_multiplier is not None else 3.0
 
 
 def compute_comfort_cost(
@@ -384,7 +334,7 @@ def compute_comfort_cost(
     Two-layer cost model:
     1. Continuous: quadratic penalty for any deviation from `preferred`,
        weighted asymmetrically by cold_penalty (below) and hot_penalty (above).
-    2. Hard rails: steep additional penalty (10×) for exceeding min/max bounds.
+    2. Acceptable rails: steep additional penalty (configurable, default 3×) outside acceptable bounds.
 
     This gives the optimizer a gradient everywhere — it always prefers
     temperatures closer to preferred, not just "anywhere in the band".
@@ -421,11 +371,11 @@ def compute_comfort_cost(
             elif pred_temp > comfort.preferred_hi:
                 cost += (pred_temp - comfort.preferred_hi) ** 2 * comfort.hot_penalty * weight
 
-            # Hard rails: steep additional penalty outside min/max
-            if pred_temp < comfort.min_temp:
-                cost += (comfort.min_temp - pred_temp) ** 2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
-            elif pred_temp > comfort.max_temp:
-                cost += (pred_temp - comfort.max_temp) ** 2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
+            # Acceptable rails: steep additional penalty outside acceptable bounds
+            if pred_temp < comfort.acceptable_lo:
+                cost += (comfort.acceptable_lo - pred_temp) ** 2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
+            elif pred_temp > comfort.acceptable_hi:
+                cost += (pred_temp - comfort.acceptable_hi) ** 2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
 
     return cost
 
@@ -463,11 +413,11 @@ def compute_comfort_cost_by_sensor(
             elif pred_temp > comfort.preferred_hi:
                 sensor_cost += (pred_temp - comfort.preferred_hi) ** 2 * comfort.hot_penalty * weight
 
-            if pred_temp < comfort.min_temp:
-                delta = comfort.min_temp - pred_temp
+            if pred_temp < comfort.acceptable_lo:
+                delta = comfort.acceptable_lo - pred_temp
                 sensor_cost += delta**2 * comfort.cold_penalty * _HARD_RAIL_MULTIPLIER * weight
-            elif pred_temp > comfort.max_temp:
-                delta = pred_temp - comfort.max_temp
+            elif pred_temp > comfort.acceptable_hi:
+                delta = pred_temp - comfort.acceptable_hi
                 sensor_cost += delta**2 * comfort.hot_penalty * _HARD_RAIL_MULTIPLIER * weight
         costs[schedule.label] = sensor_cost
     return costs
@@ -544,22 +494,22 @@ def _emergency_effector(
 
 
 def _comfort_max(sensor: str, schedules: list[ComfortSchedule], hour: int) -> float:
-    """Get the comfort max for a sensor at the given hour."""
+    """Get the acceptable upper bound for a sensor at the given hour."""
     for s in schedules:
         if s.sensor == sensor:
             c = s.comfort_at(hour)
             if c is not None:
-                return c.max_temp
+                return c.acceptable_hi
     return ABSOLUTE_MAX
 
 
 def _comfort_min(sensor: str, schedules: list[ComfortSchedule], hour: int) -> float:
-    """Get the comfort min for a sensor at the given hour."""
+    """Get the acceptable lower bound for a sensor at the given hour."""
     for s in schedules:
         if s.sensor == sensor:
             c = s.comfort_at(hour)
             if c is not None:
-                return c.min_temp
+                return c.acceptable_lo
     return ABSOLUTE_MIN
 
 
@@ -693,6 +643,183 @@ def _in_hold_window(hour: int, window: tuple[int, int]) -> bool:
     return hour >= start or hour < end
 
 
+# Advisory effector return timing grid (5-min steps).
+# Non-default devices: return to default at these steps.
+# Default devices: activate at step 0, return at these steps (proactive advice).
+ADVISORY_RETURN_STEPS = [0, 12, 24, 36]  # 0h, 1h, 2h, 3h
+
+# Combinatorics caps for advisory × HVAC product
+_ADVISORY_MAX_SCENARIOS = 50_000  # coarsen advisory grid above this
+_ADVISORY_HARD_CAP = 100_000  # two-stage sweep above this (was: hold-all)
+_TWO_STAGE_MIN_K = 10  # minimum HVAC candidates in two-stage advisory sweep
+
+
+def _advisory_combo_count(advisory_options: dict[str, list[AdvisoryDecision]]) -> int:
+    """Product of per-device option counts."""
+    n = 1
+    for opts in advisory_options.values():
+        n *= len(opts)
+    return n
+
+
+def _coarsen_advisory(
+    advisory_options: dict[str, list[AdvisoryDecision]],
+) -> dict[str, list[AdvisoryDecision]]:
+    """Reduce advisory options to [hold, 1 best action] per device.
+
+    For active (non-default) devices: keep hold + instant return-to-default.
+    For default devices: keep hold + shortest proactive option.
+    Always yields exactly 2 options per device → 2^n combos.
+    """
+    coarsened: dict[str, list[AdvisoryDecision]] = {}
+    for name, opts in advisory_options.items():
+        hold = [o for o in opts if o.action == "hold"]
+        # Instant return-to-default (close/turn_off at step 0, no return_step)
+        instant = [o for o in opts if o.action != "hold" and o.transition_step == 0 and o.return_step is None]
+        if instant:
+            coarsened[name] = hold + instant[:1]
+        else:
+            # Proactive options: pick the one with earliest return
+            proactive = sorted(
+                [o for o in opts if o.action != "hold"],
+                key=lambda o: (o.return_step or float("inf")),
+            )
+            coarsened[name] = hold + proactive[:1]
+        if not coarsened[name]:
+            coarsened[name] = [AdvisoryDecision(name, action="hold")]
+    return coarsened
+
+
+def _cross_with_advisory(
+    hvac_scenarios: list[Scenario],
+    advisory_options: dict[str, list[AdvisoryDecision]],
+    max_total: int,
+) -> list[Scenario]:
+    """Cross HVAC scenarios with advisory option product, coarsening if needed.
+
+    Returns HVAC-only scenarios unchanged if advisory product still exceeds max_total
+    even after coarsening.
+    """
+    from itertools import product
+
+    adv_names = sorted(advisory_options.keys())
+    adv_option_lists = [advisory_options[n] for n in adv_names]
+    n_combos = _advisory_combo_count(advisory_options)
+    total = len(hvac_scenarios) * n_combos
+
+    if total > max_total:
+        coarsened = _coarsen_advisory(advisory_options)
+        adv_names = sorted(coarsened.keys())
+        adv_option_lists = [coarsened[n] for n in adv_names]
+        n_combos = _advisory_combo_count(coarsened)
+        total = len(hvac_scenarios) * n_combos
+        if total > max_total:
+            print(f"  [advisory] Coarsened to {total} scenarios, still exceeds cap {max_total}, holding all")
+            return hvac_scenarios
+        print(f"  [advisory] Coarsened advisory grid: {total} total scenarios")
+
+    scenarios: list[Scenario] = []
+    for hvac in hvac_scenarios:
+        for adv_combo in product(*adv_option_lists):
+            advisories = {ad.name: ad for ad in adv_combo}
+            scenarios.append(Scenario(effectors=hvac.effectors, advisories=advisories))
+    return scenarios
+
+
+def _advisory_has_effect(
+    device: str,
+    sim_params: object,
+) -> bool:
+    """Check if an advisory device has any surviving effects in thermal_params.
+
+    An advisory device is relevant for the sweep if sysid found significant
+    tau, gain, or solar effects for at least one constrained sensor.
+    """
+    from weatherstat.simulator import SimParams
+
+    if not isinstance(sim_params, SimParams):
+        return False
+
+    # Check tau betas
+    for tau_model in sim_params.taus.values():
+        if device in tau_model.environment_tau_betas:
+            return True
+        for pair_key in tau_model.environment_interaction_betas:
+            if device in pair_key.split("+"):
+                return True
+
+    # Check gains (advisory device as effector)
+    for (eff_name, _sensor), (_gain, _lag) in sim_params.gains.items():
+        if eff_name == device:
+            return True
+
+    # Check environment solar betas
+    return device in sim_params.environment_solar_betas
+
+
+def _advisory_sweep_options(
+    environment_states: dict[str, bool],
+    sim_params: object,
+    sweep_devices: set[str] | None = None,
+) -> dict[str, list[AdvisoryDecision]]:
+    """Generate sweep options for advisory effectors.
+
+    For each advisory device with relevant effects in thermal_params:
+    - Non-default (active): hold + return to default at various timings
+    - Default (inactive): hold + proactive activate-with-return options
+
+    Devices without significant effects are omitted (held at current state).
+
+    Args:
+        environment_states: device_name -> is_active (True = non-default).
+        sim_params: SimParams with thermal model (used for relevance filter).
+        sweep_devices: If provided, only build options for these devices.
+            Other devices in environment_states still affect physics (tau) but
+            are not explored in the sweep.
+
+    Returns:
+        device_name -> list of AdvisoryDecision options for the sweep.
+    """
+    options: dict[str, list[AdvisoryDecision]] = {}
+
+    for device, is_active in environment_states.items():
+        if sweep_devices is not None and device not in sweep_devices:
+            continue
+        if not _advisory_has_effect(device, sim_params):
+            continue
+
+        device_options: list[AdvisoryDecision] = [
+            AdvisoryDecision(device, action="hold"),
+        ]
+
+        # Derive action verbs from environment config
+        env_cfg = _CFG.environment.get(device)
+        if env_cfg is not None:
+            close_action = env_cfg.close_action
+            open_action = env_cfg.open_action
+        else:
+            # Fallback for tests without config
+            close_action = "close" if "window" in device or "door" in device else "turn_off"
+            open_action = "open" if "window" in device or "door" in device else "turn_on"
+
+        if is_active:
+            # Non-default: return to default at various timings
+            for step in ADVISORY_RETURN_STEPS:
+                device_options.append(
+                    AdvisoryDecision(device, action=close_action, transition_step=step)
+                )
+        else:
+            # Default: proactive activate-with-return options
+            for step in ADVISORY_RETURN_STEPS[1:]:  # skip step 0 (instant open+close is meaningless)
+                device_options.append(
+                    AdvisoryDecision(device, action=open_action, transition_step=0, return_step=step)
+                )
+
+        options[device] = device_options
+
+    return options
+
+
 def generate_trajectory_scenarios(
     schedules: list[ComfortSchedule] | None = None,
     base_hour: int = 12,
@@ -700,6 +827,7 @@ def generate_trajectory_scenarios(
     current_temps: dict[str, float] | None = None,
     ineligible_effectors: set[str] | None = None,
     gains: dict[tuple[str, str], tuple[float, float]] | None = None,
+    advisory_options: dict[str, list[AdvisoryDecision]] | None = None,
 ) -> list[Scenario]:
     """Generate trajectory scenarios for physics sweep.
 
@@ -707,6 +835,10 @@ def generate_trajectory_scenarios(
     Fast effectors (binary) use constant modes.
     Regulating effectors use comfort-derived target grid (off + preferred).
     Dependent effectors (e.g., blowers) only active when parent is active.
+
+    advisory_options: optional dict of device_name -> list of AdvisoryDecision.
+    When provided, each HVAC scenario is crossed with advisory combos.
+    Combinatorics management: coarsen grid if >50K total, hold all if >100K.
     """
     from itertools import product
 
@@ -768,7 +900,8 @@ def generate_trajectory_scenarios(
     # Dependent effectors: constrained by parent state
     dependent_effectors = [e for e in EFFECTORS if e.depends_on]
 
-    scenarios: list[Scenario] = []
+    # Build HVAC-only scenarios first
+    hvac_scenarios: list[Scenario] = []
     for combo in product(*independent_options):
         base_decisions = {ed.name: ed for ed in combo}
 
@@ -791,11 +924,197 @@ def generate_trajectory_scenarios(
                 effectors = dict(base_decisions)
                 for dep_ed in dep_combo:
                     effectors[dep_ed.name] = dep_ed
-                scenarios.append(Scenario(effectors))
+                hvac_scenarios.append(Scenario(effectors))
         else:
-            scenarios.append(Scenario(dict(base_decisions)))
+            hvac_scenarios.append(Scenario(dict(base_decisions)))
 
-    return scenarios
+    # Cross HVAC scenarios with advisory combos
+    if not advisory_options:
+        return hvac_scenarios
+
+    return _cross_with_advisory(hvac_scenarios, advisory_options, _ADVISORY_HARD_CAP)
+
+
+# ── Advisory planning layers ──────────────────────────────────────────────
+
+
+def classify_advisory_scenario(
+    scenario: Scenario,
+    environment_states: dict[str, bool],
+) -> str:
+    """Classify a scenario's advisory layer.
+
+    Returns one of:
+      "baseline"   - no advisory decisions at all
+      "reasonable" - non-default (active) advisories return to default within horizon
+      "worst_case" - non-default (active) advisories held at current state
+      "proactive"  - default (inactive) advisories activated (with or without return)
+      "mixed"      - combination of reasonable/worst-case/proactive
+    """
+    if not scenario.advisories:
+        return "baseline"
+
+    has_return_to_default = False  # non-default device returning to default
+    has_hold_nondefault = False  # non-default device held at current
+    has_proactive = False  # default device activated
+
+    for device, adv in scenario.advisories.items():
+        is_active = environment_states.get(device, False)
+
+        if is_active:
+            # Non-default device
+            if adv.action == "hold":
+                has_hold_nondefault = True
+            else:
+                has_return_to_default = True
+        else:
+            # Default device
+            if adv.action != "hold":
+                has_proactive = True
+
+    categories = sum([has_return_to_default, has_hold_nondefault, has_proactive])
+    if categories > 1:
+        return "mixed"
+    if has_return_to_default:
+        return "reasonable"
+    if has_hold_nondefault:
+        return "worst_case"
+    if has_proactive:
+        return "proactive"
+    return "baseline"  # all hold on default-state devices
+
+
+def _check_backup_breaches(
+    predictions: dict[str, float],
+    schedules: list[ComfortSchedule],
+    base_hour: int,
+) -> list[str]:
+    """Check if any sensor predictions breach backup bounds.
+
+    Returns list of "label (Xtemp < Ybackup)" strings for breached sensors.
+    """
+    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
+    breaches: list[str] = []
+
+    for schedule in schedules:
+        for h in CONTROL_HORIZONS:
+            hours_ahead = horizon_hours.get(h, h // 12)
+            future_hour = (base_hour + hours_ahead) % 24
+            comfort = schedule.comfort_at(future_hour)
+            if comfort is None:
+                continue
+            pred = predictions.get(f"{schedule.sensor}_t+{h}")
+            if pred is None:
+                continue
+            if pred < comfort.backup_lo:
+                breaches.append(
+                    f"{schedule.label} projected {pred:.1f}{UNIT_SYMBOL} at "
+                    f"{HORIZON_LABELS.get(h, f't+{h}')}, below backup {comfort.backup_lo:.0f}{UNIT_SYMBOL}"
+                )
+            elif pred > comfort.backup_hi:
+                breaches.append(
+                    f"{schedule.label} projected {pred:.1f}{UNIT_SYMBOL} at "
+                    f"{HORIZON_LABELS.get(h, f't+{h}')}, above backup {comfort.backup_hi:.0f}{UNIT_SYMBOL}"
+                )
+
+    return breaches
+
+
+def extract_planning_layers(
+    scenarios: list[Scenario],
+    costs: list[float],
+    environment_states: dict[str, bool],
+    predictions_per_scenario: list[dict[str, float]] | None = None,
+    schedules: list[ComfortSchedule] | None = None,
+    base_hour: int = 12,
+) -> dict:
+    """Extract three planning layers from sweep results.
+
+    Classifies each scenario by its advisory layer and finds the best
+    (lowest-cost) scenario per layer.
+
+    Args:
+        scenarios: All sweep scenarios (HVAC × advisory combos).
+        costs: Total cost per scenario (comfort + energy).
+        environment_states: device_name -> is_active (True = non-default).
+        predictions_per_scenario: Optional per-scenario predictions for backup breach check.
+        schedules: Comfort schedules (for backup breach check).
+        base_hour: Current hour of day.
+
+    Returns dict with:
+        reasonable_idx: int | None - best scenario where non-default advisories return to default
+        reasonable_cost: float
+        worst_case_idx: int | None - best scenario where non-default advisories are held
+        worst_case_cost: float
+        backup_breaches: list[str] - sensor+horizon breach descriptions for worst-case
+        proactive: dict[str, dict] - device -> {"idx": int, "cost_delta": float}
+            Cost delta is vs the best baseline (no-advisory) scenario.
+        baseline_idx: int | None - best HVAC-only scenario
+        baseline_cost: float
+    """
+    best: dict[str, tuple[int, float]] = {}  # layer -> (best_idx, best_cost)
+
+    for i, (scenario, cost) in enumerate(zip(scenarios, costs, strict=True)):
+        layer = classify_advisory_scenario(scenario, environment_states)
+        prev = best.get(layer)
+        if prev is None or cost < prev[1]:
+            best[layer] = (i, cost)
+
+    baseline_idx, baseline_cost = best.get("baseline", (None, float("inf")))
+    reasonable_idx, reasonable_cost = best.get("reasonable", (None, float("inf")))
+    worst_idx, worst_cost = best.get("worst_case", (None, float("inf")))
+
+    # If no non-default advisories, reasonable = baseline
+    if reasonable_idx is None:
+        reasonable_idx = baseline_idx
+        reasonable_cost = baseline_cost
+
+    # Check backup breaches for worst-case scenario
+    backup_breaches: list[str] = []
+    if worst_idx is not None and predictions_per_scenario and schedules:
+        backup_breaches = _check_backup_breaches(
+            predictions_per_scenario[worst_idx], schedules, base_hour,
+        )
+
+    # Proactive scoring: per-device cost delta vs baseline
+    proactive: dict[str, dict] = {}
+    if baseline_idx is not None:
+        for i, (scenario, cost) in enumerate(zip(scenarios, costs, strict=True)):
+            layer = classify_advisory_scenario(scenario, environment_states)
+            if layer != "proactive":
+                continue
+            # Identify which device this proactive scenario activates
+            for device, adv in scenario.advisories.items():
+                if not environment_states.get(device, False) and adv.action != "hold":
+                    prev = proactive.get(device)
+                    cost_delta = cost - baseline_cost
+                    if prev is None or cost_delta < prev["cost_delta"]:
+                        proactive[device] = {"idx": i, "cost_delta": cost_delta}
+
+    # Include advisory decisions from key scenarios for caller output
+    reasonable_advisories: dict[str, AdvisoryDecision] = {}
+    if reasonable_idx is not None:
+        reasonable_advisories = dict(scenarios[reasonable_idx].advisories)
+
+    proactive_advisories: dict[str, AdvisoryDecision] = {}
+    for device, info in proactive.items():
+        p_idx = info["idx"]
+        adv = scenarios[p_idx].advisories.get(device)
+        if adv is not None:
+            proactive_advisories[device] = adv
+
+    return {
+        "reasonable_idx": reasonable_idx,
+        "reasonable_cost": reasonable_cost,
+        "reasonable_advisories": reasonable_advisories,
+        "worst_case_idx": worst_idx,
+        "worst_case_cost": worst_cost,
+        "backup_breaches": backup_breaches,
+        "proactive": proactive,
+        "proactive_advisories": proactive_advisories,
+        "baseline_idx": baseline_idx,
+        "baseline_cost": baseline_cost,
+    }
 
 
 # ── Physics-based sweep ──────────────────────────────────────────────────
@@ -805,7 +1124,7 @@ def sweep_scenarios_physics(
     current_temps: dict[str, float],
     outdoor_temp: float,
     forecast_temps: list[float],
-    window_states: dict[str, bool],
+    environment_states: dict[str, bool],
     sim_params: object,
     hour_of_day: float,
     recent_history: dict[str, list[float]],
@@ -816,7 +1135,7 @@ def sweep_scenarios_physics(
     *,
     solar_fractions: list[float],
     solar_elevations: list[float],
-) -> tuple[ControlDecision, Scenario, dict[str, str]]:
+) -> tuple[ControlDecision, Scenario, dict[str, str], dict | None]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
     Trajectory effectors are evaluated over a delay x duration grid.
@@ -824,8 +1143,14 @@ def sweep_scenarios_physics(
     Binary effectors sweep supported modes.
     Ineligible effectors are fixed to off.
 
-    Returns (decision, winning_scenario, blocked_dict) where blocked_dict
-    maps effector name to reason for any physically blocked effectors.
+    environment_states maps advisory effector names to their current active state.
+    The sweep generates advisory options for devices with learned effects in
+    thermal_params and crosses them with HVAC scenarios. Planning layers
+    select the reasonable plan (cooperative assumption) for HVAC action.
+
+    Returns (decision, winning_scenario, blocked_dict, advisory_layers) where
+    blocked_dict maps effector name to reason for blocked effectors, and
+    advisory_layers is the extract_planning_layers result (None if no advisories).
     """
     from weatherstat.simulator import HouseState, SimParams, predict
 
@@ -833,19 +1158,31 @@ def sweep_scenarios_physics(
 
     emergency = _emergency_effector(sim_params.gains, _CFG.constraints)
     _ineligible = ineligible_effectors or set()
-    scenarios = generate_trajectory_scenarios(
+
+    # Generate advisory sweep options (may be empty if no relevant effects in thermal_params)
+    advisory_options = _advisory_sweep_options(
+        environment_states, sim_params, sweep_devices=set(_CFG.advisory_environment),
+    ) if environment_states else {}
+    if advisory_options:
+        n_adv = sum(len(v) for v in advisory_options.values())
+        print(f"  [advisory] {len(advisory_options)} device(s), {n_adv} total options")
+
+    # Always generate HVAC-only scenarios first
+    hvac_scenarios = generate_trajectory_scenarios(
         schedules,
         base_hour,
         prev_state,
         current_temps,
         _ineligible,
         gains=sim_params.gains,
+        advisory_options=None,
     )
-    pre_count = len(scenarios)
+
+    # ── Physical constraints: block trajectory effectors at/above comfort max ──
+    pre_count = len(hvac_scenarios)
     blocked_reasons: list[str] = []
     blocked_dict: dict[str, str] = {}  # effector_name -> reason (returned to caller)
 
-    # ── Physical constraints: block trajectory effectors at/above comfort max ──
     blocked_effectors: set[str] = set()
     for eff in EFFECTORS:
         if eff.control_type != "trajectory" or not eff.temp_col:
@@ -861,9 +1198,9 @@ def sweep_scenarios_physics(
             blocked_reasons.append(f"{eff.name} {reason}")
 
     if blocked_effectors:
-        scenarios = [
+        hvac_scenarios = [
             s
-            for s in scenarios
+            for s in hvac_scenarios
             if all(s.effectors[name].mode == "off" for name in blocked_effectors if name in s.effectors)
         ]
 
@@ -874,47 +1211,139 @@ def sweep_scenarios_physics(
 
     if blocked_reasons:
         print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
-        print(f"  Reduced scenarios: {pre_count} → {len(scenarios)}")
+        print(f"  Reduced scenarios: {pre_count} → {len(hvac_scenarios)}")
 
     def _is_all_off(s: Scenario) -> bool:
         return all(ed.mode == "off" for ed in s.effectors.values())
 
-    # ── Batch simulate all scenarios ──
     sweep_state = HouseState(
         current_temps=current_temps,
         outdoor_temp=outdoor_temp,
         forecast_temps=forecast_temps,
-        window_states=window_states,
+        environment_states=environment_states,
         hour_of_day=hour_of_day,
         recent_history=recent_history,
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
     )
-    target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-    target_idx = {t: j for j, t in enumerate(target_names)}
 
-    # ── Score each scenario ──
-    best_idx = -1
-    best_cost = float("inf")
-    off_idx = -1
-    off_cost = float("inf")
+    def _score_all(
+        scens: list[Scenario], pred: np.ndarray, tnames: list[str]
+    ) -> tuple[list[float], list[dict[str, float]], int, float, int, float]:
+        """Score scenarios. Returns (costs, predictions, best_idx, best_cost, off_idx, off_cost)."""
+        tidx = {t: j for j, t in enumerate(tnames)}
+        costs: list[float] = []
+        preds: list[dict[str, float]] = []
+        b_idx, b_cost = -1, float("inf")
+        o_idx, o_cost = -1, float("inf")
+        for i, sc in enumerate(scens):
+            p = {t: float(pred[i, j]) for t, j in tidx.items()}
+            c = compute_comfort_cost(p, schedules, base_hour) + compute_energy_cost(sc, current_temps)
+            costs.append(c)
+            preds.append(p)
+            if _is_all_off(sc):
+                o_idx, o_cost = i, c
+            if c < b_cost:
+                b_cost, b_idx = c, i
+        return costs, preds, b_idx, b_cost, o_idx, o_cost
 
-    for i, scenario in enumerate(scenarios):
-        predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
-        comfort = compute_comfort_cost(predictions, schedules, base_hour)
-        energy = compute_energy_cost(scenario, current_temps)
-        total = comfort + energy
+    # ── Determine sweep strategy ──
+    n_adv_combos = _advisory_combo_count(advisory_options) if advisory_options else 0
+    n_hvac = len(hvac_scenarios)
+    needs_two_stage = advisory_options and n_hvac * n_adv_combos > _ADVISORY_HARD_CAP
 
-        if _is_all_off(scenario):
-            off_idx = i
-            off_cost = total
+    if needs_two_stage:
+        # ── Two-stage advisory sweep ──
+        # Stage 1: score HVAC-only scenarios (scalar tau fast path, cheap)
+        print(
+            f"  [advisory] Two-stage sweep: {n_hvac} HVAC × {n_adv_combos} advisory"
+            f" = {n_hvac * n_adv_combos:,} (cap: {_ADVISORY_HARD_CAP:,})"
+        )
 
-        if total < best_cost:
-            best_cost = total
-            best_idx = i
+        s1_names, s1_pred = predict(sweep_state, hvac_scenarios, sim_params, CONTROL_HORIZONS)
+        s1_costs, _, _, _, _, _ = _score_all(hvac_scenarios, s1_pred, s1_names)
+
+        # Select top-K HVAC plans (auto-sized to fit advisory product within cap)
+        effective_options = advisory_options
+        K = max(_TWO_STAGE_MIN_K, _ADVISORY_MAX_SCENARIOS // n_adv_combos)
+        if K < _TWO_STAGE_MIN_K:
+            # Full options won't fit even with MIN_K; coarsen advisory
+            effective_options = _coarsen_advisory(advisory_options)
+            n_adv_coarsened = _advisory_combo_count(effective_options)
+            K = max(_TWO_STAGE_MIN_K, _ADVISORY_MAX_SCENARIOS // n_adv_coarsened)
+
+        K = min(K, n_hvac)
+        ranked = sorted(range(n_hvac), key=lambda i: s1_costs[i])
+
+        # Always include all-off scenario for baseline (planning layers need it)
+        off_idx_s1 = next((i for i in range(n_hvac) if _is_all_off(hvac_scenarios[i])), None)
+        top_indices = set(ranked[:K])
+        if off_idx_s1 is not None:
+            top_indices.add(off_idx_s1)
+
+        top_k_hvac = [hvac_scenarios[i] for i in sorted(top_indices)]
+        print(f"  [advisory] Stage 1: {n_hvac} HVAC scored, top {len(top_k_hvac)} selected")
+
+        # Stage 2: cross top-K with advisory product
+        scenarios = _cross_with_advisory(top_k_hvac, effective_options, _ADVISORY_MAX_SCENARIOS)
+        print(f"  [advisory] Stage 2: {len(scenarios):,} combined scenarios")
+
+        target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
+        all_costs, all_predictions, best_idx, best_cost, off_idx, off_cost = _score_all(
+            scenarios, pred_matrix, target_names
+        )
+    else:
+        # ── Single-stage (existing path) ──
+        if advisory_options:
+            scenarios = _cross_with_advisory(hvac_scenarios, advisory_options, _ADVISORY_HARD_CAP)
+        else:
+            scenarios = hvac_scenarios
+
+        target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
+        all_costs, all_predictions, best_idx, best_cost, off_idx, off_cost = _score_all(
+            scenarios, pred_matrix, target_names
+        )
 
     if best_idx < 0:
         raise RuntimeError("No HVAC scenarios evaluated")
+
+    target_idx = {t: j for j, t in enumerate(target_names)}
+
+    # ── Advisory planning layers ──
+    advisory_layers: dict | None = None
+    if advisory_options and any(s.advisories for s in scenarios):
+        advisory_layers = extract_planning_layers(
+            scenarios, all_costs, environment_states,
+            predictions_per_scenario=all_predictions,
+            schedules=schedules,
+            base_hour=base_hour,
+        )
+        # Two-stage has no bare HVAC scenarios → no "baseline" layer.
+        # Use worst-case (hold all non-default) as baseline reference.
+        if advisory_layers.get("baseline_cost", float("inf")) == float("inf"):
+            wc_cost = advisory_layers.get("worst_case_cost", float("inf"))
+            if wc_cost < float("inf"):
+                advisory_layers["baseline_cost"] = wc_cost
+                advisory_layers["baseline_idx"] = advisory_layers.get("worst_case_idx")
+        # Use reasonable plan for HVAC selection (cooperative assumption)
+        reasonable_idx = advisory_layers.get("reasonable_idx")
+        if reasonable_idx is not None:
+            best_idx = reasonable_idx
+            best_cost = all_costs[reasonable_idx]
+            print(f"  [advisory] Using reasonable plan (scenario {reasonable_idx})")
+
+        # Worst-case backup breach override
+        if advisory_layers.get("backup_breaches"):
+            wc_idx = advisory_layers.get("worst_case_idx")
+            if wc_idx is not None:
+                wc_scenario = scenarios[wc_idx]
+                # If worst-case HVAC action is more aggressive, override
+                wc_has_heating = any(ed.mode != "off" for ed in wc_scenario.effectors.values())
+                best_has_heating = any(ed.mode != "off" for ed in scenarios[best_idx].effectors.values())
+                if wc_has_heating and not best_has_heating:
+                    print(f"  [advisory] Backup breach override: {advisory_layers['backup_breaches'][0]}")
+                    best_idx = wc_idx
+                    best_cost = all_costs[wc_idx]
 
     # Minimum improvement safeguard
     if off_idx >= 0 and best_idx != off_idx:
@@ -935,11 +1364,11 @@ def sweep_scenarios_physics(
             comfort = schedule.comfort_at(base_hour)
             if comfort is None:
                 continue
-            if temp < comfort.min_temp - COLD_ROOM_OVERRIDE:
+            if temp < comfort.acceptable_lo - COLD_ROOM_OVERRIDE:
                 eff_name = emergency.get(schedule.sensor)
                 if eff_name:
                     cold_effectors.add(eff_name)
-                    cold_info.append(f"{schedule.label} ({temp:.1f}{UNIT_SYMBOL} < {comfort.min_temp:.0f}{UNIT_SYMBOL})")
+                    cold_info.append(f"{schedule.label} ({temp:.1f}{UNIT_SYMBOL} < {comfort.acceptable_lo:.0f}{UNIT_SYMBOL})")
 
         # Remove blocked or ineligible effectors from cold override set
         cold_effectors -= blocked_effectors
@@ -1024,7 +1453,7 @@ def sweep_scenarios_physics(
         predictions=sensor_preds,
         trajectory_info=trajectory_info,
     )
-    return decision, scenario, blocked_dict
+    return decision, scenario, blocked_dict, advisory_layers
 
 
 # ── State persistence ─────────────────────────────────────────────────────
@@ -1180,11 +1609,14 @@ def write_command_json(
     decision: ControlDecision,
     opportunities: list | None = None,
     ineligible_effectors: set[str] | None = None,
+    advisory_layers: dict | None = None,
 ) -> Path:
     """Write executor-compatible command JSON.
 
     Uses camelCase keys matching the TS Prediction interface.
     For ineligible effectors, omits their commands (no-op for executor).
+    Advisory layer data (recommendations, warnings, proactive advice)
+    is included for informational purposes — the executor ignores these fields.
     """
     _ineligible = ineligible_effectors or set()
     command: dict[str, object] = {
@@ -1205,17 +1637,62 @@ def write_command_json(
             elif purpose == "mode":
                 command[camel_key] = ed.mode
 
-    # Active window opportunities (informational)
+    # Active environment opportunities (informational)
     if opportunities:
         command["opportunities"] = [
             {
-                "window": o.window,
+                "entry": o.entry,
                 "action": o.action,
                 "benefit": o.total_benefit,
                 "message": o.message,
             }
             for o in opportunities
         ]
+
+    # Advisory layer data (informational — executor ignores these)
+    if advisory_layers:
+        r_advisories = advisory_layers.get("reasonable_advisories", {})
+        active_recs = {d: a for d, a in r_advisories.items() if a.action != "hold"}
+        if active_recs:
+            command["advisoryRecommendations"] = [
+                {
+                    "device": dev,
+                    "action": adv.action,
+                    "inMinutes": adv.transition_step * 5,
+                    "costDelta": round(
+                        advisory_layers.get("reasonable_cost", 0) - advisory_layers.get("baseline_cost", 0), 4,
+                    ),
+                    "layer": "reasonable",
+                }
+                for dev, adv in sorted(active_recs.items())
+            ]
+
+        breaches = advisory_layers.get("backup_breaches", [])
+        if breaches:
+            command["advisoryWarnings"] = [
+                {"message": breach, "layer": "worst_case"}
+                for breach in breaches
+            ]
+
+        proactive_info = advisory_layers.get("proactive", {})
+        proactive_advs = advisory_layers.get("proactive_advisories", {})
+        if proactive_info:
+            proactive_list: list[dict[str, object]] = []
+            for dev, info in sorted(proactive_info.items()):
+                adv = proactive_advs.get(dev)
+                if adv is not None:
+                    dur_mins = (adv.return_step - adv.transition_step) * 5 if adv.return_step else None
+                    entry: dict[str, object] = {
+                        "device": dev,
+                        "action": adv.action,
+                        "costDelta": round(info["cost_delta"], 4),
+                        "layer": "proactive",
+                    }
+                    if dur_mins is not None:
+                        entry["durationMinutes"] = dur_mins
+                    proactive_list.append(entry)
+            if proactive_list:
+                command["proactiveAdvice"] = proactive_list
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -1288,14 +1765,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             print(f"  {label:<14} {eff_temp:.1f}{UNIT_SYMBOL} (setpoint: {eff_target}{UNIT_SYMBOL})")
     if out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp)):
         print(f"  Outdoor:     {float(out_temp):.1f}{UNIT_SYMBOL} (sensor)")
-    window_cols = _CFG.window_display_map
-    open_windows = [wlabel for col, wlabel in window_cols.items() if bool(latest.get(col, False))]
-    if open_windows:
-        from weatherstat.yaml_config import window_display
-        labels = [f"{label} {kind}" for label, kind in (window_display(w) for w in open_windows)]
-        print(f"  Windows:     {', '.join(labels)} open")
+    open_env = [(name, cfg) for name, cfg in _CFG.environment.items() if bool(latest.get(cfg.column, False))]
+    if open_env:
+        labels = [f"{cfg.label} {cfg.kind}" for _, cfg in open_env]
+        print(f"  Environment: {', '.join(labels)} open/active")
     else:
-        print("  Windows:     all closed")
+        print("  Environment: all at default")
     # Show other prediction sensors (not trajectory effectors)
     other_sensors = [s for s in PREDICTION_SENSORS if s not in traj_sensors]
     lw = max((len(SENSOR_LABELS.get(s, s)) for s in other_sensors), default=14) + 2
@@ -1395,19 +1870,18 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     if abs(mrt_offset) >= 0.05:
         _solar_note = f", solar sin⁺={_mrt_solar_elev:.2f}×{_mrt_solar_frac:.0%}" if _mrt_solar_elev > 0 else ""
         print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} base (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL}{_solar_note})")
-    window_states_dict = {name: bool(latest.get(f"window_{name}_open", False)) for name in _CFG.windows}
+    # Build environment states from all configured environment entries.
+    # ALL entries feed the simulator for correct tau; only advisory entries enter the sweep.
+    environment_states: dict[str, bool] = {
+        name: bool(latest.get(env_cfg.column, False)) for name, env_cfg in _CFG.environment.items()
+    }
+    advisory_sweep_devices: set[str] = set(_CFG.advisory_environment)
     constraint_labels = {c.label for c in _CFG.constraints}
-    schedules = adjust_schedules_for_windows(
-        schedules,
-        window_states_dict,
-        constraint_labels,
-        *_CFG.window_open_offset,
-    )
-    labels_with_open = {wn for wn, ws in window_states_dict.items() if ws and wn in constraint_labels}
-    if labels_with_open:
-        from weatherstat.yaml_config import window_display
-        open_labels = [f"{label} {kind}" for label, kind in (window_display(w) for w in sorted(labels_with_open))]
-        print(f"  Comfort adjusted for open: {', '.join(open_labels)}")
+    active_advisories = [n for n, s in environment_states.items() if s and n in advisory_sweep_devices and n in constraint_labels]
+    if active_advisories:
+        from weatherstat.yaml_config import environment_display
+        open_labels = [f"{label} {kind}" for label, kind in (environment_display(w, _CFG.environment.get(w)) for w in sorted(active_advisories))]
+        print(f"  Advisory sweep for: {', '.join(open_labels)}")
     recent_hist = extract_recent_history(df_raw, sim_params)
 
     # Build forecast temp list, solar fractions, and solar elevations for simulator
@@ -1468,6 +1942,11 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for eff_name, reason in ineligible.items():
             print(f"  {eff_name}: INELIGIBLE — {reason}")
 
+    # Pre-compute advisory options for scenario count display
+    _pre_adv_options = _advisory_sweep_options(
+        environment_states, sim_params, sweep_devices=advisory_sweep_devices,
+    ) if environment_states else {}
+
     n_scenarios = len(
         generate_trajectory_scenarios(
             schedules,
@@ -1476,15 +1955,16 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             current_temps,
             ineligible_effectors,
             gains=sim_params.gains,
+            advisory_options=_pre_adv_options or None,
         )
     )
     print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
     t0 = time.monotonic()
-    decision, winning_scenario, blocked_dict = sweep_scenarios_physics(
+    decision, winning_scenario, blocked_dict, advisory_layers = sweep_scenarios_physics(
         current_temps,
         outdoor,
         forecast_temp_list,
-        window_states_dict,
+        environment_states,
         sim_params,
         fractional_hour,
         recent_hist,
@@ -1508,7 +1988,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         current_temps=current_temps,
         outdoor_temp=outdoor,
         forecast_temps=forecast_temp_list,
-        window_states=window_states_dict,
+        environment_states=environment_states,
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
@@ -1648,9 +2128,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 if ed.mode == "off":
                     if c.preferred_lo <= temp <= c.preferred_hi:
                         return f"{label} {temp:.1f}{UNIT_SYMBOL} in preferred [{c.preferred_lo:.0f}-{c.preferred_hi:.0f}]"
-                    if c.min_temp <= temp <= c.max_temp:
-                        return f"{label} {temp:.1f}{UNIT_SYMBOL} in comfort [{c.min_temp:.0f}-{c.max_temp:.0f}]"
-                    return f"{label} {temp:.1f}{UNIT_SYMBOL} outside [{c.min_temp:.0f}-{c.max_temp:.0f}]"
+                    if c.acceptable_lo <= temp <= c.acceptable_hi:
+                        return f"{label} {temp:.1f}{UNIT_SYMBOL} in comfort [{c.acceptable_lo:.0f}-{c.acceptable_hi:.0f}]"
+                    return f"{label} {temp:.1f}{UNIT_SYMBOL} outside [{c.acceptable_lo:.0f}-{c.acceptable_hi:.0f}]"
                 # Device is on — explain what it's doing
                 target = decision.command_targets.get(ed.name, ed.target)
                 if target is not None and eff_cfg.control_type == "trajectory" and temp > target:
@@ -1714,6 +2194,44 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     )
     print(f"  All-off baseline: comfort={off_comfort:.4f}")
 
+    # ── Advisory layer output ──
+    if advisory_layers:
+        # Reasonable plan info
+        r_cost = advisory_layers.get("reasonable_cost", float("inf"))
+        bl_cost = advisory_layers.get("baseline_cost", float("inf"))
+        r_advisories = advisory_layers.get("reasonable_advisories", {})
+        if r_cost < float("inf") and bl_cost < float("inf") and r_cost < bl_cost and r_advisories:
+            active_advs = {d: a for d, a in r_advisories.items() if a.action != "hold"}
+            if active_advs:
+                from weatherstat.yaml_config import environment_display
+                print("\n  [advisory] Reasonable plan:")
+                for dev, adv in sorted(active_advs.items()):
+                    mins = adv.transition_step * 5
+                    timing = "now" if mins == 0 else f"in {mins}min"
+                    label, kind = environment_display(dev, _CFG.environment.get(dev))
+                    print(f"    {label} {kind}: {adv.action} {timing} (saving {bl_cost - r_cost:.4f})")
+
+        # Backup breach warnings
+        breaches = advisory_layers.get("backup_breaches", [])
+        if breaches:
+            print("\n  [advisory] BACKUP BREACH WARNINGS:")
+            for breach in breaches:
+                print(f"    WARNING: {breach}")
+
+        # Proactive advice
+        proactive_info = advisory_layers.get("proactive", {})
+        proactive_advs = advisory_layers.get("proactive_advisories", {})
+        if proactive_info:
+            print("\n  [advisory] Proactive advice:")
+            for dev, info in sorted(proactive_info.items()):
+                delta = info["cost_delta"]
+                adv = proactive_advs.get(dev)
+                if adv is not None:
+                    dur_mins = (adv.return_step - adv.transition_step) * 5 if adv.return_step else None
+                    dur_str = f" for {dur_mins}min" if dur_mins else ""
+                    label, kind = environment_display(dev, _CFG.environment.get(dev))
+                    print(f"    {label} {kind}: {adv.action}{dur_str} (cost delta {delta:+.4f})")
+
     # ── Per-sensor cost breakdown ──
     sensors_with_cost = sorted(
         s
@@ -1763,14 +2281,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     object.__setattr__(decision, "baseline_sensor_costs", off_sensor_costs)
     object.__setattr__(decision, "baseline_cost", off_comfort)
 
-    # ── Window opportunities (persistent, energy-aware) ──
-    from weatherstat.advisory import evaluate_window_opportunities, process_opportunities
+    # ── Environment opportunities (persistent, energy-aware) ──
+    from weatherstat.advisory import evaluate_environment_opportunities, process_opportunities
 
     opp_state = _HS(
         current_temps=current_temps,
         outdoor_temp=outdoor,
         forecast_temps=forecast_temp_list,
-        window_states=window_states_dict,
+        environment_states=environment_states,
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
@@ -1779,7 +2297,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Pass the same adjusted schedules used for the winning sweep, so the
     # re-sweep's comfort cost is comparable to winning_comfort_cost.
     # Using raw schedules would inflate the benefit by the MRT/profile delta.
-    window_opportunities = evaluate_window_opportunities(
+    env_opportunities = evaluate_environment_opportunities(
         opp_state,
         winning_scenario,
         winning_comfort_cost=decision.comfort_cost,
@@ -1789,12 +2307,30 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         base_hour=base_hour,
         prev_state=prev_state,
     )
-    active_opps, dismissed_windows = process_opportunities(
-        window_opportunities,
+    active_opps, dismissed_entries = process_opportunities(
+        env_opportunities,
         live=live,
         notification_target=_CFG.notification_target,
         current_hour=base_hour,
     )
+
+    # ── Persist advisory recommendations for TUI display ──
+    from weatherstat.advisory import save_advisory_recommendations
+
+    save_advisory_recommendations(advisory_layers, live=live)
+
+    # ── Advisory breach notifications (urgent — sent immediately) ──
+    if advisory_layers and advisory_layers.get("backup_breaches") and live:
+        from weatherstat.advisory import send_ha_notification
+
+        breaches = advisory_layers["backup_breaches"]
+        body = "\n".join(breaches)
+        send_ha_notification(
+            "Comfort warning",
+            body,
+            "weatherstat_advisory_warning",
+            _CFG.notification_target,
+        )
 
     # ── Infrastructure safety checks ──
     from weatherstat.safety import check_device_health, check_thermostat_modes, process_safety_alerts
@@ -1814,6 +2350,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         decision,
         opportunities=active_opps,
         ineligible_effectors=ineligible_effectors,
+        advisory_layers=advisory_layers,
     )
     print(f"\n  Command JSON: {cmd_path}")
 

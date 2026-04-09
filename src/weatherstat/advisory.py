@@ -1,8 +1,9 @@
-"""Physics-based window opportunities — persistent open/close recommendations.
+"""Physics-based environment opportunities — persistent advisory recommendations.
 
-Evaluates window state toggles using the physics simulator to determine if
-opening or closing a window would improve comfort and/or save energy. Called
-from the control loop after the electronic plan is committed.
+Evaluates environment entry toggles using the physics simulator to determine if
+changing state (opening/closing windows, raising/lowering shades, etc.) would
+improve comfort and/or save energy. Called from the control loop after the
+electronic plan is committed.
 
 Two-threshold model:
 - Opportunity threshold: minimum benefit to track (visible in control output).
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -36,17 +37,20 @@ from weatherstat.config import (
 if TYPE_CHECKING:
     from weatherstat.control import ControlState
     from weatherstat.simulator import HouseState, SimParams
-    from weatherstat.types import ComfortSchedule, Scenario, WindowOpportunity
+    from weatherstat.types import ComfortSchedule, EnvironmentOpportunity, Scenario
 
 # ── Opportunity state ────────────────────────────────────────────────────
 
 
 @dataclass
 class OpportunityState:
-    """Persistent state for window opportunities across control cycles."""
+    """Persistent state for environment opportunities and advisory recommendations."""
 
-    active: dict[str, dict]  # window_name -> opportunity data (serializable)
+    active: dict[str, dict]  # entry_name -> opportunity data (serializable)
     cooldowns: dict[str, float]  # cooldown_key -> unix_timestamp
+    recommendations: list[dict] = field(default_factory=list)  # advisory layer recommendations
+    warnings: list[dict] = field(default_factory=list)  # backup breach warnings
+    proactive: list[dict] = field(default_factory=list)  # proactive advice
 
     @classmethod
     def load(cls) -> OpportunityState:
@@ -59,14 +63,27 @@ class OpportunityState:
             return cls(active={}, cooldowns={})
 
         if "active" in data and "cooldowns" in data:
-            return cls(active=data["active"], cooldowns=data["cooldowns"])
+            return cls(
+                active=data["active"],
+                cooldowns=data["cooldowns"],
+                recommendations=data.get("recommendations", []),
+                warnings=data.get("warnings", []),
+                proactive=data.get("proactive", []),
+            )
         return cls(active={}, cooldowns={})
 
     def save(self) -> None:
         """Persist to disk."""
         ADVISORY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         ADVISORY_STATE_FILE.write_text(json.dumps(
-            {"active": self.active, "cooldowns": self.cooldowns}, indent=2,
+            {
+                "active": self.active,
+                "cooldowns": self.cooldowns,
+                "recommendations": self.recommendations,
+                "warnings": self.warnings,
+                "proactive": self.proactive,
+            },
+            indent=2,
         ))
 
 
@@ -86,10 +103,66 @@ def save_advisory_state(cooldowns: dict[str, float]) -> None:
     state.save()
 
 
+def save_advisory_recommendations(advisory_layers: dict | None, live: bool = False) -> None:
+    """Persist advisory layer recommendations to state file for TUI display.
+
+    Called from the control loop after sweep_scenarios_physics returns advisory_layers.
+    Converts AdvisoryDecision objects to serializable dicts.
+    """
+    if not live:
+        return
+    state = OpportunityState.load()
+
+    if not advisory_layers:
+        state.recommendations = []
+        state.warnings = []
+        state.proactive = []
+        state.save()
+        return
+
+    # Reasonable layer recommendations
+    recs: list[dict] = []
+    r_advisories = advisory_layers.get("reasonable_advisories", {})
+    for dev, adv in sorted(r_advisories.items()):
+        if adv.action != "hold":
+            recs.append({
+                "device": dev,
+                "action": adv.action,
+                "in_minutes": adv.transition_step * 5,
+                "cost_delta": round(
+                    advisory_layers.get("reasonable_cost", 0) - advisory_layers.get("baseline_cost", 0), 4,
+                ),
+            })
+    state.recommendations = recs
+
+    # Backup breach warnings
+    breaches = advisory_layers.get("backup_breaches", [])
+    state.warnings = [{"message": b} for b in breaches]
+
+    # Proactive advice
+    proactive_list: list[dict] = []
+    proactive_info = advisory_layers.get("proactive", {})
+    proactive_advs = advisory_layers.get("proactive_advisories", {})
+    for dev, info in sorted(proactive_info.items()):
+        adv = proactive_advs.get(dev)
+        if adv is not None:
+            entry: dict[str, object] = {
+                "device": dev,
+                "action": adv.action,
+                "cost_delta": round(info["cost_delta"], 4),
+            }
+            if adv.return_step is not None:
+                entry["duration_minutes"] = (adv.return_step - adv.transition_step) * 5
+            proactive_list.append(entry)
+    state.proactive = proactive_list
+
+    state.save()
+
+
 # ── Energy-aware opportunity evaluation ──────────────────────────────────
 
 
-def evaluate_window_opportunities(
+def evaluate_environment_opportunities(
     state: HouseState,
     winning_scenario: Scenario,
     winning_comfort_cost: float,
@@ -98,7 +171,7 @@ def evaluate_window_opportunities(
     schedules: list[ComfortSchedule],
     base_hour: int,
     prev_state: ControlState | None = None,
-) -> list[WindowOpportunity]:
+) -> list[EnvironmentOpportunity]:
     """Evaluate window toggles for comfort and energy savings.
 
     Two-tier evaluation:
@@ -106,7 +179,7 @@ def evaluate_window_opportunities(
     2. Re-sweep (if promising): full scenario sweep with toggled window to find
        best HVAC plan. Captures "open window + turn off mini split" savings.
 
-    Returns list of WindowOpportunity sorted by total benefit (best first).
+    Returns list of EnvironmentOpportunity sorted by total benefit (best first).
     """
     from weatherstat.control import (
         CONTROL_HORIZONS,
@@ -116,7 +189,7 @@ def evaluate_window_opportunities(
     )
     from weatherstat.simulator import HouseState as _HS
     from weatherstat.simulator import predict
-    from weatherstat.types import WindowOpportunity
+    from weatherstat.types import EnvironmentOpportunity
     from weatherstat.yaml_config import load_config
 
     cfg = load_config()
@@ -134,18 +207,18 @@ def evaluate_window_opportunities(
     baseline_dict = {t: float(baseline_preds[0, j]) for j, t in enumerate(target_names)}
     baseline_comfort = compute_comfort_cost(baseline_dict, schedules, base_hour)
 
-    opportunities: list[WindowOpportunity] = []
+    opportunities: list[EnvironmentOpportunity] = []
 
-    for window_name in cfg.windows:
-        is_open = state.window_states.get(window_name, False)
-        toggled_windows = dict(state.window_states)
-        toggled_windows[window_name] = not is_open
+    for env_name in cfg.advisory_environment:
+        is_open = state.environment_states.get(env_name, False)
+        toggled_states = dict(state.environment_states)
+        toggled_states[env_name] = not is_open
 
         toggled_state = _HS(
             current_temps=state.current_temps,
             outdoor_temp=state.outdoor_temp,
             forecast_temps=state.forecast_temps,
-            window_states=toggled_windows,
+            environment_states=toggled_states,
             hour_of_day=state.hour_of_day,
             recent_history=state.recent_history,
             solar_fractions=state.solar_fractions,
@@ -161,12 +234,12 @@ def evaluate_window_opportunities(
         if quick_benefit <= threshold:
             continue
 
-        # Re-sweep: find best HVAC plan with toggled window
-        resweep_decision, _resweep_scenario, _ = sweep_scenarios_physics(
+        # Re-sweep: find best HVAC plan with toggled environment factor
+        resweep_decision, _resweep_scenario, _, _ = sweep_scenarios_physics(
             current_temps=state.current_temps,
             outdoor_temp=state.outdoor_temp,
             forecast_temps=state.forecast_temps,
-            window_states=toggled_windows,
+            environment_states=toggled_states,
             sim_params=sim_params,
             hour_of_day=state.hour_of_day,
             recent_history=state.recent_history,
@@ -184,10 +257,10 @@ def evaluate_window_opportunities(
         if total_benefit <= threshold:
             continue
 
-        action = "Open" if not is_open else "Close"
+        env_cfg = cfg.environment[env_name]
+        action = env_cfg.open_action.capitalize() if not is_open else env_cfg.close_action.capitalize()
 
-        win_cfg = cfg.windows[window_name]
-        parts = [f"{action} {win_cfg.label} {win_cfg.kind}"]
+        parts = [f"{action} {env_cfg.label} {env_cfg.kind}"]
         if not is_open:
             parts.append(f"({state.outdoor_temp:.0f}{UNIT_SYMBOL} outside)")
         if comfort_improvement > 0.01:
@@ -196,8 +269,8 @@ def evaluate_window_opportunities(
             parts.append(f"energy saving +{energy_saving:.3f}")
         message = " — ".join(parts)
 
-        opportunities.append(WindowOpportunity(
-            window=window_name,
+        opportunities.append(EnvironmentOpportunity(
+            entry=env_name,
             action=action.lower(),
             comfort_improvement=round(comfort_improvement, 2),
             energy_saving=round(energy_saving, 3),
@@ -296,23 +369,24 @@ def _legacy_notification_tag(window: str) -> str:
 
 
 def process_opportunities(
-    new_opportunities: list[WindowOpportunity],
+    new_opportunities: list[EnvironmentOpportunity],
     live: bool = False,
     notification_target: str = "persistent_notification",
     current_hour: int | None = None,
-) -> tuple[list[WindowOpportunity], list[str]]:
+) -> tuple[list[EnvironmentOpportunity], list[str]]:
     """Manage opportunity lifecycle: add/keep/remove, dispatch notifications.
 
     Notifications are rolled up into a single push per control cycle listing
-    all new opportunities.  Dismissed windows clear any legacy per-window
+    all new opportunities.  Dismissed entries clear any legacy per-entry
     notification tags (transition from pre-rollup format).
 
     Returns:
-        (active_opportunities, dismissed_windows).
+        (active_opportunities, dismissed_entries).
     """
-    from weatherstat.types import WindowOpportunity
-    from weatherstat.yaml_config import window_display
+    from weatherstat.types import EnvironmentOpportunity
+    from weatherstat.yaml_config import environment_display, load_config
 
+    _env = load_config().environment
     opp_state = OpportunityState.load()
     now_iso = datetime.now(UTC).isoformat()
     now_ts = time.time()
@@ -323,22 +397,22 @@ def process_opportunities(
         quiet = start <= current_hour < end if start <= end else current_hour >= start or current_hour < end
 
     # Build candidate set from new opportunities
-    candidates = {opp.window: opp for opp in new_opportunities}
+    candidates = {opp.entry: opp for opp in new_opportunities}
     prev_active = set(opp_state.active.keys())
     curr_active: dict[str, dict] = {}
-    active_list: list[WindowOpportunity] = []
+    active_list: list[EnvironmentOpportunity] = []
     dismissed: list[str] = []
-    newly_notified: list[WindowOpportunity] = []
+    newly_notified: list[EnvironmentOpportunity] = []
 
-    print("\n[opportunities] Evaluating window opportunities...")
+    print("\n[opportunities] Evaluating environment opportunities...")
 
     if not candidates and not prev_active:
         print("  No opportunities")
         return [], []
 
-    for window, opp in candidates.items():
-        was_active = window in prev_active
-        prev_data = opp_state.active.get(window, {})
+    for entry_name, opp in candidates.items():
+        was_active = entry_name in prev_active
+        prev_data = opp_state.active.get(entry_name, {})
         first_seen = prev_data.get("first_seen", now_iso) if was_active else now_iso
         was_notified = prev_data.get("notified", False) if was_active else False
 
@@ -348,7 +422,7 @@ def process_opportunities(
             and not was_notified
             and not quiet
         )
-        cooldown_key = f"opportunity_{window}"
+        cooldown_key = f"opportunity_{entry_name}"
         if should_notify and cooldown_key in opp_state.cooldowns:
             cooldown_secs = ADVISORY_COOLDOWNS.get("free_cooling", 14400)
             if (now_ts - opp_state.cooldowns[cooldown_key]) < cooldown_secs:
@@ -356,8 +430,8 @@ def process_opportunities(
 
         notified = was_notified or should_notify
 
-        active_opp = WindowOpportunity(
-            window=opp.window,
+        active_opp = EnvironmentOpportunity(
+            entry=opp.entry,
             action=opp.action,
             comfort_improvement=opp.comfort_improvement,
             energy_saving=opp.energy_saving,
@@ -367,30 +441,30 @@ def process_opportunities(
             notified=notified,
         )
         active_list.append(active_opp)
-        curr_active[window] = asdict(active_opp)
+        curr_active[entry_name] = asdict(active_opp)
 
         if should_notify:
             opp_state.cooldowns[cooldown_key] = now_ts
             newly_notified.append(active_opp)
 
         status = "active" if was_active else "new"
-        label, kind = window_display(window)
+        label, kind = environment_display(entry_name, _env.get(entry_name))
         print(f"  {opp.action.title()} {label} {kind}: benefit={opp.total_benefit:.2f} [{status}]")
 
-    # Dismiss expired opportunities (+ legacy per-window tags from pre-rollup)
-    for window in prev_active - set(candidates.keys()):
-        prev_data = opp_state.active[window]
+    # Dismiss expired opportunities (+ legacy per-entry tags from pre-rollup)
+    for entry_name in prev_active - set(candidates.keys()):
+        prev_data = opp_state.active[entry_name]
         if prev_data.get("notified", False) and live:
-            dismiss_ha_notification(_legacy_notification_tag(window), notification_target)
-        label, kind = window_display(window)
+            dismiss_ha_notification(_legacy_notification_tag(entry_name), notification_target)
+        label, kind = environment_display(entry_name, _env.get(entry_name))
         print(f"  Dismissed: {label} {kind}")
-        dismissed.append(window)
+        dismissed.append(entry_name)
 
     # Send single rolled-up notification for all newly notified opportunities
     if newly_notified and live:
         lines: list[str] = []
         for opp in newly_notified:
-            label, kind = window_display(opp.window)
+            label, kind = environment_display(opp.entry, _env.get(opp.entry))
             line = f"{opp.action.title()} {label} {kind}"
             parts: list[str] = []
             if opp.comfort_improvement > 0.01:

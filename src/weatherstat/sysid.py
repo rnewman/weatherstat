@@ -73,17 +73,17 @@ class SensorSpec:
 class FittedTau:
     """Envelope loss rate fitted from overnight cooling data.
 
-    tau_base: sealed envelope time constant (all windows closed).
-    window_betas: per-window additional cooling rate coefficients,
-        learned by regression in Stage 2.
-    interaction_betas: cross-breeze coefficients for window pairs.
+    tau_base: sealed envelope time constant (all windows/advisories at default).
+    environment_tau_betas: per-advisory-effector additional cooling rate coefficients,
+        learned by regression in Stage 2. Keyed by device name.
+    environment_interaction_betas: pairwise interaction coefficients for advisory pairs.
     """
 
     sensor: str
     tau_base: float
     n_segments: int
-    window_betas: dict[str, float] = field(default_factory=dict)
-    interaction_betas: dict[str, float] = field(default_factory=dict)
+    environment_tau_betas: dict[str, float] = field(default_factory=dict)
+    environment_interaction_betas: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,7 @@ class SysIdResult:
     solar_elevation_gains: dict[str, float] = field(default_factory=dict)  # sensor -> gain
     state_gates: dict[str, StateGate] = field(default_factory=dict)
     mrt_weights: dict[str, float] = field(default_factory=dict)
+    environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
@@ -305,8 +306,8 @@ def _find_uncontrolled_segments(
     # Only keep segments where all window/door states are constant
     # (no transitions mid-segment). NaN (sensor didn't exist) is treated
     # as a constant unknown state and does not disqualify the segment.
-    all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
-    existing_win_cols = [c for c in all_win_cols if c in df.columns]
+    all_env_cols = [cfg.column for cfg in _CFG.environment.values()]
+    existing_env_cols = [c for c in all_env_cols if c in df.columns]
 
     segments: list[pd.DataFrame] = []
     for _, seg_df in qualifying.groupby(seg_ids):
@@ -315,7 +316,7 @@ def _find_uncontrolled_segments(
         # Check window stability: each column must have at most 1 unique
         # non-null value within the segment
         stable = True
-        for wc in existing_win_cols:
+        for wc in existing_env_cols:
             n_unique = seg_df[wc].dropna().nunique()
             if n_unique > 1:
                 stable = False
@@ -580,21 +581,23 @@ def _fit_sensor_model(
     effectors: list[EffectorSpec],
     tau_base: float,
     verbose: bool = False,
-) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float]]:
+) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float], dict[str, float]]:
     """Stage 2: Fit regression for one sensor.
 
-    Returns (gains, solar_elev_gain, solar_elev_t, window_betas, interaction_betas).
+    Returns (gains, solar_elev_gain, solar_elev_t, environment_tau_betas,
+    environment_interaction_betas, environment_solar_betas).
     solar_elev_gain is °F/hr per unit sin(elevation)×solar_fraction.
-    Window betas are per-window additional cooling rate coefficients,
-    learned as regression coefficients on window_state × (T_out - T).
+    Advisory tau betas are per-device additional cooling rate coefficients,
+    learned as regression coefficients on advisory_state × (T_out - T).
+    Advisory solar betas model how advisory state modulates solar gain.
     """
     temp_col = sensor.temp_column
     dTdt_col = f"_dTdt_{sensor.name}"
 
     if temp_col not in df.columns or dTdt_col not in df.columns:
-        return [], 0.0, 0.0, {}, {}
+        return [], 0.0, 0.0, {}, {}, {}
     if "_outdoor_best" not in df.columns:
-        return [], 0.0, 0.0, {}, {}
+        return [], 0.0, 0.0, {}, {}, {}
 
     outdoor = df["_outdoor_best"].values
     sensor_temp = df[temp_col].values
@@ -643,39 +646,62 @@ def _fit_sensor_model(
         feature_names.append("_weather_dTout_dt")
         feature_cols.append(df["_dTdt_outdoor"].values.astype(float))
 
-    # Window × ΔT features: window_state × (T_outdoor - T_sensor)
-    # The coefficient β_w gives the additional cooling rate when the window is open.
-    all_win_cols = [f"window_{name}_open" for name in _CFG.windows]
-    existing_win_cols = [c for c in all_win_cols if c in df.columns]
+    # Environment factor × ΔT features: state × (T_outdoor - T_sensor)
+    # The coefficient β gives the additional cooling/heating rate when active.
+    env_col_to_name = {cfg.column: name for name, cfg in _CFG.environment.items()}
+    all_adv_cols = [cfg.column for cfg in _CFG.environment.values()]
+    existing_adv_cols = [c for c in all_adv_cols if c in df.columns]
 
-    window_feature_start = len(feature_names)
-    window_feature_names: list[str] = []  # bare window names in order
-    for wc in existing_win_cols:
-        win_name = wc.removeprefix("window_").removesuffix("_open")
-        feature_names.append(f"_win_{win_name}")
-        feature_cols.append(df[wc].fillna(False).values.astype(float) * delta_t)
-        window_feature_names.append(win_name)
+    adv_tau_feature_start = len(feature_names)
+    adv_tau_feature_names: list[str] = []  # bare device names in order
+    adv_state_arrays: dict[str, np.ndarray] = {}  # device_name -> state array (for reuse)
+    for wc in existing_adv_cols:
+        dev_name = env_col_to_name[wc]
+        state_arr = df[wc].fillna(False).values.astype(float)
+        adv_state_arrays[dev_name] = state_arr
+        feature_names.append(f"_adv_tau_{dev_name}")
+        feature_cols.append(state_arr * delta_t)
+        adv_tau_feature_names.append(dev_name)
 
-    # Window interaction features: pairs with enough co-open data
-    interaction_feature_start = len(feature_names)
-    interaction_feature_names: list[str] = []  # "w1+w2" in order
-    for i, wc1 in enumerate(existing_win_cols):
-        for wc2 in existing_win_cols[i + 1:]:
-            co_open = df[wc1].fillna(False).values.astype(bool) & df[wc2].fillna(False).values.astype(bool)
-            if co_open.sum() >= _MIN_INTERACTION_ROWS:
-                w1 = wc1.removeprefix("window_").removesuffix("_open")
-                w2 = wc2.removeprefix("window_").removesuffix("_open")
-                feature_names.append(f"_winx_{w1}+{w2}")
-                feature_cols.append(co_open.astype(float) * delta_t)
-                interaction_feature_names.append(f"{w1}+{w2}")
+    # Advisory pairwise interaction features: pairs with enough co-active data
+    adv_interaction_start = len(feature_names)
+    adv_interaction_names: list[str] = []  # "d1+d2" in order
+    adv_dev_list = list(adv_state_arrays.keys())
+    for i, d1 in enumerate(adv_dev_list):
+        for d2 in adv_dev_list[i + 1:]:
+            co_active = adv_state_arrays[d1].astype(bool) & adv_state_arrays[d2].astype(bool)
+            if co_active.sum() >= _MIN_INTERACTION_ROWS:
+                feature_names.append(f"_adv_ix_{d1}+{d2}")
+                feature_cols.append(co_active.astype(float) * delta_t)
+                adv_interaction_names.append(f"{d1}+{d2}")
 
     # Solar elevation feature (single continuous feature per sensor)
     solar_start = len(feature_names)
+    solar_elev_arr: np.ndarray | None = None
     if "_solar_elev" in df.columns:
+        solar_elev_arr = df["_solar_elev"].values.astype(float)
         feature_names.append("_solar_elev")
-        feature_cols.append(df["_solar_elev"].values.astype(float))
+        feature_cols.append(solar_elev_arr)
+
+    # Advisory × solar interaction: advisory state modulates solar gain.
+    # Only for kinds that physically modulate solar (shades, blinds) — not
+    # windows/doors, which affect tau (already modeled) but not solar gain.
+    # Including windows/doors here produces confounded coefficients (windows
+    # are open on sunny days → regression attributes sunshine to window state).
+    _SOLAR_MOD_KINDS = {"shade"}
+    adv_solar_feature_start = len(feature_names)
+    adv_solar_feature_names: list[str] = []  # device names in order
+    if solar_elev_arr is not None:
+        for dev_name, state_arr in adv_state_arrays.items():
+            env_cfg = _CFG.environment.get(dev_name)
+            if env_cfg is None or env_cfg.kind not in _SOLAR_MOD_KINDS:
+                continue
+            feature_names.append(f"_adv_solar_{dev_name}")
+            feature_cols.append(state_arr * solar_elev_arr)
+            adv_solar_feature_names.append(dev_name)
+
     if not feature_cols:
-        return [], [], {}, {}
+        return [], 0.0, 0.0, {}, {}, {}
 
     X = np.column_stack(feature_cols)
 
@@ -713,7 +739,7 @@ def _fit_sensor_model(
     # confounded gains (they have high variance from frequent HVAC cycling).
     scale = np.ones(X.shape[1])
     for j, name in enumerate(feature_names):
-        if name.startswith("_solar_") or name.startswith("_win_") or name.startswith("_winx_"):
+        if name.startswith("_solar_") or name.startswith("_adv_"):
             s = np.std(X[:, j])
             if s > 0:
                 scale[j] = s
@@ -780,29 +806,40 @@ def _fit_sensor_model(
             negligible=negligible,
         ))
 
-    # Extract window betas
-    # β_w > 0 is physical (window increases heat exchange rate).
-    # β_w < 0 is unphysical — flag as zero.
-    window_betas: dict[str, float] = {}
-    for i, win_name in enumerate(window_feature_names):
-        idx = window_feature_start + i
+    # Extract advisory tau betas
+    # β > 0 is physical (device increases heat exchange rate when active).
+    # β < 0 is unphysical for window-type devices — flag as zero.
+    environment_tau_betas: dict[str, float] = {}
+    for i, dev_name in enumerate(adv_tau_feature_names):
+        idx = adv_tau_feature_start + i
         if idx < len(beta):
             b = float(beta[idx])
             t = float(t_stats[idx])
-            # Only keep physically sensible (positive) and statistically significant
             if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
-                window_betas[win_name] = round(b, 6)
+                environment_tau_betas[dev_name] = round(b, 6)
             elif verbose:
-                print(f"    window {win_name}: β={b:.6f}, t={t:.1f} (dropped)")
+                print(f"    advisory_tau {dev_name}: β={b:.6f}, t={t:.1f} (dropped)")
 
-    interaction_betas: dict[str, float] = {}
-    for i, pair_name in enumerate(interaction_feature_names):
-        idx = interaction_feature_start + i
+    environment_interaction_betas: dict[str, float] = {}
+    for i, pair_name in enumerate(adv_interaction_names):
+        idx = adv_interaction_start + i
         if idx < len(beta):
             b = float(beta[idx])
             t = float(t_stats[idx])
             if b > 0 and abs(t) >= _T_STAT_THRESHOLD:
-                interaction_betas[pair_name] = round(b, 6)
+                environment_interaction_betas[pair_name] = round(b, 6)
+
+    # Extract advisory × solar betas (how advisory state modulates solar gain)
+    environment_solar_betas: dict[str, float] = {}
+    for i, dev_name in enumerate(adv_solar_feature_names):
+        idx = adv_solar_feature_start + i
+        if idx < len(beta):
+            b = float(beta[idx])
+            t = float(t_stats[idx])
+            if abs(t) >= _T_STAT_THRESHOLD:
+                environment_solar_betas[dev_name] = round(b, 4)
+            elif verbose:
+                print(f"    advisory_solar {dev_name}: β={b:.6f}, t={t:.1f} (dropped)")
 
     # Extract solar elevation gain (single coefficient per sensor)
     solar_elev_gain: float = 0.0
@@ -814,7 +851,7 @@ def _fit_sensor_model(
             solar_se = round(float(se[solar_start]), 4) if not np.isnan(se[solar_start]) else 0.0
             print(f"    solar_elev: β={solar_elev_gain:.4f}, se={solar_se:.4f}, t={solar_elev_t:.1f}")
 
-    return gains, solar_elev_gain, solar_elev_t, window_betas, interaction_betas
+    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_interaction_betas, environment_solar_betas
 
 
 # ── Derived MRT weights ──────────────────────────────────────────────────
@@ -892,26 +929,29 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
     for ft in fitted_taus:
         tau_lookup[ft.sensor] = ft.tau_base
 
-    # Stage 2: Regression per sensor (effector gains, solar, window effects)
-    print("\n── Stage 2: Fitting effector gains, solar, and window effects ──")
+    # Stage 2: Regression per sensor (effector gains, solar, advisory effects)
+    print("\n── Stage 2: Fitting effector gains, solar, and advisory effects ──")
     all_gains: list[EffectorSensorGain] = []
     solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
-    all_window_betas: dict[str, dict[str, float]] = {}  # sensor -> {window -> beta}
-    all_interaction_betas: dict[str, dict[str, float]] = {}  # sensor -> {"w1+w2" -> beta}
+    all_adv_tau_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
+    all_adv_interaction_betas: dict[str, dict[str, float]] = {}  # sensor -> {"d1+d2" -> beta}
+    all_adv_solar_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
 
     for sensor in sensors:
         tau_base = tau_lookup.get(sensor.name, sensor.yaml_tau_base)
-        gains, solar_elev_gain, solar_elev_t, win_betas, int_betas = _fit_sensor_model(
+        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_int_b, adv_solar_b = _fit_sensor_model(
             df, sensor, effectors, tau_base, verbose,
         )
         all_gains.extend(gains)
         if solar_elev_gain != 0.0:
             solar_elevation_gains[sensor.name] = solar_elev_gain
             print(f"  {sensor.name}: solar_elev β={solar_elev_gain:+.3f}, t={solar_elev_t:.1f}")
-        if win_betas:
-            all_window_betas[sensor.name] = win_betas
-        if int_betas:
-            all_interaction_betas[sensor.name] = int_betas
+        if adv_tau_b:
+            all_adv_tau_betas[sensor.name] = adv_tau_b
+        if adv_int_b:
+            all_adv_interaction_betas[sensor.name] = adv_int_b
+        if adv_solar_b:
+            all_adv_solar_betas[sensor.name] = adv_solar_b
 
         if verbose and gains:
             sig_gains = [g for g in gains if not g.negligible]
@@ -923,18 +963,24 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
                         f" lag={g.best_lag_minutes:.0f}min, t={g.t_statistic:.1f}"
                     )
 
-    # Merge window betas into FittedTau
+    # Merge advisory tau betas into FittedTau
     for i, ft in enumerate(fitted_taus):
-        win_b = all_window_betas.get(ft.sensor, {})
-        int_b = all_interaction_betas.get(ft.sensor, {})
-        if win_b or int_b:
+        tau_b = all_adv_tau_betas.get(ft.sensor, {})
+        int_b = all_adv_interaction_betas.get(ft.sensor, {})
+        if tau_b or int_b:
             fitted_taus[i] = FittedTau(
                 sensor=ft.sensor,
                 tau_base=ft.tau_base,
                 n_segments=ft.n_segments,
-                window_betas=win_b,
-                interaction_betas=int_b,
+                environment_tau_betas=tau_b,
+                environment_interaction_betas=int_b,
             )
+
+    # Restructure environment_solar_betas: sensor->{device->beta} → device->{sensor->beta}
+    environment_solar_betas: dict[str, dict[str, float]] = {}
+    for sensor_name, dev_betas in all_adv_solar_betas.items():
+        for dev_name, beta_val in dev_betas.items():
+            environment_solar_betas.setdefault(dev_name, {})[sensor_name] = beta_val
 
     # Build state_gates from config
     state_gates: dict[str, StateGate] = {}
@@ -957,6 +1003,7 @@ def fit_sysid(verbose: bool = False) -> SysIdResult:
         solar_gains=[],  # legacy per-hour format, empty for elevation-based fits
         solar_elevation_gains=solar_elevation_gains,
         state_gates=state_gates,
+        environment_solar_betas=environment_solar_betas,
     )
 
 
@@ -975,30 +1022,37 @@ def print_report(result: SysIdResult) -> None:
     # Tau fits
     print("\n── Envelope Loss (tau_base, hours) ──")
     sensor_map = {s.name: s for s in result.sensors}
-    hdr = f"  {'Sensor':<30s}  {'tau_base':>8s}  {'Default':>8s}  {'Seg':>4s}  {'Windows':>8s}"
+    hdr = f"  {'Sensor':<30s}  {'tau_base':>8s}  {'Default':>8s}  {'Seg':>4s}  {'Advisory':>8s}"
     print(hdr)
     print("  " + "-" * 66)
     for ft in result.fitted_taus:
         s = sensor_map.get(ft.sensor)
         default_str = f"{s.yaml_tau_base:.1f}" if s else "?"
-        n_win = len(ft.window_betas)
-        win_str = f"{n_win} β" if n_win > 0 else "–"
-        print(f"  {ft.sensor:<30s}  {ft.tau_base:8.1f}  {default_str:>8s}  {ft.n_segments:4d}  {win_str:>8s}")
+        n_adv = len(ft.environment_tau_betas)
+        adv_str = f"{n_adv} β" if n_adv > 0 else "–"
+        print(f"  {ft.sensor:<30s}  {ft.tau_base:8.1f}  {default_str:>8s}  {ft.n_segments:4d}  {adv_str:>8s}")
 
-    # Window couplings (if any)
-    any_couplings = any(ft.window_betas for ft in result.fitted_taus)
+    # Advisory tau couplings (if any)
+    any_couplings = any(ft.environment_tau_betas for ft in result.fitted_taus)
     if any_couplings:
-        print("\n── Window Couplings (β_w: additional cooling rate when open) ──")
+        print("\n── Advisory Tau Couplings (β: additional cooling rate when active) ──")
         for ft in result.fitted_taus:
-            if not ft.window_betas and not ft.interaction_betas:
+            if not ft.environment_tau_betas and not ft.environment_interaction_betas:
                 continue
             print(f"\n  {ft.sensor}:")
-            for win, beta in sorted(ft.window_betas.items()):
-                # Show effective tau when this window is open alone
+            for dev, beta in sorted(ft.environment_tau_betas.items()):
                 eff_tau = 1.0 / (1.0 / ft.tau_base + beta) if beta > 0 else ft.tau_base
-                print(f"    {win:20s}: β={beta:.6f}  (eff tau={eff_tau:.1f}h)")
-            for pair, beta in sorted(ft.interaction_betas.items()):
+                print(f"    {dev:20s}: β={beta:.6f}  (eff tau={eff_tau:.1f}h)")
+            for pair, beta in sorted(ft.environment_interaction_betas.items()):
                 print(f"    {pair:20s}: β={beta:.6f}  (interaction)")
+
+    # Advisory solar couplings (if any)
+    if result.environment_solar_betas:
+        print("\n── Advisory Solar Couplings (β: solar gain modulation) ──")
+        for dev, sensor_betas in sorted(result.environment_solar_betas.items()):
+            print(f"\n  {dev}:")
+            for sensor_name, beta in sorted(sensor_betas.items()):
+                print(f"    {sensor_name:30s}: β={beta:+.4f}")
 
     # Effector x sensor gain matrix
     print(f"\n── Effector × Sensor Gain Matrix ({UNIT_SYMBOL}/hr, delay in parens) ──")

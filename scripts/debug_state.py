@@ -5,12 +5,13 @@ Usage:
     python scripts/debug_state.py                       # full status summary
     python scripts/debug_state.py temps                  # current temperatures + comfort
     python scripts/debug_state.py gains [SENSOR]         # sysid gains (optionally filtered)
-    python scripts/debug_state.py taus                   # tau models + window betas
+    python scripts/debug_state.py taus                   # tau models + environment betas
     python scripts/debug_state.py decisions [N]          # last N decisions (default 5)
     python scripts/debug_state.py opportunities          # advisory state
     python scripts/debug_state.py snapshots              # snapshot DB stats
     python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
     python scripts/debug_state.py why [EFFECTOR]          # explain why active effectors are on
+    python scripts/debug_state.py advisory               # advisory states + compound tau effects
 
     --bundle <dir>   Point at a debug bundle instead of the live data directory.
                      Example: python scripts/debug_state.py --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 temps
@@ -231,7 +232,7 @@ def cmd_gains(sensor_filter: str | None = None) -> None:
 
 
 def cmd_taus() -> None:
-    """Show tau models and window betas."""
+    """Show tau models and environment betas."""
     params = _load_json(_paths()["thermal_params"])
     if not params:
         print("No thermal_params.json found.")
@@ -244,12 +245,13 @@ def cmd_taus() -> None:
         tau = t["tau_base"]
         n = t.get("n_segments", "?")
         print(f"  {t['sensor']:<30} tau={tau:6.1f}h  ({n} segments)")
-        for win, beta in sorted(t.get("window_betas", {}).items()):
-            # effective tau with this window open
+        tau_betas = t.get("environment_tau_betas", t.get("advisory_tau_betas", t.get("window_betas", {})))
+        int_betas = t.get("environment_interaction_betas", t.get("advisory_interaction_betas", t.get("interaction_betas", {})))
+        for dev, beta in sorted(tau_betas.items()):
             eff = 1.0 / (1.0 / tau + beta)
-            print(f"    window {win:<20} beta={beta:.6f}  (eff tau={eff:.1f}h)")
-        for pair, beta in sorted(t.get("interaction_betas", {}).items()):
-            print(f"    cross  {pair:<20} beta={beta:.6f}")
+            print(f"    advisory {dev:<20} beta={beta:.6f}  (eff tau={eff:.1f}h)")
+        for pair, beta in sorted(int_betas.items()):
+            print(f"    interact {pair:<20} beta={beta:.6f}")
     print()
 
     # MRT weights
@@ -410,18 +412,61 @@ def cmd_why(effector_filter: str | None = None) -> None:
         print("Missing thermal_params.json or control_state.json.")
         return
 
-    # Load current temps from latest snapshot
+    # Load config for environment column mapping
+    import os
+    if _data_dir != _default_data_dir():
+        os.environ["WEATHERSTAT_DATA_DIR"] = str(_data_dir)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from weatherstat.yaml_config import load_config
+    cfg = load_config()
+
+    # Build reverse map: column_name -> config_name
+    col_to_name: dict[str, str] = {ecfg.column: ename for ename, ecfg in cfg.environment.items()}
+
+    # Load current temps + advisory states from latest snapshot
     conn = sqlite3.connect(str(p["snapshots_db"]))
     row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
     ts = row[0] if row else None
     current_temps: dict[str, float] = {}
+    advisory_active: set[str] = set()
     if ts:
         for name, value in conn.execute(
-            "SELECT name, value FROM readings WHERE timestamp = ? AND name LIKE '%_temp'", (ts,)
+            "SELECT name, value FROM readings WHERE timestamp = ?", (ts,)
         ).fetchall():
-            with contextlib.suppress(ValueError, TypeError):
-                current_temps[name] = float(value)
+            if name.endswith("_temp"):
+                with contextlib.suppress(ValueError, TypeError):
+                    current_temps[name] = float(value)
+            elif name in col_to_name and str(value) == "1":
+                advisory_active.add(col_to_name[name])
     conn.close()
+
+    # Show advisory context at top if any windows are open
+    if advisory_active:
+        # Compute worst-affected tau
+        fitted_taus = params.get("fitted_taus", [])
+        worst_ratio = 1.0
+        worst_sensor = ""
+        for t in fitted_taus:
+            tau_base = t["tau_base"]
+            inv_tau = 1.0 / tau_base
+            for dev, beta in t.get("environment_tau_betas", t.get("advisory_tau_betas", t.get("window_betas", {}))).items():
+                if dev in advisory_active:
+                    inv_tau += beta
+            for pair, beta in t.get("environment_interaction_betas", t.get("advisory_interaction_betas", t.get("interaction_betas", {}))).items():
+                parts = pair.split("+")
+                if len(parts) == 2 and all(p.strip() in advisory_active for p in parts):
+                    inv_tau += beta
+            tau_eff = 1.0 / inv_tau if inv_tau > 0 else float("inf")
+            ratio = tau_eff / tau_base
+            if ratio < worst_ratio:
+                worst_ratio = ratio
+                worst_sensor = t["sensor"]
+
+        print(f"⚠ Advisory state: {len(advisory_active)} open — {', '.join(sorted(advisory_active))}")
+        if worst_ratio < 0.5:
+            print(f"  Fastest cooling: {worst_sensor} at {worst_ratio:.0%} of base tau")
+        print("  (run `just debug advisory` for full tau breakdown)")
+        print()
 
     # Load comfort bounds + predictions from latest decision
     bounds: dict[str, dict] = {}
@@ -528,6 +573,104 @@ def cmd_why(effector_filter: str | None = None) -> None:
         print()
 
 
+def cmd_advisory() -> None:
+    """Show active advisory states and their compound effect on tau."""
+    p = _paths()
+    params = _load_json(p["thermal_params"])
+    if not params:
+        print("No thermal_params.json found.")
+        return
+
+    # Load config for environment column mapping
+    import os
+    if _data_dir != _default_data_dir():
+        os.environ["WEATHERSTAT_DATA_DIR"] = str(_data_dir)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from weatherstat.yaml_config import load_config
+    cfg = load_config()
+
+    # Build reverse map: column_name -> config_name
+    col_to_name: dict[str, str] = {ecfg.column: ename for ename, ecfg in cfg.environment.items()}
+    env_columns = set(col_to_name)
+
+    # Get current environment states from latest snapshot
+    conn = sqlite3.connect(str(p["snapshots_db"]))
+    ts_row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
+    ts = ts_row[0] if ts_row else None
+    environment_states: dict[str, bool] = {}
+    if ts:
+        for name, value in conn.execute(
+            "SELECT name, value FROM readings WHERE timestamp = ?",
+            (ts,),
+        ).fetchall():
+            if name in env_columns:
+                environment_states[col_to_name[name]] = str(value) == "1"
+    conn.close()
+
+    active = {k for k, v in environment_states.items() if v}
+    inactive = {k for k, v in environment_states.items() if not v}
+
+    print(f"Environment states (snapshot {ts}):")
+    print(f"  Active:   {', '.join(sorted(active)) or '(none)'}")
+    print(f"  Default:  {', '.join(sorted(inactive)) or '(none)'}")
+    print()
+
+    if not active:
+        print("No active environment factors — base tau applies everywhere.")
+        return
+
+    # Show compound tau effect per sensor
+    fitted_taus = params.get("fitted_taus", [])
+    advisory_solar = params.get("environment_solar_betas", params.get("advisory_solar_betas", {}))
+
+    print("Compound tau effects (with current active environment factors):")
+    print(f"  {'Sensor':<30} {'Base τ':>7} {'Eff τ':>7} {'Ratio':>7}  Contributing")
+    print(f"  {'─' * 30} {'─' * 7} {'─' * 7} {'─' * 7}  {'─' * 40}")
+
+    for t in sorted(fitted_taus, key=lambda x: x["sensor"]):
+        sensor = t["sensor"]
+        tau_base = t["tau_base"]
+        tau_betas = t.get("environment_tau_betas", t.get("advisory_tau_betas", t.get("window_betas", {})))
+        int_betas = t.get("environment_interaction_betas", t.get("advisory_interaction_betas", t.get("interaction_betas", {})))
+
+        # Sum betas for active devices
+        inv_tau = 1.0 / tau_base
+        contributors: list[str] = []
+        for dev, beta in tau_betas.items():
+            if dev in active:
+                inv_tau += beta
+                eff = 1.0 / (1.0 / tau_base + beta)
+                contributors.append(f"{dev}(→{eff:.0f}h)")
+        for pair, beta in int_betas.items():
+            parts = pair.split("+")
+            if len(parts) == 2 and all(p.strip() in active for p in parts):
+                inv_tau += beta
+                contributors.append(f"{pair}(interact)")
+
+        tau_eff = 1.0 / inv_tau if inv_tau > 0 else float("inf")
+        ratio = tau_eff / tau_base
+
+        flag = ""
+        if ratio < 0.3:
+            flag = "  ⚠ EXTREME"
+        elif ratio < 0.5:
+            flag = "  ⚠ FAST"
+
+        print(f"  {sensor:<30} {tau_base:6.1f}h {tau_eff:6.1f}h {ratio:6.1%}{flag}  {', '.join(contributors)}")
+
+    # Show environment solar betas for active devices
+    active_solar = {dev: betas for dev, betas in advisory_solar.items() if dev in active}
+    if active_solar:
+        print()
+        print("Environment solar betas (active devices):")
+        for dev in sorted(active_solar):
+            betas = active_solar[dev]
+            print(f"  {dev}:")
+            for sensor, beta in sorted(betas.items(), key=lambda x: abs(x[1]), reverse=True):
+                print(f"    {sensor:<30} β_solar={beta:+.4f} °F/hr per sin(elev)")
+    print()
+
+
 def cmd_comfort(sensor_filter: str | None = None) -> None:
     """Show comfort schedules from config."""
     # If pointing at a bundle, set WEATHERSTAT_DATA_DIR so load_config finds the right YAML
@@ -547,7 +690,7 @@ def cmd_comfort(sensor_filter: str | None = None) -> None:
             pref = f"{e.preferred_lo}-{e.preferred_hi}" if e.preferred_lo != e.preferred_hi else f"{e.preferred_lo}"
             print(
                 f"    {e.start_hour:02d}-{e.end_hour:02d}:  "
-                f"min={e.min_temp:.0f}  pref={pref}  max={e.max_temp:.0f}  "
+                f"acceptable=[{e.acceptable_lo:.0f},{e.acceptable_hi:.0f}]  pref={pref}  backup=[{e.backup_lo:.0f},{e.backup_hi:.0f}]  "
                 f"cold={e.cold_penalty:.1f}  hot={e.hot_penalty:.1f}"
             )
         if cs.mrt_weight != 1.0:
@@ -604,6 +747,7 @@ COMMANDS = {
     "snapshots": lambda args: cmd_snapshots(),
     "comfort": lambda args: cmd_comfort(args[0] if args else None),
     "why": lambda args: cmd_why(args[0] if args else None),
+    "advisory": lambda args: cmd_advisory(),
 }
 
 if __name__ == "__main__":

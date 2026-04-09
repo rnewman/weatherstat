@@ -36,7 +36,7 @@ Current reading 72.0°F, predicted 66.2°F at 1h — a 5.8°F drop.
 **Investigation:**
 - tau_base = 500h (only 3 segments — unreliable fit, hit cap)
 - 0/7 effector gains pass simulator filter (all |t| < 1.5)
-- No window_betas learned (empty)
+- No environment tau betas learned (empty)
 - 4 windows open (bedroom, piano, bathroom, living_room) but no
   cross-coupling modeled
 - Prediction is pure Newton cooling: dT/dt = (T_outdoor - 72) / 500
@@ -193,7 +193,7 @@ The 35-minute smoothing kernel means adjacent derivative estimates share data, i
 
 ### "Why is sensor X predicted at Y°F?"
 
-1. Check `thermal_params.json` for the sensor's gains, tau, window_betas
+1. Check `thermal_params.json` for the sensor's gains, tau, environment tau betas
 2. Count how many gains pass simulator filter (|t| ≥ 1.5, magnitude ≤ 3.0)
 3. If zero gains pass: prediction is pure Newton + solar. Check tau_base
    and forecast outdoor temp.

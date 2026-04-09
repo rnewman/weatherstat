@@ -196,14 +196,11 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
     for col, sensor_cfg in _CFG.humidity_sensors.items():
         values[col] = _sensor_num(sensor_cfg.entity_id)
 
-    # 7. Windows
-    any_open = False
-    for name, win_cfg in _CFG.windows.items():
-        is_open = _binary_state(win_cfg.entity_id)
-        values[f"window_{name}_open"] = is_open
-        if is_open == "1":
-            any_open = True
-    values["any_window_open"] = "1" if any_open else "0"
+    # 7. Environment factors (windows, doors, shades, etc.)
+    for _name, env_cfg in _CFG.environment.items():
+        entity = states.get(env_cfg.entity_id)
+        is_active = entity is not None and entity.get("state") == env_cfg.active_state
+        values[env_cfg.column] = "1" if is_active else "0"
 
     # 8. Per-room temperature sensors (non-thermostat, non-outdoor)
     for col, sensor_cfg in _CFG.temp_sensors.items():

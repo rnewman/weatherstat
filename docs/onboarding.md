@@ -12,7 +12,7 @@ This guide walks you through setting up weatherstat for your house. You'll need 
 - **Python 3.12+** and **uv** (for the control pipeline)
 
 Optional but valuable:
-- Window/door binary sensors (sysid learns their thermal effect)
+- Window/door/vent binary sensors (sysid learns their thermal effect; configured in the `environment:` section)
 - Humidity sensors
 - A weather integration (met.no is the default; provides forecasts)
 
@@ -62,7 +62,7 @@ The script finds:
 - **Fan entities** — blowers, circulation fans
 - **Temperature sensors** — by `device_class` or unit of measurement
 - **Humidity sensors** — by `device_class`
-- **Window/door sensors** — binary sensors with window/door `device_class`
+- **Window/door sensors** — binary sensors with window/door `device_class` (placed in the `environment:` section)
 - **Weather entities** — forecast providers
 - **Location** — latitude, longitude, elevation, timezone from `zone.home`
 
@@ -144,9 +144,11 @@ With this config, a bedroom with `preferred: 72, min: 70, max: 74` in Home mode 
 
 `penalty_scale` is also available (multiplies all cold/hot penalties), but `preferred_widen` is usually the right tool — it directly expresses "I don't care where in this range the temperature is."
 
-### Windows (optional)
+### Environment (optional)
 
-If you have window/door sensors, list them. You don't need to configure which rooms they affect — sysid learns the thermal coupling from data.
+Observable factors that affect physics — windows, doors, shades, vents, space heaters — go in the `environment:` section. Each entry declares a `kind` (window, door, shade, vent, heater), an `entity_id`, a `column` name for EAV storage, `default_state`/`active_state`, and optionally `advisory: true` to include it in the trajectory sweep for proactive recommendations.
+
+You don't need to configure which rooms they affect — sysid learns the thermal coupling from data.
 
 ### Temperature unit
 
@@ -180,7 +182,7 @@ This runs the config parser to catch errors before you start collecting data.
 just collect           # 5-min loop with auto-recovery (Ctrl+C to stop)
 ```
 
-The collector writes snapshots to `~/.weatherstat/snapshots/snapshots.db` in EAV format. Each snapshot captures the full state of your house: temperatures, HVAC states, window states, weather conditions, and forecasts.
+The collector writes snapshots to `~/.weatherstat/snapshots/snapshots.db` in EAV format. Each snapshot captures the full state of your house: temperatures, HVAC states, environment states, weather conditions, and forecasts.
 
 **Let it run for at least 3–5 days** before proceeding. Sysid needs:
 - Overnight cooling curves (all HVAC off) to fit τ
@@ -195,7 +197,7 @@ More data = better model. A week is good; a month is great.
 just sysid
 ```
 
-This reads your collector data and fits the thermal model parameters: τ (envelope time constant), per-effector gains (how much each device warms/cools each sensor), effective lags, solar gain profiles, and window coupling coefficients.
+This reads your collector data and fits the thermal model parameters: τ (envelope time constant), per-effector gains (how much each device warms/cools each sensor), effective lags, solar gain profiles, and environment coupling coefficients (how each window, door, vent, etc. affects each sensor's dynamics).
 
 Output goes to `~/.weatherstat/thermal_params.json`. Review the console output — it shows fitted parameters, data quality metrics, and any warnings about insufficient data or confounded gains.
 
@@ -222,7 +224,7 @@ Review the output:
 - Winning plan (which effectors are on, at what settings)
 - Per-device rationale (counterfactual attribution)
 - Predicted temperatures at each horizon
-- Window opportunity recommendations (if any)
+- Environment advisory recommendations (if any)
 
 The command JSON is written to `~/.weatherstat/predictions/` but not applied.
 
@@ -258,7 +260,7 @@ This executes the decisions: sets thermostat targets, changes mini-split modes, 
 - How much each effector warms/cools each sensor (gains)
 - Effective response delays (lag bins)
 - Solar gain by room and time of day
-- How each window affects each sensor's temperature dynamics
-- Cross-breeze interactions between windows
+- How each environment factor (window, door, vent, etc.) affects each sensor's temperature dynamics
+- Pairwise interactions between environment factors (e.g., cross-breeze effects)
 
 This separation is deliberate: you declare what exists, the system discovers how things interact. When in doubt, add sensors and effectors to the config and let sysid figure out whether they matter.

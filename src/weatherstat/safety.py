@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import requests
@@ -158,7 +158,7 @@ def _check_when_condition(check: HealthCheck) -> bool:
         if not last_changed:
             return False
         changed_at = datetime.fromisoformat(last_changed)
-        elapsed_min = (datetime.now(timezone.utc) - changed_at).total_seconds() / 60
+        elapsed_min = (datetime.now(UTC) - changed_at).total_seconds() / 60
         if elapsed_min < check.when_for_minutes:
             return False
 

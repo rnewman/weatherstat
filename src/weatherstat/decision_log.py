@@ -141,17 +141,21 @@ def log_decision(
     # Serialize predictions (label -> {horizon -> temp})
     predictions_json = json.dumps(decision.predictions)
 
-    # Serialize comfort bounds at decision time (enriched: includes preferred band + penalties)
+    # Serialize comfort bounds at decision time (enriched: includes all three tiers + penalties)
     comfort_bounds: dict[str, dict[str, float]] = {}
     for sched in schedules:
         if isinstance(sched, ComfortSchedule):
             c = sched.comfort_at(base_hour)
             if c is not None:
                 comfort_bounds[sched.label] = {
-                    "min": c.min_temp,
-                    "max": c.max_temp,
+                    "min": c.acceptable_lo,  # backward-compat key for old plotter rows
+                    "max": c.acceptable_hi,
                     "preferred_lo": c.preferred_lo,
                     "preferred_hi": c.preferred_hi,
+                    "acceptable_lo": c.acceptable_lo,
+                    "acceptable_hi": c.acceptable_hi,
+                    "backup_lo": c.backup_lo,
+                    "backup_hi": c.backup_hi,
                     "cold_penalty": c.cold_penalty,
                     "hot_penalty": c.hot_penalty,
                 }
@@ -363,11 +367,16 @@ def _compute_actual_comfort_cost(
     """Compute retroactive comfort cost from actual temperatures.
 
     Uses the same two-layer cost model as compute_comfort_cost (control.py):
-    continuous penalty from preferred band + 10× hard rails at min/max.
+    continuous penalty from preferred band + configurable acceptable rails multiplier.
 
     Outcomes are keyed by sensor column (e.g. "bedroom_temp");
     comfort_bounds are keyed by label (e.g. "bedroom"). We map via SENSOR_LABELS.
     """
+    from weatherstat.yaml_config import load_config
+
+    _cfg = load_config()
+    _hard_rail = float(_cfg.hard_rail_multiplier) if _cfg.hard_rail_multiplier is not None else 3.0
+
     horizon_weights = {"1h": 1.0, "2h": 0.9, "4h": 0.7, "6h": 0.5}
     cost = 0.0
 
@@ -376,11 +385,11 @@ def _compute_actual_comfort_cost(
         bounds = comfort_bounds.get(label)
         if bounds is None:
             continue
-        min_temp = bounds["min"]
-        max_temp = bounds["max"]
-        # Enriched bounds (logged after this change); fall back to min/max for old rows
-        pref_lo = bounds.get("preferred_lo", min_temp)
-        pref_hi = bounds.get("preferred_hi", max_temp)
+        # Three-tier bounds; fall back to min/max for old rows
+        acc_lo = bounds.get("acceptable_lo", bounds.get("min", 60.0))
+        acc_hi = bounds.get("acceptable_hi", bounds.get("max", 80.0))
+        pref_lo = bounds.get("preferred_lo", acc_lo)
+        pref_hi = bounds.get("preferred_hi", acc_hi)
         cold_pen = bounds.get("cold_penalty", 2.0)
         hot_pen = bounds.get("hot_penalty", 1.0)
 
@@ -396,11 +405,11 @@ def _compute_actual_comfort_cost(
             elif actual > pref_hi:
                 cost += (actual - pref_hi) ** 2 * hot_pen * weight
 
-            # Hard rails: steep additional penalty (10×) outside min/max
-            if actual < min_temp:
-                cost += (min_temp - actual) ** 2 * cold_pen * 10.0 * weight
-            elif actual > max_temp:
-                cost += (actual - max_temp) ** 2 * hot_pen * 10.0 * weight
+            # Acceptable rails: steep additional penalty
+            if actual < acc_lo:
+                cost += (acc_lo - actual) ** 2 * cold_pen * _hard_rail * weight
+            elif actual > acc_hi:
+                cost += (actual - acc_hi) ** 2 * hot_pen * _hard_rail * weight
 
     return round(cost, 4)
 

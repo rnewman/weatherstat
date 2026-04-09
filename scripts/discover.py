@@ -488,12 +488,19 @@ def generate_yaml(c: Classified) -> str:
     w('#     message: "Boiler connection lost"')
     w()
 
-    # ── Windows ──
-    w("# ── Windows: environmental modifiers ──────────────────────────────────────")
-    w("# Window/door sensors. Sysid learns the thermal effect of each window —")
-    w("# you don't need to configure which rooms they affect.")
+    # ── Environment ──
+    w("# ── Environment: observable factors affecting physics ─────────────────────")
+    w("# Windows, doors, shades, vents, space heaters — anything the system")
+    w("# observes for physics modeling and optionally advises on.")
+    w("# Sysid learns the thermal effect of each entry automatically.")
+    w("#")
+    w("# column: EAV column name in snapshots DB (must be unique)")
+    w("# kind: 'window', 'door', 'shade', etc. — drives display verbs")
+    w("# default_state: normal state ('closed', 'open') — used as physics baseline")
+    w("# active_state: HA state string when non-default (e.g., 'on')")
+    w("# advisory: true to include in advisory sweep (optional, default false)")
     w()
-    w("windows:")
+    w("environment:")
     all_openings = c.windows + c.doors
     if not all_openings:
         w("  # No window/door sensors found (optional but valuable).")
@@ -510,8 +517,16 @@ def generate_yaml(c: Classified) -> str:
             while name in seen_names:
                 name = f"{name}_2"
             seen_names.add(name)
+            is_door = e.device_class == "door" or "door" in e.entity_id.lower()
+            kind = "door" if is_door else "window"
+            column = f"{name}_open"
             w(f"  {name}:")
             w(f"    entity_id: {e.entity_id}")
+            w(f"    column: {column}")
+            w(f"    kind: {kind}")
+            w("    default_state: closed")
+            w('    active_state: "on"')
+            w("    # advisory: true  # uncomment after sysid learns effects")
             w(f"    # {e.friendly_name}")
     w()
 

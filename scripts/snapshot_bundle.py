@@ -281,7 +281,6 @@ def replay_bundle(bundle_dir: Path) -> None:
 
     from weatherstat.config import PREDICTION_SENSORS, SENSOR_LABELS, TIMEZONE
     from weatherstat.control import (
-        adjust_schedules_for_windows,
         apply_comfort_profile,
         apply_mrt_correction,
         default_comfort_schedules,
@@ -323,10 +322,10 @@ def replay_bundle(bundle_dir: Path) -> None:
     out_temp_raw = snap.get(outdoor_sensor) if outdoor_sensor else snap.get("met_outdoor_temp")
     out_temp = float(out_temp_raw) if out_temp_raw else 50.0
 
-    # Window states
-    window_states: dict[str, bool] = {}
-    for wname in cfg.windows:
-        window_states[wname] = snap.get(f"window_{wname}_open", "0") == "1"
+    # Environment states
+    environment_states: dict[str, bool] = {}
+    for ename, ecfg in cfg.environment.items():
+        environment_states[ename] = snap.get(ecfg.column, "0") == "1"
 
     # Forecast temps and solar fractions
     forecast_temps: list[float] = []
@@ -406,14 +405,10 @@ def replay_bundle(bundle_dir: Path) -> None:
     }
     schedules, mrt_offset = apply_mrt_correction(schedules, outdoor, cfg.mrt_correction, mrt_weights)
 
-    # Window adjustments
-    constraint_labels = {c.label for c in cfg.constraints}
-    schedules = adjust_schedules_for_windows(schedules, window_states, constraint_labels, *cfg.window_open_offset)
-
     print(f"\nOutdoor: {outdoor:.1f}°F  Weather: {current_condition}  Local hour: {base_hour}")
     print(f"Profile: {profile_name or 'default'}  MRT offset: {mrt_offset:+.1f}°F")
-    open_windows = [k for k, v in sorted(window_states.items()) if v]
-    print(f"Windows: {', '.join(open_windows) if open_windows else 'all closed'}")
+    active_env = [k for k, v in sorted(environment_states.items()) if v]
+    print(f"Environment: {', '.join(active_env) if active_env else 'all default'}")
     if prev_state:
         print(f"Prev state: {prev_state.modes}")
     print()
@@ -439,11 +434,11 @@ def replay_bundle(bundle_dir: Path) -> None:
         for step in range(1, max_steps + 1)
     ]
 
-    decision, scenario, blocked = sweep_scenarios_physics(
+    decision, scenario, blocked, _ = sweep_scenarios_physics(
         current_temps=current_temps,
         outdoor_temp=outdoor,
         forecast_temps=forecast_temps,
-        window_states=window_states,
+        environment_states=environment_states,
         sim_params=sim_params,
         hour_of_day=fractional_hour,
         recent_history=recent_hist,
