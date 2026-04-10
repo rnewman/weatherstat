@@ -197,18 +197,22 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
         values[col] = _sensor_num(sensor_cfg.entity_id)
 
     # 7. Environment factors (windows, doors, shades, etc.)
+    # Column semantics: "active fraction" — 1.0 = fully in active (non-default) state.
+    # For HA covers: current_position is 0 (closed) to 100 (open). The active
+    # fraction is therefore position/100 when active_state == "open" and
+    # 1 - position/100 when active_state == "closed".
     for _name, env_cfg in _CFG.environment.items():
         entity = states.get(env_cfg.entity_id)
         if env_cfg.value_type == "continuous":
-            # Continuous position: 0.0 (closed/lowered) to 1.0 (open/raised)
-            pos = 0.0
+            openness = 0.0
             if entity is not None:
                 raw_pos = entity.get("attributes", {}).get("current_position")
                 if raw_pos is not None:
-                    pos = round(float(raw_pos) / 100.0, 2)
+                    openness = float(raw_pos) / 100.0
                 elif entity.get("state") == "open":
-                    pos = 1.0
-            values[env_cfg.column] = str(pos)
+                    openness = 1.0
+            active_frac = openness if env_cfg.active_state == "open" else 1.0 - openness
+            values[env_cfg.column] = str(round(active_frac, 2))
         else:
             is_active = entity is not None and entity.get("state") == env_cfg.active_state
             values[env_cfg.column] = "1" if is_active else "0"

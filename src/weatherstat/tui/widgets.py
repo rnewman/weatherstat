@@ -356,7 +356,7 @@ class EffectorPanel(Static):
 
 
 class OpportunityPanel(Static):
-    """Active window opportunities and advisory recommendations."""
+    """Active environment opportunities and per-device advisory alternatives."""
 
     def __init__(self) -> None:
         super().__init__("", classes="panel")
@@ -364,33 +364,21 @@ class OpportunityPanel(Static):
     def set_data(
         self,
         opportunities: list[dict],
-        recommendations: list[dict] | None = None,
+        advisory_opportunities: list[dict] | None = None,
         warnings: list[dict] | None = None,
-        proactive: list[dict] | None = None,
     ) -> None:
         from weatherstat.yaml_config import environment_display, load_config
 
         _env = load_config().environment
         lines: list[str] = ["[bold]Opportunities[/]"]
 
-        # Advisory warnings (backup breaches) — most urgent first
+        # Backup breach warnings — most urgent first
         if warnings:
             for w in warnings:
                 msg = w.get("message", "?")
                 lines.append(f"  [bold red]{msg}[/]")
 
-        # Advisory recommendations (reasonable layer)
-        if recommendations:
-            for rec in recommendations:
-                dev = rec.get("device", "?")
-                action = rec.get("action", "?")
-                mins = rec.get("in_minutes", 0)
-                delta = rec.get("cost_delta", 0)
-                timing = "now" if mins == 0 else f"in {mins}m"
-                label, kind = environment_display(dev, _env.get(dev))
-                lines.append(f"  [cyan]{action} {label} {kind}[/] {timing} (saving {-delta:+.2f})")
-
-        # Environment opportunities (existing system)
+        # Persistent EnvironmentOpportunity entries (threshold-gated, notification lifecycle)
         if opportunities:
             for opp in opportunities:
                 entry_name = opp.get("entry", opp.get("window", "?"))
@@ -399,16 +387,23 @@ class OpportunityPanel(Static):
                 label, kind = environment_display(entry_name, _env.get(entry_name))
                 lines.append(f"  [yellow]{action} {label} {kind}[/] (benefit: {benefit:.2f})")
 
-        # Proactive advice
-        if proactive:
-            for p in proactive:
-                dev = p.get("device", "?")
-                action = p.get("action", "?")
-                delta = p.get("cost_delta", 0)
-                dur = p.get("duration_minutes")
+        # Per-device advisory alternatives from the sweep. Styled by current_state:
+        # cyan = currently active → recommend returning to default;
+        # dim  = currently default → proactive activation suggestion.
+        if advisory_opportunities:
+            for ao in advisory_opportunities:
+                dev = ao.get("device", "?")
+                action = ao.get("action", "?")
+                mins = ao.get("in_minutes", 0)
+                delta = ao.get("cost_delta", 0)
+                dur = ao.get("duration_minutes")
                 dur_str = f" for {dur}m" if dur else ""
+                timing = "now" if mins == 0 else f"in {mins}m"
                 label, kind = environment_display(dev, _env.get(dev))
-                lines.append(f"  [dim]{action} {label} {kind}{dur_str} ({delta:+.2f})[/]")
+                style = "cyan" if ao.get("current_state") else "dim"
+                lines.append(
+                    f"  [{style}]{action} {label} {kind}[/] {timing}{dur_str} ({delta:+.2f})"
+                )
 
         if len(lines) == 1:
             lines.append("  (none)")

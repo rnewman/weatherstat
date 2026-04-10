@@ -425,7 +425,6 @@ def cmd_why(effector_filter: str | None = None) -> None:
     row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
     ts = row[0] if row else None
     current_temps: dict[str, float] = {}
-    advisory_active: set[str] = set()
     if ts:
         for name, value in conn.execute(
             "SELECT name, value FROM readings WHERE timestamp = ?", (ts,)
@@ -433,8 +432,20 @@ def cmd_why(effector_filter: str | None = None) -> None:
             if name.endswith("_temp"):
                 with contextlib.suppress(ValueError, TypeError):
                     current_temps[name] = float(value)
-            elif name in col_to_name and str(value) == "1":
-                advisory_active.add(col_to_name[name])
+    # Per-column latest lookup for env entries (sparse storage may skip columns)
+    advisory_active: set[str] = set()
+    for col in col_to_name:
+        r = conn.execute(
+            "SELECT value FROM readings WHERE name = ? ORDER BY timestamp DESC LIMIT 1",
+            (col,),
+        ).fetchone()
+        if r is None:
+            continue
+        try:
+            if float(r[0]) > 0.5:
+                advisory_active.add(col_to_name[col])
+        except (TypeError, ValueError):
+            pass
     conn.close()
 
     # Show advisory context at top if any windows are open
@@ -590,14 +601,21 @@ def cmd_advisory() -> None:
     conn = sqlite3.connect(str(p["snapshots_db"]))
     ts_row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
     ts = ts_row[0] if ts_row else None
+    # Query each env column's most recent value independently — sparse columns
+    # may not exist at the global max timestamp. Treat > 0.5 as active so both
+    # binary ("1") and continuous ("0.85", "1.00") work.
     environment_states: dict[str, bool] = {}
-    if ts:
-        for name, value in conn.execute(
-            "SELECT name, value FROM readings WHERE timestamp = ?",
-            (ts,),
-        ).fetchall():
-            if name in env_columns:
-                environment_states[col_to_name[name]] = str(value) == "1"
+    for name in env_columns:
+        row = conn.execute(
+            "SELECT value FROM readings WHERE name = ? ORDER BY timestamp DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+        if row is None:
+            continue
+        try:
+            environment_states[col_to_name[name]] = float(row[0]) > 0.5
+        except (TypeError, ValueError):
+            environment_states[col_to_name[name]] = False
     conn.close()
 
     active = {k for k, v in environment_states.items() if v}

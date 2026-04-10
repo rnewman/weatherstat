@@ -174,10 +174,53 @@ class AdvisoryDecision:
     return_step: int | None = None  # 5-min step at which device returns to prior state
 
 
+@dataclass(frozen=True)
+class DeviceOpportunity:
+    """Per-device marginal benefit from the advisory sweep.
+
+    For each environment device, holds the delta between the best scenario where
+    the device changes state and the best scenario where it holds — with the rest
+    of the system (HVAC + other advisories) free to optimize around each choice.
+    Negative cost_delta means the change is beneficial.
+    """
+
+    device: str  # environment entry name
+    current_state: bool  # True if currently non-default (active)
+    advisory: AdvisoryDecision  # the change action + timing from the best-change scenario
+    idx: int  # scenario index of the best-change scenario
+    cost_delta: float  # cost_change - cost_hold (< 0 = beneficial)
+    comfort_delta: float  # comfort component of cost_delta
+    energy_delta: float  # energy component of cost_delta
+
+
+@dataclass(frozen=True)
+class AdvisoryPlan:
+    """Output of the advisory sweep: baseline hold cost + per-device alternatives + hedge.
+
+    baseline_idx/baseline_cost refer to the cheapest scenario where every
+    environment device's advisory action is "hold" — i.e. the plan the system
+    should commit to if the user takes no action.
+
+    opportunities are the per-device marginals (DeviceOpportunity list), already
+    filtered to devices where both a best-change and best-hold scenario exist.
+
+    backup_breaches are worst-case predicted bound violations derived from the
+    baseline scenario's predictions — used both for warnings and for the
+    defensive-HVAC override in the control loop.
+    """
+
+    baseline_idx: int | None
+    baseline_cost: float  # inf when no all-hold scenario exists
+    opportunities: tuple[DeviceOpportunity, ...] = ()
+    backup_breaches: tuple[str, ...] = ()
+
+
 _ACTION_VERBS: dict[str, tuple[str, str]] = {
+    # (close_action, open_action) — close = return to default state, open = leave default.
+    # For shades default_state is "open", so the verbs are flipped relative to windows.
     "window": ("close", "open"),
     "door": ("close", "open"),
-    "shade": ("lower", "raise"),
+    "shade": ("raise", "lower"),
     "vent": ("close", "open"),
     "heater": ("turn_off", "turn_on"),
 }

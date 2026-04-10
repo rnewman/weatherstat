@@ -23,19 +23,20 @@ from weatherstat.control import (
     _in_quiet_hours,
     _regulating_sweep_options,
     apply_mrt_correction,
-    classify_advisory_scenario,
     compute_comfort_cost,
     compute_energy_cost,
-    extract_planning_layers,
+    extract_advisory_plan,
     generate_trajectory_scenarios,
     write_command_json,
 )
 from weatherstat.types import (
     AdvisoryDecision,
+    AdvisoryPlan,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
     ControlState,
+    DeviceOpportunity,
     EffectorDecision,
     RoomComfort,
     Scenario,
@@ -1258,95 +1259,54 @@ class TestTwoStageAdvisorySweep:
         assert len(result) == 20 * 3125  # full product fits in 62.5K
 
 
-class TestClassifyAdvisoryScenario:
-    """Test classify_advisory_scenario()."""
+class TestExtractAdvisoryPlan:
+    """Test extract_advisory_plan()."""
 
-    def test_baseline_no_advisories(self) -> None:
-        s = Scenario(effectors={})
-        assert classify_advisory_scenario(s, {"win": True}) == "baseline"
-
-    def test_reasonable_returns_to_default(self) -> None:
-        s = Scenario(
-            effectors={},
-            advisories={"win": AdvisoryDecision("win", action="close", transition_step=12)},
-        )
-        assert classify_advisory_scenario(s, {"win": True}) == "reasonable"
-
-    def test_worst_case_holds_active(self) -> None:
-        s = Scenario(
-            effectors={},
-            advisories={"win": AdvisoryDecision("win", action="hold")},
-        )
-        assert classify_advisory_scenario(s, {"win": True}) == "worst_case"
-
-    def test_proactive_activates_default(self) -> None:
-        s = Scenario(
-            effectors={},
-            advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=12)},
-        )
-        assert classify_advisory_scenario(s, {"win": False}) == "proactive"
-
-    def test_hold_on_default_is_baseline(self) -> None:
-        """Holding a default-state device is baseline (no change)."""
-        s = Scenario(
-            effectors={},
-            advisories={"win": AdvisoryDecision("win", action="hold")},
-        )
-        assert classify_advisory_scenario(s, {"win": False}) == "baseline"
-
-    def test_mixed_active_and_proactive(self) -> None:
-        """Scenario with both return-to-default and proactive is mixed."""
-        s = Scenario(
-            effectors={},
-            advisories={
-                "win1": AdvisoryDecision("win1", action="close", transition_step=0),
-                "win2": AdvisoryDecision("win2", action="open", transition_step=0, return_step=12),
-            },
-        )
-        assert classify_advisory_scenario(s, {"win1": True, "win2": False}) == "mixed"
-
-
-class TestExtractPlanningLayers:
-    """Test extract_planning_layers()."""
-
-    def test_basic_layer_extraction(self) -> None:
-        """Finds best scenario per layer."""
+    def test_basic_per_device_opportunity(self) -> None:
+        """Per-device opportunity uses cheapest change vs cheapest hold."""
         environment_states = {"win": True}
         scenarios = [
-            Scenario(effectors={}),  # 0: baseline
-            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: worst_case
-            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),  # 2: reasonable
-            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=12)}),  # 3: reasonable
+            Scenario(effectors={}),  # 0: HVAC-only, counts as all-hold baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: hold
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),  # 2: change
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=12)}),  # 3: change, worse
         ]
         costs = [5.0, 6.0, 3.0, 4.0]
 
-        result = extract_planning_layers(scenarios, costs, environment_states)
-        assert result["baseline_idx"] == 0
-        assert result["baseline_cost"] == 5.0
-        assert result["reasonable_idx"] == 2  # lowest cost reasonable
-        assert result["reasonable_cost"] == 3.0
-        assert result["worst_case_idx"] == 1
-        assert result["worst_case_cost"] == 6.0
+        plan = extract_advisory_plan(scenarios, costs, environment_states)
+        # Baseline is cheapest all-hold: scenario 0 (no advisories) at 5.0.
+        assert plan.baseline_idx == 0
+        assert plan.baseline_cost == 5.0
+        # One opportunity for "win": best_change = idx 2 (cost 3.0), best_hold = idx 1 (cost 6.0)
+        assert len(plan.opportunities) == 1
+        opp = plan.opportunities[0]
+        assert opp.device == "win"
+        assert opp.current_state is True
+        assert opp.idx == 2
+        assert opp.cost_delta == -3.0  # 3.0 - 6.0
+        assert opp.advisory.action == "close"
+        assert opp.advisory.transition_step == 0
 
-    def test_no_non_default_reasonable_falls_back(self) -> None:
-        """When no non-default devices, reasonable = baseline."""
+    def test_no_change_scenarios_no_opportunity(self) -> None:
+        """When every scenario holds, device has no opportunity."""
         scenarios = [
-            Scenario(effectors={}),  # baseline
-            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # baseline (hold on default)
+            Scenario(effectors={}),
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),
         ]
         costs = [5.0, 4.0]
 
-        result = extract_planning_layers(scenarios, costs, {"win": False})
-        # Both are baseline; second is lower cost
-        assert result["baseline_idx"] == 1
-        assert result["reasonable_idx"] == 1  # falls back to baseline
+        plan = extract_advisory_plan(scenarios, costs, {"win": False})
+        # Cheapest all-hold scenario wins.
+        assert plan.baseline_idx == 1
+        assert plan.baseline_cost == 4.0
+        assert plan.opportunities == ()
 
-    def test_proactive_scoring(self) -> None:
-        """Proactive advice shows cost delta vs baseline."""
+    def test_proactive_open_default_device(self) -> None:
+        """Proactively opening a default-state device appears as an opportunity."""
         environment_states = {"win": False}
         scenarios = [
             Scenario(effectors={}),  # 0: baseline
-            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: also baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: also hold
             Scenario(
                 effectors={},
                 advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=12)},
@@ -1354,18 +1314,25 @@ class TestExtractPlanningLayers:
             Scenario(
                 effectors={},
                 advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=24)},
-            ),  # 3: proactive (better)
+            ),  # 3: proactive (best)
         ]
         costs = [5.0, 4.5, 3.5, 3.0]
 
-        result = extract_planning_layers(scenarios, costs, environment_states)
-        assert result["baseline_idx"] == 1  # 4.5 < 5.0
-        assert "win" in result["proactive"]
-        assert result["proactive"]["win"]["idx"] == 3  # best proactive
-        assert result["proactive"]["win"]["cost_delta"] == 3.0 - 4.5  # vs baseline
+        plan = extract_advisory_plan(scenarios, costs, environment_states)
+        assert plan.baseline_idx == 1  # 4.5 < 5.0 (both all-hold)
+        assert plan.baseline_cost == 4.5
+        assert len(plan.opportunities) == 1
+        opp = plan.opportunities[0]
+        assert opp.device == "win"
+        assert opp.current_state is False
+        assert opp.idx == 3
+        assert opp.advisory.action == "open"
+        assert opp.advisory.return_step == 24
+        # cost_delta vs best_hold (idx 1, cost 4.5)
+        assert opp.cost_delta == -1.5
 
-    def test_backup_breach_detection(self) -> None:
-        """Backup breaches are detected in worst-case scenario."""
+    def test_backup_breach_from_baseline(self) -> None:
+        """Backup breaches are computed from the baseline (all-hold) scenario."""
         environment_states = {"win": True}
         schedules = [
             ComfortSchedule(
@@ -1375,62 +1342,71 @@ class TestExtractPlanningLayers:
             ),
         ]
         scenarios = [
-            Scenario(effectors={}),  # 0: baseline
-            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),  # 1: worst_case
+            Scenario(effectors={}),  # 0: HVAC-only, all-hold baseline
+            Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),  # 1: change
         ]
-        costs = [5.0, 6.0]
-        # Worst-case predictions breach backup_lo (65)
+        costs = [6.0, 5.0]
         predictions = [
-            {"room_temp_t+72": 66.0},  # baseline: fine
-            {"room_temp_t+72": 63.0},  # worst_case: below backup 65
+            {"room_temp_t+72": 63.0},  # baseline breaches backup_lo (65)
+            {"room_temp_t+72": 66.0},  # change avoids breach
         ]
 
-        result = extract_planning_layers(
+        plan = extract_advisory_plan(
             scenarios, costs, environment_states,
             predictions_per_scenario=predictions,
             schedules=schedules,
             base_hour=12,
         )
-        assert len(result["backup_breaches"]) > 0
-        assert "63.0" in result["backup_breaches"][0]
-        assert "65" in result["backup_breaches"][0]
+        assert plan.baseline_idx == 0
+        assert len(plan.backup_breaches) > 0
+        assert "63.0" in plan.backup_breaches[0]
+        assert "65" in plan.backup_breaches[0]
 
-    def test_enriched_advisories_in_result(self) -> None:
-        """Result includes actual AdvisoryDecision objects for reasonable and proactive layers."""
+    def test_multiple_devices_independent_marginals(self) -> None:
+        """Each device gets its own best-change/best-hold pair independently."""
         environment_states = {"win_a": True, "win_b": False}
         scenarios = [
-            Scenario(effectors={}),  # 0: baseline
-            Scenario(effectors={}, advisories={
-                "win_a": AdvisoryDecision("win_a", action="close", transition_step=0),
-            }),  # 1: reasonable
+            # 0: both hold
             Scenario(effectors={}, advisories={
                 "win_a": AdvisoryDecision("win_a", action="hold"),
-            }),  # 2: worst_case
+                "win_b": AdvisoryDecision("win_b", action="hold"),
+            }),
+            # 1: close win_a, hold win_b
             Scenario(effectors={}, advisories={
+                "win_a": AdvisoryDecision("win_a", action="close", transition_step=0),
+                "win_b": AdvisoryDecision("win_b", action="hold"),
+            }),
+            # 2: hold win_a, open win_b
+            Scenario(effectors={}, advisories={
+                "win_a": AdvisoryDecision("win_a", action="hold"),
                 "win_b": AdvisoryDecision("win_b", action="open", transition_step=0, return_step=12),
-            }),  # 3: proactive
+            }),
+            # 3: both change — the "mixed" case the old classifier hid
+            Scenario(effectors={}, advisories={
+                "win_a": AdvisoryDecision("win_a", action="close", transition_step=0),
+                "win_b": AdvisoryDecision("win_b", action="open", transition_step=0, return_step=12),
+            }),
         ]
-        costs = [5.0, 3.0, 6.0, 4.0]
+        costs = [6.0, 4.0, 5.0, 3.0]
 
-        result = extract_planning_layers(scenarios, costs, environment_states)
+        plan = extract_advisory_plan(scenarios, costs, environment_states)
+        # Baseline = scenario 0 (only all-hold scenario)
+        assert plan.baseline_idx == 0
+        assert plan.baseline_cost == 6.0
 
-        # Reasonable advisories
-        assert "reasonable_advisories" in result
-        assert "win_a" in result["reasonable_advisories"]
-        adv = result["reasonable_advisories"]["win_a"]
-        assert adv.action == "close"
-        assert adv.transition_step == 0
-
-        # Proactive advisories
-        assert "proactive_advisories" in result
-        assert "win_b" in result["proactive_advisories"]
-        padv = result["proactive_advisories"]["win_b"]
-        assert padv.action == "open"
-        assert padv.return_step == 12
+        by_device = {o.device: o for o in plan.opportunities}
+        # win_a: best_change includes idx 3 (cost 3.0), best_hold includes idx 2 (cost 5.0)
+        assert by_device["win_a"].idx == 3
+        assert by_device["win_a"].cost_delta == -2.0
+        assert by_device["win_a"].advisory.action == "close"
+        # win_b: best_change includes idx 3 (cost 3.0), best_hold includes idx 1 (cost 4.0)
+        assert by_device["win_b"].idx == 3
+        assert by_device["win_b"].cost_delta == -1.0
+        assert by_device["win_b"].advisory.action == "open"
 
 
 class TestWriteCommandJsonAdvisory:
-    """Test advisory layer data in command JSON output."""
+    """Test advisory plan data in command JSON output."""
 
     def _make_decision(self) -> ControlDecision:
         """Create a minimal ControlDecision for testing."""
@@ -1443,46 +1419,50 @@ class TestWriteCommandJsonAdvisory:
             energy_cost=1.0,
         )
 
-    def test_no_advisory_layers(self, tmp_path: object) -> None:
-        """No advisory fields when advisory_layers is None."""
+    def test_no_advisory_plan(self, tmp_path: object) -> None:
+        """No advisory fields when advisory_plan is None."""
         import json as _json
         from unittest.mock import patch
 
         decision = self._make_decision()
         with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
-            path = write_command_json(decision, advisory_layers=None)
+            path = write_command_json(decision, advisory_plan=None)
         data = _json.loads(path.read_text())
-        assert "advisoryRecommendations" not in data
+        assert "advisoryOpportunities" not in data
         assert "advisoryWarnings" not in data
-        assert "proactiveAdvice" not in data
 
-    def test_reasonable_recommendations(self, tmp_path: object) -> None:
-        """Advisory recommendations from reasonable layer appear in JSON."""
+    def test_beneficial_opportunity_serialized(self, tmp_path: object) -> None:
+        """Beneficial opportunities appear in JSON with camelCase keys."""
         import json as _json
         from unittest.mock import patch
 
         decision = self._make_decision()
-        layers = {
-            "reasonable_advisories": {
-                "piano_window": AdvisoryDecision("piano_window", action="close", transition_step=12),
-            },
-            "reasonable_cost": 3.0,
-            "baseline_cost": 5.0,
-            "backup_breaches": [],
-            "proactive": {},
-            "proactive_advisories": {},
-        }
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=(
+                DeviceOpportunity(
+                    device="piano_window",
+                    current_state=True,
+                    advisory=AdvisoryDecision("piano_window", action="close", transition_step=12),
+                    idx=2,
+                    cost_delta=-2.0,
+                    comfort_delta=-1.5,
+                    energy_delta=-0.5,
+                ),
+            ),
+        )
         with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
-            path = write_command_json(decision, advisory_layers=layers)
+            path = write_command_json(decision, advisory_plan=plan)
         data = _json.loads(path.read_text())
-        assert "advisoryRecommendations" in data
-        recs = data["advisoryRecommendations"]
-        assert len(recs) == 1
-        assert recs[0]["device"] == "piano_window"
-        assert recs[0]["action"] == "close"
-        assert recs[0]["inMinutes"] == 60  # 12 steps × 5 min
-        assert recs[0]["layer"] == "reasonable"
-        assert recs[0]["costDelta"] == -2.0  # 3.0 - 5.0
+        assert "advisoryOpportunities" in data
+        opps = data["advisoryOpportunities"]
+        assert len(opps) == 1
+        assert opps[0]["device"] == "piano_window"
+        assert opps[0]["currentState"] is True
+        assert opps[0]["action"] == "close"
+        assert opps[0]["inMinutes"] == 60  # 12 steps × 5 min
+        assert opps[0]["costDelta"] == -2.0
 
     def test_backup_breach_warnings(self, tmp_path: object) -> None:
         """Backup breach warnings appear in JSON."""
@@ -1490,69 +1470,112 @@ class TestWriteCommandJsonAdvisory:
         from unittest.mock import patch
 
         decision = self._make_decision()
-        layers = {
-            "reasonable_advisories": {},
-            "backup_breaches": [
-                "room_temp projected 63.0 at 6h, below backup minimum 65",
-            ],
-            "proactive": {},
-            "proactive_advisories": {},
-        }
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=(),
+            backup_breaches=("room_temp projected 63.0 at 6h, below backup minimum 65",),
+        )
         with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
-            path = write_command_json(decision, advisory_layers=layers)
+            path = write_command_json(decision, advisory_plan=plan)
         data = _json.loads(path.read_text())
         assert "advisoryWarnings" in data
         assert len(data["advisoryWarnings"]) == 1
         assert "63.0" in data["advisoryWarnings"][0]["message"]
-        assert data["advisoryWarnings"][0]["layer"] == "worst_case"
 
-    def test_proactive_advice(self, tmp_path: object) -> None:
-        """Proactive advice with duration appears in JSON."""
+    def test_proactive_opportunity_with_duration(self, tmp_path: object) -> None:
+        """Opportunity with return_step emits durationMinutes."""
         import json as _json
         from unittest.mock import patch
 
         decision = self._make_decision()
-        layers = {
-            "reasonable_advisories": {},
-            "backup_breaches": [],
-            "proactive": {
-                "living_room_window": {"idx": 2, "cost_delta": -0.31},
-            },
-            "proactive_advisories": {
-                "living_room_window": AdvisoryDecision(
-                    "living_room_window", action="open", transition_step=0, return_step=24,
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=4.5,
+            opportunities=(
+                DeviceOpportunity(
+                    device="living_room_window",
+                    current_state=False,
+                    advisory=AdvisoryDecision(
+                        "living_room_window", action="open", transition_step=0, return_step=24,
+                    ),
+                    idx=3,
+                    cost_delta=-0.31,
+                    comfort_delta=-0.2,
+                    energy_delta=-0.11,
                 ),
-            },
-        }
+            ),
+        )
         with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
-            path = write_command_json(decision, advisory_layers=layers)
+            path = write_command_json(decision, advisory_plan=plan)
         data = _json.loads(path.read_text())
-        assert "proactiveAdvice" in data
-        advice = data["proactiveAdvice"]
-        assert len(advice) == 1
-        assert advice[0]["device"] == "living_room_window"
-        assert advice[0]["action"] == "open"
-        assert advice[0]["durationMinutes"] == 120  # (24 - 0) × 5
-        assert advice[0]["costDelta"] == -0.31
-        assert advice[0]["layer"] == "proactive"
+        assert "advisoryOpportunities" in data
+        opps = data["advisoryOpportunities"]
+        assert len(opps) == 1
+        assert opps[0]["device"] == "living_room_window"
+        assert opps[0]["currentState"] is False
+        assert opps[0]["action"] == "open"
+        assert opps[0]["durationMinutes"] == 120  # (24 - 0) × 5
+        assert opps[0]["costDelta"] == -0.31
 
-    def test_hold_only_advisories_excluded(self, tmp_path: object) -> None:
-        """Hold-only reasonable advisories don't produce recommendations."""
+    def test_non_beneficial_opportunities_excluded(self, tmp_path: object) -> None:
+        """Opportunities with cost_delta >= 0 are not written."""
         import json as _json
         from unittest.mock import patch
 
         decision = self._make_decision()
-        layers = {
-            "reasonable_advisories": {
-                "win": AdvisoryDecision("win", action="hold"),
-            },
-            "reasonable_cost": 5.0,
-            "baseline_cost": 5.0,
-            "backup_breaches": [],
-            "proactive": {},
-            "proactive_advisories": {},
-        }
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=(
+                DeviceOpportunity(
+                    device="win",
+                    current_state=True,
+                    advisory=AdvisoryDecision("win", action="close", transition_step=0),
+                    idx=1,
+                    cost_delta=0.3,  # worse than baseline
+                    comfort_delta=0.3,
+                    energy_delta=0.0,
+                ),
+            ),
+        )
         with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
-            path = write_command_json(decision, advisory_layers=layers)
+            path = write_command_json(decision, advisory_plan=plan)
         data = _json.loads(path.read_text())
-        assert "advisoryRecommendations" not in data
+        assert "advisoryOpportunities" not in data
+
+    def test_opportunities_sorted_by_cost_delta(self, tmp_path: object) -> None:
+        """Multiple beneficial opportunities are sorted best-first."""
+        import json as _json
+        from unittest.mock import patch
+
+        decision = self._make_decision()
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=(
+                DeviceOpportunity(
+                    device="small_win",
+                    current_state=False,
+                    advisory=AdvisoryDecision("small_win", action="open", transition_step=0),
+                    idx=1,
+                    cost_delta=-0.5,
+                    comfort_delta=-0.5,
+                    energy_delta=0.0,
+                ),
+                DeviceOpportunity(
+                    device="big_win",
+                    current_state=True,
+                    advisory=AdvisoryDecision("big_win", action="close", transition_step=0),
+                    idx=2,
+                    cost_delta=-2.0,
+                    comfort_delta=-2.0,
+                    energy_delta=0.0,
+                ),
+            ),
+        )
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            path = write_command_json(decision, advisory_plan=plan)
+        data = _json.loads(path.read_text())
+        opps = data["advisoryOpportunities"]
+        assert [o["device"] for o in opps] == ["big_win", "small_win"]

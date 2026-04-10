@@ -35,26 +35,24 @@ from weatherstat.config import (
 )
 
 if TYPE_CHECKING:
-    from weatherstat.control import ControlState
-    from weatherstat.simulator import HouseState, SimParams
-    from weatherstat.types import ComfortSchedule, EnvironmentOpportunity, Scenario
+    from weatherstat.simulator import HouseState
+    from weatherstat.types import AdvisoryPlan, ComfortSchedule, EnvironmentOpportunity
 
 # ── Opportunity state ────────────────────────────────────────────────────
 
 
 @dataclass
 class OpportunityState:
-    """Persistent state for environment opportunities and advisory recommendations."""
+    """Persistent state for environment opportunities and advisory plan outputs."""
 
     active: dict[str, dict]  # entry_name -> opportunity data (serializable)
     cooldowns: dict[str, float]  # cooldown_key -> unix_timestamp
-    recommendations: list[dict] = field(default_factory=list)  # advisory layer recommendations
+    opportunities: list[dict] = field(default_factory=list)  # per-device advisory opportunities
     warnings: list[dict] = field(default_factory=list)  # backup breach warnings
-    proactive: list[dict] = field(default_factory=list)  # proactive advice
 
     @classmethod
     def load(cls) -> OpportunityState:
-        """Load from disk. Handles old flat-dict format (cooldowns only)."""
+        """Load from disk. Returns an empty state when the file is missing or unreadable."""
         if not ADVISORY_STATE_FILE.exists():
             return cls(active={}, cooldowns={})
         try:
@@ -66,9 +64,8 @@ class OpportunityState:
             return cls(
                 active=data["active"],
                 cooldowns=data["cooldowns"],
-                recommendations=data.get("recommendations", []),
+                opportunities=data.get("opportunities", []),
                 warnings=data.get("warnings", []),
-                proactive=data.get("proactive", []),
             )
         return cls(active={}, cooldowns={})
 
@@ -79,9 +76,8 @@ class OpportunityState:
             {
                 "active": self.active,
                 "cooldowns": self.cooldowns,
-                "recommendations": self.recommendations,
+                "opportunities": self.opportunities,
                 "warnings": self.warnings,
-                "proactive": self.proactive,
             },
             indent=2,
         ))
@@ -103,59 +99,44 @@ def save_advisory_state(cooldowns: dict[str, float]) -> None:
     state.save()
 
 
-def save_advisory_recommendations(advisory_layers: dict | None, live: bool = False) -> None:
-    """Persist advisory layer recommendations to state file for TUI display.
+def save_advisory_recommendations(advisory_plan: AdvisoryPlan | None, live: bool = False) -> None:
+    """Persist advisory plan outputs to state file for TUI display.
 
-    Called from the control loop after sweep_scenarios_physics returns advisory_layers.
-    Converts AdvisoryDecision objects to serializable dicts.
+    Writes a single opportunities list (styled by current_state in the TUI) plus
+    backup breach warnings. ``cost_delta < 0`` is the sole gate — sysid-confounded
+    tau betas can make a change look cheaper even when it isn't; we drop anything
+    non-beneficial so we don't surface advice the user shouldn't follow.
     """
     if not live:
         return
     state = OpportunityState.load()
 
-    if not advisory_layers:
-        state.recommendations = []
+    if not advisory_plan:
+        state.opportunities = []
         state.warnings = []
-        state.proactive = []
         state.save()
         return
 
-    # Reasonable layer recommendations
-    recs: list[dict] = []
-    r_advisories = advisory_layers.get("reasonable_advisories", {})
-    for dev, adv in sorted(r_advisories.items()):
-        if adv.action != "hold":
-            recs.append({
-                "device": dev,
-                "action": adv.action,
-                "in_minutes": adv.transition_step * 5,
-                "cost_delta": round(
-                    advisory_layers.get("reasonable_cost", 0) - advisory_layers.get("baseline_cost", 0), 4,
-                ),
-            })
-    state.recommendations = recs
-
-    # Backup breach warnings
-    breaches = advisory_layers.get("backup_breaches", [])
-    state.warnings = [{"message": b} for b in breaches]
-
-    # Proactive advice
-    proactive_list: list[dict] = []
-    proactive_info = advisory_layers.get("proactive", {})
-    proactive_advs = advisory_layers.get("proactive_advisories", {})
-    for dev, info in sorted(proactive_info.items()):
-        adv = proactive_advs.get(dev)
-        if adv is not None:
-            entry: dict[str, object] = {
-                "device": dev,
-                "action": adv.action,
-                "cost_delta": round(info["cost_delta"], 4),
-            }
-            if adv.return_step is not None:
-                entry["duration_minutes"] = (adv.return_step - adv.transition_step) * 5
-            proactive_list.append(entry)
-    state.proactive = proactive_list
-
+    opps: list[dict] = []
+    beneficial = sorted(
+        (o for o in advisory_plan.opportunities if o.cost_delta < 0),
+        key=lambda o: o.cost_delta,
+    )
+    for opp in beneficial:
+        entry: dict[str, object] = {
+            "device": opp.device,
+            "current_state": opp.current_state,
+            "action": opp.advisory.action,
+            "in_minutes": opp.advisory.transition_step * 5,
+            "cost_delta": round(opp.cost_delta, 4),
+        }
+        if opp.advisory.return_step is not None:
+            entry["duration_minutes"] = (
+                opp.advisory.return_step - opp.advisory.transition_step
+            ) * 5
+        opps.append(entry)
+    state.opportunities = opps
+    state.warnings = [{"message": b} for b in advisory_plan.backup_breaches]
     state.save()
 
 
@@ -164,33 +145,24 @@ def save_advisory_recommendations(advisory_layers: dict | None, live: bool = Fal
 
 def evaluate_environment_opportunities(
     state: HouseState,
-    winning_scenario: Scenario,
-    winning_comfort_cost: float,
-    winning_energy_cost: float,
-    sim_params: SimParams,
     schedules: list[ComfortSchedule],
-    base_hour: int,
-    prev_state: ControlState | None = None,
+    advisory_plan: AdvisoryPlan | None,
 ) -> list[EnvironmentOpportunity]:
-    """Evaluate window toggles for comfort and energy savings.
+    """Build environment opportunities from per-device advisory marginals.
 
-    Two-tier evaluation:
-    1. Quick check: simulate winning scenario with window toggled → comfort delta.
-    2. Re-sweep (if promising): full scenario sweep with toggled window to find
-       best HVAC plan. Captures "open window + turn off mini split" savings.
-
-    Returns list of EnvironmentOpportunity sorted by total benefit (best first).
+    Reads ``advisory_plan.opportunities`` — the sweep already explored every
+    joint advisory combination in the trajectory search, so per-device
+    marginals (with the rest of the system free to optimize) are exact.
+    Each beneficial change becomes an ``EnvironmentOpportunity`` with
+    normalized benefit, threshold-gated for the persistent notification
+    lifecycle. Returns the list sorted by total benefit (best first).
     """
-    from weatherstat.control import (
-        CONTROL_HORIZONS,
-        HORIZON_WEIGHTS,
-        compute_comfort_cost,
-        sweep_scenarios_physics,
-    )
-    from weatherstat.simulator import HouseState as _HS
-    from weatherstat.simulator import predict
+    from weatherstat.control import CONTROL_HORIZONS, HORIZON_WEIGHTS
     from weatherstat.types import EnvironmentOpportunity
     from weatherstat.yaml_config import load_config
+
+    if not advisory_plan:
+        return []
 
     cfg = load_config()
     threshold = ADVISORY_OPPORTUNITY_THRESHOLD
@@ -202,65 +174,26 @@ def evaluate_environment_opportunities(
     total_hw = sum(HORIZON_WEIGHTS.get(h, 0.5) for h in CONTROL_HORIZONS)
     cost_norm = len(schedules) * total_hw if schedules else 1.0
 
-    # Baseline comfort cost with current window states
-    target_names, baseline_preds = predict(state, [winning_scenario], sim_params, CONTROL_HORIZONS)
-    baseline_dict = {t: float(baseline_preds[0, j]) for j, t in enumerate(target_names)}
-    baseline_comfort = compute_comfort_cost(baseline_dict, schedules, base_hour)
-
     opportunities: list[EnvironmentOpportunity] = []
 
-    for env_name in cfg.advisory_environment:
-        is_open = state.environment_states.get(env_name, False)
-        toggled_states = dict(state.environment_states)
-        toggled_states[env_name] = not is_open
-
-        toggled_state = _HS(
-            current_temps=state.current_temps,
-            outdoor_temp=state.outdoor_temp,
-            forecast_temps=state.forecast_temps,
-            environment_states=toggled_states,
-            hour_of_day=state.hour_of_day,
-            recent_history=state.recent_history,
-            solar_fractions=state.solar_fractions,
-            solar_elevations=state.solar_elevations,
-        )
-
-        # Quick check: comfort improvement with same HVAC plan
-        _, toggled_preds = predict(toggled_state, [winning_scenario], sim_params, CONTROL_HORIZONS)
-        toggled_dict = {t: float(toggled_preds[0, j]) for j, t in enumerate(target_names)}
-        quick_comfort = compute_comfort_cost(toggled_dict, schedules, base_hour)
-        quick_benefit = (baseline_comfort - quick_comfort) / cost_norm
-
-        if quick_benefit <= threshold:
+    for opp in advisory_plan.opportunities:
+        if opp.device not in cfg.advisory_environment:
+            continue
+        if opp.cost_delta >= 0:
             continue
 
-        # Re-sweep: find best HVAC plan with toggled environment factor
-        resweep_decision, _resweep_scenario, _, _ = sweep_scenarios_physics(
-            current_temps=state.current_temps,
-            outdoor_temp=state.outdoor_temp,
-            forecast_temps=state.forecast_temps,
-            environment_states=toggled_states,
-            sim_params=sim_params,
-            hour_of_day=state.hour_of_day,
-            recent_history=state.recent_history,
-            schedules=schedules,
-            base_hour=base_hour,
-            prev_state=prev_state,
-            solar_fractions=state.solar_fractions,
-            solar_elevations=state.solar_elevations,
-        )
-
-        comfort_improvement = (winning_comfort_cost - resweep_decision.comfort_cost) / cost_norm
-        energy_saving = winning_energy_cost - resweep_decision.energy_cost
+        comfort_improvement = -opp.comfort_delta / cost_norm
+        energy_saving = -opp.energy_delta  # raw cost units, not normalized
         total_benefit = comfort_improvement + energy_saving
 
         if total_benefit <= threshold:
             continue
 
-        env_cfg = cfg.environment[env_name]
-        action = env_cfg.open_action.capitalize() if not is_open else env_cfg.close_action.capitalize()
+        env_cfg = cfg.environment[opp.device]
+        is_open = opp.current_state
+        action = env_cfg.open_action if not is_open else env_cfg.close_action
 
-        parts = [f"{action} {env_cfg.label} {env_cfg.kind}"]
+        parts = [f"{action.capitalize()} {env_cfg.label} {env_cfg.kind}"]
         if not is_open:
             parts.append(f"({state.outdoor_temp:.0f}{UNIT_SYMBOL} outside)")
         if comfort_improvement > 0.01:
@@ -270,8 +203,8 @@ def evaluate_environment_opportunities(
         message = " — ".join(parts)
 
         opportunities.append(EnvironmentOpportunity(
-            entry=env_name,
-            action=action.lower(),
+            entry=opp.device,
+            action=action,
             comfort_improvement=round(comfort_improvement, 2),
             energy_saving=round(energy_saving, 3),
             total_benefit=round(total_benefit, 2),

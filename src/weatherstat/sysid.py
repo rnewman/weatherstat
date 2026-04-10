@@ -669,9 +669,16 @@ def _fit_sensor_model(
     # The coefficient β gives the additional cooling/heating rate when active.
     # Skip devices with too few active rows — near-zero-variance columns blow up
     # the condition number and the coefficient can't be reliably estimated anyway.
+    # Skip kind=shade entirely: shades affect solar gain (modeled separately as
+    # _adv_solar_*), not envelope conduction. A shade has no physical mechanism
+    # for changing tau, and "closed shade" tends to correlate with HVAC-off
+    # nighttime hours, producing strongly confounded β > 0 (apparent fast cooling).
     _MIN_ACTIVE_ROWS = 50  # ~4h of 5-min data
+    _TAU_SKIP_KINDS = {"shade"}
     env_col_to_name = {cfg.column: name for name, cfg in _CFG.environment.items()}
-    all_adv_cols = [cfg.column for cfg in _CFG.environment.values()]
+    all_adv_cols = [
+        cfg.column for cfg in _CFG.environment.values() if cfg.kind not in _TAU_SKIP_KINDS
+    ]
     existing_adv_cols = [c for c in all_adv_cols if c in df.columns]
 
     adv_tau_feature_start = len(feature_names)
@@ -689,6 +696,17 @@ def _fit_sensor_model(
         feature_names.append(f"_adv_tau_{dev_name}")
         feature_cols.append(state_arr * delta_t)
         adv_tau_feature_names.append(dev_name)
+
+    # Solar features still need state arrays for skipped tau-kinds (shades).
+    # Build them now, since the tau loop above didn't.
+    for wc in [c for c in (cfg.column for cfg in _CFG.environment.values()) if c in df.columns]:
+        dev_name = env_col_to_name[wc]
+        if dev_name in adv_state_arrays:
+            continue
+        state_arr = df[wc].astype("float64").fillna(0.0).values
+        if int(state_arr.sum()) < _MIN_ACTIVE_ROWS:
+            continue
+        adv_state_arrays[dev_name] = state_arr
 
     # Solar elevation feature (single continuous feature per sensor)
     solar_start = len(feature_names)

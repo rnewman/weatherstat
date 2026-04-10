@@ -359,7 +359,11 @@ class TestEnvironmentEntryConfig:
         assert cfg.open_action == "open"
 
     def test_shade_action_verbs(self) -> None:
-        """Shade kind uses lower/raise action verbs."""
+        """Shade kind uses raise/lower verbs.
+
+        close_action returns the shade to its default state (open=raised),
+        open_action moves it toward the active state (closed=lowered).
+        """
         from weatherstat.types import EnvironmentEntryConfig
 
         cfg = EnvironmentEntryConfig(
@@ -367,8 +371,8 @@ class TestEnvironmentEntryConfig:
             column="moss_garden_shade_active", kind="shade", default_state="open",
             active_state="closed", advisory=True,
         )
-        assert cfg.close_action == "lower"
-        assert cfg.open_action == "raise"
+        assert cfg.close_action == "raise"
+        assert cfg.open_action == "lower"
         assert cfg.label == "moss garden shade"
 
     def test_yaml_parsing(self) -> None:
@@ -405,45 +409,61 @@ class TestEnvironmentEntryConfig:
 
 
 class TestSaveAdvisoryRecommendations:
-    """Test advisory recommendation persistence."""
+    """Test advisory plan persistence."""
 
-    def test_save_with_layers(self, tmp_path, monkeypatch) -> None:
-        """Advisory layers are saved to state file."""
+    def test_save_with_plan(self, tmp_path, monkeypatch) -> None:
+        """Advisory plan opportunities + warnings are saved to state file."""
         from weatherstat.advisory import save_advisory_recommendations
-        from weatherstat.types import AdvisoryDecision
+        from weatherstat.types import AdvisoryDecision, AdvisoryPlan, DeviceOpportunity
 
         state_file = tmp_path / "state.json"
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
 
-        layers = {
-            "reasonable_advisories": {
-                "win_a": AdvisoryDecision("win_a", action="close", transition_step=12),
-            },
-            "reasonable_cost": 3.0,
-            "baseline_cost": 5.0,
-            "backup_breaches": ["room_temp projected 63 at 6h"],
-            "proactive": {
-                "win_b": {"idx": 0, "cost_delta": -0.5},
-            },
-            "proactive_advisories": {
-                "win_b": AdvisoryDecision("win_b", action="open", transition_step=0, return_step=24),
-            },
-        }
-        save_advisory_recommendations(layers, live=True)
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=(
+                DeviceOpportunity(
+                    device="win_a",
+                    current_state=True,
+                    advisory=AdvisoryDecision("win_a", action="close", transition_step=12),
+                    idx=1,
+                    cost_delta=-2.0,
+                    comfort_delta=-1.5,
+                    energy_delta=-0.5,
+                ),
+                DeviceOpportunity(
+                    device="win_b",
+                    current_state=False,
+                    advisory=AdvisoryDecision(
+                        "win_b", action="open", transition_step=0, return_step=24,
+                    ),
+                    idx=2,
+                    cost_delta=-0.5,
+                    comfort_delta=-0.5,
+                    energy_delta=0.0,
+                ),
+            ),
+            backup_breaches=("room_temp projected 63 at 6h",),
+        )
+        save_advisory_recommendations(plan, live=True)
 
         data = json.loads(state_file.read_text())
-        assert len(data["recommendations"]) == 1
-        assert data["recommendations"][0]["device"] == "win_a"
-        assert data["recommendations"][0]["action"] == "close"
-        assert data["recommendations"][0]["in_minutes"] == 60
+        # Single unified opportunities list, sorted by cost_delta (best first)
+        assert len(data["opportunities"]) == 2
+        assert data["opportunities"][0]["device"] == "win_a"
+        assert data["opportunities"][0]["action"] == "close"
+        assert data["opportunities"][0]["in_minutes"] == 60
+        assert data["opportunities"][0]["current_state"] is True
+        assert data["opportunities"][1]["device"] == "win_b"
+        assert data["opportunities"][1]["current_state"] is False
+        assert data["opportunities"][1]["duration_minutes"] == 120
+        # Warnings from backup breaches
         assert len(data["warnings"]) == 1
         assert "63" in data["warnings"][0]["message"]
-        assert len(data["proactive"]) == 1
-        assert data["proactive"][0]["device"] == "win_b"
-        assert data["proactive"][0]["duration_minutes"] == 120
 
-    def test_save_clears_when_no_layers(self, tmp_path, monkeypatch) -> None:
-        """None advisory_layers clears recommendations."""
+    def test_save_clears_when_no_plan(self, tmp_path, monkeypatch) -> None:
+        """None advisory_plan clears opportunities and warnings."""
         from weatherstat.advisory import save_advisory_recommendations
 
         state_file = tmp_path / "state.json"
@@ -451,36 +471,73 @@ class TestSaveAdvisoryRecommendations:
         state_file.write_text(json.dumps({
             "active": {},
             "cooldowns": {},
-            "recommendations": [{"device": "old"}],
+            "opportunities": [{"device": "old"}],
             "warnings": [{"message": "old"}],
-            "proactive": [{"device": "old"}],
         }))
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
 
         save_advisory_recommendations(None, live=True)
 
         data = json.loads(state_file.read_text())
-        assert data["recommendations"] == []
+        assert data["opportunities"] == []
         assert data["warnings"] == []
-        assert data["proactive"] == []
 
-    def test_no_save_in_dry_run(self, tmp_path, monkeypatch) -> None:
-        """Dry run does not persist anything."""
+    def test_non_beneficial_opportunities_dropped(self, tmp_path, monkeypatch) -> None:
+        """When cost_delta >= 0, the opportunity is not saved.
+
+        Sysid-confounded tau betas can make a change look "best" even when its
+        cost exceeds baseline (e.g., "raise the shades" at night, where closed
+        shades correlate with HVAC-off fast cooling). Don't surface advice the
+        user shouldn't follow.
+        """
         from weatherstat.advisory import save_advisory_recommendations
-        from weatherstat.types import AdvisoryDecision
+        from weatherstat.types import AdvisoryDecision, AdvisoryPlan, DeviceOpportunity
 
         state_file = tmp_path / "state.json"
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
 
-        layers = {
-            "reasonable_advisories": {
-                "win": AdvisoryDecision("win", action="close"),
-            },
-            "reasonable_cost": 3.0,
-            "baseline_cost": 5.0,
-            "backup_breaches": [],
-            "proactive": {},
-            "proactive_advisories": {},
-        }
-        save_advisory_recommendations(layers, live=False)
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=7.0,
+            opportunities=(
+                DeviceOpportunity(
+                    device="win_a",
+                    current_state=True,
+                    advisory=AdvisoryDecision("win_a", action="close", transition_step=0),
+                    idx=1,
+                    cost_delta=2.0,  # WORSE than hold
+                    comfort_delta=2.0,
+                    energy_delta=0.0,
+                ),
+            ),
+        )
+        save_advisory_recommendations(plan, live=True)
+
+        data = json.loads(state_file.read_text())
+        assert data["opportunities"] == []
+
+    def test_no_save_in_dry_run(self, tmp_path, monkeypatch) -> None:
+        """Dry run does not persist anything."""
+        from weatherstat.advisory import save_advisory_recommendations
+        from weatherstat.types import AdvisoryDecision, AdvisoryPlan, DeviceOpportunity
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+
+        plan = AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=(
+                DeviceOpportunity(
+                    device="win",
+                    current_state=True,
+                    advisory=AdvisoryDecision("win", action="close"),
+                    idx=1,
+                    cost_delta=-2.0,
+                    comfort_delta=-2.0,
+                    energy_delta=0.0,
+                ),
+            ),
+        )
+        save_advisory_recommendations(plan, live=False)
         assert not state_file.exists()

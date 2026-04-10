@@ -211,9 +211,11 @@ class WeatherstatApp(App):
         import weatherstat.config
         import weatherstat.control
         import weatherstat.extract
+        import weatherstat.types
         import weatherstat.yaml_config
 
         try:
+            importlib.reload(weatherstat.types)
             importlib.reload(weatherstat.yaml_config)
             importlib.reload(weatherstat.config)
             importlib.reload(weatherstat.extract)
@@ -318,9 +320,8 @@ class WeatherstatApp(App):
                 active = data.get("active", {})
                 self.query_one(OpportunityPanel).set_data(
                     opportunities=list(active.values()),
-                    recommendations=data.get("recommendations"),
+                    advisory_opportunities=data.get("opportunities"),
                     warnings=data.get("warnings"),
-                    proactive=data.get("proactive"),
                 )
             except Exception as e:
                 self._log(f"[config] [red]Failed to load opportunities: {e}[/]")
