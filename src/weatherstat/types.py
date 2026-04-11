@@ -140,20 +140,6 @@ class ComfortSchedule:
 
 
 @dataclass(frozen=True)
-class EnvironmentOpportunity:
-    """A persistent opportunity to improve comfort/energy by toggling an environment entry."""
-
-    entry: str  # environment entry name (e.g., "bedroom", "door_balcony")
-    action: str  # "open", "close", "lower", "raise", "turn_on", "turn_off"
-    comfort_improvement: float  # comfort cost reduction
-    energy_saving: float  # energy cost reduction from HVAC changes
-    total_benefit: float  # comfort_improvement + energy_saving
-    message: str  # human-readable description
-    first_seen: str = ""  # ISO timestamp when first detected
-    notified: bool = False  # whether push notification was sent
-
-
-@dataclass(frozen=True)
 class AdvisoryDecision:
     """Decision for an advisory effector in a scenario.
 
@@ -189,8 +175,6 @@ class DeviceOpportunity:
     advisory: AdvisoryDecision  # the change action + timing from the best-change scenario
     idx: int  # scenario index of the best-change scenario
     cost_delta: float  # cost_change - cost_hold (< 0 = beneficial)
-    comfort_delta: float  # comfort component of cost_delta
-    energy_delta: float  # energy component of cost_delta
 
 
 @dataclass(frozen=True)

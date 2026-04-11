@@ -198,8 +198,10 @@ class ConstraintSchedule:
 class AdvisoryConfig:
     cooldowns: dict[str, int]
     quiet_hours: tuple[int, int] = (22, 7)
-    opportunity_threshold: float = 0.3  # minimum benefit to track
-    notification_threshold: float = 1.5  # minimum benefit to push notification
+    # Minimum |cost_delta| in raw sweep cost units to push a Home Assistant
+    # notification. Smaller beneficial opportunities are still tracked and
+    # displayed in the TUI; this gate only controls phone push notifications.
+    notification_threshold: float = 1.5
 
 
 @dataclass(frozen=True)
@@ -737,7 +739,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     advisory_config = AdvisoryConfig(
         cooldowns={str(k): int(v) for k, v in adv_data.get("cooldowns", {}).items()},
         quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
-        opportunity_threshold=float(adv_data.get("opportunity_threshold", 0.3)),
         notification_threshold=float(adv_data.get("notification_threshold", 1.5)),
     )
 

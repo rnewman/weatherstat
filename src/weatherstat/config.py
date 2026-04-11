@@ -116,7 +116,6 @@ EFFECTOR_MAP: dict[str, EffectorConfig] = {e.name: e for e in EFFECTORS}
 # Advisory configuration (from YAML)
 ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
 ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
-ADVISORY_OPPORTUNITY_THRESHOLD: float = _CFG.advisory.opportunity_threshold
 ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
 
 

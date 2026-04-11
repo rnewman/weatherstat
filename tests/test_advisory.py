@@ -87,10 +87,10 @@ def _make_schedules(**overrides: list[ComfortScheduleEntry]) -> list[ComfortSche
 
 # ── Solar elevation regression test ──────────────────────────────────────
 #
-# Regression test for the bug where evaluate_environment_opportunities dropped
-# solar_elevations when constructing the toggled HouseState, causing the
-# simulator to fall back from elevation-based solar (significant gains) to
-# the empty legacy per-hour model.  Every window toggle appeared to cool
+# Regression test for the bug where the (now-deleted) per-window re-sweep
+# dropped solar_elevations when constructing the toggled HouseState, causing
+# the simulator to fall back from elevation-based solar (significant gains)
+# to the empty legacy per-hour model. Every window toggle appeared to cool
 # rooms down, producing spurious opportunities.
 
 
@@ -189,153 +189,262 @@ class TestSolarElevationNotDropped:
 # ── Opportunity state tests ──────────────────────────────────────────────
 
 
-class TestOpportunityState:
-    """Test persistent opportunity state management."""
+class TestAdvisoryState:
+    """Test persistent advisory state management."""
 
     def test_load_empty(self, tmp_path, monkeypatch) -> None:
-        """Empty state file → empty active and cooldowns."""
-        from weatherstat.advisory import OpportunityState
+        """Missing state file → empty cooldowns/opportunities/warnings."""
+        from weatherstat.advisory import AdvisoryState
 
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
-        state = OpportunityState.load()
-        assert state.active == {}
+        state = AdvisoryState.load()
         assert state.cooldowns == {}
+        assert state.opportunities == []
+        assert state.warnings == []
 
-    def test_load_new_format(self, tmp_path, monkeypatch) -> None:
-        """New format with active + cooldowns loads correctly."""
-        from weatherstat.advisory import OpportunityState
+    def test_load_existing_format(self, tmp_path, monkeypatch) -> None:
+        """State file with cooldowns + opportunities + warnings round-trips."""
+        from weatherstat.advisory import AdvisoryState
 
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
-            "active": {"bedroom": {"action": "open", "total_benefit": 2.0}},
             "cooldowns": {"opportunity_bedroom": 1000.0},
+            "opportunities": [{"device": "bedroom", "action": "open", "cost_delta": -2.0}],
+            "warnings": [{"message": "test"}],
         }))
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-        state = OpportunityState.load()
-        assert "bedroom" in state.active
+        state = AdvisoryState.load()
         assert state.cooldowns["opportunity_bedroom"] == 1000.0
+        assert state.opportunities[0]["device"] == "bedroom"
+        assert state.warnings[0]["message"] == "test"
 
     def test_save_and_reload(self, tmp_path, monkeypatch) -> None:
         """Round-trip save and load."""
-        from weatherstat.advisory import OpportunityState
+        from weatherstat.advisory import AdvisoryState
 
         state_file = tmp_path / "state.json"
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-        state = OpportunityState(
-            active={"piano": {"action": "open", "total_benefit": 1.5}},
+        state = AdvisoryState(
             cooldowns={"opportunity_piano": 5000.0},
+            opportunities=[{"device": "piano", "cost_delta": -1.5}],
+            warnings=[{"message": "breach"}],
         )
         state.save()
-        loaded = OpportunityState.load()
-        assert loaded.active == state.active
+        loaded = AdvisoryState.load()
         assert loaded.cooldowns == state.cooldowns
+        assert loaded.opportunities == state.opportunities
+        assert loaded.warnings == state.warnings
 
 
 # ── Opportunity lifecycle tests ──────────────────────────────────────────
 
 
-class TestProcessOpportunities:
-    """Test opportunity lifecycle: new, persist, expire."""
+class TestProcessAdvisoryPlan:
+    """Test the unified advisory pipeline: persistence + notifications."""
 
     @staticmethod
-    def _make_opp(entry: str, benefit: float = 2.0):
-        from weatherstat.types import EnvironmentOpportunity
+    def _plan(*opps, breaches: tuple[str, ...] = ()):
+        from weatherstat.types import AdvisoryPlan
 
-        return EnvironmentOpportunity(
-            entry=entry,
-            action="open",
-            comfort_improvement=benefit * 0.7,
-            energy_saving=benefit * 0.3,
-            total_benefit=benefit,
-            message=f"Open {entry} — test",
+        return AdvisoryPlan(
+            baseline_idx=0,
+            baseline_cost=5.0,
+            opportunities=tuple(opps),
+            backup_breaches=breaches,
         )
 
-    def test_new_opportunity_tracked(self, tmp_path, monkeypatch, capsys) -> None:
-        """New opportunity is added to active set."""
-        from weatherstat.advisory import process_opportunities
+    @staticmethod
+    def _opp(device: str, cost_delta: float, action: str = "open", **adv_kwargs):
+        from weatherstat.types import AdvisoryDecision, DeviceOpportunity
 
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
-        opp = self._make_opp("bedroom", 1.0)
-        active, dismissed = process_opportunities([opp], live=False, current_hour=12)
-        assert len(active) == 1
-        assert active[0].entry == "bedroom"
-        assert len(dismissed) == 0
-        assert "new" in capsys.readouterr().out.lower()
+        return DeviceOpportunity(
+            device=device,
+            current_state=False,
+            advisory=AdvisoryDecision(device, action=action, **adv_kwargs),
+            idx=1,
+            cost_delta=cost_delta,
+        )
 
-    def test_opportunity_persists_across_cycles(self, tmp_path, monkeypatch) -> None:
-        """Opportunity stays active across multiple cycles."""
-        from weatherstat.advisory import process_opportunities
-
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-        opp = self._make_opp("bedroom", 1.0)
-
-        # Cycle 1: new
-        active1, _ = process_opportunities([opp], live=True, current_hour=12)
-        assert len(active1) == 1
-
-        # Cycle 2: still valid
-        active2, _ = process_opportunities([opp], live=True, current_hour=12)
-        assert len(active2) == 1
-        assert active2[0].first_seen == active1[0].first_seen  # preserved
-
-    def test_expired_opportunity_dismissed(self, tmp_path, monkeypatch, capsys) -> None:
-        """Opportunity removed when no longer in candidates."""
-        from weatherstat.advisory import process_opportunities
+    def test_beneficial_opportunity_persisted(self, tmp_path, monkeypatch) -> None:
+        """Beneficial opportunity is written to the state file in live mode."""
+        from weatherstat.advisory import process_advisory_plan
 
         state_file = tmp_path / "state.json"
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-        opp = self._make_opp("bedroom", 1.0)
+        plan = self._plan(self._opp("bedroom", -1.0))
 
-        # Cycle 1: active
-        process_opportunities([opp], live=True, current_hour=12)
+        process_advisory_plan(plan, live=True, current_hour=12)
 
-        # Cycle 2: no longer a candidate → dismissed
-        active, dismissed = process_opportunities([], live=True, current_hour=12)
-        assert len(active) == 0
-        assert "bedroom" in dismissed
+        data = json.loads(state_file.read_text())
+        assert len(data["opportunities"]) == 1
+        assert data["opportunities"][0]["device"] == "bedroom"
+        assert data["opportunities"][0]["cost_delta"] == -1.0
+
+    def test_non_beneficial_dropped(self, tmp_path, monkeypatch) -> None:
+        """Opportunities with cost_delta >= 0 are not persisted."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        plan = self._plan(self._opp("bedroom", 0.5))  # worse than baseline
+
+        process_advisory_plan(plan, live=True, current_hour=12)
+
+        data = json.loads(state_file.read_text())
+        assert data["opportunities"] == []
+
+    def test_dry_run_no_save(self, tmp_path, monkeypatch) -> None:
+        """Dry run does not write the state file."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        plan = self._plan(self._opp("bedroom", -2.0))
+
+        process_advisory_plan(plan, live=False, current_hour=12)
+        assert not state_file.exists()
 
     def test_below_notification_threshold_not_notified(self, tmp_path, monkeypatch) -> None:
-        """Opportunity below notification threshold is tracked but not notified."""
-        from weatherstat.advisory import process_opportunities
+        """Opportunity below |cost_delta| threshold is tracked but does not notify."""
+        from weatherstat.advisory import process_advisory_plan
 
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
-        # benefit=0.5, notification_threshold=1.5 → tracked, not notified
-        opp = self._make_opp("bedroom", 0.5)
-        active, _ = process_opportunities([opp], live=False, current_hour=12)
-        assert len(active) == 1
-        assert not active[0].notified
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        # |cost_delta| = 0.5 < default notification_threshold of 1.5
+        plan = self._plan(self._opp("bedroom", -0.5))
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        process_advisory_plan(plan, live=True, current_hour=12)
+
+        # Tracked
+        data = json.loads(state_file.read_text())
+        assert len(data["opportunities"]) == 1
+        # Not notified
+        assert sent == []
+        assert "opportunity_bedroom" not in data["cooldowns"]
 
     def test_above_notification_threshold_notified(self, tmp_path, monkeypatch) -> None:
-        """Opportunity above notification threshold is marked as notified."""
-        from weatherstat.advisory import process_opportunities
+        """Opportunity above threshold sends a single rolled-up notification."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        plan = self._plan(self._opp("bedroom", -2.0))
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        process_advisory_plan(plan, live=True, current_hour=12)
+
+        assert len(sent) == 1
+        data = json.loads(state_file.read_text())
+        assert "opportunity_bedroom" in data["cooldowns"]
+
+    def test_quiet_hours_suppress_notification(self, tmp_path, monkeypatch) -> None:
+        """Quiet hours suppress notifications even when above threshold."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        plan = self._plan(self._opp("bedroom", -5.0))
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        process_advisory_plan(plan, live=True, current_hour=23)
+
+        # Tracked but not notified
+        data = json.loads(state_file.read_text())
+        assert len(data["opportunities"]) == 1
+        assert sent == []
+
+    def test_cooldown_suppresses_repeat_notification(self, tmp_path, monkeypatch) -> None:
+        """Recently-notified opportunity does not re-notify within cooldown."""
+        import time as _time
+
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        # Pre-populate cooldown timestamp from now
+        state_file.write_text(json.dumps({
+            "cooldowns": {"opportunity_bedroom": _time.time()},
+            "opportunities": [],
+            "warnings": [],
+        }))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        plan = self._plan(self._opp("bedroom", -3.0))
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        process_advisory_plan(plan, live=True, current_hour=12)
+
+        # Tracked but not re-notified
+        data = json.loads(state_file.read_text())
+        assert len(data["opportunities"]) == 1
+        assert sent == []
+
+    def test_warnings_persisted(self, tmp_path, monkeypatch) -> None:
+        """Backup-breach warnings are persisted alongside opportunities."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        plan = self._plan(breaches=("room_temp projected 63 at 6h",))
+
+        process_advisory_plan(plan, live=True, current_hour=12)
+
+        data = json.loads(state_file.read_text())
+        assert len(data["warnings"]) == 1
+        assert "63" in data["warnings"][0]["message"]
+
+    def test_none_plan_clears_state_and_dismisses_rollup(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Passing advisory_plan=None clears opportunities and dismisses the rollup."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        # Pre-populate with stale opportunities so the dismiss path triggers
+        state_file.write_text(json.dumps({
+            "cooldowns": {},
+            "opportunities": [{"device": "old"}],
+            "warnings": [{"message": "old"}],
+        }))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        dismissed: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.dismiss_ha_notification",
+            lambda *a, **kw: dismissed.append((a, kw)) or True,
+        )
+
+        process_advisory_plan(None, live=True, current_hour=12)
+
+        data = json.loads(state_file.read_text())
+        assert data["opportunities"] == []
+        assert data["warnings"] == []
+        assert len(dismissed) == 1
+
+    def test_empty_opportunities_console_output(self, tmp_path, monkeypatch, capsys) -> None:
+        """Empty plan logs the no-opportunities line."""
+        from weatherstat.advisory import process_advisory_plan
 
         monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
-        # benefit=2.0 > notification_threshold=1.5 → notified
-        opp = self._make_opp("bedroom", 2.0)
-        active, _ = process_opportunities([opp], live=False, current_hour=12)
-        assert len(active) == 1
-        assert active[0].notified
+        plan = self._plan()
 
-    def test_quiet_hours_suppress_notification_not_tracking(self, tmp_path, monkeypatch) -> None:
-        """During quiet hours: tracked but not notified, even above threshold."""
-        from weatherstat.advisory import process_opportunities
+        process_advisory_plan(plan, live=False, current_hour=12)
 
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
-        opp = self._make_opp("bedroom", 5.0)
-        active, _ = process_opportunities([opp], live=False, current_hour=23)
-        assert len(active) == 1
-        assert not active[0].notified  # quiet hours suppress notification
-
-    def test_empty_opportunities(self, tmp_path, monkeypatch, capsys) -> None:
-        """No opportunities → empty result."""
-        from weatherstat.advisory import process_opportunities
-
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
-        active, dismissed = process_opportunities([], live=False, current_hour=12)
-        assert active == []
-        assert dismissed == []
-        assert "No opportunities" in capsys.readouterr().out
+        assert "No beneficial opportunities" in capsys.readouterr().out
 
 
 class TestEnvironmentEntryConfig:
@@ -408,136 +517,6 @@ class TestEnvironmentEntryConfig:
             cfg.name = "changed"  # type: ignore[misc]
 
 
-class TestSaveAdvisoryRecommendations:
-    """Test advisory plan persistence."""
-
-    def test_save_with_plan(self, tmp_path, monkeypatch) -> None:
-        """Advisory plan opportunities + warnings are saved to state file."""
-        from weatherstat.advisory import save_advisory_recommendations
-        from weatherstat.types import AdvisoryDecision, AdvisoryPlan, DeviceOpportunity
-
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-
-        plan = AdvisoryPlan(
-            baseline_idx=0,
-            baseline_cost=5.0,
-            opportunities=(
-                DeviceOpportunity(
-                    device="win_a",
-                    current_state=True,
-                    advisory=AdvisoryDecision("win_a", action="close", transition_step=12),
-                    idx=1,
-                    cost_delta=-2.0,
-                    comfort_delta=-1.5,
-                    energy_delta=-0.5,
-                ),
-                DeviceOpportunity(
-                    device="win_b",
-                    current_state=False,
-                    advisory=AdvisoryDecision(
-                        "win_b", action="open", transition_step=0, return_step=24,
-                    ),
-                    idx=2,
-                    cost_delta=-0.5,
-                    comfort_delta=-0.5,
-                    energy_delta=0.0,
-                ),
-            ),
-            backup_breaches=("room_temp projected 63 at 6h",),
-        )
-        save_advisory_recommendations(plan, live=True)
-
-        data = json.loads(state_file.read_text())
-        # Single unified opportunities list, sorted by cost_delta (best first)
-        assert len(data["opportunities"]) == 2
-        assert data["opportunities"][0]["device"] == "win_a"
-        assert data["opportunities"][0]["action"] == "close"
-        assert data["opportunities"][0]["in_minutes"] == 60
-        assert data["opportunities"][0]["current_state"] is True
-        assert data["opportunities"][1]["device"] == "win_b"
-        assert data["opportunities"][1]["current_state"] is False
-        assert data["opportunities"][1]["duration_minutes"] == 120
-        # Warnings from backup breaches
-        assert len(data["warnings"]) == 1
-        assert "63" in data["warnings"][0]["message"]
-
-    def test_save_clears_when_no_plan(self, tmp_path, monkeypatch) -> None:
-        """None advisory_plan clears opportunities and warnings."""
-        from weatherstat.advisory import save_advisory_recommendations
-
-        state_file = tmp_path / "state.json"
-        # Pre-populate with stale data
-        state_file.write_text(json.dumps({
-            "active": {},
-            "cooldowns": {},
-            "opportunities": [{"device": "old"}],
-            "warnings": [{"message": "old"}],
-        }))
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-
-        save_advisory_recommendations(None, live=True)
-
-        data = json.loads(state_file.read_text())
-        assert data["opportunities"] == []
-        assert data["warnings"] == []
-
-    def test_non_beneficial_opportunities_dropped(self, tmp_path, monkeypatch) -> None:
-        """When cost_delta >= 0, the opportunity is not saved.
-
-        Sysid-confounded tau betas can make a change look "best" even when its
-        cost exceeds baseline (e.g., "raise the shades" at night, where closed
-        shades correlate with HVAC-off fast cooling). Don't surface advice the
-        user shouldn't follow.
-        """
-        from weatherstat.advisory import save_advisory_recommendations
-        from weatherstat.types import AdvisoryDecision, AdvisoryPlan, DeviceOpportunity
-
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-
-        plan = AdvisoryPlan(
-            baseline_idx=0,
-            baseline_cost=7.0,
-            opportunities=(
-                DeviceOpportunity(
-                    device="win_a",
-                    current_state=True,
-                    advisory=AdvisoryDecision("win_a", action="close", transition_step=0),
-                    idx=1,
-                    cost_delta=2.0,  # WORSE than hold
-                    comfort_delta=2.0,
-                    energy_delta=0.0,
-                ),
-            ),
-        )
-        save_advisory_recommendations(plan, live=True)
-
-        data = json.loads(state_file.read_text())
-        assert data["opportunities"] == []
-
-    def test_no_save_in_dry_run(self, tmp_path, monkeypatch) -> None:
-        """Dry run does not persist anything."""
-        from weatherstat.advisory import save_advisory_recommendations
-        from weatherstat.types import AdvisoryDecision, AdvisoryPlan, DeviceOpportunity
-
-        state_file = tmp_path / "state.json"
-        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
-
-        plan = AdvisoryPlan(
-            baseline_idx=0,
-            baseline_cost=5.0,
-            opportunities=(
-                DeviceOpportunity(
-                    device="win",
-                    current_state=True,
-                    advisory=AdvisoryDecision("win", action="close"),
-                    idx=1,
-                    cost_delta=-2.0,
-                    comfort_delta=-2.0,
-                    energy_delta=0.0,
-                ),
-            ),
-        )
-        save_advisory_recommendations(plan, live=False)
-        assert not state_file.exists()
+# TestSaveAdvisoryRecommendations was merged into TestProcessAdvisoryPlan above.
+# (save_advisory_recommendations was folded into process_advisory_plan during the
+# advisory pipeline cleanup.)

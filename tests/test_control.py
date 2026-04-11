@@ -1447,8 +1447,6 @@ class TestWriteCommandJsonAdvisory:
                     advisory=AdvisoryDecision("piano_window", action="close", transition_step=12),
                     idx=2,
                     cost_delta=-2.0,
-                    comfort_delta=-1.5,
-                    energy_delta=-0.5,
                 ),
             ),
         )
@@ -1501,8 +1499,6 @@ class TestWriteCommandJsonAdvisory:
                     ),
                     idx=3,
                     cost_delta=-0.31,
-                    comfort_delta=-0.2,
-                    energy_delta=-0.11,
                 ),
             ),
         )
@@ -1534,8 +1530,6 @@ class TestWriteCommandJsonAdvisory:
                     advisory=AdvisoryDecision("win", action="close", transition_step=0),
                     idx=1,
                     cost_delta=0.3,  # worse than baseline
-                    comfort_delta=0.3,
-                    energy_delta=0.0,
                 ),
             ),
         )
@@ -1560,8 +1554,6 @@ class TestWriteCommandJsonAdvisory:
                     advisory=AdvisoryDecision("small_win", action="open", transition_step=0),
                     idx=1,
                     cost_delta=-0.5,
-                    comfort_delta=-0.5,
-                    energy_delta=0.0,
                 ),
                 DeviceOpportunity(
                     device="big_win",
@@ -1569,8 +1561,6 @@ class TestWriteCommandJsonAdvisory:
                     advisory=AdvisoryDecision("big_win", action="close", transition_step=0),
                     idx=2,
                     cost_delta=-2.0,
-                    comfort_delta=-2.0,
-                    energy_delta=0.0,
                 ),
             ),
         )

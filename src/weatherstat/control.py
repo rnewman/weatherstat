@@ -1037,28 +1037,15 @@ def extract_advisory_plan(
             predictions_per_scenario[baseline_idx], schedules, base_hour,
         ))
 
-    # Comfort/energy decomposition is cached per scenario index because the
-    # same baseline idx is re-used for every device without a best_hold match.
-    _comfort_cache: dict[int, float] = {}
-
-    def _comfort_for(idx: int) -> float | None:
-        if predictions_per_scenario is None or schedules is None:
-            return None
-        if idx not in _comfort_cache:
-            _comfort_cache[idx] = compute_comfort_cost(
-                predictions_per_scenario[idx], schedules, base_hour,
-            )
-        return _comfort_cache[idx]
-
     opportunities: list[DeviceOpportunity] = []
     for device in environment_states:
         if device not in best_change:
             continue
         idx_w, cost_w = best_change[device]
         if device in best_hold:
-            idx_wo, cost_wo = best_hold[device]
+            _idx_wo, cost_wo = best_hold[device]
         elif baseline_idx is not None:
-            idx_wo, cost_wo = baseline_idx, baseline_cost
+            cost_wo = baseline_cost
         else:
             continue
 
@@ -1066,24 +1053,12 @@ def extract_advisory_plan(
         if advisory is None:
             continue
 
-        comfort_w = _comfort_for(idx_w)
-        comfort_wo = _comfort_for(idx_wo)
-        if comfort_w is not None and comfort_wo is not None:
-            comfort_delta = comfort_w - comfort_wo
-            energy_delta = (cost_w - cost_wo) - comfort_delta
-        else:
-            # Synthetic-test path: caller didn't supply predictions/schedules.
-            comfort_delta = cost_w - cost_wo
-            energy_delta = 0.0
-
         opportunities.append(DeviceOpportunity(
             device=device,
             current_state=environment_states.get(device, False),
             advisory=advisory,
             idx=idx_w,
             cost_delta=cost_w - cost_wo,
-            comfort_delta=comfort_delta,
-            energy_delta=energy_delta,
         ))
 
     return AdvisoryPlan(
@@ -1643,7 +1618,6 @@ def _serialize_advisory_opportunity(opp: DeviceOpportunity) -> dict[str, object]
 
 def write_command_json(
     decision: ControlDecision,
-    opportunities: list | None = None,
     ineligible_effectors: set[str] | None = None,
     advisory_plan: AdvisoryPlan | None = None,
 ) -> Path:
@@ -1672,19 +1646,6 @@ def write_command_json(
                     command[camel_key] = target_val
             elif purpose == "mode":
                 command[camel_key] = ed.mode
-
-    # Active environment opportunities (informational, normalized with threshold
-    # gating and notification lifecycle).
-    if opportunities:
-        command["opportunities"] = [
-            {
-                "entry": o.entry,
-                "action": o.action,
-                "benefit": o.total_benefit,
-                "message": o.message,
-            }
-            for o in opportunities
-        ]
 
     # Advisory plan data (informational — executor ignores these)
     if advisory_plan:
@@ -2277,39 +2238,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     object.__setattr__(decision, "baseline_sensor_costs", off_sensor_costs)
     object.__setattr__(decision, "baseline_cost", off_comfort)
 
-    # ── Environment opportunities (persistent, energy-aware) ──
-    from weatherstat.advisory import evaluate_environment_opportunities, process_opportunities
+    # ── Persist advisory recommendations + dispatch notifications ──
+    from weatherstat.advisory import process_advisory_plan
 
-    opp_state = _HS(
-        current_temps=current_temps,
-        outdoor_temp=outdoor,
-        forecast_temps=forecast_temp_list,
-        environment_states=environment_states,
-        hour_of_day=fractional_hour,
-        recent_history=recent_hist,
-        solar_fractions=solar_fractions,
-        solar_elevations=solar_elevations,
-    )
-    # Single source of truth: read per-device opportunities from the planning
-    # sweep itself. The sweep already explored every joint advisory combination
-    # in the trajectory search, so per-device marginals (with the rest of the
-    # system free to optimize) are exact, not a re-sweep approximation.
-    env_opportunities = evaluate_environment_opportunities(
-        opp_state,
-        schedules=schedules,
-        advisory_plan=advisory_plan,
-    )
-    active_opps, dismissed_entries = process_opportunities(
-        env_opportunities,
+    process_advisory_plan(
+        advisory_plan,
         live=live,
         notification_target=_CFG.notification_target,
         current_hour=base_hour,
     )
-
-    # ── Persist advisory recommendations for TUI display ──
-    from weatherstat.advisory import save_advisory_recommendations
-
-    save_advisory_recommendations(advisory_plan, live=live)
 
     # ── Advisory breach notifications (urgent — sent immediately) ──
     if advisory_plan and advisory_plan.backup_breaches and live:
@@ -2339,7 +2276,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Write command JSON (omit targets for ineligible effectors)
     cmd_path = write_command_json(
         decision,
-        opportunities=active_opps,
         ineligible_effectors=ineligible_effectors,
         advisory_plan=advisory_plan,
     )

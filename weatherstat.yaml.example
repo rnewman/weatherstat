@@ -292,8 +292,7 @@ notifications:
   target: notify.mobile_app_phone    # HA notify service target
 
 advisory:
-  opportunity_threshold: 0.3    # minimum benefit to track a window opportunity
-  notification_threshold: 1.5   # minimum benefit to push a notification
+  notification_threshold: 1.5   # min |cost_delta| (raw sweep cost) to push a phone notification
   quiet_hours: [22, 7]          # suppress notifications during these hours
   cooldowns:
     free_cooling: 14400         # seconds between re-notifying about open opportunities

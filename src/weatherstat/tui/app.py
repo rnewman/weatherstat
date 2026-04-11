@@ -317,10 +317,8 @@ class WeatherstatApp(App):
         if ADVISORY_STATE_FILE.exists():
             try:
                 data = json.loads(ADVISORY_STATE_FILE.read_text())
-                active = data.get("active", {})
                 self.query_one(OpportunityPanel).set_data(
-                    opportunities=list(active.values()),
-                    advisory_opportunities=data.get("opportunities"),
+                    opportunities=data.get("opportunities"),
                     warnings=data.get("warnings"),
                 )
             except Exception as e:

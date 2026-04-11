@@ -356,15 +356,14 @@ class EffectorPanel(Static):
 
 
 class OpportunityPanel(Static):
-    """Active environment opportunities and per-device advisory alternatives."""
+    """Per-device advisory opportunities and backup breach warnings."""
 
     def __init__(self) -> None:
         super().__init__("", classes="panel")
 
     def set_data(
         self,
-        opportunities: list[dict],
-        advisory_opportunities: list[dict] | None = None,
+        opportunities: list[dict] | None = None,
         warnings: list[dict] | None = None,
     ) -> None:
         from weatherstat.yaml_config import environment_display, load_config
@@ -378,29 +377,20 @@ class OpportunityPanel(Static):
                 msg = w.get("message", "?")
                 lines.append(f"  [bold red]{msg}[/]")
 
-        # Persistent EnvironmentOpportunity entries (threshold-gated, notification lifecycle)
-        if opportunities:
-            for opp in opportunities:
-                entry_name = opp.get("entry", opp.get("window", "?"))
-                action = opp.get("action", "?")
-                benefit = opp.get("total_benefit", 0)
-                label, kind = environment_display(entry_name, _env.get(entry_name))
-                lines.append(f"  [yellow]{action} {label} {kind}[/] (benefit: {benefit:.2f})")
-
         # Per-device advisory alternatives from the sweep. Styled by current_state:
         # cyan = currently active → recommend returning to default;
         # dim  = currently default → proactive activation suggestion.
-        if advisory_opportunities:
-            for ao in advisory_opportunities:
-                dev = ao.get("device", "?")
-                action = ao.get("action", "?")
-                mins = ao.get("in_minutes", 0)
-                delta = ao.get("cost_delta", 0)
-                dur = ao.get("duration_minutes")
+        if opportunities:
+            for opp in opportunities:
+                dev = opp.get("device", "?")
+                action = opp.get("action", "?")
+                mins = opp.get("in_minutes", 0)
+                delta = opp.get("cost_delta", 0)
+                dur = opp.get("duration_minutes")
                 dur_str = f" for {dur}m" if dur else ""
                 timing = "now" if mins == 0 else f"in {mins}m"
                 label, kind = environment_display(dev, _env.get(dev))
-                style = "cyan" if ao.get("current_state") else "dim"
+                style = "cyan" if opp.get("current_state") else "dim"
                 lines.append(
                     f"  [{style}]{action} {label} {kind}[/] {timing}{dur_str} ({delta:+.2f})"
                 )
