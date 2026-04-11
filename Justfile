@@ -56,6 +56,10 @@ sysid *ARGS:
 tui *ARGS:
     uv run --extra tui python -m weatherstat.tui {{ARGS}}
 
+# Interactive TUI with embedded web frontend (--web-host, --web-port also accepted)
+tui-web *ARGS:
+    uv run --extra tui python -m weatherstat.tui --web {{ARGS}}
+
 # Comfort performance dashboard (last 7 days by default)
 comfort *ARGS:
     uv run python ./scripts/plot_comfort.py {{ARGS}}

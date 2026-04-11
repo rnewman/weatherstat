@@ -62,6 +62,7 @@ just execute          # Apply latest command JSON to HA
 just execute --force  # Apply ignoring manual overrides
 just tui              # Interactive TUI dashboard
 just tui --live       # TUI starting in live mode
+just tui-web          # TUI with embedded mobile web frontend (default 0.0.0.0:8765)
 just comfort          # Comfort performance dashboard (last 7 days)
 just debug            # Full debug summary (temps, gains, tau, state)
 just debug temps      # Current temps + comfort bounds

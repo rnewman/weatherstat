@@ -1,14 +1,17 @@
-"""Weatherstat TUI application — unified HVAC dashboard."""
+"""Weatherstat TUI application — unified HVAC dashboard.
+
+`WeatherstatApp` is a thin Textual frontend over `TUIController`. The
+controller owns all mutable runtime state and all business logic; the app
+owns widgets, key bindings, and the Textual event loop. See
+`controller.py` for the data flow.
+"""
 
 from __future__ import annotations
 
-import contextlib
-import io
-import json
+import threading
 import traceback
 from datetime import UTC, datetime, timedelta
 
-from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -16,6 +19,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Footer, Static, TabbedContent, TabPane
 
 from weatherstat.config import CONTROL_INTERVAL, SYSID_INTERVAL
+from weatherstat.tui.controller import ActionResult, StatusSnapshot, TUIController
 from weatherstat.tui.widgets import (
     AccuracyPanel,
     EffectorPanel,
@@ -86,23 +90,29 @@ class WeatherstatApp(App):
         Binding("question_mark", "help", "Help"),
     ]
 
-    def __init__(self, live: bool = False) -> None:
+    def __init__(
+        self,
+        live: bool = False,
+        *,
+        web_enabled: bool = False,
+        web_host: str = "0.0.0.0",
+        web_port: int = 8765,
+    ) -> None:
         super().__init__()
-        self.live_mode = live
-        self._cycle_running = False
-        self._sysid_running = False
         self._cycle_timer: object | None = None
         self._sysid_timer: object | None = None
-        self._next_cycle_at: datetime | None = None
+        self._web_enabled = web_enabled
+        self._web_host = web_host
+        self._web_port = web_port
+        self._web_server: object | None = None
 
-        # Latest decision (from control cycle)
-        self._latest_decision: object | None = None
-        self._baseline_cost: float | None = None
-        self._overrides: dict[str, str] = {}  # effector_name -> description
-
-        # Solar elevation gains from sysid (for sun-aware MRT correction)
-        self._solar_elevation_gains_cache: dict[str, float] = {}
-        self._load_solar_elevation_gains()
+        self.controller = TUIController(
+            live=live,
+            log=self._log,
+            worker=_spawn_worker,
+            on_snapshot=self._on_snapshot,
+            on_main=self.call_from_thread,
+        )
 
     def compose(self) -> ComposeResult:
         yield StatusHeader()
@@ -130,12 +140,21 @@ class WeatherstatApp(App):
     def on_mount(self) -> None:
         self._log("Weatherstat TUI starting...")
         self._log(f"  Control interval: {CONTROL_INTERVAL}s, Sysid interval: {SYSID_INTERVAL}s")
-        self._load_initial_state()
-        self._collect_snapshot()  # initial snapshot
+
+        # Initial population — synchronous from UI thread
+        self._refresh_snapshot_now()
+        self._collect_snapshot()
+        self._refresh_history()
+
+        # Periodic timers
         self.set_interval(MONITOR_INTERVAL, self._monitor_tick)
         self.set_interval(SNAPSHOT_INTERVAL, self._collect_snapshot)
         self._schedule_next_cycle()
         self._schedule_sysid()
+
+        # Optional embedded web server
+        if self._web_enabled:
+            self._start_web_server()
 
     # ── Tab switching ───────────────────────────────────────────────────────
 
@@ -155,54 +174,32 @@ class WeatherstatApp(App):
     # ── Key actions ─────────────────────────────────────────────────────────
 
     def action_toggle_live(self) -> None:
-        if self.live_mode:
-            self.live_mode = False
-            self._log("[control] Switched to DRY-RUN mode")
-            self._update_header()
-        else:
-            self.push_screen(
-                ConfirmScreen("Enable LIVE execution? Commands will be sent to Home Assistant."),
-                self._on_live_confirmed,
-            )
-
-    def _on_live_confirmed(self, confirmed: bool) -> None:
-        if confirmed:
-            self.live_mode = True
-            self._log("[control] Switched to LIVE mode")
-            self._update_header()
+        result = self.controller.toggle_live()
+        self._notify_result(result)
 
     def action_force_execute(self) -> None:
-        if not self._overrides:
-            self.notify("No overrides detected", severity="information")
+        result = self.controller.force_execute()
+        if result.status == "noop":
+            self.notify(result.message, severity="information")
             return
-        names = ", ".join(self._overrides)
-        self.push_screen(
-            ConfirmScreen(f"Force-execute past overrides on: {names}?"),
-            self._on_force_confirmed,
-        )
-
-    def _on_force_confirmed(self, confirmed: bool) -> None:
-        if confirmed:
-            self._force_execute()
-
-    @work(thread=True)
-    def _force_execute(self) -> None:
-        self._run_executor(force=True)
+        self._notify_result(result)
 
     def action_run_cycle(self) -> None:
-        if self._cycle_running:
-            self.notify("Control cycle already running", severity="warning")
+        result = self.controller.run_cycle()
+        if result.status == "already_running":
+            self.notify(result.message, severity="warning")
             return
-        self._run_control_cycle()
+        self._notify_result(result)
 
     def action_run_sysid(self) -> None:
-        if self._sysid_running:
-            self.notify("Sysid already running", severity="warning")
+        result = self.controller.run_sysid()
+        if result.status == "already_running":
+            self.notify(result.message, severity="warning")
             return
-        self._run_sysid()
+        self._notify_result(result)
 
     def action_toggle_profile(self) -> None:
-        self._toggle_profile()
+        _spawn_worker(lambda: self._notify_result_main(self.controller.toggle_profile()))
 
     def action_reload_config(self) -> None:
         """Reload weatherstat.yaml and refresh all config-derived state."""
@@ -220,7 +217,7 @@ class WeatherstatApp(App):
             importlib.reload(weatherstat.config)
             importlib.reload(weatherstat.extract)
             importlib.reload(weatherstat.control)
-            self._refresh_temps()
+            self.controller.publish_snapshot()
             self._log("[config] Reloaded weatherstat.yaml")
             self.notify("Config reloaded", severity="information")
         except Exception as e:
@@ -228,7 +225,7 @@ class WeatherstatApp(App):
             self.notify(f"Config reload failed: {e}", severity="error")
 
     def action_quit_app(self) -> None:
-        if self.live_mode:
+        if self.controller.live_mode:
             self.push_screen(
                 ConfirmScreen("Live mode is active. Control loop will stop. Quit?"),
                 self._on_quit_confirmed,
@@ -255,420 +252,170 @@ class WeatherstatApp(App):
         )
         self.notify(help_text, title="Help", timeout=10)
 
-    # ── Initial state loading ───────────────────────────────────────────────
+    # ── Notification helpers ───────────────────────────────────────────────
 
-    def _load_initial_state(self) -> None:
-        self._monitor_tick()
-        self._load_sysid_status()
-        self._load_control_state()
-        self._refresh_history()
+    def _notify_result(self, result: ActionResult) -> None:
+        severity = "information" if result.ok else "error"
+        self.notify(result.message, severity=severity)
 
-    def _load_solar_elevation_gains(self) -> None:
-        """Load sysid solar elevation gains from thermal_params.json."""
-        from weatherstat.config import DATA_DIR
+    def _notify_result_main(self, result: ActionResult) -> None:
+        self.call_from_thread(self._notify_result, result)
 
-        params_file = DATA_DIR / "thermal_params.json"
-        if params_file.exists():
-            try:
-                data = json.loads(params_file.read_text())
-                self._solar_elevation_gains_cache = data.get("solar_elevation_gains", {})
-            except Exception as e:
-                self._log(f"[config] [red]Failed to load solar gains: {e}[/]")
+    # ── Snapshot pump ───────────────────────────────────────────────────────
 
-    def _load_sysid_status(self) -> None:
-        from weatherstat.config import DATA_DIR
+    def _on_snapshot(self, snap: StatusSnapshot) -> None:
+        """Called by the controller (possibly from a worker thread)."""
+        self.call_from_thread(self._apply_snapshot, snap)
 
-        params_file = DATA_DIR / "thermal_params.json"
-        if params_file.exists():
-            try:
-                data = json.loads(params_file.read_text())
-                ts = data.get("timestamp", "")
-                if ts:
-                    dt = datetime.fromisoformat(ts)
-                    age = datetime.now(UTC) - dt.replace(tzinfo=UTC) if dt.tzinfo is None else datetime.now(UTC) - dt
-                    self.query_one(StatusHeader).set_state(sysid_age=_format_age(age))
-            except Exception as e:
-                self._log(f"[config] [red]Failed to load sysid status: {e}[/]")
-
-    def _load_control_state(self) -> None:
-        """Load effector state + opportunities from state files (startup only)."""
-        from weatherstat.config import CONTROL_STATE_FILE
-
-        if CONTROL_STATE_FILE.exists():
-            try:
-                data = json.loads(CONTROL_STATE_FILE.read_text())
-                decisions = []
-                modes = data.get("modes", {})
-                setpoints = data.get("setpoints", {})
-                for name, mode in modes.items():
-                    decisions.append({"name": name, "mode": mode})
-                self.query_one(EffectorPanel).set_data(
-                    decisions=decisions,
-                    command_targets=setpoints,
-                )
-            except Exception as e:
-                self._log(f"[config] [red]Failed to load control state: {e}[/]")
-        self._load_opportunities()
-
-    def _load_opportunities(self) -> None:
-        """Refresh opportunity panel from advisory_state.json."""
-        from weatherstat.config import ADVISORY_STATE_FILE
-
-        if ADVISORY_STATE_FILE.exists():
-            try:
-                data = json.loads(ADVISORY_STATE_FILE.read_text())
-                self.query_one(OpportunityPanel).set_data(
-                    opportunities=data.get("opportunities"),
-                    warnings=data.get("warnings"),
-                )
-            except Exception as e:
-                self._log(f"[config] [red]Failed to load opportunities: {e}[/]")
-
-    # ── Collector (5-min) ─────────────────────────────────────────────────
-
-    @work(thread=True)
-    def _collect_snapshot(self) -> None:
+    def _refresh_snapshot_now(self) -> None:
+        """Build and apply a snapshot synchronously. Call from UI thread only."""
         try:
-            from weatherstat.collector import collect_once
-
-            collect_once(log=self._log)
+            snap = self.controller.build_snapshot()
+            self._apply_snapshot(snap)
         except Exception as e:
-            self._log(f"[collector] [red]Error: {e}[/]")
+            self._log(f"[snapshot] [red]Refresh error: {e}[/]")
             self._log(traceback.format_exc())
 
-    # ── Monitor timer (30s) ─────────────────────────────────────────────────
+    def _apply_snapshot(self, snap: StatusSnapshot) -> None:
+        """Push a snapshot into all widgets. Always runs on the UI thread."""
+        try:
+            self._update_header_from_snapshot(snap)
+            self._update_temperatures(snap)
+            self._update_environment(snap)
+            self._update_forecast(snap)
+            self._update_effectors(snap)
+            self._update_opportunities(snap)
+            self._update_predictions(snap)
+        except Exception as e:
+            self._log(f"[snapshot] [red]Apply failed: {e}[/]")
+            self._log(traceback.format_exc())
+
+    def _update_header_from_snapshot(self, snap: StatusSnapshot) -> None:
+        header = self.query_one(StatusHeader)
+        next_cycle_str = "?"
+        if snap.next_cycle_at is not None:
+            remaining = snap.next_cycle_at - datetime.now(UTC)
+            secs = max(0, int(remaining.total_seconds()))
+            next_cycle_str = f"{secs // 60}m"
+        header.set_state(
+            profile=snap.profile or "?",
+            live=snap.live,
+            collector_age=_format_age(snap.collector_age) if snap.collector_age is not None else "no data",
+            collector_rows=snap.collector_rows,
+            sysid_age=_format_age(snap.sysid_age) if snap.sysid_age is not None else "?",
+            next_cycle=next_cycle_str,
+            outdoor_temp=snap.outdoor_temp,
+            cycle_running=snap.cycle_running,
+            sysid_running=snap.sysid_running,
+            local_tz=snap.local_tz,
+        )
+
+    def _update_temperatures(self, snap: StatusSnapshot) -> None:
+        comfort_tuples = {
+            label: (
+                cb.acceptable_lo,
+                cb.preferred_lo,
+                cb.preferred_hi,
+                cb.acceptable_hi,
+            )
+            for label, cb in snap.comfort.items()
+        }
+        self.query_one(TemperaturePanel).set_data(
+            snap.temps,
+            comfort_tuples,
+            snap.sensor_labels,
+            mrt_offsets=snap.mrt_offsets or None,
+        )
+        self.query_one(EffectorPanel).set_current_temps(snap.temps)
+
+    def _update_environment(self, snap: StatusSnapshot) -> None:
+        entries = [(e.label, e.kind, e.is_active) for e in snap.environment]
+        self.query_one(EnvironmentPanel).set_data(entries)
+
+    def _update_forecast(self, snap: StatusSnapshot) -> None:
+        self.query_one(ForecastPanel).set_data(snap.forecast, snap.weather_condition)
+
+    def _update_effectors(self, snap: StatusSnapshot) -> None:
+        if not snap.effectors:
+            return
+        decisions = [
+            {
+                "name": e.name,
+                "mode": e.mode,
+                "target": e.target,
+                "delay_steps": e.delay_steps,
+                "duration_steps": e.duration_steps,
+            }
+            for e in snap.effectors
+        ]
+        costs_tuple = (0.0, 0.0, 0.0)
+        baseline = None
+        if snap.costs is not None:
+            costs_tuple = (snap.costs.total, snap.costs.comfort, snap.costs.energy)
+            baseline = snap.costs.baseline
+        panel = self.query_one(EffectorPanel)
+        panel.set_data(
+            decisions=decisions,
+            command_targets=snap.command_targets,
+            costs=costs_tuple,
+            baseline_cost=baseline,
+            rationale=snap.rationale,
+            sensor_costs=snap.sensor_costs,
+            baseline_sensor_costs=snap.baseline_sensor_costs,
+        )
+        # Override map (mirrored from controller)
+        overrides = {e.name: e.override for e in snap.effectors if e.override}
+        panel.set_overrides(overrides)
+
+    def _update_opportunities(self, snap: StatusSnapshot) -> None:
+        self.query_one(OpportunityPanel).set_data(
+            opportunities=snap.opportunities or None,
+            warnings=snap.warnings or None,
+        )
+
+    def _update_predictions(self, snap: StatusSnapshot) -> None:
+        if snap.predictions:
+            self.query_one(PredictionPanel).set_data(snap.predictions, snap.sensor_labels)
+
+    # ── Periodic ticks ──────────────────────────────────────────────────────
 
     def _monitor_tick(self) -> None:
-        self._refresh_snapshot_status()
-        self._refresh_temps()
-        self._update_header()
+        """Refresh from disk + memory and push to widgets."""
+        self._refresh_snapshot_now()
 
-    def _refresh_snapshot_status(self) -> None:
-        try:
-            from weatherstat.extract import snapshot_status
+    def _collect_snapshot(self) -> None:
+        """Run the collector once in a worker thread (5-min cadence)."""
+        def _run() -> None:
+            try:
+                from weatherstat.collector import collect_once
 
-            ts, count = snapshot_status()
-            header = self.query_one(StatusHeader)
-            if ts:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                age = datetime.now(UTC) - dt
-                header.set_state(collector_age=_format_age(age), collector_rows=count)
-            else:
-                header.set_state(collector_age="no data", collector_rows=0)
-        except Exception as e:
-            self._log(f"[collector] [red]Snapshot status error: {e}[/]")
+                collect_once(log=self._log)
+            except Exception as e:
+                self._log(f"[collector] [red]Error: {e}[/]")
+                self._log(traceback.format_exc())
 
-    def _refresh_temps(self) -> None:
-        try:
-            from weatherstat.config import PREDICTION_SENSORS, SENSOR_LABELS
-            from weatherstat.control import (
-                apply_comfort_profile,
-                apply_mrt_correction,
-                default_comfort_schedules,
-                fetch_active_comfort_profile,
-            )
-            from weatherstat.extract import latest_snapshot_values
-            from weatherstat.yaml_config import load_config
-
-            values = latest_snapshot_values()
-            if not values:
-                return
-
-            cfg = load_config()
-
-            # Current temperatures for constraint sensors
-            temps: dict[str, float] = {}
-            for sensor_col in PREDICTION_SENSORS:
-                val = values.get(sensor_col)
-                if val is not None:
-                    with contextlib.suppress(ValueError, TypeError):
-                        temps[sensor_col] = float(val)
-
-            # Comfort schedules: base → profile offsets → MRT correction
-            schedules = default_comfort_schedules()
-            active_profile = fetch_active_comfort_profile()
-            schedules = apply_comfort_profile(schedules, active_profile)
-            if active_profile is not None:
-                self.query_one(StatusHeader).set_state(profile=active_profile.name)
-
-            # Outdoor temp (needed for MRT and header)
-            outdoor_col = cfg.outdoor_sensor
-            outdoor_temp = None
-            for col in [outdoor_col, "met_outdoor_temp"]:
-                if col and col in values:
-                    with contextlib.suppress(ValueError, TypeError):
-                        outdoor_temp = float(values[col])
-                        break
-            if outdoor_temp is not None:
-                self.query_one(StatusHeader).set_state(outdoor_temp=outdoor_temp)
-
-            # Sun-aware MRT correction using outdoor temp + current solar state
-            mrt_per_sensor: dict[str, float] = {}
-            if outdoor_temp is not None and cfg.mrt_correction:
-                from weatherstat.weather import condition_to_solar_fraction as _csf
-                from weatherstat.weather import solar_sin_elevation as _sse
-
-                mrt_weights = {c.sensor: c.mrt_weight for c in cfg.constraints if c.mrt_weight != 1.0}
-                _now_utc = datetime.now(UTC)
-                _solar_elev = _sse(cfg.location.latitude, cfg.location.longitude, _now_utc)
-                # Use current weather condition for solar fraction
-                _condition = values.get("weather_condition", "")
-                _solar_frac = _csf(_condition) if _condition else 0.5
-                schedules, _mrt_offset, mrt_per_sensor = apply_mrt_correction(
-                    schedules, outdoor_temp, cfg.mrt_correction,
-                    mrt_weights or None,
-                    solar_elevation_gains=self._solar_elevation_gains_cache or None,
-                    current_solar_elev=_solar_elev,
-                    current_solar_fraction=_solar_frac,
-                )
-
-            # Extract comfort bounds from adjusted schedules
-            now_hour = datetime.now().hour
-            comfort: dict[str, tuple[float, float, float, float]] = {}
-            for s in schedules:
-                c = s.comfort_at(now_hour)
-                if c is not None:
-                    comfort[s.label] = (c.acceptable_lo, c.preferred_lo, c.preferred_hi, c.acceptable_hi)
-
-            self.query_one(TemperaturePanel).set_data(
-                temps, comfort, SENSOR_LABELS,
-                mrt_offsets=mrt_per_sensor or None,
-            )
-            self.query_one(EffectorPanel).set_current_temps(temps)
-
-            # Environment factor states
-            env_entries: list[tuple[str, str, bool]] = []
-            for env_cfg in cfg.environment.values():
-                val = values.get(env_cfg.column)
-                if val is not None:
-                    is_active = val in ("True", "true", "1", "1.0")
-                    env_entries.append((env_cfg.label, env_cfg.kind, is_active))
-            self.query_one(EnvironmentPanel).set_data(env_entries)
-
-            # Forecast
-            forecasts: dict[str, float] = {}
-            for h in [1, 2, 4, 6, 12]:
-                val = values.get(f"forecast_temp_{h}h")
-                if val is not None:
-                    with contextlib.suppress(ValueError, TypeError):
-                        forecasts[f"{h}h"] = float(val)
-            condition = values.get("weather_condition", "")
-            self.query_one(ForecastPanel).set_data(forecasts, condition)
-
-        except Exception as e:
-            self._log(f"[monitor] [red]Error refreshing temps: {e}[/]")
-            self._log(traceback.format_exc())
-
-    def _update_header(self) -> None:
-        header = self.query_one(StatusHeader)
-        header.set_state(live=self.live_mode)
-        if self._next_cycle_at:
-            remaining = self._next_cycle_at - datetime.now(UTC)
-            secs = max(0, int(remaining.total_seconds()))
-            header.set_state(next_cycle=f"{secs // 60}m")
-        try:
-            from weatherstat.config import TIMEZONE
-
-            header.set_state(local_tz=TIMEZONE)
-        except Exception as e:
-            self._log(f"[config] [red]Timezone load error: {e}[/]")
-
-    # ── Control cycle worker ────────────────────────────────────────────────
+        _spawn_worker(_run)
 
     def _schedule_next_cycle(self) -> None:
-        self._next_cycle_at = datetime.now(UTC) + timedelta(seconds=CONTROL_INTERVAL)
-        if self._cycle_timer is not None:
-            # Cancel doesn't exist on Timer, but we track via _next_cycle_at
-            pass
+        when = datetime.now(UTC) + timedelta(seconds=CONTROL_INTERVAL)
+        self.controller.set_next_cycle_at(when)
         self._cycle_timer = self.set_timer(CONTROL_INTERVAL, self._auto_cycle)
 
     def _auto_cycle(self) -> None:
-        if not self._cycle_running:
-            self._run_control_cycle()
+        if not self.controller.is_cycle_running():
+            self.controller.run_cycle()
         self._schedule_next_cycle()
 
-    # ── Periodic sysid ────────────────────────────────────────────────────
-
     def _schedule_sysid(self) -> None:
-        """Schedule periodic sysid if configured (interval > 0)."""
         if SYSID_INTERVAL <= 0:
             return
         self._sysid_timer = self.set_timer(SYSID_INTERVAL, self._auto_sysid)
 
     def _auto_sysid(self) -> None:
-        if not self._sysid_running:
+        if not self.controller.is_sysid_running():
             self._log("[sysid] Periodic sysid starting...")
-            self._run_sysid()
+            self.controller.run_sysid()
         self._schedule_sysid()
-
-    @work(thread=True)
-    def _run_control_cycle(self) -> None:
-        self._cycle_running = True
-        self.call_from_thread(self._update_header_running, True)
-        self._log(f"\n[control] Starting {'LIVE' if self.live_mode else 'DRY-RUN'} control cycle...")
-
-        buf = io.StringIO()
-        decision = None
-        try:
-            from weatherstat.control import run_control_cycle
-
-            with contextlib.redirect_stdout(buf):
-                decision = run_control_cycle(live=self.live_mode)
-        except Exception as e:
-            self._log(f"[control] [red]Error: {e}[/]")
-            self._log(traceback.format_exc())
-
-        # Log captured output
-        output = buf.getvalue()
-        if output:
-            for line in output.splitlines():
-                self._log(line)
-
-        if decision:
-            self._latest_decision = decision
-            self.call_from_thread(self._update_from_decision, decision)
-
-            # Execute via TS executor in live mode
-            if self.live_mode:
-                self._run_executor(force=False)
-        else:
-            self._log("[control] No decision returned (skipped or error)")
-
-        self._cycle_running = False
-        self.call_from_thread(self._update_header_running, False)
-        self.call_from_thread(self._monitor_tick)
-
-    def _update_header_running(self, running: bool) -> None:
-        self.query_one(StatusHeader).set_state(cycle_running=running)
-
-    def _update_from_decision(self, decision: object) -> None:
-        from weatherstat.types import ControlDecision
-
-        if not isinstance(decision, ControlDecision):
-            return
-
-        from weatherstat.config import SENSOR_LABELS
-
-        # Update effector panel
-        eff_dicts = [
-            {"name": e.name, "mode": e.mode, "target": e.target, "delay_steps": e.delay_steps, "duration_steps": e.duration_steps}
-            for e in decision.effectors
-        ]
-        self.query_one(EffectorPanel).set_data(
-            decisions=eff_dicts,
-            command_targets=decision.command_targets,
-            costs=(decision.total_cost, decision.comfort_cost, decision.energy_cost),
-            baseline_cost=decision.baseline_cost if decision.baseline_cost else self._baseline_cost,
-            rationale=decision.rationale,
-            sensor_costs=decision.sensor_costs,
-            baseline_sensor_costs=decision.baseline_sensor_costs,
-        )
-
-        # Update predictions panel
-        self.query_one(PredictionPanel).set_data(decision.predictions, SENSOR_LABELS)
-
-        # Refresh opportunities from state file (don't overwrite effector panel)
-        self._load_opportunities()
-
-    # ── Executor ───────────────────────────────────────────────────────────
-
-    def _run_executor(self, *, force: bool = False) -> None:
-        """Execute latest command via HA REST API. Called from worker threads."""
-        from weatherstat.executor import execute
-
-        result = execute(force=force, log=self._log)
-        self._overrides = result.overrides
-        self.call_from_thread(self._update_override_display)
-
-    def _update_override_display(self) -> None:
-        self.query_one(EffectorPanel).set_overrides(self._overrides)
-
-    # ── Sysid worker ────────────────────────────────────────────────────────
-
-    @work(thread=True)
-    def _run_sysid(self) -> None:
-        self._sysid_running = True
-        self.call_from_thread(self.query_one(StatusHeader).set_state, sysid_running=True)
-        self._log("\n[sysid] Starting system identification...")
-
-        buf = io.StringIO()
-        try:
-            from weatherstat.sysid import fit_sysid, save_sysid_result
-
-            with contextlib.redirect_stdout(buf):
-                result, diagnostics = fit_sysid()
-
-            # Quality gate: reject obviously bad fits
-            n_taus = len(result.fitted_taus)
-            n_gains = sum(1 for g in result.effector_sensor_gains if not g.negligible)
-            if n_taus == 0:
-                self._log("[sysid] [red]Rejected: no sensors fitted[/]")
-            elif n_gains == 0:
-                self._log("[sysid] [red]Rejected: no significant gains found[/]")
-            else:
-                with contextlib.redirect_stdout(buf):
-                    save_sysid_result(result, sensor_diagnostics=diagnostics)
-                self._log(
-                    f"[sysid] Complete. {result.n_snapshots} snapshots,"
-                    f" {n_taus} sensors, {n_gains} gains."
-                )
-        except Exception as e:
-            self._log(f"[sysid] [red]Error: {e}[/]")
-            self._log(traceback.format_exc())
-
-        output = buf.getvalue()
-        if output:
-            for line in output.splitlines():
-                self._log(f"[sysid] {line}")
-
-        self._sysid_running = False
-        self._load_solar_elevation_gains()  # refresh sysid solar gains
-        self.call_from_thread(self.query_one(StatusHeader).set_state, sysid_running=False)
-        self.call_from_thread(self._load_sysid_status)
-
-    # ── Profile toggle ──────────────────────────────────────────────────────
-
-    @work(thread=True)
-    def _toggle_profile(self) -> None:
-        try:
-            import os
-
-            import requests
-
-            ha_url = os.environ.get("HA_URL", "")
-            ha_token = os.environ.get("HA_TOKEN", "")
-            if not ha_url or not ha_token:
-                self._log("[profile] HA_URL/HA_TOKEN not set")
-                return
-
-            headers = {"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"}
-            entity_id = "input_select.thermostat_mode"
-
-            # Get current state
-            resp = requests.get(f"{ha_url}/api/states/{entity_id}", headers=headers, timeout=10)
-            resp.raise_for_status()
-            current = resp.json().get("state", "Home")
-            options = resp.json().get("attributes", {}).get("options", ["Home", "Away"])
-
-            # Cycle to next
-            idx = options.index(current) if current in options else 0
-            next_profile = options[(idx + 1) % len(options)]
-
-            # Set it
-            requests.post(
-                f"{ha_url}/api/services/input_select/select_option",
-                headers=headers,
-                json={"entity_id": entity_id, "option": next_profile},
-                timeout=10,
-            )
-            self._log(f"[profile] Switched to {next_profile}")
-            self.call_from_thread(self.query_one(StatusHeader).set_state, profile=next_profile)
-            # Immediately re-render comfort bars with new profile
-            self.call_from_thread(self._refresh_temps)
-
-        except Exception as e:
-            self._log(f"[profile] [red]Error: {e}[/]")
-            self._log(traceback.format_exc())
 
     # ── History tab ─────────────────────────────────────────────────────────
 
@@ -687,6 +434,23 @@ class WeatherstatApp(App):
             self._log(f"[history] [red]Error: {e}[/]")
             self._log(traceback.format_exc())
 
+    # ── Web server ──────────────────────────────────────────────────────────
+
+    def _start_web_server(self) -> None:
+        try:
+            from weatherstat.web import start_web_server
+
+            self._web_server = start_web_server(
+                self.controller,
+                host=self._web_host,
+                port=self._web_port,
+                log=self._log,
+            )
+            self._log(f"[web] Listening on http://{self._web_host}:{self._web_port}")
+        except Exception as e:
+            self._log(f"[web] [red]Failed to start web server: {e}[/]")
+            self._log(traceback.format_exc())
+
     # ── Logging ─────────────────────────────────────────────────────────────
 
     def _log(self, message: str) -> None:
@@ -698,14 +462,19 @@ class WeatherstatApp(App):
             pass
 
 
-# ── Utilities ───────────────────────────────────────────────────────────────
+# ── Module helpers ──────────────────────────────────────────────────────────
+
+
+def _spawn_worker(fn) -> None:
+    """Spawn a daemon thread for a worker callable."""
+    threading.Thread(target=fn, daemon=True).start()
 
 
 def _format_age(td: timedelta) -> str:
     """Format a timedelta as a human-readable age string."""
     total_seconds = int(td.total_seconds())
     if total_seconds < 0:
-        return "<1s"  # rounding can push timestamp slightly ahead of now
+        return "<1s"
     if total_seconds < 60:
         return f"{total_seconds}s"
     minutes = total_seconds // 60
