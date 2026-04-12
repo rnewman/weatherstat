@@ -90,12 +90,6 @@ HORIZON_WEIGHTS: dict[int, float] = {
     144: 0.01, # 12h — negligible
 }
 
-# Minimum cost improvement over all-off required to justify active HVAC.
-# Prevents noise-driven decisions when model predictions barely differ between
-# scenarios. Equivalent to requiring ~1° of genuine comfort improvement at
-# one horizon before turning on heating.
-MIN_IMPROVEMENT = _CFG.min_improvement if _CFG.min_improvement is not None else delta_temp(1.0)
-
 # Cold-room override: force zone heating when a room's current temperature is
 # this far below its comfort min. Compensates for undertrained models that
 # predict rooms warming without HVAC (because training data is all HVAC-on).
@@ -453,19 +447,22 @@ def compute_energy_cost(
 
         elif eff_cfg.control_type == "regulating":
             p_band = eff_cfg.proportional_band
-            label = ed.name.removeprefix("mini_split_")
-            room_temp = temps.get(label)
+            room_temp = temps.get(eff_cfg.temp_col) if eff_cfg.temp_col else None
             if room_temp is not None and ed.target is not None:
                 delta = max(0.0, ed.target - room_temp) if ed.mode == "heat" else max(0.0, room_temp - ed.target)
                 avg_activity = min(1.0, delta / p_band)
             else:
                 avg_activity = 0.5
+            dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
+            active_fraction = dur / max_h
             assert isinstance(ec, int | float)
-            cost += ec * avg_activity
+            cost += ec * avg_activity * active_fraction
 
         elif eff_cfg.control_type == "binary":
+            dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
+            active_fraction = dur / max_h
             assert isinstance(ec, dict)
-            cost += ec.get(ed.mode, 0.0)
+            cost += ec.get(ed.mode, 0.0) * active_fraction
 
     return cost
 
@@ -575,11 +572,6 @@ def _regulating_sweep_options(
         for (eff_name, sensor_name), (gain, _lag) in gains.items():
             if eff_name == eff.name and gain != 0 and sensor_name in schedule_sensors:
                 affected_sensors.append(sensor_name)
-    # Fallback: naming convention (backward compat for tests without gains)
-    if not affected_sensors:
-        fallback = eff.name.removeprefix("mini_split_") + "_temp"
-        if fallback in schedule_sensors:
-            affected_sensors = [fallback]
 
     # ── Collect preferred temps from all affected sensors ──
     heat_targets: list[float] = []  # pref_lo values
@@ -607,14 +599,13 @@ def _regulating_sweep_options(
             if eff_name == eff.name and abs(gain) > best_gain and sensor_name in temps:
                 best_gain = abs(gain)
                 ref_temp = temps[sensor_name]
-    if ref_temp is None:
-        # Fallback: naming convention sensor
-        fallback = eff.name.removeprefix("mini_split_") + "_temp"
-        ref_temp = temps.get(fallback)
+    if ref_temp is None and eff.temp_col:
+        ref_temp = temps.get(eff.temp_col)
 
     p_band = eff.proportional_band
 
-    # ── Generate options per supported mode ──
+    # ── Generate options per supported mode with delay × duration ──
+    max_horizon = max(CONTROL_HORIZONS)
     for mode in eff.supported_modes:
         targets = heat_targets if mode == "heat" else cool_targets if mode == "cool" else []
         for target in targets:
@@ -624,7 +615,17 @@ def _regulating_sweep_options(
                     continue
                 if mode == "cool" and ref_temp < target - p_band:
                     continue
-            options.append(EffectorDecision(eff.name, mode=mode, target=round(target, 1)))
+            for delay in TRAJECTORY_DELAYS:
+                if delay >= max_horizon:
+                    continue
+                for duration in TRAJECTORY_DURATIONS:
+                    effective_duration = min(duration, max_horizon - delay)
+                    options.append(EffectorDecision(
+                        eff.name, mode=mode, target=round(target, 1),
+                        delay_steps=delay, duration_steps=effective_duration,
+                    ))
+    # Deduplicate (capping creates duplicates)
+    options = [options[0]] + list(dict.fromkeys(options[1:]))
 
     # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
     if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
@@ -890,7 +891,20 @@ def generate_trajectory_scenarios(
                 ]
 
         elif eff.control_type == "binary":
-            per_effector_options[eff.name] = [EffectorDecision(eff.name, mode=m) for m in eff.supported_modes]
+            binary_options: list[EffectorDecision] = [EffectorDecision(eff.name)]
+            for m in eff.supported_modes:
+                if m == "off":
+                    continue
+                for delay in TRAJECTORY_DELAYS:
+                    if delay >= max_horizon:
+                        continue
+                    for duration in TRAJECTORY_DURATIONS:
+                        effective_duration = min(duration, max_horizon - delay)
+                        binary_options.append(EffectorDecision(
+                            eff.name, mode=m,
+                            delay_steps=delay, duration_steps=effective_duration,
+                        ))
+            per_effector_options[eff.name] = list(dict.fromkeys(binary_options))
 
     # Cartesian product of independent effectors
     independent_names = list(per_effector_options.keys())
@@ -1181,23 +1195,20 @@ def sweep_scenarios_physics(
 
     def _score_all(
         scens: list[Scenario], pred: np.ndarray, tnames: list[str]
-    ) -> tuple[list[float], list[dict[str, float]], int, float, int, float]:
-        """Score scenarios. Returns (costs, predictions, best_idx, best_cost, off_idx, off_cost)."""
+    ) -> tuple[list[float], list[dict[str, float]], int, float]:
+        """Score scenarios. Returns (costs, predictions, best_idx, best_cost)."""
         tidx = {t: j for j, t in enumerate(tnames)}
         costs: list[float] = []
         preds: list[dict[str, float]] = []
         b_idx, b_cost = -1, float("inf")
-        o_idx, o_cost = -1, float("inf")
         for i, sc in enumerate(scens):
             p = {t: float(pred[i, j]) for t, j in tidx.items()}
             c = compute_comfort_cost(p, schedules, base_hour) + compute_energy_cost(sc, current_temps)
             costs.append(c)
             preds.append(p)
-            if _is_all_off(sc):
-                o_idx, o_cost = i, c
             if c < b_cost:
                 b_cost, b_idx = c, i
-        return costs, preds, b_idx, b_cost, o_idx, o_cost
+        return costs, preds, b_idx, b_cost
 
     # ── Determine sweep strategy ──
     n_adv_combos = _advisory_combo_count(advisory_options) if advisory_options else 0
@@ -1213,7 +1224,7 @@ def sweep_scenarios_physics(
         )
 
         s1_names, s1_pred = predict(sweep_state, hvac_scenarios, sim_params, CONTROL_HORIZONS)
-        s1_costs, _, _, _, _, _ = _score_all(hvac_scenarios, s1_pred, s1_names)
+        s1_costs, _, _, _ = _score_all(hvac_scenarios, s1_pred, s1_names)
 
         # Select top-K HVAC plans (auto-sized to fit advisory product within cap)
         # Coarsen up-front when the full advisory grid would force K below MIN_K.
@@ -1250,7 +1261,7 @@ def sweep_scenarios_physics(
         print(f"  [advisory] Stage 2: {len(scenarios):,} combined scenarios")
 
         target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-        all_costs, all_predictions, best_idx, best_cost, off_idx, off_cost = _score_all(
+        all_costs, all_predictions, best_idx, best_cost = _score_all(
             scenarios, pred_matrix, target_names
         )
     else:
@@ -1261,7 +1272,7 @@ def sweep_scenarios_physics(
             scenarios = hvac_scenarios
 
         target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-        all_costs, all_predictions, best_idx, best_cost, off_idx, off_cost = _score_all(
+        all_costs, all_predictions, best_idx, best_cost = _score_all(
             scenarios, pred_matrix, target_names
         )
 
@@ -1296,14 +1307,6 @@ def sweep_scenarios_physics(
             if baseline_has_heating and not best_has_heating:
                 print(f"  [advisory] Backup breach override: {advisory_plan.backup_breaches[0]}")
                 best_idx = advisory_plan.baseline_idx
-                best_cost = all_costs[advisory_plan.baseline_idx]
-
-    # Minimum improvement safeguard
-    if off_idx >= 0 and best_idx != off_idx:
-        improvement = off_cost - best_cost
-        if improvement < MIN_IMPROVEMENT:
-            print(f"  Reverting to all-off: improvement {improvement:.3f} < threshold {MIN_IMPROVEMENT:.1f}")
-            best_idx = off_idx
 
     # ── Cold-sensor safety override ──
     # Force immediate heating (delay=0) when a sensor is significantly below comfort min
@@ -2067,16 +2070,17 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         eff_cfg = EFFECTOR_MAP.get(ed.name)
         if eff_cfg is None:
             return ""
-        # Find the sensor this effector most affects
+        # Find the sensor this effector most affects (highest-gain constrained sensor)
         sensor_col = ""
+        schedule_set = {s.sensor for s in schedules}
         if eff_cfg.control_type == "trajectory":
             sensor_col = eff_cfg.temp_col  # e.g., "thermostat_upstairs_temp"
-        elif eff_cfg.control_type == "regulating":
-            sensor_col = ed.name.removeprefix("mini_split_") + "_temp"
-        elif eff_cfg.control_type == "binary":
-            # Blowers affect the rooms they serve — use naming convention
-            room = ed.name.removeprefix("blower_")
-            sensor_col = f"{room}_temp"
+        else:
+            best_gain = 0.0
+            for (eff_name, s_col), (gain, _lag) in sim_params.gains.items():
+                if eff_name == ed.name and abs(gain) > best_gain and s_col in schedule_set:
+                    best_gain = abs(gain)
+                    sensor_col = s_col
 
         if not sensor_col:
             return ""

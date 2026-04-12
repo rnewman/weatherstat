@@ -136,10 +136,10 @@ Where:
 - Each effector `e` contributes a gain (°F/hr per activity unit) delayed by its fitted lag
 - Solar gain uses an elevation-based model: one `β_solar` per sensor × `sin⁺(solar_elevation)` × weather-conditioned solar fraction (sunny=1.0, cloudy=0.15, etc.). Solar elevation is computed analytically from latitude, longitude, and time — no external data needed. `sin⁺(elevation)` naturally captures both hour-of-day variation (low at sunrise/sunset, high at noon) and seasonal variation (winter noon ~30° at Seattle, April ~48°, summer ~66°). This replaced the prior per-hour model (11 coefficients per sensor, hours 7–17) which had no seasonal awareness — coefficients fitted from winter data underpredicted spring solar gain by ~35%. The per-sensor regression coefficient absorbs compound house geometry (window orientations, roof pitch, glass vs wall). **Planned next step:** per-sensor irradiance gain coefficients fitted against 5-plane irradiance data (horizontal + 4 cardinal walls) from forecast.solar, which will also capture directionality (e.g., west rooms warm more in afternoon). Data collection started 2026-04-05; see `docs/FUTURE.md` § "Irradiance-Based Solar Model"
 
-**Effector control types** (property of each effector, not separate code categories):
+**Effector control types** (property of each effector, not separate code categories). All types support delay × duration parameters — the sweep explores when to start and how long to run each effector:
 - **Trajectory:** Pre-computed binary activity from delay/duration parameters. Used for slow-twitch effectors (e.g., hydronic thermostats with 45-75 min lag).
-- **Binary:** Constant activity from mode encoding (e.g., off=0, low=1, high=2 — configured per-device in `state_encoding`). Used for discrete-level effectors (e.g., blowers).
-- **Regulating:** Proportional activity computed inside the Euler loop: `activity = clip((target - T) / proportional_band, 0, 1)`. Activity drops to zero as the room reaches the target. Used for self-regulating climate devices (e.g., mini splits).
+- **Binary:** Constant activity from mode encoding (e.g., off=0, low=1, high=2 — configured per-device in `state_encoding`), gated by delay/duration active window. Used for discrete-level effectors (e.g., blowers).
+- **Regulating:** Proportional activity computed inside the Euler loop: `activity = clip((target - T) / proportional_band, 0, 1)`, gated by delay/duration active window. Activity drops to zero as the room reaches the target, or outside the active window. Used for self-regulating climate devices (e.g., mini splits).
 
 **Effector dependencies:** Some effectors only produce useful output when all their dependencies are active (e.g., a blower circulating air over hydronic coils only helps when heat is flowing through them). `depends_on` references one or more parent effectors by name; the dependency is met when *all* parents are active (AND gate). The simulator models this via multiplicative activity gates; scenario generation prunes combinations where any parent is inactive.
 
@@ -201,12 +201,12 @@ Decides what HVAC actions to take right now, using receding-horizon optimization
 **Each control cycle:**
 1. Read current house state (temperatures, HVAC states, environment states, weather).
 2. Fetch weather forecast for the prediction horizon.
-3. Enumerate candidate trajectories: each thermostat gets a delay × duration grid (e.g., "delay 1h, heat for 2h, coast"), crossed with blower modes and mini-split target temperatures (~5,000–15,000 scenarios depending on config).
+3. Enumerate candidate trajectories: every effector sweeps a delay × duration grid (e.g., "delay 1h, cool for 2h"), crossed across all effectors. Regulating effectors additionally sweep target temperatures from comfort schedule preferred bounds.
 4. For each candidate: forward-simulate all sensor temperatures. Score the resulting trajectories against comfort schedules and energy costs.
 5. Select the trajectory with the best score.
 6. Emit electronic commands for the executor.
 
-**Trajectory search:** Effector options are generated per control_type: trajectory effectors get delay × duration grids, regulating effectors get gains-aware mode + target combinations (heat targets from affected sensors' `pref_lo`, cool targets from `pref_hi`, with idle suppression when the highest-gain sensor is already past target), binary effectors get their supported modes. The sweep takes the cartesian product, with dependent effectors constrained by their parent's state. Boiler activity is confirmed via state_gate multiplication in the simulator.
+**Trajectory search:** All effector types sweep delay × duration grids (`[0, 12, 24] × [12, 24, 72]` steps = 0/1/2h delays × 1/2/6h durations). Regulating effectors additionally sweep gains-aware mode + target combinations (heat targets from affected sensors' `pref_lo`, cool targets from `pref_hi`, with idle suppression when the highest-gain sensor is already past target). Binary effectors sweep their supported modes. The sweep takes the cartesian product, with dependent effectors constrained by their parent's state. Boiler activity is confirmed via state_gate multiplication in the simulator.
 
 **Receding horizon:** Only the immediate action matters. A trajectory of "delay 2h then heat" means "stay off now." At the next cycle (default 5 minutes, configurable via `control_interval`), the controller re-evaluates with fresh data and may choose differently.
 
@@ -229,7 +229,7 @@ Active environment states (e.g., open windows) widen the comfort band to avoid f
 
 **Horizon weighting:** Closer predictions weighted higher (more accurate, more actionable).
 
-**Energy cost scaling:** Each effector's cost comes from its per-effector `energy_cost` config. Trajectory effectors: cost proportional to `duration / max_horizon`. Regulating effectors: cost proportional to expected activity (target vs outdoor temperature within proportional band). Binary effectors: per-mode cost dict.
+**Energy cost scaling:** Each effector's cost comes from its per-effector `energy_cost` config, scaled by `active_fraction = duration / max_horizon`. Trajectory and binary effectors: base cost × active_fraction. Regulating effectors: base cost × expected activity (target vs room temperature within proportional band) × active_fraction. Delayed or shorter-duration actions naturally cost less, allowing the optimizer to find "cool in 2h for 1h" as cheaper than "cool now for 6h" when comfort allows.
 
 **Physical constraints:**
 - Dependent effectors forced off when their dependency is inactive (e.g., blowers off when thermostat isn't calling for heat).

@@ -80,7 +80,7 @@ Pull the latest sensor data from Home Assistant: sensor temperatures, outdoor te
 
 ### 2. Generate candidate plans
 
-Enumerate thousands of possible HVAC actions. For a trajectory effector like a thermostat: "turn on now and heat for 3 hours", "wait 1 hour then heat for 2 hours", "stay off." For a regulating effector like a mini-split: "heat to 72°F", "cool to 70°F", "turn off." For a binary effector like a blower motor: "off", "low", "high." The sweep takes the cartesian product of all effector options — typically 5,000–15,000 scenarios.
+Enumerate thousands of possible HVAC actions. Every effector type sweeps delay × duration combinations (start now/in 1h/in 2h × run for 1h/2h/6h). For a trajectory effector like a thermostat: "turn on now and heat for 3 hours", "wait 1 hour then heat for 2 hours", "stay off." For a regulating effector like a mini-split: "cool to 70°F starting in 2h for 1h", "heat to 72°F now for 6h", "turn off." For a binary effector like a blower motor: "high for 2h", "low starting in 1h." The sweep takes the cartesian product of all effector options.
 
 ### 3. Simulate each plan
 
@@ -155,7 +155,6 @@ The system is conservative by design:
 - **Hold times**: Minimum 3 minutes between setpoint changes.
 - **Mode hold windows**: No mini-split mode changes during configurable quiet hours (e.g., 10pm–7am), so you're not woken by compressor starts — only silent target temperature adjustments.
 - **Cold-room override**: If any sensor drops significantly below its comfort minimum, constrain the sweep to scenarios where the most-coupled trajectory effector (from sysid's coupling matrix) is heating immediately — overriding delay and cost trade-offs.
-- **Minimum improvement threshold**: Don't turn on HVAC unless it improves the score by at least 1.0 units over doing nothing.
 - **Override detection**: If a human manually adjusts a thermostat, respect the override.
 - **Health monitoring**: Alert if critical infrastructure (boiler connection, return temperature) is in a bad state.
 

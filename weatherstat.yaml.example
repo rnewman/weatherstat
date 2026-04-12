@@ -310,7 +310,6 @@ defaults:
   # setpoint_max: 78         # absolute maximum setpoint
   # cautious_offset: 2       # setpoint offset above/below current temp
   # max_1h_change: 5         # sanity check: max predicted 1h change
-  # min_improvement: 1       # min cost improvement to justify turning on HVAC
   # cold_room_override: 1    # force heating when this far below comfort min
   # backup_margin: 3         # backup bounds = acceptable ± this margin (default: 3°F / 1.7°C)
   # control_interval: 300    # seconds between control cycles (default: 300 = 5 min)

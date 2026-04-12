@@ -233,7 +233,6 @@ class WeatherstatConfig:
     setpoint_max: float | None = None  # absolute maximum setpoint (default: 78°F / 26°C)
     cautious_offset: float | None = None  # setpoint offset above/below current (default: 2°F / 1.1°C)
     max_1h_change: float | None = None  # sanity check: max predicted 1h change (default: 5°F / 2.8°C)
-    min_improvement: float | None = None  # min cost improvement to justify HVAC (default: 1°F / 0.6°C)
     cold_room_override: float | None = None  # force heating when this far below min (default: 1°F / 0.6°C)
     backup_margin: float = 3.0  # backup bounds = acceptable ± this margin (default: 3°F / 1.7°C)
     hard_rail_multiplier: float | None = None  # penalty multiplier outside acceptable bounds (default: 3.0)
@@ -777,7 +776,6 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         setpoint_max=_opt_float("setpoint_max"),
         cautious_offset=_opt_float("cautious_offset"),
         max_1h_change=_opt_float("max_1h_change"),
-        min_improvement=_opt_float("min_improvement"),
         cold_room_override=_opt_float("cold_room_override"),
         hard_rail_multiplier=_opt_float("hard_rail_multiplier"),
         backup_margin=backup_margin,

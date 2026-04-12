@@ -71,11 +71,10 @@ Sysid uses all available collector data. More data = tighter parameter estimates
 ## 3. Control loop
 
 The controller runs a physics-based trajectory sweep: for each combination of
-effector options (trajectory effectors get delay × duration grids, regulating
-effectors get mode + target combinations, binary effectors get their supported
-modes), it forward-simulates sensor temperatures over a 6-hour horizon and
-selects the scenario that minimizes comfort cost + energy cost (~5,000–15,000
-scenarios).
+effector options (all effector types sweep delay × duration grids; regulating
+effectors additionally sweep mode + target combinations), it forward-simulates
+sensor temperatures over a 6-hour horizon and selects the scenario that
+minimizes comfort cost + energy cost.
 
 Re-evaluated every 5 minutes by default (configurable via `control_interval` in
 the `defaults` section). Receding horizon — only the immediate action is

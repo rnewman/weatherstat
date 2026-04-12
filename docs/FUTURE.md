@@ -243,9 +243,11 @@ Batch prediction gives ~160ms per sweep (~14K scenarios). The unified effector
 model generates scenarios as the cartesian product of per-effector options,
 so count grows as `|options|^N_independent`.
 
-**Current:** 2 trajectory (8 each) × 2 regulating (up to 6 each with
-gains-aware multi-target sweep) × 3 binary (3 each) ≈ 14–16K scenarios
-(pruned by dependency constraints and idle suppression).
+**Current:** All effector types sweep delay × duration grids (9 combos per
+mode). 2 trajectory (10 each) × 2 regulating (1 + modes×targets×9 delay/dur
+each, ~37 with idle suppression) × 3 binary (1 + modes×9, ~19 each) —
+potentially large cross products, managed by the existing coarsening logic
+(reduce at >50K, hold-all at >100K).
 Adding a 3rd trajectory effector: ~100K+ scenarios, ~1s sweep.
 
 **Future approaches (in priority order):**

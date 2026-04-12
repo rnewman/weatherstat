@@ -756,15 +756,15 @@ class TestRegulatingSweepOptions:
         assert len(options) == 1
         assert options[0].mode == "off"
 
-    def test_sweep_fallback_without_gains(self) -> None:
-        """Without gains, falls back to naming convention for sensor lookup."""
+    def test_sweep_without_gains_returns_off_only(self) -> None:
+        """Without gains, no sensors are affected -> only off option."""
         eff = self._bedroom_eff()
         options = _regulating_sweep_options(
             eff, self._bedroom_schedule(), 12,
             current_temps={"bedroom_temp": 68.0},
         )
-        # Should still find bedroom_temp via naming convention
-        assert any(o.mode == "heat" for o in options)
+        assert len(options) == 1
+        assert options[0].mode == "off"
 
 
 # ── Mode hold window tests ──────────────────────────────────────────
@@ -874,7 +874,7 @@ class TestProportionalEnergyCost:
         high_target = Scenario(effectors={
             "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=69.0),
         })
-        temps = {"bedroom": 68.0}
+        temps = {"mini_split_bedroom_temp": 68.0}
         assert compute_energy_cost(low_target, temps) < compute_energy_cost(high_target, temps)
 
     def test_off_mini_split_no_energy_cost(self) -> None:
@@ -890,7 +890,7 @@ class TestTrajectoryWithSchedules:
     """Test trajectory generation with comfort schedule integration."""
 
     def test_scenario_count_with_schedules(self) -> None:
-        """With schedules, should have 2 options per split (off + preferred)."""
+        """With schedules and gains, regulating effectors get delay×duration options."""
         schedules = [
             ComfortSchedule(
                 sensor="bedroom_temp",
@@ -903,10 +903,17 @@ class TestTrajectoryWithSchedules:
                 entries=(ComfortScheduleEntry(0, 24, RoomComfort("living_room", 71.0, 71.0, 69.0, 74.0, 66.0, 77.0)),),
             ),
         ]
+        gains = {
+            ("mini_split_bedroom", "bedroom_temp"): (0.732, 10.0),
+            ("mini_split_living_room", "living_room_temp"): (0.65, 10.0),
+        }
         # Room temps below preferred -> heat mode for both splits
         current_temps = {"bedroom_temp": 68.0, "living_room_temp": 69.0}
-        scenarios = generate_trajectory_scenarios(schedules, base_hour=12, current_temps=current_temps)
-        # 4 mini split combos (2x2): off + preferred per split
+        scenarios = generate_trajectory_scenarios(
+            schedules, base_hour=12, current_temps=current_temps, gains=gains,
+        )
+        # Each split: off + heat@preferred × delay×duration combos
+        # Should have more than 4 combos now (off + multiple delay/duration variants)
         split_combos = set()
         for s in scenarios:
             combo = tuple(
@@ -915,7 +922,8 @@ class TestTrajectoryWithSchedules:
                 if EFFECTOR_MAP.get(name) and EFFECTOR_MAP[name].control_type == "regulating"
             )
             split_combos.add(combo)
-        assert len(split_combos) == 4
+        # At minimum: off×off, off×heat, heat×off, heat×heat (mode/target combos)
+        assert len(split_combos) >= 4
 
     def test_all_off_still_present(self) -> None:
         """All-off baseline should still be in scenario set."""

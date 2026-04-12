@@ -377,10 +377,11 @@ class _RegulatingEffector:
     """Info for a regulating (target-based) effector, used in Euler loop."""
 
     effector_name: str
-    split_name: str
     proportional_band: float
     targets: np.ndarray  # (n_scenarios,) — target temp per scenario
     modes: np.ndarray  # (n_scenarios,) — +1 for heat, -1 for cool, 0 for off
+    delay_steps: np.ndarray  # (n_scenarios,)
+    duration_steps: np.ndarray  # (n_scenarios,)
 
 
 def _build_activity_matrices(
@@ -450,11 +451,18 @@ def _build_activity_matrices(
                     dep_active &= trajectory_active.get(dname, np.zeros((n, n_future), dtype=bool))
             else:
                 dep_active = np.ones((n, n_future), dtype=bool)
-            enc_vals = np.array([
-                encoding.get(s.effectors.get(name, EffectorDecision(name)).mode, 0.0)
-                for s in scenarios
+            decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
+            enc_vals = np.array([encoding.get(d.mode, 0.0) for d in decisions])
+            delay_arr = np.array([d.delay_steps for d in decisions])
+            dur_arr = np.array([
+                d.duration_steps if d.duration_steps is not None else (n_future - d.delay_steps)
+                for d in decisions
             ])
-            future = dep_active.astype(np.float64) * enc_vals[:, None]
+            time_active = (
+                (steps[None, :] >= delay_arr[:, None])
+                & (steps[None, :] < (delay_arr + dur_arr)[:, None])
+            )
+            future = dep_active.astype(np.float64) * enc_vals[:, None] * time_active.astype(np.float64)
 
         elif dtype == "mini_split":
             eff_cfg = EFFECTOR_MAP.get(name)
@@ -470,22 +478,35 @@ def _build_activity_matrices(
                     1.0 if d.mode == "heat" else (-1.0 if d.mode == "cool" else 0.0)
                     for d in decisions
                 ])
+                delays = np.array([d.delay_steps for d in decisions])
+                durations = np.array([
+                    d.duration_steps if d.duration_steps is not None else (n_future - d.delay_steps)
+                    for d in decisions
+                ])
                 regulating.append(_RegulatingEffector(
                     effector_name=name,
-                    split_name=name.removeprefix("mini_split_"),
                     proportional_band=eff_cfg.proportional_band,
                     targets=targets,
                     modes=modes,
+                    delay_steps=delays,
+                    duration_steps=durations,
                 ))
                 # Still need history in the matrix for lag lookback
                 future = np.zeros((n, n_future))
             else:
-                # Binary mini split (original behavior)
-                enc_vals = np.array([
-                    encoding.get(s.effectors.get(name, EffectorDecision(name)).mode, 0.0)
-                    for s in scenarios
+                # Binary mini split: apply delay/duration mask
+                ms_decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
+                enc_vals = np.array([encoding.get(d.mode, 0.0) for d in ms_decisions])
+                ms_delays = np.array([d.delay_steps for d in ms_decisions])
+                ms_durs = np.array([
+                    d.duration_steps if d.duration_steps is not None else (n_future - d.delay_steps)
+                    for d in ms_decisions
                 ])
-                future = np.broadcast_to(enc_vals[:, None], (n, n_future))
+                ms_active = (
+                    (steps[None, :] >= ms_delays[:, None])
+                    & (steps[None, :] < (ms_delays + ms_durs)[:, None])
+                )
+                future = enc_vals[:, None] * ms_active.astype(np.float64)
 
         else:
             future = np.zeros((n, n_future))
@@ -742,14 +763,15 @@ def predict(
                 total_eff[:, dst_start:dst_end] += gain * mat[:, src_start:src_end]
 
         # Collect regulating effector info for this sensor
-        sensor_reg: list[tuple[float, int, float, np.ndarray, np.ndarray]] = []
+        sensor_reg: list[tuple[float, int, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         for reg in regulating_effectors:
             gain_info = sensor_gains.get(reg.effector_name)
             if gain_info is None:
                 continue
             gain, lag_min = gain_info
             lag_steps = int(round(lag_min / 5.0))
-            sensor_reg.append((abs(gain), lag_steps, reg.proportional_band, reg.targets, reg.modes))
+            sensor_reg.append((abs(gain), lag_steps, reg.proportional_band, reg.targets, reg.modes,
+                               reg.delay_steps, reg.duration_steps))
 
         # Euler integration: loop over timesteps, vectorized over scenarios
         T = np.full(n_scenarios, cur_temp)
@@ -762,13 +784,16 @@ def predict(
             dTdt = (outdoor_vec[step_idx] - T) / tau_val + total_eff[:, step] + solar_val
 
             # Regulating effector contributions (proportional to target - current temp)
-            for abs_gain, lag_s, p_band, targets, modes in sensor_reg:
+            for abs_gain, lag_s, p_band, targets, modes, delays, durations in sensor_reg:
                 if step - lag_s < 1:
                     continue
+                # Active mask: effector is on during [delay, delay+duration)
+                active = (step >= delays) & (step < delays + durations)
+                effective_modes = np.where(active, modes, 0.0)
                 # Heating: activity = clip((target - T) / band, 0, 1)
                 # Cooling: activity = clip((T - target) / band, 0, 1)
-                heat_mask = modes > 0  # (n_scenarios,)
-                cool_mask = modes < 0
+                heat_mask = effective_modes > 0  # (n_scenarios,)
+                cool_mask = effective_modes < 0
                 activity = np.zeros(n_scenarios)
                 if heat_mask.any():
                     activity = np.where(
