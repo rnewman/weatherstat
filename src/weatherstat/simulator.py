@@ -404,13 +404,22 @@ def _build_activity_matrices(
     n_total = _HISTORY_STEPS + n_future
     steps = np.arange(n_future)  # [0, 1, ..., n_future-1]
 
+    # Pre-extract all effector decisions once (avoid repeated list comps over 100K+ scenarios)
+    eff_names = {eff["name"] for eff in params.effectors}
+    _off_cache: dict[str, EffectorDecision] = {}
+    decisions_by_eff: dict[str, list[EffectorDecision]] = {}
+    for name in eff_names:
+        _off_cache[name] = EffectorDecision(name)
+        off = _off_cache[name]
+        decisions_by_eff[name] = [s.effectors.get(name, off) for s in scenarios]
+
     # Build trajectory active masks for all trajectory effectors
     trajectory_active: dict[str, np.ndarray] = {}
     for eff in params.effectors:
         if eff["device_type"] != "thermostat":
             continue
         name = eff["name"]
-        decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
+        decisions = decisions_by_eff[name]
         heating = np.array([d.mode != "off" for d in decisions])
         delay = np.array([d.delay_steps for d in decisions])
         dur = np.array([
@@ -430,6 +439,7 @@ def _build_activity_matrices(
         name = eff["name"]
         encoding = eff.get("command_encoding") or eff["encoding"]
         dtype = eff["device_type"]
+        decisions = decisions_by_eff[name]
 
         # History: shared across all scenarios
         hist = recent_history.get(name, [])
@@ -445,13 +455,11 @@ def _build_activity_matrices(
             eff_cfg = EFFECTOR_MAP.get(name)
             dep_names = eff_cfg.depends_on if eff_cfg else ()
             if dep_names:
-                # AND gate: blower needs ALL parents active
                 dep_active = np.ones((n, n_future), dtype=bool)
                 for dname in dep_names:
                     dep_active &= trajectory_active.get(dname, np.zeros((n, n_future), dtype=bool))
             else:
                 dep_active = np.ones((n, n_future), dtype=bool)
-            decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
             enc_vals = np.array([encoding.get(d.mode, 0.0) for d in decisions])
             delay_arr = np.array([d.delay_steps for d in decisions])
             dur_arr = np.array([
@@ -468,8 +476,6 @@ def _build_activity_matrices(
             eff_cfg = EFFECTOR_MAP.get(name)
 
             if eff_cfg and eff_cfg.control_type == "regulating":
-                # Regulating: extract targets/modes per scenario for Euler loop
-                decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
                 targets = np.array([
                     d.target if d.mode != "off" and d.target is not None else 0.0
                     for d in decisions
@@ -491,16 +497,13 @@ def _build_activity_matrices(
                     delay_steps=delays,
                     duration_steps=durations,
                 ))
-                # Still need history in the matrix for lag lookback
                 future = np.zeros((n, n_future))
             else:
-                # Binary mini split: apply delay/duration mask
-                ms_decisions = [s.effectors.get(name, EffectorDecision(name)) for s in scenarios]
-                enc_vals = np.array([encoding.get(d.mode, 0.0) for d in ms_decisions])
-                ms_delays = np.array([d.delay_steps for d in ms_decisions])
+                enc_vals = np.array([encoding.get(d.mode, 0.0) for d in decisions])
+                ms_delays = np.array([d.delay_steps for d in decisions])
                 ms_durs = np.array([
                     d.duration_steps if d.duration_steps is not None else (n_future - d.delay_steps)
-                    for d in ms_decisions
+                    for d in decisions
                 ])
                 ms_active = (
                     (steps[None, :] >= ms_delays[:, None])

@@ -130,7 +130,7 @@ def _history_to_series(
         if state in ("unavailable", "unknown"):
             continue
         try:
-            ts = pd.to_datetime(ts_str, utc=True)
+            ts = pd.to_datetime(ts_str, utc=True, format="ISO8601")
         except (ValueError, TypeError):
             continue
         val = value_fn(state)  # type: ignore[operator]
@@ -156,7 +156,7 @@ def _climate_to_series(
         if state in ("unavailable", "unknown"):
             continue
         try:
-            ts = pd.to_datetime(ts_str, utc=True)
+            ts = pd.to_datetime(ts_str, utc=True, format="ISO8601")
         except (ValueError, TypeError):
             continue
 
@@ -196,7 +196,7 @@ def _fan_to_series(records: list[dict[str, object]]) -> pd.Series:
         if state in ("unavailable", "unknown"):
             continue
         try:
-            ts = pd.to_datetime(ts_str, utc=True)
+            ts = pd.to_datetime(ts_str, utc=True, format="ISO8601")
         except (ValueError, TypeError):
             continue
 
@@ -231,7 +231,7 @@ def _weather_to_series(
         if state in ("unavailable", "unknown"):
             continue
         try:
-            ts = pd.to_datetime(ts_str, utc=True)
+            ts = pd.to_datetime(ts_str, utc=True, format="ISO8601")
         except (ValueError, TypeError):
             continue
 

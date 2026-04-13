@@ -145,7 +145,7 @@ Where:
 
 **Integration:** Euler steps at 5-minute resolution, chaining hourly weather forecast segments for the outdoor temperature trajectory.
 
-**Batch simulation:** The controller calls `predict()` with thousands of candidate scenarios. Each scenario specifies effector timelines (trajectory-parameterized), and the simulator evaluates all of them against the same initial conditions. Internally, Euler integration is vectorized across all scenarios using numpy — the outer loop is over sensors and timesteps, with numpy broadcasting handling all scenarios simultaneously.
+**Batch simulation:** The controller calls `predict()` with candidate scenarios. Each scenario specifies effector timelines (trajectory-parameterized), and the simulator evaluates all of them against the same initial conditions. Internally, Euler integration is vectorized across all scenarios using numpy — the outer loop is over sensors and timesteps, with numpy broadcasting handling all scenarios simultaneously. For the HVAC sweep (hundreds of thousands of combinations), the controller exploits superposition — the linearity of the forcing terms — to decompose the search: simulate ~170 marginal scenarios instead of ~500K full Euler integrations, then reconstruct all combination temperatures via array addition (see "Marginal decomposition" in section 4).
 
 #### 3b. System Identification (`src/weatherstat/sysid.py`)
 
@@ -230,6 +230,32 @@ Active environment states (e.g., open windows) widen the comfort band to avoid f
 **Horizon weighting:** Closer predictions weighted higher (more accurate, more actionable).
 
 **Energy cost scaling:** Each effector's cost comes from its per-effector `energy_cost` config, scaled by `active_fraction = duration / max_horizon`. Trajectory and binary effectors: base cost × active_fraction. Regulating effectors: base cost × expected activity (target vs room temperature within proportional band) × active_fraction. Delayed or shorter-duration actions naturally cost less, allowing the optimizer to find "cool in 2h for 1h" as cheaper than "cool now for 6h" when comfort allows.
+
+**Marginal decomposition (superposition):** The Euler integration for each sensor is a linear recurrence with additive forcing:
+
+```
+T[t+1] = T[t] × (1 - dt/τ) + dt × (T_outdoor[t]/τ + Σ_eff gain_eff × activity_eff[t] + solar[t])
+```
+
+Each effector's contribution to the forcing term is independent of every other effector's decision. By the superposition principle for linear systems, predicted temperatures decompose exactly into a sum of per-effector marginal effects:
+
+```
+T(eff_A=a, eff_B=b, ...) = T_base + δT_A(a) + δT_B(b) + ...
+```
+
+where `T_base` is the all-off trajectory and `δT_eff(option)` is the temperature change from activating that single effector option in isolation. This means the controller does not need to simulate all N_combinations Euler integrations — it only needs one simulation per effector option (~85–170 marginals for the current house), then recovers all combination temperatures via array addition.
+
+The sweep uses this decomposition in three phases:
+
+1. **Marginal simulation.** Simulate `T_base` (all-off) plus one run per effector option. Dependent effectors (e.g., blowers gated by a thermostat) cannot be separated from their parents — their activity is the product of their own mode and the parent's active mask — so they are simulated as compound groups: each (thermostat option × blower combo) produces one compound δT. Total: ~170 Euler integrations instead of ~500K.
+
+2. **Combination scoring.** For every combination of effector options, reconstruct predicted temperatures by summing pre-computed marginals: `T_pred = T_base + δT_A[idx_A] + δT_B[idx_B] + ...`, where index arrays come from a meshgrid of the Cartesian product. Score with the vectorized comfort + energy cost functions. No Euler integration — just array indexing and addition across all ~500K combinations in one pass.
+
+3. **Exact refinement.** The top-K candidates (~100) are re-simulated with full Euler integration, capturing effects that break linearity, and the final winner is selected from these exact results.
+
+Regulating effectors (mini splits with proportional activity) break linearity because their activity depends on the current temperature: `activity = clip((target - T) / band, 0, 1)`. In phase 1, regulating marginals are computed using `T_base` as the background temperature, which is approximate — the true background includes other effectors' contributions. The approximation error is bounded by `Σ|δT_other| / proportional_band` and is typically ≤1°F. This is sufficient for ranking in phase 2; the exact refinement in phase 3 corrects any ranking errors by re-simulating with the full nonlinear regulating loop.
+
+Advisory effectors (windows, shades, vents) modulate τ and solar gain multiplicatively, fully breaking superposition. They continue to use full Euler simulation in Stage 2 of the two-stage advisory sweep, which crosses top-K HVAC plans with advisory combinations.
 
 **Physical constraints:**
 - Dependent effectors forced off when their dependency is inactive (e.g., blowers off when thermostat isn't calling for heat).

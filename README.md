@@ -80,11 +80,13 @@ Pull the latest sensor data from Home Assistant: sensor temperatures, outdoor te
 
 ### 2. Generate candidate plans
 
-Enumerate thousands of possible HVAC actions. Every effector type sweeps delay × duration combinations (start now/in 1h/in 2h × run for 1h/2h/6h). For a trajectory effector like a thermostat: "turn on now and heat for 3 hours", "wait 1 hour then heat for 2 hours", "stay off." For a regulating effector like a mini-split: "cool to 70°F starting in 2h for 1h", "heat to 72°F now for 6h", "turn off." For a binary effector like a blower motor: "high for 2h", "low starting in 1h." The sweep takes the cartesian product of all effector options.
+Enumerate hundreds of thousands of possible HVAC configurations. Every effector type sweeps delay × duration combinations (start now/in 1h/in 2h × run for 1h/2h/6h). For a trajectory effector like a thermostat: "turn on now and heat for 3 hours", "wait 1 hour then heat for 2 hours", "stay off." For a regulating effector like a mini-split: "cool to 70°F starting in 2h for 1h", "heat to 72°F now for 6h", "turn off." For a binary effector like a blower motor: "high for 2h", "low starting in 1h." The sweep takes the Cartesian product of all effector options — for my house, that's ~500K combinations.
 
 ### 3. Simulate each plan
 
-For every candidate, forward-simulate all sensor temperatures for the next 6 hours using the physics model. This uses the fitted parameters (τ, gains, lags, solar profiles), the weather forecast for outdoor temperature, and the current environment states. The simulator runs in batch: numpy broadcasts across all scenarios simultaneously. HVAC-only scenarios use a scalar-tau fast path (~30ms for 7,000+ plans); advisory sweeps with per-step tau dynamics are slower.
+For every candidate, forward-simulate all sensor temperatures for the next 6 hours using the physics model. This uses the fitted parameters (τ, gains, lags, solar profiles), the weather forecast for outdoor temperature, and the current environment states. The simulator runs in batch: numpy broadcasts across all scenarios simultaneously.
+
+The Euler integration is a linear recurrence with additive forcing per effector, so the controller exploits **superposition**: instead of simulating all ~500K combinations, it simulates ~170 marginals (an all-off baseline plus one per effector option), then reconstructs every combination's temperatures by summing the marginal deltas. The full sweep scores all ~500K combinations via array addition and vectorized cost functions, then re-simulates the top ~100 candidates with exact Euler integration to capture nonlinearities from regulating effectors. Advisory sweeps (windows, shades) modulate τ multiplicatively, breaking superposition, so they continue with full simulation on the narrowed HVAC candidate set.
 
 ### 4. Score against comfort and energy
 
@@ -184,7 +186,7 @@ Home Assistant  ←──── REST API ────→  Collector (Python, 5-m
   Controller (Python) ←── predict() ── Simulator (Python)
        │
        ├── Comfort schedules + energy costs
-       ├── Scenario sweep (5,000-15,000 plans)
+       ├── Scenario sweep (~500K plans via superposition)
        ├── Advisory recommendations (environment)
        ├── Safety checks (health)
        └── Decision log (outcomes)

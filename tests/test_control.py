@@ -7,6 +7,8 @@ trajectory generation, window schedule adjustment, and quiet hours.
 
 from __future__ import annotations
 
+import numpy as np
+
 from weatherstat.config import EFFECTOR_MAP, EFFECTORS
 from weatherstat.control import (
     _ADVISORY_HARD_CAP,
@@ -1270,6 +1272,15 @@ class TestTwoStageAdvisorySweep:
 class TestExtractAdvisoryPlan:
     """Test extract_advisory_plan()."""
 
+    @staticmethod
+    def _empty_pred(n_scenarios: int) -> tuple[np.ndarray, dict[str, int]]:
+        """Build empty pred_matrix/target_name_index for tests that don't check breaches."""
+        return np.zeros((n_scenarios, 0)), {}
+
+    @staticmethod
+    def _dummy_schedules() -> list[ComfortSchedule]:
+        return []
+
     def test_basic_per_device_opportunity(self) -> None:
         """Per-device opportunity uses cheapest change vs cheapest hold."""
         environment_states = {"win": True}
@@ -1279,9 +1290,14 @@ class TestExtractAdvisoryPlan:
             Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),  # 2: change
             Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=12)}),  # 3: change, worse
         ]
-        costs = [5.0, 6.0, 3.0, 4.0]
+        costs = np.array([5.0, 6.0, 3.0, 4.0])
+        pred, tidx = self._empty_pred(4)
 
-        plan = extract_advisory_plan(scenarios, costs, environment_states)
+        plan = extract_advisory_plan(
+            scenarios, costs, environment_states,
+            pred_matrix=pred, target_name_index=tidx,
+            schedules=self._dummy_schedules(), base_hour=12,
+        )
         # Baseline is cheapest all-hold: scenario 0 (no advisories) at 5.0.
         assert plan.baseline_idx == 0
         assert plan.baseline_cost == 5.0
@@ -1301,9 +1317,14 @@ class TestExtractAdvisoryPlan:
             Scenario(effectors={}),
             Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="hold")}),
         ]
-        costs = [5.0, 4.0]
+        costs = np.array([5.0, 4.0])
+        pred, tidx = self._empty_pred(2)
 
-        plan = extract_advisory_plan(scenarios, costs, {"win": False})
+        plan = extract_advisory_plan(
+            scenarios, costs, {"win": False},
+            pred_matrix=pred, target_name_index=tidx,
+            schedules=self._dummy_schedules(), base_hour=12,
+        )
         # Cheapest all-hold scenario wins.
         assert plan.baseline_idx == 1
         assert plan.baseline_cost == 4.0
@@ -1324,9 +1345,14 @@ class TestExtractAdvisoryPlan:
                 advisories={"win": AdvisoryDecision("win", action="open", transition_step=0, return_step=24)},
             ),  # 3: proactive (best)
         ]
-        costs = [5.0, 4.5, 3.5, 3.0]
+        costs = np.array([5.0, 4.5, 3.5, 3.0])
+        pred, tidx = self._empty_pred(4)
 
-        plan = extract_advisory_plan(scenarios, costs, environment_states)
+        plan = extract_advisory_plan(
+            scenarios, costs, environment_states,
+            pred_matrix=pred, target_name_index=tidx,
+            schedules=self._dummy_schedules(), base_hour=12,
+        )
         assert plan.baseline_idx == 1  # 4.5 < 5.0 (both all-hold)
         assert plan.baseline_cost == 4.5
         assert len(plan.opportunities) == 1
@@ -1353,15 +1379,18 @@ class TestExtractAdvisoryPlan:
             Scenario(effectors={}),  # 0: HVAC-only, all-hold baseline
             Scenario(effectors={}, advisories={"win": AdvisoryDecision("win", action="close", transition_step=0)}),  # 1: change
         ]
-        costs = [6.0, 5.0]
-        predictions = [
-            {"room_temp_t+72": 63.0},  # baseline breaches backup_lo (65)
-            {"room_temp_t+72": 66.0},  # change avoids breach
-        ]
+        costs = np.array([6.0, 5.0])
+        # Build pred_matrix: 2 scenarios × 1 target column (room_temp_t+72)
+        target_name_index = {"room_temp_t+72": 0}
+        pred_matrix = np.array([
+            [63.0],  # baseline breaches backup_lo (65)
+            [66.0],  # change avoids breach
+        ])
 
         plan = extract_advisory_plan(
             scenarios, costs, environment_states,
-            predictions_per_scenario=predictions,
+            pred_matrix=pred_matrix,
+            target_name_index=target_name_index,
             schedules=schedules,
             base_hour=12,
         )
@@ -1395,9 +1424,14 @@ class TestExtractAdvisoryPlan:
                 "win_b": AdvisoryDecision("win_b", action="open", transition_step=0, return_step=12),
             }),
         ]
-        costs = [6.0, 4.0, 5.0, 3.0]
+        costs = np.array([6.0, 4.0, 5.0, 3.0])
+        pred, tidx = self._empty_pred(4)
 
-        plan = extract_advisory_plan(scenarios, costs, environment_states)
+        plan = extract_advisory_plan(
+            scenarios, costs, environment_states,
+            pred_matrix=pred, target_name_index=tidx,
+            schedules=self._dummy_schedules(), base_hour=12,
+        )
         # Baseline = scenario 0 (only all-hold scenario)
         assert plan.baseline_idx == 0
         assert plan.baseline_cost == 6.0
@@ -1577,3 +1611,322 @@ class TestWriteCommandJsonAdvisory:
         data = _json.loads(path.read_text())
         opps = data["advisoryOpportunities"]
         assert [o["device"] for o in opps] == ["big_win", "small_win"]
+
+
+# ── Superposition tests ──────────────────────────────────────────────────
+
+
+class TestSuperposition:
+    """Test marginal decomposition (superposition) sweep infrastructure."""
+
+    @staticmethod
+    def _make_state(outdoor: float = 42.0, hour: float = 14.5) -> object:
+        from weatherstat.simulator import HouseState
+
+        temps = {
+            "thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0,
+            "bedroom_temp": 68.5, "office_temp": 67.0, "family_room_temp": 69.5,
+            "kitchen_temp": 68.0, "piano_temp": 67.5, "bathroom_temp": 68.0,
+            "living_room_temp": 69.0,
+        }
+        return HouseState(
+            current_temps=temps,
+            outdoor_temp=outdoor,
+            forecast_temps=[outdoor] * 12,
+            environment_states={},
+            hour_of_day=hour,
+            solar_fractions=[0.0] * 12,
+            solar_elevations=[0.0] * 72,
+        )
+
+    def test_option_groups_match_scenarios(self) -> None:
+        """Option groups produce the same Cartesian product count as generate_trajectory_scenarios."""
+        from weatherstat.control import (
+            _build_option_groups,
+            _enumerate_options,
+        )
+        from weatherstat.simulator import load_sim_params
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+
+        # Count via groups
+        group_product = 1
+        for g in groups:
+            group_product *= len(g.options)
+
+        # Count via generate_trajectory_scenarios
+        scenarios = generate_trajectory_scenarios(schedules, 12, None, temps, set(), gains=sim_params.gains)
+
+        assert group_product == len(scenarios), (
+            f"Group product {group_product} != scenario count {len(scenarios)}"
+        )
+
+    def test_option_groups_contain_all_effectors(self) -> None:
+        """Every effector appears in exactly one group."""
+        from weatherstat.control import (
+            _build_option_groups,
+            _enumerate_options,
+        )
+        from weatherstat.simulator import load_sim_params
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+
+        all_names: list[str] = []
+        for g in groups:
+            all_names.extend(g.names)
+
+        # Every independent effector and dependent should appear
+        for name in per_eff:
+            assert name in all_names, f"Independent effector {name} missing from groups"
+        for dep in deps:
+            assert dep.name in all_names, f"Dependent effector {dep.name} missing from groups"
+
+        # No duplicates
+        assert len(all_names) == len(set(all_names)), "Duplicate effector names across groups"
+
+    def test_compound_group_exists(self) -> None:
+        """Thermostat_downstairs + blowers form a compound group."""
+        from weatherstat.control import (
+            _build_option_groups,
+            _enumerate_options,
+        )
+        from weatherstat.simulator import load_sim_params
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+
+        compound = [g for g in groups if len(g.names) > 1]
+        assert len(compound) >= 1, "Expected at least one compound group (thermostat + blowers)"
+
+        # The compound group should contain thermostat_downstairs
+        ds_group = [g for g in compound if "thermostat_downstairs" in g.names]
+        assert len(ds_group) == 1
+        # And blower dependents
+        assert any("blower" in n for n in ds_group[0].names)
+
+    def test_marginals_baseline_shape(self) -> None:
+        """Marginal result has correct shapes."""
+        from weatherstat.control import (
+            CONTROL_HORIZONS,
+            _build_option_groups,
+            _compute_marginals,
+            _enumerate_options,
+        )
+        from weatherstat.simulator import load_sim_params
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+        state = self._make_state()
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+        marginals = _compute_marginals(state, groups, sim_params, CONTROL_HORIZONS)
+
+        # t_base should be 1-D: (n_targets,)
+        assert marginals.t_base.ndim == 1
+        n_targets = len(marginals.t_base)
+        assert n_targets > 0
+
+        # One delta array per group
+        assert len(marginals.deltas) == len(groups)
+        for i, (group, delta) in enumerate(zip(groups, marginals.deltas, strict=True)):
+            assert delta.shape == (len(group.options), n_targets), (
+                f"Group {i} delta shape {delta.shape} != ({len(group.options)}, {n_targets})"
+            )
+
+    def test_superposition_exact_for_trajectory(self) -> None:
+        """For trajectory-only effectors, marginal reconstruction matches full predict().
+
+        Trajectory effectors have deterministic activity (not state-dependent),
+        so superposition should be exact (within float tolerance).
+        """
+        from weatherstat.control import (
+            CONTROL_HORIZONS,
+            _build_option_groups,
+            _compute_marginals,
+            _enumerate_options,
+            _materialize_scenarios,
+            _score_combinations,
+        )
+        from weatherstat.simulator import load_sim_params, predict
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+        state = self._make_state()
+
+        # Only include trajectory effectors (no regulating)
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        traj_only = {k: v for k, v in per_eff.items()
+                     if EFFECTOR_MAP[k].control_type == "trajectory"}
+        traj_deps = [d for d in deps if all(p in traj_only for p in d.depends_on)]
+
+        groups = _build_option_groups(traj_only, traj_deps, temps)
+        marginals = _compute_marginals(state, groups, sim_params, CONTROL_HORIZONS)
+
+        # Score all combos approximately
+        from weatherstat.control import _ComfortSpec
+
+        comfort_spec = _ComfortSpec.build(schedules, 12, marginals.target_name_index)
+        approx_costs, combo_indices, n_combos = _score_combinations(
+            marginals, groups, comfort_spec,
+        )
+
+        # Materialize ALL combos and do exact simulation
+        all_flat = list(range(n_combos))
+        all_scenarios = _materialize_scenarios(groups, combo_indices, all_flat)
+        exact_names, exact_pred = predict(state, all_scenarios, sim_params, CONTROL_HORIZONS)
+
+        # Compare reconstructed temps vs exact temps
+        # Build reconstructed pred matrix
+        reconstructed = np.tile(marginals.t_base, (n_combos, 1))
+        for delta, idx in zip(marginals.deltas, combo_indices, strict=True):
+            reconstructed += delta[idx]
+
+        # Trajectory effectors are deterministic, so reconstruction should be exact
+        # (binary effectors with parent gating are also deterministic)
+        assert np.allclose(reconstructed, exact_pred, atol=0.01), (
+            f"Max deviation: {np.max(np.abs(reconstructed - exact_pred)):.4f}°F"
+        )
+
+    def test_superposition_ranking_with_regulating(self) -> None:
+        """Top-K from approximate scoring contains the true winner from full simulation.
+
+        Regulating effectors break linearity slightly, but the true winner should
+        still be within the top-K approximate candidates.
+        """
+        from weatherstat.control import (
+            _SUPERPOSITION_TOP_K,
+            CONTROL_HORIZONS,
+            _build_option_groups,
+            _compute_marginals,
+            _enumerate_options,
+            _materialize_scenarios,
+            _score_combinations,
+        )
+        from weatherstat.simulator import load_sim_params, predict
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+        state = self._make_state()
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+        marginals = _compute_marginals(state, groups, sim_params, CONTROL_HORIZONS)
+
+        from weatherstat.control import _ComfortSpec
+
+        comfort_spec = _ComfortSpec.build(schedules, 12, marginals.target_name_index)
+        approx_costs, combo_indices, n_combos = _score_combinations(
+            marginals, groups, comfort_spec,
+        )
+
+        # Get approximate top-K
+        ranked = np.argsort(approx_costs)
+        K = min(_SUPERPOSITION_TOP_K, n_combos)
+        top_flat = sorted(int(i) for i in ranked[:K])
+
+        # Full simulation of ALL combos
+        all_scenarios = _materialize_scenarios(groups, combo_indices, list(range(n_combos)))
+        from weatherstat.control import _batch_comfort_cost, _batch_energy_cost
+
+        exact_names, exact_pred = predict(state, all_scenarios, sim_params, CONTROL_HORIZONS)
+        tidx = {t: j for j, t in enumerate(exact_names)}
+        exact_comfort = _batch_comfort_cost(exact_pred, _ComfortSpec.build(schedules, 12, tidx))
+        exact_energy = _batch_energy_cost(all_scenarios, temps)
+        exact_costs = exact_comfort + exact_energy
+
+        # The true winner must be in the top-K
+        true_best = int(np.argmin(exact_costs))
+        assert true_best in top_flat, (
+            f"True winner at flat index {true_best} (cost {exact_costs[true_best]:.4f}) "
+            f"not in top-{K} (worst in top-K: {approx_costs[ranked[K-1]]:.4f})"
+        )
+
+    def test_materialize_scenarios_correct(self) -> None:
+        """Materialized scenarios have correct effector decisions."""
+        from weatherstat.control import (
+            _build_option_groups,
+            _enumerate_options,
+            _materialize_scenarios,
+        )
+        from weatherstat.simulator import load_sim_params
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+
+        # Build combo indices
+        option_counts = [len(g.options) for g in groups]
+        grids = np.meshgrid(*[np.arange(n) for n in option_counts], indexing="ij")
+        combo_indices = [g.ravel() for g in grids]
+
+        # Materialize first and last
+        scenarios = _materialize_scenarios(groups, combo_indices, [0, len(combo_indices[0]) - 1])
+        assert len(scenarios) == 2
+
+        # First scenario (all option index 0 = all-off)
+        first = scenarios[0]
+        for g in groups:
+            for name in g.names:
+                assert first.effectors[name].mode == "off", (
+                    f"First scenario should be all-off but {name} is {first.effectors[name].mode}"
+                )
+
+    def test_energy_costs_precomputed(self) -> None:
+        """Pre-computed energy costs match compute_energy_cost for materialized scenarios."""
+        from weatherstat.control import (
+            _build_option_groups,
+            _enumerate_options,
+            _materialize_scenarios,
+        )
+        from weatherstat.simulator import load_sim_params
+
+        sim_params = load_sim_params()
+        schedules = make_schedules()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0, "bedroom_temp": 68.5}
+
+        per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
+        groups = _build_option_groups(per_eff, deps, temps)
+
+        # Build combo indices
+        option_counts = [len(g.options) for g in groups]
+        grids = np.meshgrid(*[np.arange(n) for n in option_counts], indexing="ij")
+        combo_indices = [g.ravel() for g in grids]
+        n_combos = len(combo_indices[0])
+
+        # Pre-computed sum
+        precomputed = np.zeros(n_combos)
+        for group, idx in zip(groups, combo_indices, strict=True):
+            precomputed += group.energy_costs[idx]
+
+        # Compute via compute_energy_cost on materialized scenarios
+        sample_indices = [0, n_combos // 4, n_combos // 2, n_combos - 1]
+        sample_indices = [i for i in sample_indices if i < n_combos]
+        scenarios = _materialize_scenarios(groups, combo_indices, sample_indices)
+
+        for s_idx, flat_idx in enumerate(sample_indices):
+            expected = compute_energy_cost(scenarios[s_idx], temps)
+            assert abs(precomputed[flat_idx] - expected) < 0.001, (
+                f"Energy cost mismatch at flat {flat_idx}: "
+                f"precomputed={precomputed[flat_idx]:.4f} vs expected={expected:.4f}"
+            )

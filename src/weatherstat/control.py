@@ -20,6 +20,7 @@ import json
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -467,6 +468,163 @@ def compute_energy_cost(
     return cost
 
 
+@dataclass(frozen=True)
+class _ComfortSpec:
+    """Pre-extracted comfort parameters for vectorized scoring.
+
+    Each array has shape (n_active,) where n_active is the number of
+    (schedule × horizon) pairs with valid comfort bounds and prediction columns.
+    """
+
+    col_indices: np.ndarray  # indices into pred_matrix columns
+    pref_lo: np.ndarray
+    pref_hi: np.ndarray
+    acc_lo: np.ndarray
+    acc_hi: np.ndarray
+    cold_pen: np.ndarray
+    hot_pen: np.ndarray
+    weights: np.ndarray
+
+    @staticmethod
+    def build(
+        schedules: list[ComfortSchedule],
+        base_hour: int,
+        target_name_index: dict[str, int],
+    ) -> _ComfortSpec:
+        """Build comfort spec from schedules and prediction column index."""
+        horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
+        specs: list[tuple[int, float, float, float, float, float, float, float]] = []
+        for schedule in schedules:
+            for h in CONTROL_HORIZONS:
+                future_hour = (base_hour + horizon_hours[h]) % 24
+                comfort = schedule.comfort_at(future_hour)
+                col_key = f"{schedule.sensor}_t+{h}"
+                col_idx = target_name_index.get(col_key)
+                if comfort is None or col_idx is None:
+                    continue
+                specs.append((
+                    col_idx, comfort.preferred_lo, comfort.preferred_hi,
+                    comfort.acceptable_lo, comfort.acceptable_hi,
+                    comfort.cold_penalty, comfort.hot_penalty,
+                    HORIZON_WEIGHTS.get(h, 0.5),
+                ))
+        if not specs:
+            empty = np.array([], dtype=np.float64)
+            return _ComfortSpec(
+                col_indices=np.array([], dtype=np.intp),
+                pref_lo=empty, pref_hi=empty,
+                acc_lo=empty, acc_hi=empty,
+                cold_pen=empty, hot_pen=empty,
+                weights=empty,
+            )
+        arr = np.array(specs)
+        return _ComfortSpec(
+            col_indices=arr[:, 0].astype(np.intp),
+            pref_lo=arr[:, 1], pref_hi=arr[:, 2],
+            acc_lo=arr[:, 3], acc_hi=arr[:, 4],
+            cold_pen=arr[:, 5], hot_pen=arr[:, 6],
+            weights=arr[:, 7],
+        )
+
+
+def _batch_comfort_cost(
+    pred_matrix: np.ndarray,
+    spec: _ComfortSpec,
+) -> np.ndarray:
+    """Vectorized comfort cost for all scenarios. Returns (n_scenarios,) array."""
+    if len(spec.col_indices) == 0:
+        return np.zeros(pred_matrix.shape[0])
+    temps = pred_matrix[:, spec.col_indices]  # (N, n_active)
+    # Continuous: quadratic deviation from preferred band
+    dev_lo = np.maximum(0.0, spec.pref_lo - temps)
+    dev_hi = np.maximum(0.0, temps - spec.pref_hi)
+    cost_cont = dev_lo**2 * spec.cold_pen * spec.weights + dev_hi**2 * spec.hot_pen * spec.weights
+    # Hard rails
+    rail_lo = np.maximum(0.0, spec.acc_lo - temps)
+    rail_hi = np.maximum(0.0, temps - spec.acc_hi)
+    cost_rail = (rail_lo**2 * spec.cold_pen + rail_hi**2 * spec.hot_pen) * _HARD_RAIL_MULTIPLIER * spec.weights
+    return (cost_cont + cost_rail).sum(axis=1)
+
+
+def _batch_energy_cost(
+    scenarios: list[Scenario],
+    current_temps: dict[str, float],
+) -> np.ndarray:
+    """Vectorized energy cost for all scenarios. Returns (n_scenarios,) array."""
+    n = len(scenarios)
+    max_h = max(CONTROL_HORIZONS)
+    costs = np.zeros(n)
+
+    # Determine which effectors need energy cost computation
+    active_effs = []
+    for eff_cfg in EFFECTORS:
+        ec = eff_cfg.energy_cost
+        if isinstance(ec, (int, float)) and ec == 0:
+            continue
+        if isinstance(ec, dict) and all(v == 0 for v in ec.values()):
+            continue
+        active_effs.append(eff_cfg)
+
+    if not active_effs:
+        return costs
+
+    # Single pass: extract per-effector decision data for all scenarios at once
+    _off_decisions: dict[str, EffectorDecision] = {e.name: EffectorDecision(e.name) for e in active_effs}
+    eff_decisions: dict[str, list[EffectorDecision]] = {e.name: [] for e in active_effs}
+    for s in scenarios:
+        for e in active_effs:
+            eff_decisions[e.name].append(s.effectors.get(e.name, _off_decisions[e.name]))
+
+    # Compute costs per effector using pre-extracted decisions
+    for eff_cfg in active_effs:
+        ec = eff_cfg.energy_cost
+        decisions = eff_decisions[eff_cfg.name]
+        active = np.array([d.mode != "off" for d in decisions])
+        if not active.any():
+            continue
+
+        durations = np.array([
+            d.duration_steps if d.duration_steps is not None else (max_h - d.delay_steps)
+            for d in decisions
+        ])
+        active_frac = durations / max_h
+
+        if eff_cfg.control_type == "trajectory":
+            assert isinstance(ec, (int, float))
+            costs += np.where(active, ec * active_frac, 0.0)
+
+        elif eff_cfg.control_type == "regulating":
+            assert isinstance(ec, (int, float))
+            p_band = eff_cfg.proportional_band
+            room_temp = current_temps.get(eff_cfg.temp_col) if eff_cfg.temp_col else None
+            if room_temp is not None:
+                targets = np.array([d.target if d.target is not None else room_temp for d in decisions])
+                heat_modes = np.array([d.mode == "heat" for d in decisions])
+                delta = np.where(heat_modes,
+                                 np.maximum(0.0, targets - room_temp),
+                                 np.maximum(0.0, room_temp - targets))
+                activity = np.minimum(1.0, delta / p_band)
+            else:
+                activity = np.full(n, 0.5)
+            costs += np.where(active, ec * activity * active_frac, 0.0)
+
+        elif eff_cfg.control_type == "binary":
+            assert isinstance(ec, dict)
+            mode_costs = np.array([ec.get(d.mode, 0.0) for d in decisions])
+            costs += mode_costs * active_frac
+
+    return costs
+
+
+def _pred_dict(
+    pred_matrix: np.ndarray,
+    idx: int,
+    target_name_index: dict[str, int],
+) -> dict[str, float]:
+    """Build a prediction dict for a single scenario index."""
+    return {t: float(pred_matrix[idx, j]) for t, j in target_name_index.items()}
+
+
 def _emergency_effector(
     gains: dict[tuple[str, str], tuple[float, float]],
     constraints: list[ConstraintSchedule],
@@ -820,37 +978,27 @@ def _advisory_sweep_options(
     return options
 
 
-def generate_trajectory_scenarios(
-    schedules: list[ComfortSchedule] | None = None,
-    base_hour: int = 12,
-    prev_state: ControlState | None = None,
-    current_temps: dict[str, float] | None = None,
-    ineligible_effectors: set[str] | None = None,
-    gains: dict[tuple[str, str], tuple[float, float]] | None = None,
-    advisory_options: dict[str, list[AdvisoryDecision]] | None = None,
-) -> list[Scenario]:
-    """Generate trajectory scenarios for physics sweep.
+def _enumerate_options(
+    schedules: list[ComfortSchedule] | None,
+    base_hour: int,
+    prev_state: ControlState | None,
+    current_temps: dict[str, float] | None,
+    ineligible_effectors: set[str] | None,
+    gains: dict[tuple[str, str], tuple[float, float]] | None,
+) -> tuple[dict[str, list[EffectorDecision]], list]:
+    """Enumerate per-effector sweep options (shared by scenario generation and option groups).
 
-    Slow effectors (trajectory) get a delay x duration grid.
-    Fast effectors (binary) use constant modes.
-    Regulating effectors use comfort-derived target grid (off + preferred).
-    Dependent effectors (e.g., blowers) only active when parent is active.
-
-    advisory_options: optional dict of device_name -> list of AdvisoryDecision.
-    When provided, each HVAC scenario is crossed with advisory combos.
-    Combinatorics management: coarsen grid if >50K total, hold all if >100K.
+    Returns (per_effector_options, dependent_effector_configs).
+    per_effector_options maps independent effector names to their option lists.
+    dependent_effector_configs is the list of EffectorConfig objects with depends_on set.
     """
-    from itertools import product
-
     max_horizon = max(CONTROL_HORIZONS)
     _ineligible = ineligible_effectors or set()
 
-    # Build per-effector option lists
     per_effector_options: dict[str, list[EffectorDecision]] = {}
 
     for eff in EFFECTORS:
         if eff.depends_on:
-            # Dependent effectors handled after their parents
             continue
 
         if eff.control_type == "trajectory":
@@ -871,18 +1019,12 @@ def generate_trajectory_scenarios(
                                 duration_steps=effective_duration,
                             )
                         )
-                # Deduplicate (capping creates duplicates)
                 per_effector_options[eff.name] = list(dict.fromkeys(options))
 
         elif eff.control_type == "regulating":
             if schedules is not None:
                 per_effector_options[eff.name] = _regulating_sweep_options(
-                    eff,
-                    schedules,
-                    base_hour,
-                    gains,
-                    prev_state,
-                    current_temps,
+                    eff, schedules, base_hour, gains, prev_state, current_temps,
                 )
             else:
                 per_effector_options[eff.name] = [
@@ -906,12 +1048,288 @@ def generate_trajectory_scenarios(
                         ))
             per_effector_options[eff.name] = list(dict.fromkeys(binary_options))
 
-    # Cartesian product of independent effectors
+    dependent_effectors = [e for e in EFFECTORS if e.depends_on]
+    return per_effector_options, dependent_effectors
+
+
+# ── Superposition-based sweep ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class EffectorOptionGroup:
+    """One independent group in the Cartesian product sweep.
+
+    Singleton groups contain a single effector. Compound groups contain a parent
+    effector and its dependents (e.g., thermostat + blowers), since dependent
+    activity is the product of parent and dependent state (not separable).
+
+    ``options`` is a tuple of dicts, each mapping effector name -> EffectorDecision,
+    with the first option always being all-off for the group.
+    """
+
+    names: tuple[str, ...]
+    options: tuple[dict[str, EffectorDecision], ...]
+    energy_costs: np.ndarray  # (n_options,)
+
+
+@dataclass(frozen=True)
+class MarginalResult:
+    """Pre-computed marginal temperature effects for superposition scoring.
+
+    ``t_base`` is the all-off predicted temperature at each target column.
+    ``deltas[i]`` is a (n_options_i, n_targets) array of temperature deltas
+    for each option in group i, relative to t_base.
+    """
+
+    t_base: np.ndarray  # (n_targets,)
+    deltas: list[np.ndarray]  # per group: (n_options, n_targets)
+    target_names: list[str]
+    target_name_index: dict[str, int]
+
+
+# Top-K for exact refinement after approximate marginal scoring
+_SUPERPOSITION_TOP_K = 100
+
+
+def _option_energy_cost(
+    option: dict[str, EffectorDecision],
+    current_temps: dict[str, float],
+) -> float:
+    """Energy cost for a single option (dict of effector decisions)."""
+    cost = 0.0
+    max_h = max(CONTROL_HORIZONS)
+    for ed in option.values():
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None or ed.mode == "off":
+            continue
+        ec = eff_cfg.energy_cost
+        dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
+        active_frac = dur / max_h
+        if eff_cfg.control_type == "trajectory":
+            assert isinstance(ec, (int, float))
+            cost += ec * active_frac
+        elif eff_cfg.control_type == "regulating":
+            room_temp = current_temps.get(eff_cfg.temp_col) if eff_cfg.temp_col else None
+            if room_temp is not None and ed.target is not None:
+                delta = max(0.0, ed.target - room_temp) if ed.mode == "heat" else max(0.0, room_temp - ed.target)
+                activity = min(1.0, delta / eff_cfg.proportional_band)
+            else:
+                activity = 0.5
+            assert isinstance(ec, (int, float))
+            cost += ec * activity * active_frac
+        elif eff_cfg.control_type == "binary":
+            assert isinstance(ec, dict)
+            cost += ec.get(ed.mode, 0.0) * active_frac
+    return cost
+
+
+def _build_option_groups(
+    per_effector_options: dict[str, list[EffectorDecision]],
+    dependent_effectors: list,
+    current_temps: dict[str, float],
+) -> list[EffectorOptionGroup]:
+    """Build independent option groups from per-effector option lists.
+
+    Independent effectors without dependents become singleton groups.
+    Effectors with dependents form compound groups where parent+dependent
+    options are enumerated together (dependency gate is not separable).
+    """
+    from collections import defaultdict
+    from itertools import product as iproduct
+
+    independent_names = list(per_effector_options.keys())
+
+    # Map parent → dependent effector configs
+    parent_deps: dict[str, list] = defaultdict(list)
+    for dep in dependent_effectors:
+        for pname in dep.depends_on:
+            parent_deps[pname].append(dep)
+
+    # Merge parents that share a dependent via union-find
+    uf_parent: dict[str, str] = {n: n for n in independent_names}
+
+    def _find(x: str) -> str:
+        while uf_parent[x] != x:
+            uf_parent[x] = uf_parent[uf_parent[x]]
+            x = uf_parent[x]
+        return x
+
+    for dep in dependent_effectors:
+        parents_in_indep = [p for p in dep.depends_on if p in uf_parent]
+        for i in range(1, len(parents_in_indep)):
+            ra, rb = _find(parents_in_indep[0]), _find(parents_in_indep[i])
+            if ra != rb:
+                uf_parent[ra] = rb
+
+    # Group independents by their root
+    root_members: dict[str, list[str]] = defaultdict(list)
+    for n in independent_names:
+        root_members[_find(n)].append(n)
+
+    groups: list[EffectorOptionGroup] = []
+    for _root, members in root_members.items():
+        # Collect all dependents of any member in this component
+        group_deps: list = []
+        seen_dep_names: set[str] = set()
+        for m in members:
+            for d in parent_deps.get(m, []):
+                if d.name not in seen_dep_names:
+                    group_deps.append(d)
+                    seen_dep_names.add(d.name)
+
+        if not group_deps:
+            # Singleton group for each independent effector
+            for m in members:
+                opts = tuple({m: ed} for ed in per_effector_options[m])
+                energy = np.array([_option_energy_cost(o, current_temps) for o in opts])
+                groups.append(EffectorOptionGroup(names=(m,), options=opts, energy_costs=energy))
+        else:
+            # Compound group: all members + their dependents
+            all_names = tuple(members + [d.name for d in group_deps])
+            parent_option_lists = [per_effector_options[m] for m in members]
+            compound_opts: list[dict[str, EffectorDecision]] = []
+
+            for parent_combo in iproduct(*parent_option_lists):
+                base = {ed.name: ed for ed in parent_combo}
+                dep_option_lists: list[list[EffectorDecision]] = []
+                for dep in group_deps:
+                    all_parents_active = all(
+                        (p := base.get(pn)) is not None and p.mode != "off" and p.delay_steps == 0
+                        for pn in dep.depends_on
+                    )
+                    if all_parents_active:
+                        dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep.supported_modes])
+                    else:
+                        dep_option_lists.append([EffectorDecision(dep.name)])
+                for dep_combo in iproduct(*dep_option_lists):
+                    opt = dict(base)
+                    for dep_ed in dep_combo:
+                        opt[dep_ed.name] = dep_ed
+                    compound_opts.append(opt)
+
+            opts_tuple = tuple(compound_opts)
+            energy = np.array([_option_energy_cost(o, current_temps) for o in opts_tuple])
+            groups.append(EffectorOptionGroup(names=all_names, options=opts_tuple, energy_costs=energy))
+
+    return groups
+
+
+def _compute_marginals(
+    sweep_state: object,
+    groups: list[EffectorOptionGroup],
+    sim_params: object,
+    horizons: list[int],
+) -> MarginalResult:
+    """Compute T_base and per-group δT marginals via superposition.
+
+    Simulates one all-off baseline plus one scenario per group option (~145 total).
+    The δT for each option is the temperature difference from the baseline when
+    only that group's effectors are active.
+    """
+    from weatherstat.simulator import HouseState, SimParams, predict
+
+    assert isinstance(sweep_state, HouseState)
+    assert isinstance(sim_params, SimParams)
+
+    # Build marginal scenarios: baseline (all-off) + one per group option
+    scenarios: list[Scenario] = [Scenario({})]
+    group_slices: list[tuple[int, int]] = []
+    for group in groups:
+        start = len(scenarios)
+        for opt in group.options:
+            scenarios.append(Scenario(effectors=opt))
+        group_slices.append((start, len(scenarios)))
+
+    target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, horizons)
+    t_base = pred_matrix[0]
+
+    deltas: list[np.ndarray] = []
+    for start, end in group_slices:
+        deltas.append(pred_matrix[start:end] - t_base[None, :])
+
+    return MarginalResult(
+        t_base=t_base,
+        deltas=deltas,
+        target_names=list(target_names),
+        target_name_index={t: j for j, t in enumerate(target_names)},
+    )
+
+
+def _score_combinations(
+    marginals: MarginalResult,
+    groups: list[EffectorOptionGroup],
+    comfort_spec: _ComfortSpec,
+) -> tuple[np.ndarray, list[np.ndarray], int]:
+    """Score all Cartesian product combinations via marginal reconstruction.
+
+    Returns (costs, combo_indices, n_combos) where costs is (n_combos,) and
+    combo_indices is a list of (n_combos,) index arrays (one per group).
+    """
+    option_counts = [len(g.options) for g in groups]
+    grids = np.meshgrid(*[np.arange(n) for n in option_counts], indexing="ij")
+    combo_indices = [g.ravel() for g in grids]
+    n_combos = len(combo_indices[0])
+
+    # Reconstruct predicted temperatures: T = T_base + Σ δT_group[idx]
+    t_pred = np.tile(marginals.t_base, (n_combos, 1))
+    for delta, idx in zip(marginals.deltas, combo_indices, strict=True):
+        t_pred += delta[idx]
+
+    # Comfort cost (vectorized)
+    comfort = _batch_comfort_cost(t_pred, comfort_spec)
+
+    # Energy cost (pre-computed per group, sum via fancy indexing)
+    energy = np.zeros(n_combos)
+    for group, idx in zip(groups, combo_indices, strict=True):
+        energy += group.energy_costs[idx]
+
+    return comfort + energy, combo_indices, n_combos
+
+
+def _materialize_scenarios(
+    groups: list[EffectorOptionGroup],
+    combo_indices: list[np.ndarray],
+    flat_indices: list[int] | np.ndarray,
+) -> list[Scenario]:
+    """Build Scenario objects for specific combinations by flat index."""
+    scenarios: list[Scenario] = []
+    for flat_idx in flat_indices:
+        effectors: dict[str, EffectorDecision] = {}
+        for g, group in enumerate(groups):
+            opt_idx = int(combo_indices[g][flat_idx])
+            effectors.update(group.options[opt_idx])
+        scenarios.append(Scenario(effectors))
+    return scenarios
+
+
+def generate_trajectory_scenarios(
+    schedules: list[ComfortSchedule] | None = None,
+    base_hour: int = 12,
+    prev_state: ControlState | None = None,
+    current_temps: dict[str, float] | None = None,
+    ineligible_effectors: set[str] | None = None,
+    gains: dict[tuple[str, str], tuple[float, float]] | None = None,
+    advisory_options: dict[str, list[AdvisoryDecision]] | None = None,
+) -> list[Scenario]:
+    """Generate trajectory scenarios for physics sweep.
+
+    Slow effectors (trajectory) get a delay x duration grid.
+    Fast effectors (binary) use constant modes.
+    Regulating effectors use comfort-derived target grid (off + preferred).
+    Dependent effectors (e.g., blowers) only active when parent is active.
+
+    advisory_options: optional dict of device_name -> list of AdvisoryDecision.
+    When provided, each HVAC scenario is crossed with advisory combos.
+    Combinatorics management: coarsen grid if >50K total, hold all if >100K.
+    """
+    from itertools import product
+
+    per_effector_options, dependent_effectors = _enumerate_options(
+        schedules, base_hour, prev_state, current_temps, ineligible_effectors, gains,
+    )
+
     independent_names = list(per_effector_options.keys())
     independent_options = [per_effector_options[n] for n in independent_names]
-
-    # Dependent effectors: constrained by parent state
-    dependent_effectors = [e for e in EFFECTORS if e.depends_on]
 
     # Build HVAC-only scenarios first
     hvac_scenarios: list[Scenario] = []
@@ -989,11 +1407,12 @@ def _check_backup_breaches(
 
 def extract_advisory_plan(
     scenarios: list[Scenario],
-    costs: list[float],
+    costs: np.ndarray,
     environment_states: dict[str, bool],
-    predictions_per_scenario: list[dict[str, float]] | None = None,
-    schedules: list[ComfortSchedule] | None = None,
-    base_hour: int = 12,
+    pred_matrix: np.ndarray,
+    target_name_index: dict[str, int],
+    schedules: list[ComfortSchedule],
+    base_hour: int,
 ) -> AdvisoryPlan:
     """Extract the advisory plan from sweep results.
 
@@ -1046,9 +1465,10 @@ def extract_advisory_plan(
     # Backup breaches are evaluated on the baseline scenario — "what happens if
     # the user takes no action?" — not on the cheapest non-hold plan.
     backup_breaches: tuple[str, ...] = ()
-    if baseline_idx is not None and predictions_per_scenario and schedules:
+    if baseline_idx is not None:
+        baseline_preds = _pred_dict(pred_matrix, baseline_idx, target_name_index)
         backup_breaches = tuple(_check_backup_breaches(
-            predictions_per_scenario[baseline_idx], schedules, base_hour,
+            baseline_preds, schedules, base_hour,
         ))
 
     opportunities: list[DeviceOpportunity] = []
@@ -1133,22 +1553,14 @@ def sweep_scenarios_physics(
         n_adv = sum(len(v) for v in advisory_options.values())
         print(f"  [advisory] {len(advisory_options)} device(s), {n_adv} total options")
 
-    # Always generate HVAC-only scenarios first
-    hvac_scenarios = generate_trajectory_scenarios(
-        schedules,
-        base_hour,
-        prev_state,
-        current_temps,
-        _ineligible,
-        gains=sim_params.gains,
-        advisory_options=None,
+    # ── Option enumeration ──
+    per_effector_options, dependent_effectors = _enumerate_options(
+        schedules, base_hour, prev_state, current_temps, _ineligible, gains=sim_params.gains,
     )
 
     # ── Physical constraints: block trajectory effectors at/above comfort max ──
-    pre_count = len(hvac_scenarios)
     blocked_reasons: list[str] = []
     blocked_dict: dict[str, str] = {}  # effector_name -> reason (returned to caller)
-
     blocked_effectors: set[str] = set()
     for eff in EFFECTORS:
         if eff.control_type != "trajectory" or not eff.temp_col:
@@ -1163,12 +1575,11 @@ def sweep_scenarios_physics(
             blocked_dict[eff.name] = reason
             blocked_reasons.append(f"{eff.name} {reason}")
 
+    # Apply blocking by restricting options to off-only
     if blocked_effectors:
-        hvac_scenarios = [
-            s
-            for s in hvac_scenarios
-            if all(s.effectors[name].mode == "off" for name in blocked_effectors if name in s.effectors)
-        ]
+        for name in blocked_effectors:
+            if name in per_effector_options:
+                per_effector_options[name] = [EffectorDecision(name)]
 
     # Note: no "thermal direction" pruning — the trajectory sweep and cost
     # function decide whether heating is justified.  Pre-emptive heating for
@@ -1177,7 +1588,12 @@ def sweep_scenarios_physics(
 
     if blocked_reasons:
         print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
-        print(f"  Reduced scenarios: {pre_count} → {len(hvac_scenarios)}")
+
+    # ── Build option groups + marginals (superposition) ──
+    groups = _build_option_groups(per_effector_options, dependent_effectors, current_temps)
+    n_combos_total = 1
+    for g in groups:
+        n_combos_total *= len(g.options)
 
     def _is_all_off(s: Scenario) -> bool:
         return all(ed.mode == "off" for ed in s.effectors.values())
@@ -1194,87 +1610,133 @@ def sweep_scenarios_physics(
     )
 
     def _score_all(
-        scens: list[Scenario], pred: np.ndarray, tnames: list[str]
-    ) -> tuple[list[float], list[dict[str, float]], int, float]:
-        """Score scenarios. Returns (costs, predictions, best_idx, best_cost)."""
+        scens: list[Scenario], pred: np.ndarray, tnames: list[str],
+    ) -> tuple[np.ndarray, int, float]:
+        """Score scenarios (vectorized). Returns (costs, best_idx, best_cost)."""
         tidx = {t: j for j, t in enumerate(tnames)}
-        costs: list[float] = []
-        preds: list[dict[str, float]] = []
-        b_idx, b_cost = -1, float("inf")
-        for i, sc in enumerate(scens):
-            p = {t: float(pred[i, j]) for t, j in tidx.items()}
-            c = compute_comfort_cost(p, schedules, base_hour) + compute_energy_cost(sc, current_temps)
-            costs.append(c)
-            preds.append(p)
-            if c < b_cost:
-                b_cost, b_idx = c, i
-        return costs, preds, b_idx, b_cost
+        comfort = _batch_comfort_cost(pred, _ComfortSpec.build(schedules, base_hour, tidx))
+        energy = _batch_energy_cost(scens, current_temps)
+        total = comfort + energy
+        best_idx = int(np.argmin(total))
+        return total, best_idx, float(total[best_idx])
 
-    # ── Determine sweep strategy ──
+    # ── Marginal decomposition (Stage 1) ──
+    n_marginal = 1 + sum(len(g.options) for g in groups)
+    print(f"\n[control] Superposition sweep: {n_combos_total:,} combos from {n_marginal} marginals...")
+
+    marginals = _compute_marginals(sweep_state, groups, sim_params, CONTROL_HORIZONS)
+
+    # Build comfort spec with target name index from marginals
+    comfort_spec_indexed = _ComfortSpec.build(schedules, base_hour, marginals.target_name_index)
+
+    # Score all combinations approximately
+    approx_costs, combo_indices, n_combos = _score_combinations(
+        marginals, groups, comfort_spec_indexed,
+    )
+
+    # ── Top-K selection ──
+    ranked = np.argsort(approx_costs)
+    K = min(_SUPERPOSITION_TOP_K, n_combos)
+    top_flat = set(int(i) for i in ranked[:K])
+
+    # Always include all-off (flat index where all groups are at option 0)
+    all_off_flat = 0  # meshgrid with indexing='ij': first element is all zeros
+    top_flat.add(all_off_flat)
+
+    top_flat_sorted = sorted(top_flat)
+
+    # ── Cold-sensor safety override (on approximate arrays) ──
+    # Check before materializing, so we can add the constrained-best to top-K
+    cold_effectors: set[str] = set()
+    cold_info: list[str] = []
+    # Check if all-off is the approximate winner
+    approx_best_flat = int(ranked[0])
+    all_off_scenario_wins = approx_best_flat == all_off_flat
+
+    if all_off_scenario_wins:
+        for schedule in schedules:
+            temp = current_temps.get(schedule.sensor)
+            if temp is None:
+                continue
+            comfort_entry = schedule.comfort_at(base_hour)
+            if comfort_entry is None:
+                continue
+            if temp < comfort_entry.acceptable_lo - COLD_ROOM_OVERRIDE:
+                eff_name = emergency.get(schedule.sensor)
+                if eff_name:
+                    cold_effectors.add(eff_name)
+                    cold_info.append(
+                        f"{schedule.label} ({temp:.1f}{UNIT_SYMBOL}"
+                        f" < {comfort_entry.acceptable_lo:.0f}{UNIT_SYMBOL})"
+                    )
+
+        cold_effectors -= blocked_effectors
+        cold_effectors -= _ineligible
+
+        if cold_effectors:
+            # Build group-level masks: for each cold effector, find which group
+            # contains it and which options have it active at delay=0
+            eff_to_group: dict[str, int] = {}
+            for gi, group in enumerate(groups):
+                for name in group.names:
+                    eff_to_group[name] = gi
+
+            constrained_mask = np.ones(n_combos, dtype=bool)
+            for cold_eff in cold_effectors:
+                gi = eff_to_group.get(cold_eff)
+                if gi is None:
+                    constrained_mask[:] = False
+                    break
+                group = groups[gi]
+                valid_options = np.array([
+                    cold_eff in opt and opt[cold_eff].mode != "off" and opt[cold_eff].delay_steps == 0
+                    for opt in group.options
+                ])
+                constrained_mask &= valid_options[combo_indices[gi]]
+
+            if constrained_mask.any():
+                masked_costs = np.where(constrained_mask, approx_costs, np.inf)
+                constrained_best_flat = int(np.argmin(masked_costs))
+                # Add to top-K for exact refinement
+                top_flat.add(constrained_best_flat)
+                top_flat_sorted = sorted(top_flat)
+
+    # ── Materialize top-K scenarios ──
+    top_k_hvac = _materialize_scenarios(groups, combo_indices, top_flat_sorted)
+
+    # ── Determine advisory strategy ──
     n_adv_combos = _advisory_combo_count(advisory_options) if advisory_options else 0
-    n_hvac = len(hvac_scenarios)
-    needs_two_stage = advisory_options and n_hvac * n_adv_combos > _ADVISORY_HARD_CAP
+    needs_two_stage = advisory_options and len(top_k_hvac) * n_adv_combos > _ADVISORY_HARD_CAP
 
-    if needs_two_stage:
-        # ── Two-stage advisory sweep ──
-        # Stage 1: score HVAC-only scenarios (scalar tau fast path, cheap)
-        print(
-            f"  [advisory] Two-stage sweep: {n_hvac} HVAC × {n_adv_combos} advisory"
-            f" = {n_hvac * n_adv_combos:,} (cap: {_ADVISORY_HARD_CAP:,})"
-        )
-
-        s1_names, s1_pred = predict(sweep_state, hvac_scenarios, sim_params, CONTROL_HORIZONS)
-        s1_costs, _, _, _ = _score_all(hvac_scenarios, s1_pred, s1_names)
-
-        # Select top-K HVAC plans (auto-sized to fit advisory product within cap)
-        # Coarsen up-front when the full advisory grid would force K below MIN_K.
-        # The previous `max(MIN_K, …)` wrapping masked the small K and prevented
-        # coarsening, so cross_with_advisory ended up coarsening anyway and we
-        # left most of the scenario budget unused.
-        K_under_full = _ADVISORY_MAX_SCENARIOS // n_adv_combos if n_adv_combos else 0
-        if K_under_full < _TWO_STAGE_MIN_K:
-            effective_options = _coarsen_advisory(advisory_options)
-            n_adv_eff = _advisory_combo_count(effective_options)
+    if advisory_options:
+        # Advisory sweep: cross top-K with advisory product
+        if needs_two_stage:
+            K_under_full = _ADVISORY_MAX_SCENARIOS // n_adv_combos if n_adv_combos else 0
+            if K_under_full < _TWO_STAGE_MIN_K:
+                effective_options = _coarsen_advisory(advisory_options)
+                n_adv_eff = _advisory_combo_count(effective_options)
+            else:
+                effective_options = advisory_options
+                n_adv_eff = n_adv_combos
+            # Reduce top-K to fit within cap
+            adv_K = max(_TWO_STAGE_MIN_K, (_ADVISORY_MAX_SCENARIOS // n_adv_eff) - 1)
+            adv_K = min(adv_K, len(top_k_hvac))
+            top_k_hvac = top_k_hvac[:adv_K]
         else:
             effective_options = advisory_options
-            n_adv_eff = n_adv_combos
 
-        # Maximize K under the chosen advisory grid (may exceed MIN_K).
-        # Subtract 1 to leave room for the always-included all-off scenario,
-        # otherwise (K+1) * n_adv_eff can spill over the cap and trigger the
-        # cross_with_advisory fallback that drops advisory entirely.
-        K = max(_TWO_STAGE_MIN_K, (_ADVISORY_MAX_SCENARIOS // n_adv_eff) - 1)
-        K = min(K, n_hvac)
-        ranked = sorted(range(n_hvac), key=lambda i: s1_costs[i])
-
-        # Always include all-off scenario for baseline (planning layers need it)
-        off_idx_s1 = next((i for i in range(n_hvac) if _is_all_off(hvac_scenarios[i])), None)
-        top_indices = set(ranked[:K])
-        if off_idx_s1 is not None:
-            top_indices.add(off_idx_s1)
-
-        top_k_hvac = [hvac_scenarios[i] for i in sorted(top_indices)]
-        print(f"  [advisory] Stage 1: {n_hvac} HVAC scored, top {len(top_k_hvac)} selected")
-
-        # Stage 2: cross top-K with advisory product
         scenarios = _cross_with_advisory(top_k_hvac, effective_options, _ADVISORY_MAX_SCENARIOS)
-        print(f"  [advisory] Stage 2: {len(scenarios):,} combined scenarios")
+        print(f"  [advisory] {len(top_k_hvac)} HVAC × {n_adv_combos} advisory = {len(scenarios):,} scenarios")
 
         target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-        all_costs, all_predictions, best_idx, best_cost = _score_all(
-            scenarios, pred_matrix, target_names
-        )
+        all_costs, best_idx, best_cost = _score_all(scenarios, pred_matrix, target_names)
     else:
-        # ── Single-stage (existing path) ──
-        if advisory_options:
-            scenarios = _cross_with_advisory(hvac_scenarios, advisory_options, _ADVISORY_HARD_CAP)
-        else:
-            scenarios = hvac_scenarios
+        # No advisory: exact refinement of top-K
+        scenarios = top_k_hvac
+        print(f"  Exact refinement: {len(scenarios)} scenarios")
 
         target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-        all_costs, all_predictions, best_idx, best_cost = _score_all(
-            scenarios, pred_matrix, target_names
-        )
+        all_costs, best_idx, best_cost = _score_all(scenarios, pred_matrix, target_names)
 
     if best_idx < 0:
         raise RuntimeError("No HVAC scenarios evaluated")
@@ -1286,7 +1748,8 @@ def sweep_scenarios_physics(
     if advisory_options and any(s.advisories for s in scenarios):
         advisory_plan = extract_advisory_plan(
             scenarios, all_costs, environment_states,
-            predictions_per_scenario=all_predictions,
+            pred_matrix=pred_matrix,
+            target_name_index=target_idx,
             schedules=schedules,
             base_hour=base_hour,
         )
@@ -1308,52 +1771,29 @@ def sweep_scenarios_physics(
                 print(f"  [advisory] Backup breach override: {advisory_plan.backup_breaches[0]}")
                 best_idx = advisory_plan.baseline_idx
 
-    # ── Cold-sensor safety override ──
-    # Force immediate heating (delay=0) when a sensor is significantly below comfort min
-    if _is_all_off(scenarios[best_idx]):
-        cold_effectors: set[str] = set()
-        cold_info: list[str] = []
-        for schedule in schedules:
-            temp = current_temps.get(schedule.sensor)
-            if temp is None:
-                continue
-            comfort = schedule.comfort_at(base_hour)
-            if comfort is None:
-                continue
-            if temp < comfort.acceptable_lo - COLD_ROOM_OVERRIDE:
-                eff_name = emergency.get(schedule.sensor)
-                if eff_name:
-                    cold_effectors.add(eff_name)
-                    cold_info.append(f"{schedule.label} ({temp:.1f}{UNIT_SYMBOL} < {comfort.acceptable_lo:.0f}{UNIT_SYMBOL})")
-
-        # Remove blocked or ineligible effectors from cold override set
-        cold_effectors -= blocked_effectors
-        cold_effectors -= _ineligible
-
-        if cold_effectors:
-            constrained_best = -1
-            constrained_cost = float("inf")
-            for i, scenario in enumerate(scenarios):
-                # Cold-room override requires immediate heating (delay=0) for cold effectors
-                if any(
-                    not (scenario.effectors[name].mode != "off" and scenario.effectors[name].delay_steps == 0)
-                    for name in cold_effectors
-                    if name in scenario.effectors
-                ):
-                    continue
-                predictions = {t: float(pred_matrix[i, j]) for t, j in target_idx.items()}
-                c = compute_comfort_cost(predictions, schedules, base_hour)
-                e = compute_energy_cost(scenario, current_temps)
-                if c + e < constrained_cost:
-                    constrained_cost = c + e
-                    constrained_best = i
-            if constrained_best >= 0:
+    # ── Cold-sensor safety override (exact) ──
+    # cold_effectors and cold_info were computed during approximate scoring above.
+    # The constrained-best was added to top-K, so it's available here. Now apply
+    # the override on exact costs if all-off still wins after exact refinement.
+    if cold_effectors and _is_all_off(scenarios[best_idx]):
+        constrained_mask_exact = np.ones(len(scenarios), dtype=bool)
+        for i, scenario in enumerate(scenarios):
+            for name in cold_effectors:
+                ed = scenario.effectors.get(name)
+                if ed is None or ed.mode == "off" or ed.delay_steps != 0:
+                    constrained_mask_exact[i] = False
+                    break
+        if constrained_mask_exact.any():
+            masked_costs = np.where(constrained_mask_exact, all_costs, np.inf)
+            constrained_best = int(np.argmin(masked_costs))
+            if constrained_mask_exact[constrained_best]:
                 print(f"  Cold sensor override: {', '.join(cold_info)}")
                 best_idx = constrained_best
 
     # ── Build ControlDecision ──
     scenario = scenarios[best_idx]
-    predictions = {t: float(pred_matrix[best_idx, j]) for t, j in target_idx.items()}
+    predictions = _pred_dict(pred_matrix, best_idx, target_idx)
+    # Recompute comfort/energy split for the winner (cheap: single scenario)
     comfort = compute_comfort_cost(predictions, schedules, base_hour)
     energy = compute_energy_cost(scenario, current_temps)
     total = comfort + energy
@@ -1912,23 +2352,6 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for eff_name, reason in ineligible.items():
             print(f"  {eff_name}: INELIGIBLE — {reason}")
 
-    # Pre-compute advisory options for scenario count display
-    _pre_adv_options = _advisory_sweep_options(
-        environment_states, sim_params, sweep_devices=advisory_sweep_devices,
-    ) if environment_states else {}
-
-    n_scenarios = len(
-        generate_trajectory_scenarios(
-            schedules,
-            base_hour,
-            prev_state,
-            current_temps,
-            ineligible_effectors,
-            gains=sim_params.gains,
-            advisory_options=_pre_adv_options or None,
-        )
-    )
-    print(f"\n[control] Sweeping {n_scenarios} trajectory scenarios...")
     t0 = time.monotonic()
     decision, winning_scenario, blocked_dict, advisory_plan = sweep_scenarios_physics(
         current_temps,
@@ -1946,7 +2369,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         solar_elevations=solar_elevations,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
-    print(f"  Sweep completed in {elapsed_ms:.0f}ms ({elapsed_ms / n_scenarios:.1f}ms/combo)")
+    print(f"  Sweep completed in {elapsed_ms:.0f}ms")
 
     # ── Compute baselines for rationale ──
     horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
