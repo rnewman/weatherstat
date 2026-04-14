@@ -76,6 +76,10 @@ replay *ARGS:
 bundle *ARGS:
     uv run python ./scripts/snapshot_bundle.py {{ARGS}}
 
+# Sysid experiment harness (flags: --save-baseline, --compare <baseline.json>, --variant <name>)
+experiment-sysid *ARGS:
+    uv run python ./scripts/experiment_sysid.py {{ARGS}}
+
 # Verify live config parses correctly
 verify:
     #!/usr/bin/env bash

@@ -665,6 +665,22 @@ def _fit_sensor_model(
         feature_names.append("_weather_dTout_dt")
         feature_cols.append(df["_dTdt_outdoor"].values.astype(float))
 
+    # Time-of-day Fourier features — absorb diurnal patterns in internal
+    # heat (occupancy, cooking, stored wall heat) that correlate with HVAC
+    # activity but aren't caused by it.
+    if "_ts" in df.columns:
+        _tz = _CFG.location.timezone
+        ts_local = df["_ts"].dt.tz_convert(_tz)
+        hour_frac = (ts_local.dt.hour + ts_local.dt.minute / 60.0).values
+        hour_rad = hour_frac * (2 * np.pi / 24)
+        feature_names.extend(["_tod_sin1", "_tod_cos1", "_tod_sin2", "_tod_cos2"])
+        feature_cols.extend([
+            np.sin(hour_rad),
+            np.cos(hour_rad),
+            np.sin(2 * hour_rad),
+            np.cos(2 * hour_rad),
+        ])
+
     # Environment factor × ΔT features: state × (T_outdoor - T_sensor)
     # The coefficient β gives the additional cooling/heating rate when active.
     # Skip devices with too few active rows — near-zero-variance columns blow up
@@ -809,12 +825,15 @@ def _fit_sensor_model(
         prefix = "ERROR" if issue.severity.value == "error" else "WARNING"
         print(f"  {prefix} [{sensor.name}]: {issue.message}")
 
-    # Report weather control feature coefficients (diagnostic, not stored)
+    # Report weather/time-of-day control feature coefficients (diagnostic, not stored)
     if verbose:
         for i, fname in enumerate(feature_names):
             if fname.startswith("_weather_"):
                 label = fname.removeprefix("_weather_")
                 print(f"    weather {label}: β={beta[i]:.6f}, t={t_stats[i]:.1f}")
+            elif fname.startswith("_tod_"):
+                label = fname.removeprefix("_tod_")
+                print(f"    tod {label}: β={beta[i]:.6f}, t={t_stats[i]:.1f}")
 
     # Extract effector gains
     gains: list[EffectorSensorGain] = []
