@@ -81,11 +81,15 @@ class HealthCheck:
     expected_state: str | None = None  # alert if state != this (for binary/enum entities)
     severity: str = "warning"
     message: str = ""
-    # Optional condition: only evaluate this check when another entity is in a
-    # given state for at least ``when_for_minutes`` minutes.
     when_entity: str | None = None
     when_state: str | None = None
     when_for_minutes: float = 0
+    # Sustained threshold: require at least ``sustain_samples`` readings within
+    # the last ``sustain_minutes`` to violate the threshold before alerting.
+    # Filters transient dips (e.g., boiler purge cycles) that recover quickly.
+    # 0 = single-point check (no history fetch).
+    sustain_minutes: float = 0
+    sustain_samples: int = 0  # minimum violating readings required in window
 
 
 @dataclass(frozen=True)
@@ -632,6 +636,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             when_entity=when.get("entity"),
             when_state=str(when["state"]) if "state" in when else None,
             when_for_minutes=float(when.get("for_minutes", 0)),
+            sustain_minutes=float(hc.get("sustain_minutes", 0)),
+            sustain_samples=int(hc.get("sustain_samples", 0)),
         ))
 
     # ── Environment factors (windows, doors, shades, vents, etc.) ──

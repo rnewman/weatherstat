@@ -146,6 +146,8 @@ health:
     min_value: 120
     severity: critical
     message: "Boiler outlet temp too low while heating — check for flame failure"
+    sustain_minutes: 15  # history window to check
+    sustain_samples: 12  # at least 12 violating readings in window (filters cycling dips)
     when:
       entity: sensor.combi_heating_mode
       state: "Space Heating"

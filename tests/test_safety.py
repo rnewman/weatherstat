@@ -7,10 +7,12 @@ from unittest.mock import MagicMock, patch
 
 from weatherstat.safety import (
     SafetyAlert,
+    _check_sustained,
     check_device_health,
     check_thermostat_modes,
     process_safety_alerts,
 )
+from weatherstat.yaml_config import HealthCheck
 
 # ── Mock decision and latest row ──────────────────────────────────────────
 
@@ -97,17 +99,36 @@ class TestCheckDeviceHealth:
         return resp
 
     @staticmethod
-    def _mock_by_entity(entity_responses: dict[str, dict]) -> callable:
+    def _mock_by_entity(entity_responses: dict[str, dict], *, history_readings: dict[str, list[tuple[float, str]]] | None = None) -> callable:
         """Return a side_effect function that returns different responses per entity.
 
         Values can be a plain string (state only) or a dict with ``state`` and
         optional ``last_changed`` keys.
+
+        ``history_readings``, if provided, maps entity IDs to lists of
+        ``(minutes_ago, state_value)`` pairs for the HA history API
+        (used by sustained threshold checks).
         """
         def _get(url: str, **_kwargs: object) -> MagicMock:
-            entity_id = url.rsplit("/", 1)[-1]
-            info = entity_responses.get(entity_id)
             resp = MagicMock()
             resp.status_code = 200
+
+            # History API: /api/history/period/<timestamp>?filter_entity_id=...
+            if "/api/history/period/" in url:
+                params = _kwargs.get("params", {})
+                eid = params.get("filter_entity_id", "")
+                raw = (history_readings or {}).get(eid, [])
+                now = datetime.now(UTC)
+                entries = [
+                    {"state": val, "last_changed": (now - timedelta(minutes=m)).isoformat()}
+                    for m, val in raw
+                ]
+                resp.json.return_value = [entries]
+                return resp
+
+            # State API: /api/states/<entity_id>
+            entity_id = url.rsplit("/", 1)[-1]
+            info = entity_responses.get(entity_id)
             if info is None:
                 resp.json.return_value = {"state": "unknown"}
             elif isinstance(info, str):
@@ -140,7 +161,9 @@ class TestCheckDeviceHealth:
             "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(5)},
             "sensor.combi_outlet_temp": "100.0",
         }
-        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states)):
+        # Sustained check: low since start of window (single transition held 15 min).
+        history = {"sensor.combi_outlet_temp": [(15, "100")]}
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states, history_readings=history)):
             alerts = check_device_health()
         assert len(alerts) == 1
         assert alerts[0].key == "combi_outlet_fault"
@@ -203,6 +226,123 @@ class TestCheckDeviceHealth:
         with patch("weatherstat.safety.requests.get", return_value=self._mock_ha_response("", 404)):
             alerts = check_device_health()
         assert len(alerts) == 0
+
+
+# ── _check_sustained ────────────────────────────────────────────────────
+
+
+class TestCheckSustained:
+    """Tests for the M-of-N sustained threshold check with 1-minute resampling."""
+
+    @staticmethod
+    def _make_check(
+        min_value: float | None = None,
+        max_value: float | None = None,
+        sustain_minutes: float = 15,
+        sustain_samples: int = 12,
+    ) -> HealthCheck:
+        return HealthCheck(
+            name="test_outlet",
+            entity_id="sensor.test_outlet_temp",
+            min_value=min_value,
+            max_value=max_value,
+            sustain_minutes=sustain_minutes,
+            sustain_samples=sustain_samples,
+        )
+
+    @staticmethod
+    def _mock_history_resp(
+        entries: list[tuple[float, str]],
+        *,
+        sustain_minutes: float = 15,
+        status_code: int = 200,
+    ) -> MagicMock:
+        """Build a mock HA history response with timestamped entries.
+
+        ``entries`` is a list of (minutes_ago, state_value) pairs.  Timestamps
+        are computed relative to "now" which aligns with ``_check_sustained``'s
+        own ``datetime.now(UTC)`` call.
+        """
+        now = datetime.now(UTC)
+        resp = MagicMock()
+        resp.status_code = status_code
+        if status_code != 200:
+            return resp
+        history = []
+        for mins_ago, val in entries:
+            ts = (now - timedelta(minutes=mins_ago)).isoformat()
+            history.append({"state": val, "last_changed": ts})
+        resp.json.return_value = [history]
+        return resp
+
+    def test_sustained_low_triggers(self) -> None:
+        """Single low reading at start of window held for 15 min → 15 samples, all violating."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        # One state change at the start: 100°F held for the entire window.
+        entries = [(15, "100")]
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check) is True
+
+    def test_transient_dip_does_not_trigger(self) -> None:
+        """30-second purge dip then recovery → only ~1 minute sample violates."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        # Healthy at start, dip at 3 min ago for 30 seconds, then recovery.
+        entries = [(15, "150"), (3.0, "80"), (2.5, "150")]
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check) is False
+
+    def test_sawtooth_recovery_does_not_trigger(self) -> None:
+        """10-minute sawtooth with recovery → not enough sustained violation."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        # Healthy first 5 min, dip for 5 min, recover for last 5 min.
+        entries = [(15, "150"), (10, "90"), (5, "150")]
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check) is False
+
+    def test_12_of_15_minutes_low(self) -> None:
+        """Low for 12+ minutes out of 15 → triggers."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        # Healthy for first 2 min, then low for remaining 13 min.
+        entries = [(15, "150"), (13, "90")]
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check) is True
+
+    def test_11_of_15_minutes_low(self) -> None:
+        """Low for 11 minutes out of 15 → does not trigger (need 12)."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        # Healthy for first 4 min, then low for remaining 11 min.
+        entries = [(15, "150"), (11, "90")]
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check) is False
+
+    def test_max_value_sustained(self) -> None:
+        """max_value threshold sustained for full window → True."""
+        check = self._make_check(max_value=200, sustain_samples=3, sustain_minutes=5)
+        entries = [(5, "210")]
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries, sustain_minutes=5)):
+            assert _check_sustained(check) is True
+
+    def test_no_data_before_first_sample(self) -> None:
+        """State change only in the last minute → most samples have no value."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        entries = [(0.5, "90")]  # only 0.5 min ago
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check) is False
+
+    def test_ha_error_returns_false(self) -> None:
+        """HA history API failure → don't alert."""
+        check = self._make_check(min_value=110, sustain_samples=5)
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp([], status_code=500)):
+            assert _check_sustained(check) is False
+
+    def test_empty_history_returns_false(self) -> None:
+        """No history data → don't alert."""
+        check = self._make_check(min_value=110, sustain_samples=5)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [[]]
+        with patch("weatherstat.safety.requests.get", return_value=resp):
+            assert _check_sustained(check) is False
 
 
 # ── process_safety_alerts ────────────────────────────────────────────────

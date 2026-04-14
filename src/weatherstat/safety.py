@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import requests
@@ -165,6 +165,81 @@ def _check_when_condition(check: HealthCheck) -> bool:
     return True
 
 
+def _check_sustained(check: HealthCheck) -> bool:
+    """Return True if enough 1-minute samples in the sustain window violate the threshold.
+
+    Fetches HA history for the entity over the last ``sustain_minutes``,
+    resamples at 1-minute intervals by forward-filling the last known state,
+    and counts how many samples violate.  This handles both high-frequency
+    oscillations (many state changes, few violations) and sustained flat
+    violations (one state change held for many minutes).
+    """
+    min_required = check.sustain_samples
+    if min_required <= 0:
+        return True  # misconfigured — fall through to alert
+
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=check.sustain_minutes)
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.get(
+        f"{HA_URL}/api/history/period/{window_start.isoformat()}",
+        headers=headers,
+        params={
+            "filter_entity_id": check.entity_id,
+            "minimal_response": "",
+            "no_attributes": "",
+            "significant_changes_only": "",
+            "end_time": now.isoformat(),
+        },
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        return False  # can't verify — don't alert
+
+    history = resp.json()
+    if not history or not history[0]:
+        return False
+
+    # Build sorted (timestamp, value) pairs from state changes.
+    transitions: list[tuple[datetime, float]] = []
+    for entry in history[0]:
+        state = entry.get("state", "")
+        if state in ("unavailable", "unknown"):
+            continue
+        ts_str = entry.get("last_changed", "")
+        if not ts_str:
+            continue
+        try:
+            transitions.append((datetime.fromisoformat(ts_str), float(state)))
+        except (ValueError, TypeError):
+            continue
+
+    if not transitions:
+        return False
+
+    # Resample at 1-minute intervals, forward-filling the last known value.
+    violating = 0
+    n_samples = int(check.sustain_minutes)
+    for i in range(n_samples):
+        sample_time = window_start + timedelta(minutes=i + 0.5)  # sample at :30s marks
+        # Find last transition at or before sample_time.
+        val: float | None = None
+        for ts, v in transitions:
+            if ts <= sample_time:
+                val = v
+            else:
+                break
+        if val is None:
+            continue  # no data before this sample point
+        if check.min_value is not None and val <= check.min_value or check.max_value is not None and val >= check.max_value:
+            violating += 1
+
+    return violating >= min_required
+
+
 def _check_health_threshold(check: HealthCheck) -> SafetyAlert | None:
     """Fetch an entity from HA and compare against configured thresholds."""
     # Evaluate optional precondition first.
@@ -212,23 +287,23 @@ def _check_health_threshold(check: HealthCheck) -> SafetyAlert | None:
     except (ValueError, TypeError):
         return None
 
-    if check.min_value is not None and value <= check.min_value:
-        return SafetyAlert(
-            key=f"{check.name}_fault",
-            title=f"{check.name} health check failed",
-            message=check.message or f"{check.entity_id} = {value}",
-            severity=check.severity,
-        )
+    violated = False
+    if check.min_value is not None and value <= check.min_value or check.max_value is not None and value >= check.max_value:
+        violated = True
 
-    if check.max_value is not None and value >= check.max_value:
-        return SafetyAlert(
-            key=f"{check.name}_fault",
-            title=f"{check.name} health check failed",
-            message=check.message or f"{check.entity_id} = {value}",
-            severity=check.severity,
-        )
+    if not violated:
+        return None
 
-    return None
+    # Sustained threshold: require all readings over the window to violate.
+    if check.sustain_minutes > 0 and not _check_sustained(check):
+        return None
+
+    return SafetyAlert(
+        key=f"{check.name}_fault",
+        title=f"{check.name} health check failed",
+        message=check.message or f"{check.entity_id} = {value}",
+        severity=check.severity,
+    )
 
 
 # ── Dispatch ──────────────────────────────────────────────────────────────
