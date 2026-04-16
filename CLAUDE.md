@@ -69,10 +69,12 @@ just tui --live       # TUI starting in live mode
 just tui-web          # TUI with embedded mobile web frontend (default 0.0.0.0:8765)
 just comfort          # Comfort performance dashboard (last 7 days)
 just debug            # Full debug summary (temps, gains, tau, state)
-just debug temps      # Current temps + comfort bounds
+just debug temps      # Current temps + comfort bounds (from snapshot DB)
+just debug live       # Live temps from HA REST API (always current)
 just debug gains      # Sysid effector→sensor gains
 just debug taus       # Tau models + advisory betas
-just debug why        # Explain why active effectors are on
+just debug why        # Explain why active effectors are on (snapshot DB temps)
+just debug decision-why  # Explain latest decision (live temps from decision log)
 just debug advisory   # Advisory states + compound tau effects
 just debug decisions  # Recent decision log
 just lint             # Lint src + tests

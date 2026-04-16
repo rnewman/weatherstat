@@ -4,9 +4,11 @@
 Usage:
     python scripts/debug_state.py                       # full status summary
     python scripts/debug_state.py temps                  # current temperatures + comfort
+    python scripts/debug_state.py live                   # live HA temperatures + comfort (no snapshot DB)
     python scripts/debug_state.py gains [SENSOR]         # sysid gains (optionally filtered)
     python scripts/debug_state.py taus                   # tau models + environment betas
     python scripts/debug_state.py decisions [N]          # last N decisions (default 5)
+    python scripts/debug_state.py decision-why [N]       # explain decision N using live temps from decision log
     python scripts/debug_state.py opportunities          # advisory state
     python scripts/debug_state.py snapshots              # snapshot DB stats
     python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
@@ -98,6 +100,32 @@ def _ago(ts_str: str | None) -> str:
         return ts_str
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+_STALE_THRESHOLD_MINUTES = 10
+
+
+def _snapshot_staleness_warning(ts: str | None) -> None:
+    """Print a warning if the latest snapshot is stale."""
+    if not ts:
+        print("⚠ No snapshot data. Use 'just debug decisions' for live temps from the control loop.")
+        return
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        age_minutes = (datetime.now(UTC) - dt).total_seconds() / 60
+        if age_minutes > _STALE_THRESHOLD_MINUTES:
+            if age_minutes > 120:
+                age_str = f"{age_minutes / 60:.0f}h"
+            else:
+                age_str = f"{age_minutes:.0f}m"
+            print(f"⚠ Snapshot data is {age_str} stale — temps shown here are NOT current.")
+            print(f"  Use 'just debug decisions' or 'just debug live' for current temps.")
+    except (ValueError, TypeError):
+        pass
+
+
 # ── Subcommands ──────────────────────────────────────────────────────────
 
 
@@ -108,6 +136,7 @@ def cmd_temps() -> None:
     row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
     ts = row[0] if row else None
     print(f"Latest snapshot: {ts} ({_ago(ts)})")
+    _snapshot_staleness_warning(ts)
 
     if not ts:
         print("No data.")
@@ -133,6 +162,109 @@ def cmd_temps() -> None:
         except (ValueError, TypeError):
             continue
         # Find comfort bounds by label match
+        label = name.replace("_temp", "")
+        b = bounds.get(label, {})
+        cmin = b.get("min", "")
+        cmax = b.get("max", "")
+        plo = b.get("preferred_lo", "")
+        phi = b.get("preferred_hi", "")
+
+        status = ""
+        if cmin and cmax:
+            if temp < float(cmin):
+                status = f"COLD ({temp - float(cmin):+.1f})"
+            elif temp > float(cmax):
+                status = f"HOT ({temp - float(cmax):+.1f})"
+            elif plo and phi:
+                if temp < float(plo):
+                    status = "below pref"
+                elif temp > float(phi):
+                    status = "above pref"
+                else:
+                    status = "in band"
+
+        if plo and phi:
+            plo_f, phi_f = float(plo), float(phi)
+            pref_str = f"{plo_f:.1f}" if abs(plo_f - phi_f) < 0.05 else f"{plo_f:.1f}-{phi_f:.1f}"
+        else:
+            pref_str = ""
+        cmin_str = f"{float(cmin):.1f}" if cmin else ""
+        cmax_str = f"{float(cmax):.1f}" if cmax else ""
+        print(f"  {name:<30} {temp:6.1f}  {cmin_str:>5} {pref_str:>9} {cmax_str:>5}  {status}")
+
+
+def cmd_live() -> None:
+    """Live temperatures from HA REST API + comfort bounds from latest decision.
+
+    Unlike `temps` (which reads the snapshot DB), this fetches directly from
+    Home Assistant — the same data source the control loop uses.
+    """
+    import os
+
+    import requests
+
+    from weatherstat.yaml_config import load_config
+
+    cfg = load_config()
+    url = os.environ.get("HA_URL", "")
+    token = os.environ.get("HA_TOKEN", "")
+    if not url or not token:
+        print("Error: HA_URL and HA_TOKEN must be set (check ~/.weatherstat/.env).")
+        return
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        resp = requests.get(f"{url}/api/states", headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Error fetching HA states: {e}")
+        return
+
+    all_states = {s["entity_id"]: s for s in resp.json()}
+
+    # Extract temperature values using the same column mapping as the collector
+    temps: dict[str, float] = {}
+    for col_name, sensor_cfg in cfg.temp_sensors.items():
+        entity = all_states.get(sensor_cfg.entity_id)
+        if entity:
+            try:
+                val = float(entity.get("state", ""))
+                if val == val:  # not NaN
+                    temps[col_name] = val
+            except (ValueError, TypeError):
+                pass
+    # Also grab effector temps (thermostats, mini splits)
+    for eff_name, eff_cfg in cfg.effectors.items():
+        entity = all_states.get(eff_cfg.entity_id)
+        if entity:
+            attrs = entity.get("attributes", {})
+            temp_col = f"{eff_name}_temp"
+            temp_val = attrs.get("current_temperature")
+            if temp_val is not None:
+                try:
+                    temps[temp_col] = float(temp_val)
+                except (ValueError, TypeError):
+                    pass
+    # Weather entity: met_outdoor_temp
+    weather = all_states.get(cfg.weather_entity)
+    if weather:
+        try:
+            temps["met_outdoor_temp"] = float(weather.get("attributes", {}).get("temperature", ""))
+        except (ValueError, TypeError):
+            pass
+
+    # Load comfort bounds from latest decision
+    p = _paths()
+    bounds = _load_comfort_bounds(p)
+
+    ts_now = datetime.now(UTC).isoformat(timespec="seconds")
+    print(f"Live from HA: {ts_now}")
+    print()
+    print(f"  {'Sensor':<30} {'Temp':>6}  {'Min':>5} {'Pref':>9} {'Max':>5}  Status")
+    print(f"  {'─' * 30} {'─' * 6}  {'─' * 5} {'─' * 9} {'─' * 5}  {'─' * 10}")
+
+    for name in sorted(temps):
+        temp = temps[name]
         label = name.replace("_temp", "")
         b = bounds.get(label, {})
         cmin = b.get("min", "")
@@ -577,6 +709,168 @@ def cmd_why(effector_filter: str | None = None) -> None:
         print()
 
 
+def cmd_decision_why(n: int = 1) -> None:
+    """Explain decision using live temps from the decision log.
+
+    Like `why`, but uses current_temps recorded at decision time (from HA REST API)
+    instead of the snapshot DB. This gives a consistent view even when the collector
+    is stale or down.
+    """
+    p = _paths()
+    params = _load_json(p["thermal_params"])
+    if not params:
+        print("Missing thermal_params.json.")
+        return
+
+    if not p["decision_log"].exists():
+        print("No decision_log.db found.")
+        return
+
+    conn = sqlite3.connect(str(p["decision_log"]))
+    row = conn.execute(
+        """SELECT timestamp, live, current_temps, comfort_bounds, predictions,
+                  comfort_cost, energy_cost, effector_decisions, active_profile
+           FROM decisions ORDER BY timestamp DESC LIMIT 1 OFFSET ?""",
+        (n - 1,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        print("No decisions found.")
+        return
+
+    ts, live, temps_json, bounds_json, preds_json, cc, ec, eff_json, profile = row
+    current_temps: dict[str, float] = json.loads(temps_json) if temps_json else {}
+    bounds: dict[str, dict] = json.loads(bounds_json) if bounds_json else {}
+    predictions: dict[str, dict] = json.loads(preds_json) if preds_json else {}
+    effs = json.loads(eff_json) if eff_json else []
+
+    mode_label = "LIVE" if live else "DRY"
+    print(f"Decision: {ts}  [{mode_label}]  profile={profile or '?'}")
+    print(f"  Cost: comfort={cc:.1f}  energy={ec:.3f}  total={cc + ec:.1f}")
+    print()
+
+    # Show current temps with comfort bounds (same format as cmd_temps)
+    print(f"  {'Sensor':<30} {'Temp':>6}  {'Min':>5} {'Pref':>9} {'Max':>5}  Status")
+    print(f"  {'─' * 30} {'─' * 6}  {'─' * 5} {'─' * 9} {'─' * 5}  {'─' * 10}")
+    for name in sorted(current_temps):
+        if not name.endswith("_temp"):
+            continue
+        temp = current_temps[name]
+        label = name.replace("_temp", "")
+        b = bounds.get(label, {})
+        cmin = b.get("min", "")
+        cmax = b.get("max", "")
+        plo = b.get("preferred_lo", "")
+        phi = b.get("preferred_hi", "")
+
+        status = ""
+        if cmin and cmax:
+            if temp < float(cmin):
+                status = f"COLD ({temp - float(cmin):+.1f})"
+            elif temp > float(cmax):
+                status = f"HOT ({temp - float(cmax):+.1f})"
+            elif plo and phi:
+                if temp < float(plo):
+                    status = "below pref"
+                elif temp > float(phi):
+                    status = "above pref"
+                else:
+                    status = "in band"
+
+        if plo and phi:
+            plo_f, phi_f = float(plo), float(phi)
+            pref_str = f"{plo_f:.1f}" if abs(plo_f - phi_f) < 0.05 else f"{plo_f:.1f}-{phi_f:.1f}"
+        else:
+            pref_str = ""
+        cmin_str = f"{float(cmin):.1f}" if cmin else ""
+        cmax_str = f"{float(cmax):.1f}" if cmax else ""
+        print(f"  {name:<30} {temp:6.1f}  {cmin_str:>5} {pref_str:>9} {cmax_str:>5}  {status}")
+
+    print()
+
+    # Show effector decisions
+    active_effs: dict[str, dict] = {}
+    for e in effs:
+        if e.get("mode", "off") != "off":
+            active_effs[e["name"]] = e
+
+    if not active_effs:
+        print("All effectors off.")
+        return
+
+    # Index gains by effector
+    gains_by_effector: dict[str, list[dict]] = {}
+    for g in params.get("effector_sensor_gains", []):
+        gains_by_effector.setdefault(g["effector"], []).append(g)
+
+    for eff_name, eff_dec in sorted(active_effs.items()):
+        mode = eff_dec.get("mode", "?")
+        target = eff_dec.get("target")
+        delay = eff_dec.get("delay_steps", 0)
+        duration = eff_dec.get("duration_steps")
+        target_str = f" @ {target}°F" if target is not None else ""
+        timing = ""
+        if delay:
+            timing += f" delay={delay * 5}m"
+        if duration is not None:
+            timing += f" duration={duration * 5}m"
+        print(f"━━━ {eff_name} = {mode}{target_str}{timing} ━━━")
+
+        gains = gains_by_effector.get(eff_name, [])
+        sig_gains = [g for g in gains if not g.get("negligible", True)]
+        sig_gains.sort(key=lambda g: abs(g.get("gain_f_per_hour", 0)), reverse=True)
+
+        if not sig_gains:
+            print("  No significant sysid gains.")
+            print()
+            continue
+
+        print(f"  Gains → constrained sensors:")
+        for g in sig_gains:
+            sensor = g["sensor"]
+            gain = g.get("gain_f_per_hour", 0)
+            t_stat = g.get("t_statistic", 0)
+            temp = current_temps.get(sensor)
+            label = sensor.replace("_temp", "")
+            b = bounds.get(label, {})
+
+            status = ""
+            if temp is not None and b:
+                cmin = b.get("min")
+                cmax = b.get("max")
+                plo = b.get("preferred_lo")
+                phi = b.get("preferred_hi")
+                if cmin is not None and cmax is not None:
+                    if temp > float(cmax):
+                        status = f"HOT ({temp - float(cmax):+.1f})"
+                    elif temp < float(cmin):
+                        status = f"COLD ({float(cmin) - temp:+.1f})"
+                    elif plo is not None and temp < float(plo):
+                        status = "below pref"
+                    elif phi is not None and temp > float(phi):
+                        status = "above pref"
+                    else:
+                        status = "in band"
+
+            temp_str = f"{temp:.1f}°F" if temp is not None else "n/a"
+            gain_dir = "warms" if gain > 0 else "cools"
+            print(f"    {sensor:<30} {gain:+.4f}°F/hr ({gain_dir})  t={t_stat:.2f}  now={temp_str}  [{status}]")
+
+        # Show predictions
+        constrained_sensors = {g["sensor"] for g in sig_gains if g["sensor"].replace("_temp", "") in bounds}
+        if constrained_sensors and predictions:
+            print("  Predicted trajectories (with this plan):")
+            for sensor in sorted(constrained_sensors):
+                preds = predictions.get(sensor, {})
+                if preds:
+                    parts = [f"{h}={v:.1f}" for h, v in preds.items()]
+                    temp = current_temps.get(sensor, 0)
+                    print(f"    {sensor:<30} now={temp:.1f}  {', '.join(parts)}")
+
+        print()
+
+
 def cmd_advisory() -> None:
     """Show active advisory states and their compound effect on tau."""
     p = _paths()
@@ -745,9 +1039,11 @@ def cmd_summary() -> None:
 
 COMMANDS = {
     "temps": lambda args: cmd_temps(),
+    "live": lambda args: cmd_live(),
     "gains": lambda args: cmd_gains(args[0] if args else None),
     "taus": lambda args: cmd_taus(),
     "decisions": lambda args: cmd_decisions(int(args[0]) if args else 5),
+    "decision-why": lambda args: cmd_decision_why(int(args[0]) if args else 1),
     "opportunities": lambda args: cmd_opportunities(),
     "snapshots": lambda args: cmd_snapshots(),
     "comfort": lambda args: cmd_comfort(args[0] if args else None),
