@@ -287,7 +287,7 @@ def _get_db() -> sqlite3.Connection:
     if _db is not None:
         return _db
     SNAPSHOTS_DB.parent.mkdir(parents=True, exist_ok=True)
-    _db = sqlite3.connect(str(SNAPSHOTS_DB))
+    _db = sqlite3.connect(str(SNAPSHOTS_DB), check_same_thread=False)
     _db.execute("PRAGMA journal_mode = WAL")
     _db.execute(_CREATE_READINGS_SQL)
     _db.commit()
