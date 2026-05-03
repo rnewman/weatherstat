@@ -66,7 +66,7 @@ dT/dt = (T_outdoor - T) / tau                      # envelope heat loss/gain
 
 **Lag** is the delay between turning on an effector and seeing its effect. Forced air: 5–15 minutes. Mini-split: 10–20 minutes. Hydronic floor heat: 45–90 minutes. This is the fundamental parameter that makes high-lag systems hard to control reactively.
 
-**Solar gain** varies by room, time of day, and season. The model computes the sun's elevation angle analytically from latitude, longitude, and time, so it automatically predicts stronger solar heating in summer (higher sun) than winter (lower sun). A south-facing room with large windows will have a higher solar coefficient than a north-facing one. The weather condition (sunny vs cloudy) modulates the solar forcing.
+**Solar gain** varies by room, time of day, and season. The model computes the sun's elevation angle analytically from latitude, longitude, and time, so it automatically predicts stronger solar heating in summer (higher sun) than winter (lower sun). A south-facing room with large windows will have a higher solar coefficient than a north-facing one. Cloud coverage (0–100%) modulates the solar forcing through a Kasten-Czeplak attenuation curve, so a hazy sunny day at 25% cloud is correctly distinguished from a perfectly clear sky.
 
 The system doesn't assume or configure these parameters. It *learns* them from your data through **system identification** (sysid): fit τ from (typically overnight) cooling curves when the heating is off, then fit gains, lags, and solar coefficients from the residuals using regression. The more data you collect, the better the model gets.
 

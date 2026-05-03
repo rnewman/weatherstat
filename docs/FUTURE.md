@@ -23,19 +23,33 @@ will face new challenges in summer:
 
 ## Irradiance-Based Solar Model
 
-**Status:** Data collection started 2026-04-05. Elevation-based model deployed
-2026-04-05 as an intermediate step (see below).
+**Status:** Data collection started 2026-04-05. Two intermediate steps deployed
+since then (see below) — the per-plane irradiance model is the remaining
+future work.
 
-**Intermediate step (done):** The per-hour model (11 coefficients per sensor,
-hours 7–17) was replaced by an elevation-based model: one coefficient per
-sensor × `sin⁺(solar_elevation)` × weather-conditioned fraction. Solar
-elevation is computed analytically from lat/lon/time — no external data needed.
-This captures seasonal variation (Feb noon ~30°, Apr ~48°, Jun ~66° at Seattle)
-and hour-of-day variation in a single continuous feature. The old model
-underpredicted spring solar gain by ~35% because winter-fitted coefficients had
-no way to increase with sun angle. Cloud coverage (0–100%) is now collected in
-the snapshot data alongside the discrete weather condition, for future use as a
-continuous solar fraction.
+**Intermediate step #1 (done, Apr 2026):** The per-hour model (11 coefficients
+per sensor, hours 7–17) was replaced by an elevation-based model: one
+coefficient per sensor × `sin⁺(solar_elevation)` × weather-conditioned
+fraction. Solar elevation is computed analytically from lat/lon/time — no
+external data needed. This captures seasonal variation (Feb noon ~30°,
+Apr ~48°, Jun ~66° at Seattle) and hour-of-day variation in a single
+continuous feature. The old model underpredicted spring solar gain by ~35%
+because winter-fitted coefficients had no way to increase with sun angle.
+
+**Intermediate step #2 (done, May 2026):** The categorical weather-condition
+fraction (`sunny=1.0`, `partlycloudy=0.5`, `cloudy=0.15`) was replaced by a
+continuous transfer derived from `cloud_coverage` (0–100%, collected since
+April 2026) via Kasten-Czeplak: `f = 1 − 0.75·(cc/100)^3.4`. Snapshots
+predating cloud-coverage collection fall back to the categorical map
+row-by-row via `Series.combine_first`. This eliminated a structural bias
+where family_room over-predicted on sunny days (4h p90 +3.15°F, 6h max
++5.73°F) because the categorical map lumped all sunny days (cc 0–30%) into
+a single `1.0` bucket; the regression averaged them and over-extrapolated on
+truly clear days. After the change, `solar_elevation_gains[family_room]`
+dropped 42% (2.02 → 1.17 °F/hr) and other rooms saw ~15-20% drops, consistent
+with the model now distinguishing within-bucket variation. Implementation:
+single helper `effective_solar_fraction(cloud_coverage, condition)` in
+`weather.py` used by sysid, control, TUI, and replay/bundle scripts.
 
 **What the elevation model doesn't capture:** directionality. A west-facing
 room heats more in afternoon than morning at the same elevation. The irradiance

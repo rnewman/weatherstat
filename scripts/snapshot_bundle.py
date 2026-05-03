@@ -288,7 +288,7 @@ def replay_bundle(bundle_dir: Path) -> None:
     )
     from weatherstat.simulator import extract_recent_history, load_sim_params
     from weatherstat.types import ControlState
-    from weatherstat.weather import condition_to_solar_fraction
+    from weatherstat.weather import effective_solar_fraction
     from weatherstat.yaml_config import load_config
 
     cfg = load_config()
@@ -327,18 +327,29 @@ def replay_bundle(bundle_dir: Path) -> None:
     for ename, ecfg in cfg.environment.items():
         environment_states[ename] = snap.get(ecfg.column, "0") == "1"
 
-    # Forecast temps and solar fractions
+    def _cc(key: str) -> float | None:
+        raw = snap.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    # Forecast temps and solar fractions. Cloud coverage (April 2026+) takes
+    # precedence over the categorical condition; old bundles fall through to
+    # condition_to_solar_fraction.
     forecast_temps: list[float] = []
     solar_fractions: list[float] = []
-    current_condition = snap.get("weather_condition", "unknown")
-    solar_fractions.append(condition_to_solar_fraction(current_condition))
+    current_condition = str(snap.get("weather_condition", "unknown"))
+    solar_fractions.append(effective_solar_fraction(_cc("cloud_coverage"), current_condition))
     for h in range(1, 13):
         ft = snap.get(f"forecast_temp_{h}h")
-        fc = snap.get(f"forecast_condition_{h}h", "unknown")
+        fc = str(snap.get(f"forecast_condition_{h}h", "unknown"))
         if ft is not None:
             try:
                 forecast_temps.append(float(ft))
-                solar_fractions.append(condition_to_solar_fraction(fc))
+                solar_fractions.append(effective_solar_fraction(_cc(f"forecast_cloud_{h}h"), fc))
             except (ValueError, TypeError):
                 break
         else:

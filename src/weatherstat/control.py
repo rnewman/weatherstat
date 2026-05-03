@@ -113,6 +113,30 @@ TRAJECTORY_DELAYS = [0, 12, 24]  # 0h, 1h, 2h
 TRAJECTORY_DURATIONS = [12, 24, 72]  # 1h, 2h, 6h (full horizon)
 
 
+# ── Snapshot row helpers ──────────────────────────────────────────────────
+
+
+def _row_cloud_coverage(row: object) -> float | None:
+    """Extract cloud_coverage from a snapshot row, normalized to float | None.
+
+    Handles missing column, None, NaN, and string values from the EAV pivot.
+    Returns None when cloud_coverage is unavailable so callers can fall back
+    to the categorical condition map.
+    """
+    if not hasattr(row, "get"):
+        return None
+    raw = row.get("cloud_coverage")
+    if raw is None or raw == "":
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(v):
+        return None
+    return v
+
+
 # ── Default comfort profiles ──────────────────────────────────────────────
 
 
@@ -2391,14 +2415,16 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     local_now = datetime.now(ZoneInfo(TIMEZONE))
     base_hour = local_now.hour
 
-    # Current weather condition for solar fraction
+    # Current weather condition + cloud_coverage for solar fraction
     _current_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
-    from weatherstat.weather import condition_to_solar_fraction as _c2sf
+    _current_cc = _row_cloud_coverage(latest)
+    from weatherstat.weather import effective_solar_fraction as _esf
 
-    _sf = _c2sf(_current_cond)
+    _sf = _esf(_current_cc, _current_cond)
     _is_night = base_hour < 7 or base_hour >= 19
     _sf_note = "night, no solar gain" if _is_night else f"solar fraction: {_sf:.0%}"
-    print(f"  Weather:     {_current_cond} ({_sf_note})")
+    _cc_note = f", cc={_current_cc:.0f}%" if _current_cc is not None else ""
+    print(f"  Weather:     {_current_cond}{_cc_note} ({_sf_note})")
 
     # Comfort schedules: base → profile offsets → MRT correction → window adjustments
     schedules = default_comfort_schedules()
@@ -2427,14 +2453,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # MRT correction: adjust targets for cold/warm wall surface effects.
     # Dynamic: solar wall warming reduces the cold-wall correction on sunny days.
     # Manual mrt_weight from YAML still applies as a multiplier.
-    from weatherstat.weather import condition_to_solar_fraction as _csf
+    from weatherstat.weather import effective_solar_fraction as _esf_mrt
     from weatherstat.weather import solar_sin_elevation as _sse
 
     _out_valid = out_temp is not None and not (isinstance(out_temp, float) and np.isnan(out_temp))
     _mrt_outdoor = float(out_temp) if _out_valid else abs_temp(50.0)
     _mrt_weights = {c.sensor: c.mrt_weight for c in _CFG.constraints if c.mrt_weight != 1.0}
     _mrt_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
-    _mrt_solar_frac = _csf(_mrt_cond)
+    _mrt_cc = _row_cloud_coverage(latest)
+    _mrt_solar_frac = _esf_mrt(_mrt_cc, _mrt_cond)
     _mrt_solar_elev = _sse(_CFG.location.latitude, _CFG.location.longitude, datetime.now(UTC))
     _sensor_cols = [s.sensor for s in schedules]
     _mrt_per_sensor = compute_current_mrt_offsets(
@@ -2466,13 +2493,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     recent_hist = extract_recent_history(df_raw, sim_params)
 
     # Build forecast temp list, solar fractions, and solar elevations for simulator
-    from weatherstat.weather import condition_to_solar_fraction, solar_sin_elevation
+    from weatherstat.weather import effective_solar_fraction, solar_sin_elevation
 
     forecast_temp_list: list[float] = []
     solar_fractions: list[float] = []
-    # Index 0 = current hour's solar fraction (from latest snapshot condition)
+    # Index 0 = current hour's solar fraction. Prefer continuous cloud_coverage
+    # from the snapshot; fall back to the categorical weather_condition.
     current_condition = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
-    solar_fractions.append(condition_to_solar_fraction(current_condition))
+    current_cc = _row_cloud_coverage(latest)
+    solar_fractions.append(effective_solar_fraction(current_cc, current_condition))
 
     if forecast:
         from weatherstat.forecast import forecast_at_horizons as _fah
@@ -2484,7 +2513,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             entry = at_h.get(f"{h}h")
             if entry is not None:
                 forecast_temp_list.append(entry.temperature)
-                solar_fractions.append(condition_to_solar_fraction(entry.condition))
+                solar_fractions.append(effective_solar_fraction(entry.cloud_coverage, entry.condition))
             elif forecast_temp_list:
                 forecast_temp_list.append(forecast_temp_list[-1])
                 solar_fractions.append(solar_fractions[-1])

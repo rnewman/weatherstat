@@ -53,6 +53,37 @@ def condition_to_solar_fraction(condition: str) -> float:
     return SOLAR_FRACTION.get(condition, _DEFAULT_SOLAR_FRACTION)
 
 
+def kasten_czeplak(cloud_coverage_pct: float) -> float:
+    """Kasten-Czeplak (1980) clear-sky attenuation as a function of cloud cover.
+
+    Returns the fraction of clear-sky irradiance reaching the surface for a
+    given cloud cover percentage (0–100). Empirically: clear-sky stays near
+    1.0 for cc ≲ 30%, drops sharply above cc ≳ 60%. This non-linear shape
+    matches observed sunny→partly-cloudy→overcast attenuation much better
+    than a linear model and avoids over-attenuating lightly hazy days.
+    """
+    cc = max(0.0, min(100.0, float(cloud_coverage_pct))) / 100.0
+    return max(0.0, 1.0 - 0.75 * (cc ** 3.4))
+
+
+def effective_solar_fraction(
+    cloud_coverage: float | None,
+    condition: str | None,
+) -> float:
+    """Continuous solar fraction in [0, 1].
+
+    Prefers ``cloud_coverage`` (Kasten-Czeplak transfer); falls back to the
+    categorical condition map when cloud_coverage is missing — e.g., snapshots
+    from before April 2026 (when the column was introduced) and forecast entries
+    whose source did not provide a cloud_coverage attribute.
+    """
+    if cloud_coverage is not None:
+        return kasten_czeplak(cloud_coverage)
+    if condition:
+        return condition_to_solar_fraction(condition)
+    return _DEFAULT_SOLAR_FRACTION
+
+
 def encode_weather_condition(condition: str) -> int:
     """Encode a weather condition string to a numeric code.
 

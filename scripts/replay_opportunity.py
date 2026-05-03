@@ -82,7 +82,7 @@ def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]
         if name in col_to_name:
             environment_states[col_to_name[name]] = val == "1"
 
-    from weatherstat.weather import condition_to_solar_fraction
+    from weatherstat.weather import effective_solar_fraction
 
     forecast_dict: dict[int, float] = {}
     for h in range(1, 13):
@@ -99,12 +99,24 @@ def _load_snapshot_context(timestamp: str) -> tuple[dict[str, bool], list[float]
         else:
             break  # stop at first gap
 
-    # Solar fractions from weather conditions
-    current_condition = snap.get("weather_condition", "unknown")
-    solar_fractions: list[float] = [condition_to_solar_fraction(str(current_condition))]
+    def _cc(key: str) -> float | None:
+        raw = snap.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    # Solar fractions: prefer cloud_coverage when available (April 2026+),
+    # fall back to the categorical weather condition for older snapshots.
+    current_condition = str(snap.get("weather_condition", "unknown"))
+    solar_fractions: list[float] = [effective_solar_fraction(_cc("cloud_coverage"), current_condition)]
+    # Forecast cloud coverage is only stored at horizons {1, 2, 4, 6, 12}; for
+    # other horizons the condition fallback engages.
     for h in range(1, 13):
-        fc = snap.get(f"forecast_condition_{h}h", "unknown")
-        solar_fractions.append(condition_to_solar_fraction(str(fc)))
+        fc = str(snap.get(f"forecast_condition_{h}h", "unknown"))
+        solar_fractions.append(effective_solar_fraction(_cc(f"forecast_cloud_{h}h"), fc))
 
     return environment_states, forecast_temps, solar_fractions
 

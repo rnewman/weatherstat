@@ -315,7 +315,7 @@ class TUIController:
         if outdoor_temp is not None and cfg.mrt_correction:
             try:
                 from weatherstat.weather import (
-                    condition_to_solar_fraction as _csf,
+                    effective_solar_fraction as _esf,
                 )
                 from weatherstat.weather import (
                     solar_sin_elevation as _sse,
@@ -329,7 +329,12 @@ class TUIController:
                 _now_utc = datetime.now(UTC)
                 _solar_elev = _sse(cfg.location.latitude, cfg.location.longitude, _now_utc)
                 _condition = values.get("weather_condition", "")
-                _solar_frac = _csf(_condition) if _condition else 0.5
+                _cc_raw = values.get("cloud_coverage")
+                try:
+                    _cc = float(_cc_raw) if _cc_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    _cc = None
+                _solar_frac = _esf(_cc, _condition or None)
                 with self._lock:
                     solar_gains = dict(self._solar_elevation_gains)
                 sensor_cols = [s.sensor for s in schedules]

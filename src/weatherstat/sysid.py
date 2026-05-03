@@ -534,8 +534,13 @@ def _preprocess(
             df[f"_lag_{eff.name}_{label}"] = lagged_sum / max(count, 1)
 
     # Solar elevation: raw degrees (for tau segment selection) and
-    # sin⁺(elevation) × condition_fraction (for regression feature).
-    from weatherstat.weather import condition_to_solar_fraction, solar_elevation, solar_sin_elevation
+    # sin⁺(elevation) × solar_fraction (for regression feature).
+    from weatherstat.weather import (
+        condition_to_solar_fraction,
+        kasten_czeplak,
+        solar_elevation,
+        solar_sin_elevation,
+    )
 
     lat = _CFG.location.latitude
     lon = _CFG.location.longitude
@@ -544,8 +549,24 @@ def _preprocess(
     # replace hardcoded nighttime hours. Negative = sun below horizon.
     df["_solar_elev_deg"] = df["_ts"].apply(lambda dt: solar_elevation(lat, lon, dt))
 
-    # Regression feature: sin⁺(elevation) × weather condition fraction.
-    solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3) if "weather_condition" in df.columns else pd.Series(0.3, index=df.index)
+    # Solar fraction: prefer continuous cloud_coverage (April 2026+) via the
+    # Kasten-Czeplak transfer function; fall back to the categorical condition
+    # map for older rows. The two scales are roughly comparable (both ~[0, 1]
+    # with sunny ≈ 1.0, overcast ≈ 0.15-0.25), so the regression sees a single
+    # feature and the per-sensor β absorbs any residual unit difference.
+    if "cloud_coverage" in df.columns:
+        cc = pd.to_numeric(df["cloud_coverage"], errors="coerce")
+        continuous = cc.apply(lambda v: kasten_czeplak(v) if pd.notna(v) else None)
+        if "weather_condition" in df.columns:
+            cat = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3)
+            solar_frac = continuous.combine_first(cat)
+        else:
+            solar_frac = continuous.fillna(0.3)
+    elif "weather_condition" in df.columns:
+        solar_frac = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3)
+    else:
+        solar_frac = pd.Series(0.3, index=df.index)
+
     df["_solar_elev"] = df["_ts"].apply(lambda dt: solar_sin_elevation(lat, lon, dt)) * solar_frac
 
     return df
