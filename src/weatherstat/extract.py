@@ -224,6 +224,7 @@ def _weather_to_series(
     temperatures: list[float | None] = []
     humidities: list[float | None] = []
     wind_speeds: list[float | None] = []
+    cloud_coverages: list[float | None] = []
 
     for rec in records:
         ts_str = str(rec.get("last_changed") or rec.get("last_updated", ""))
@@ -251,12 +252,16 @@ def _weather_to_series(
         ws = attrs.get("wind_speed")
         wind_speeds.append(float(ws) if ws is not None else None)
 
+        cc = attrs.get("cloud_coverage")
+        cloud_coverages.append(float(cc) if cc is not None else None)
+
     idx = pd.DatetimeIndex(times)
     return {
         "condition": pd.Series(conditions, index=idx, dtype=str),
         "temperature": pd.Series(temperatures, index=idx, dtype=float),
         "humidity": pd.Series(humidities, index=idx, dtype=float),
         "wind_speed": pd.Series(wind_speeds, index=idx, dtype=float),
+        "cloud_coverage": pd.Series(cloud_coverages, index=idx, dtype=float),
     }
 
 
@@ -430,7 +435,11 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
     weather_records = attr_history.get(WEATHER_ENTITY, [])
     if weather_records:
         weather_dict = _weather_to_series(weather_records)
-        _weather_col_map = {"condition": "weather_condition", "temperature": "met_outdoor_temp"}
+        _weather_col_map = {
+            "condition": "weather_condition",
+            "temperature": "met_outdoor_temp",
+            "cloud_coverage": "cloud_coverage",
+        }
         for suffix, series in weather_dict.items():
             col = _weather_col_map.get(suffix, f"outdoor_{suffix}")
             s = series[~series.index.duplicated(keep="last")]

@@ -517,7 +517,11 @@ class WeatherstatConfig:
             ("outdoor_humidity", "REAL"),
             ("wind_speed", "REAL"),
             ("weather_condition", "TEXT"),
+            ("cloud_coverage", "REAL"),
         ])
+        # Forecast cloud coverage at the same horizons as forecast_condition_*h.
+        for h in (1, 2, 4, 6, 12):
+            defs.append((f"forecast_cloud_{h}h", "REAL"))
         for col in self.humidity_sensors:
             defs.append((col, "REAL"))
         # Environment factors (windows, doors, shades, etc.)
