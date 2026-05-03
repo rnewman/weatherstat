@@ -178,6 +178,15 @@ class DeviceOpportunity:
 
 
 @dataclass(frozen=True)
+class BackupBreach:
+    """A predicted violation of a sensor's backup comfort bound."""
+
+    sensor: str          # e.g. "family_room_temp"
+    direction: str       # "lo" or "hi"
+    message: str         # human-readable, e.g. "family_room projected 77.4°F at 6h, above backup 77.0°F"
+
+
+@dataclass(frozen=True)
 class AdvisoryPlan:
     """Output of the advisory sweep: baseline hold cost + per-device alternatives + hedge.
 
@@ -196,7 +205,7 @@ class AdvisoryPlan:
     baseline_idx: int | None
     baseline_cost: float  # inf when no all-hold scenario exists
     opportunities: tuple[DeviceOpportunity, ...] = ()
-    backup_breaches: tuple[str, ...] = ()
+    backup_breaches: tuple[BackupBreach, ...] = ()
 
 
 _ACTION_VERBS: dict[str, tuple[str, str]] = {

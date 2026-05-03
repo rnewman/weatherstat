@@ -29,7 +29,7 @@ from weatherstat.config import (
 )
 
 if TYPE_CHECKING:
-    from weatherstat.types import AdvisoryPlan, DeviceOpportunity
+    from weatherstat.types import AdvisoryPlan, BackupBreach, DeviceOpportunity
 
 # ── Persistent state ──────────────────────────────────────────────────────
 
@@ -220,7 +220,7 @@ def process_advisory_plan(
             (o for o in advisory_plan.opportunities if o.cost_delta < 0),
             key=lambda o: o.cost_delta,
         )
-        warnings = [{"message": b} for b in advisory_plan.backup_breaches]
+        warnings = [{"sensor": b.sensor, "message": b.message} for b in advisory_plan.backup_breaches]
 
     state.opportunities = [_serialize_opportunity(o) for o in beneficial]
     state.warnings = warnings
@@ -282,3 +282,61 @@ def process_advisory_plan(
     elif had_opportunities and not beneficial:
         # The previously-active rollup no longer applies — clear it.
         dismiss_ha_notification(_ROLLUP_TAG, notification_target)
+
+
+# ── Comfort breach notifications ──────────────────────────────────────────
+
+# Default: re-warn at most once per hour per sensor. Tunable via
+# weatherstat.yaml ``advisory.cooldowns.comfort_breach`` (seconds).
+_COMFORT_BREACH_DEFAULT_COOLDOWN = 3600
+_COMFORT_BREACH_TAG = "weatherstat_advisory_warning"
+
+
+def process_comfort_breaches(
+    breaches: list[BackupBreach],
+    *,
+    live: bool = False,
+    notification_target: str = "persistent_notification",
+) -> list[BackupBreach]:
+    """Dispatch comfort-breach warnings with per-sensor cooldown.
+
+    Cooldown is per (sensor, direction) so a low-side breach doesn't suppress a
+    later high-side breach on the same sensor. State is shared with the rest of
+    the advisory cooldowns dict, keyed under ``comfort_breach_<sensor>_<dir>``.
+
+    The whole batch is sent as a single notification (replacing any prior one
+    via the shared tag) — but we only send when at least one breach has cleared
+    its cooldown, and we only mark the breaches we actually announce.
+    """
+    if not breaches:
+        return []
+
+    state = AdvisoryState.load()
+    cooldown_secs = ADVISORY_COOLDOWNS.get("comfort_breach", _COMFORT_BREACH_DEFAULT_COOLDOWN)
+    now_ts = time.time()
+
+    fresh: list[BackupBreach] = []
+    for b in breaches:
+        key = f"comfort_breach_{b.sensor}_{b.direction}"
+        last = state.cooldowns.get(key)
+        if last is not None and (now_ts - last) < cooldown_secs:
+            continue
+        fresh.append(b)
+
+    if not fresh:
+        print(f"  [advisory] {len(breaches)} comfort breach(es) on cooldown")
+        return []
+
+    print(f"  [advisory] {len(fresh)} comfort breach(es) past cooldown — notifying")
+
+    if not live:
+        return fresh
+
+    body = "\n".join(b.message for b in fresh)
+    sent = send_ha_notification("Comfort warning", body, _COMFORT_BREACH_TAG, notification_target)
+    if sent:
+        for b in fresh:
+            state.cooldowns[f"comfort_breach_{b.sensor}_{b.direction}"] = now_ts
+        state.save()
+        print(f"    → Sent to HA ({notification_target})")
+    return fresh

@@ -282,7 +282,7 @@ def replay_bundle(bundle_dir: Path) -> None:
     from weatherstat.config import PREDICTION_SENSORS, SENSOR_LABELS, TIMEZONE
     from weatherstat.control import (
         apply_comfort_profile,
-        apply_mrt_correction,
+        compute_current_mrt_offsets,
         default_comfort_schedules,
         sweep_scenarios_physics,
     )
@@ -398,15 +398,20 @@ def replay_bundle(bundle_dir: Path) -> None:
         active_profile = cfg.comfort_profiles.get(profile_name)
     schedules = apply_comfort_profile(schedules, active_profile)
 
-    # MRT correction
+    # MRT correction — compute per-sensor offsets (schedules stay uncorrected)
     mrt_weights = {
         c.sensor: (c.mrt_weight if c.mrt_weight != 1.0 else sim_params.mrt_weights.get(c.sensor, 1.0))
         for c in cfg.constraints
     }
-    schedules, mrt_offset = apply_mrt_correction(schedules, outdoor, cfg.mrt_correction, mrt_weights)
+    sensor_cols = [s.sensor for s in schedules]
+    mrt_per_sensor = compute_current_mrt_offsets(
+        sensor_cols, outdoor, cfg.mrt_correction,
+        mrt_weights=mrt_weights,
+    )
+    mrt_offset = max(mrt_per_sensor.values()) if mrt_per_sensor else 0.0
 
     print(f"\nOutdoor: {outdoor:.1f}°F  Weather: {current_condition}  Local hour: {base_hour}")
-    print(f"Profile: {profile_name or 'default'}  MRT offset: {mrt_offset:+.1f}°F")
+    print(f"Profile: {profile_name or 'default'}  MRT offset: {mrt_offset:+.1f}°F (max)")
     active_env = [k for k, v in sorted(environment_states.items()) if v]
     print(f"Environment: {', '.join(active_env) if active_env else 'all default'}")
     if prev_state:

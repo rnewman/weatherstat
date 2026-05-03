@@ -244,13 +244,18 @@ class TestProcessAdvisoryPlan:
 
     @staticmethod
     def _plan(*opps, breaches: tuple[str, ...] = ()):
-        from weatherstat.types import AdvisoryPlan
+        from weatherstat.types import AdvisoryPlan, BackupBreach
 
+        # Tests pass plain strings; wrap as low-side breaches with a synthetic sensor.
+        wrapped = tuple(
+            BackupBreach(sensor=f"sensor_{i}", direction="lo", message=msg)
+            for i, msg in enumerate(breaches)
+        )
         return AdvisoryPlan(
             baseline_idx=0,
             baseline_cost=5.0,
             opportunities=tuple(opps),
-            backup_breaches=breaches,
+            backup_breaches=wrapped,
         )
 
     @staticmethod
@@ -445,6 +450,148 @@ class TestProcessAdvisoryPlan:
         process_advisory_plan(plan, live=False, current_hour=12)
 
         assert "No beneficial opportunities" in capsys.readouterr().out
+
+
+class TestProcessComfortBreaches:
+    """Test the comfort-breach notification dispatcher with per-sensor cooldown."""
+
+    @staticmethod
+    def _breach(sensor: str, direction: str = "lo", message: str = "msg"):
+        from weatherstat.types import BackupBreach
+
+        return BackupBreach(sensor=sensor, direction=direction, message=message)
+
+    def test_first_breach_sends_notification(self, tmp_path, monkeypatch) -> None:
+        from weatherstat.advisory import process_comfort_breaches
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        fresh = process_comfort_breaches(
+            [self._breach("family_room_temp", "hi", "fr projected 78")],
+            live=True,
+        )
+
+        assert len(fresh) == 1
+        assert len(sent) == 1
+        data = json.loads(state_file.read_text())
+        assert "comfort_breach_family_room_temp_hi" in data["cooldowns"]
+
+    def test_repeat_breach_suppressed_within_cooldown(self, tmp_path, monkeypatch) -> None:
+        import time as _time
+
+        from weatherstat.advisory import process_comfort_breaches
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "cooldowns": {"comfort_breach_family_room_temp_hi": _time.time()},
+            "opportunities": [],
+            "warnings": [],
+        }))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        fresh = process_comfort_breaches(
+            [self._breach("family_room_temp", "hi", "fr projected 78")],
+            live=True,
+        )
+
+        assert fresh == []
+        assert sent == []
+
+    def test_different_sensor_not_suppressed(self, tmp_path, monkeypatch) -> None:
+        """One sensor on cooldown shouldn't gate another sensor's first breach."""
+        import time as _time
+
+        from weatherstat.advisory import process_comfort_breaches
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "cooldowns": {"comfort_breach_family_room_temp_hi": _time.time()},
+            "opportunities": [],
+            "warnings": [],
+        }))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        fresh = process_comfort_breaches(
+            [
+                self._breach("family_room_temp", "hi", "fr projected 78"),
+                self._breach("piano_temp", "hi", "piano projected 79"),
+            ],
+            live=True,
+        )
+
+        assert len(fresh) == 1
+        assert fresh[0].sensor == "piano_temp"
+        assert len(sent) == 1
+
+    def test_different_direction_not_suppressed(self, tmp_path, monkeypatch) -> None:
+        """A high-side cooldown shouldn't suppress a low-side breach on the same sensor."""
+        import time as _time
+
+        from weatherstat.advisory import process_comfort_breaches
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "cooldowns": {"comfort_breach_family_room_temp_hi": _time.time()},
+            "opportunities": [],
+            "warnings": [],
+        }))
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        fresh = process_comfort_breaches(
+            [self._breach("family_room_temp", "lo", "fr projected 65")],
+            live=True,
+        )
+
+        assert len(fresh) == 1
+        assert fresh[0].direction == "lo"
+        assert len(sent) == 1
+
+    def test_dry_run_no_send_no_state_write(self, tmp_path, monkeypatch) -> None:
+        from weatherstat.advisory import process_comfort_breaches
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append((a, kw)) or True,
+        )
+
+        fresh = process_comfort_breaches(
+            [self._breach("family_room_temp", "hi", "fr projected 78")],
+            live=False,
+        )
+
+        assert len(fresh) == 1
+        assert sent == []
+        assert not state_file.exists()
+
+    def test_empty_breaches_noop(self, tmp_path, monkeypatch) -> None:
+        from weatherstat.advisory import process_comfort_breaches
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        assert process_comfort_breaches([], live=True) == []
 
 
 class TestEnvironmentEntryConfig:

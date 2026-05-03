@@ -24,9 +24,11 @@ from weatherstat.control import (
     _in_hold_window,
     _in_quiet_hours,
     _regulating_sweep_options,
-    apply_mrt_correction,
     compute_comfort_cost,
+    compute_current_mrt_offsets,
     compute_energy_cost,
+    compute_horizon_mrt_offsets,
+    compute_mrt_offset,
     extract_advisory_plan,
     generate_trajectory_scenarios,
     write_command_json,
@@ -34,6 +36,7 @@ from weatherstat.control import (
 from weatherstat.types import (
     AdvisoryDecision,
     AdvisoryPlan,
+    BackupBreach,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
@@ -257,21 +260,22 @@ class TestThreeTierComfort:
         assert c.backup_lo == 65.0  # 67 + (-2)
         assert c.backup_hi == 78.0  # 77 + 1
 
-    def test_mrt_correction_shifts_all_tiers(self) -> None:
-        """MRT correction shifts all three tiers equally."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
+    def test_mrt_offset_applies_uniformly_to_all_tiers(self) -> None:
+        """MRT offset is a single value — it applies equally to all tiers.
+
+        After the refactor, MRT correction produces an offset that is
+        subtracted from predicted temps (feels-like), not added to bounds.
+        The offset is tier-agnostic: preferred, acceptable, and backup
+        all use the same feels-like temperature.
+        """
         cfg = MrtCorrectionConfig(alpha=0.1, reference_temp=50.0, max_offset=3.0)
-        adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, cfg)
+        offset = compute_mrt_offset(35.0, cfg)
         # Offset = 0.1 × (50 - 35) = 1.5
-        c = adjusted[0].entries[0].comfort
-        assert abs(c.preferred_lo - 73.5) < 0.01
-        assert abs(c.acceptable_lo - 71.5) < 0.01
-        assert abs(c.backup_lo - 68.5) < 0.01
-        assert abs(c.backup_hi - 78.5) < 0.01
+        assert abs(offset - 1.5) < 0.01
+        # feels_like = air_temp - offset → all tier comparisons shift equally
+        air_temp = 73.5
+        feels_like = air_temp - offset
+        assert abs(feels_like - 72.0) < 0.01
 
 
 # ── Cautious setpoint tests ──────────────────────────────────────────────
@@ -314,7 +318,12 @@ class TestCautiousSetpoint:
 
 
 class TestMrtCorrection:
-    """Test mean radiant temperature correction for comfort targets."""
+    """Test MRT offset computation.
+
+    MRT offsets are subtracted from predicted air temps to get "feels-like":
+      feels_like = air_temp - offset
+    Positive offset = cold outside = feels colder than measured.
+    """
 
     @staticmethod
     def _cfg(alpha: float = 0.1, reference_temp: float = 50.0, max_offset: float = 3.0):
@@ -322,228 +331,151 @@ class TestMrtCorrection:
 
         return MrtCorrectionConfig(alpha=alpha, reference_temp=reference_temp, max_offset=max_offset)
 
-    def test_cold_day_raises_targets(self) -> None:
+    def test_cold_day_positive_offset(self) -> None:
         """35°F outside, ref=50, alpha=0.1 → +1.5°F offset."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
+        offset = compute_mrt_offset(35.0, self._cfg())
         assert abs(offset - 1.5) < 0.01
-        entry = adjusted[0].entries[0]
-        assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
-        assert abs(entry.comfort.acceptable_lo - 71.5) < 0.01
-        assert abs(entry.comfort.acceptable_hi - 75.5) < 0.01
 
-    def test_warm_day_lowers_targets(self) -> None:
-        """80°F outside, ref=50, alpha=0.1 → clamped to -3.0°F."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adjusted, offset, _ = apply_mrt_correction(schedules, 80.0, self._cfg())
-        assert abs(offset - (-3.0)) < 0.01  # clamped
-        entry = adjusted[0].entries[0]
-        assert abs(entry.comfort.preferred_lo - 69.0) < 0.01
+    def test_warm_day_negative_offset_clamped(self) -> None:
+        """80°F outside, ref=50, alpha=0.1 → raw -3.0, clamped to -3.0°F."""
+        offset = compute_mrt_offset(80.0, self._cfg())
+        assert abs(offset - (-3.0)) < 0.01
 
-    def test_at_reference_no_change(self) -> None:
-        """Outdoor = reference → no correction."""
-        schedules = make_schedules()
-        adjusted, offset, _ = apply_mrt_correction(schedules, 50.0, self._cfg())
+    def test_at_reference_zero(self) -> None:
+        """Outdoor = reference → zero offset."""
+        offset = compute_mrt_offset(50.0, self._cfg())
         assert offset == 0.0
-        assert adjusted == schedules
 
     def test_clamped_at_max(self) -> None:
-        """0°F outside → raw offset 5.0, clamped to 3.0."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adjusted, offset, _ = apply_mrt_correction(schedules, 0.0, self._cfg())
+        """0°F outside → raw 5.0, clamped to 3.0."""
+        offset = compute_mrt_offset(0.0, self._cfg())
         assert abs(offset - 3.0) < 0.01
-        entry = adjusted[0].entries[0]
-        assert abs(entry.comfort.preferred_lo - 75.0) < 0.01
 
-    def test_none_config_no_change(self) -> None:
-        """mrt_config=None → schedules returned unchanged."""
-        schedules = make_schedules()
-        adjusted, offset, _ = apply_mrt_correction(schedules, 35.0, None)
-        assert offset == 0.0
-        assert adjusted is schedules
-
-    def test_penalties_preserved(self) -> None:
-        """MRT correction shifts temps but preserves penalty weights."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0, 3.0, 0.5)),),
-        )]
-        adjusted, _, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
-        entry = adjusted[0].entries[0]
-        assert entry.comfort.cold_penalty == 3.0
-        assert entry.comfort.hot_penalty == 0.5
+    def test_none_config_returns_empty(self) -> None:
+        """mrt_config=None → empty offsets dict."""
+        result = compute_current_mrt_offsets(["bedroom_temp"], 35.0, None)
+        assert result == {}
 
     def test_mrt_weight_scales_offset(self) -> None:
         """Per-sensor weight=0.5 produces half the offset."""
-        schedules = [ComfortSchedule(
-            sensor="piano_temp",
-            label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        # Base offset: 0.1 * (50 - 35) = 1.5°F; weighted: 1.5 * 0.5 = 0.75°F
-        adjusted, base_offset, per_sensor = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.5},
+        # Base: 0.1 * (50 - 35) = 1.5; weighted: 0.75
+        offset = compute_mrt_offset(35.0, self._cfg(), mrt_weight=0.5)
+        assert abs(offset - 0.75) < 0.01
+
+    def test_mrt_weight_zero_no_offset(self) -> None:
+        """weight=0 → zero offset."""
+        offset = compute_mrt_offset(35.0, self._cfg(), mrt_weight=0.0)
+        assert abs(offset) < 0.01
+
+    def test_current_mrt_offsets_per_sensor(self) -> None:
+        """compute_current_mrt_offsets returns per-sensor offsets."""
+        result = compute_current_mrt_offsets(
+            ["piano_temp", "bathroom_temp"], 35.0, self._cfg(),
+            mrt_weights={"piano_temp": 0.5, "bathroom_temp": 1.5},
         )
-        assert abs(base_offset - 1.5) < 0.01
-        entry = adjusted[0].entries[0]
-        assert abs(entry.comfort.preferred_lo - 72.75) < 0.01
-        assert abs(entry.comfort.acceptable_lo - 70.75) < 0.01
-        assert abs(per_sensor["piano_temp"] - 0.75) < 0.01
+        # Base: 1.5; piano: 0.75, bathroom: 2.25
+        assert abs(result["piano_temp"] - 0.75) < 0.01
+        assert abs(result["bathroom_temp"] - 2.25) < 0.01
 
-    def test_mrt_weight_zero_no_adjustment(self) -> None:
-        """Per-sensor weight=0.0 suppresses MRT correction for that sensor."""
-        schedules = [ComfortSchedule(
-            sensor="piano_temp",
-            label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adjusted, base_offset, per_sensor = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.0},
+    def test_default_weight_is_one(self) -> None:
+        """No weight dict → default weight=1.0."""
+        result = compute_current_mrt_offsets(
+            ["bedroom_temp"], 35.0, self._cfg(),
         )
-        assert abs(base_offset - 1.5) < 0.01
-        assert abs(per_sensor["piano_temp"]) < 0.01  # weight=0 → zero offset
-        entry = adjusted[0].entries[0]
-        assert abs(entry.comfort.preferred_lo - 72.0) < 0.01  # unchanged
+        assert abs(result["bedroom_temp"] - 1.5) < 0.01
 
-    def test_mrt_different_weights_per_sensor(self) -> None:
-        """Two sensors with different weights get different offsets."""
-        schedules = [
-            ComfortSchedule(
-                sensor="piano_temp",
-                label="piano",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-            ),
-            ComfortSchedule(
-                sensor="bathroom_temp",
-                label="bathroom",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bathroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-            ),
-        ]
-        # Base offset: 1.5°F; piano×0.5=0.75, bathroom×1.5=2.25
-        adjusted, _, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"piano_temp": 0.5, "bathroom_temp": 1.5},
+    def test_horizon_offsets_use_forecast_temps(self) -> None:
+        """Per-horizon offsets use forecast outdoor temp, not current."""
+        cfg = self._cfg()
+        # Current: 35°F. Forecast: [45, 55, 65, 75, ...] at h+1, h+2, ...
+        # At 1h (h+1, forecast_idx=0): outdoor=45 → offset = 0.1*(50-45) = 0.5
+        # At 2h (h+2, forecast_idx=1): outdoor=55 → offset = 0.1*(50-55) = -0.5
+        result = compute_horizon_mrt_offsets(
+            ["bedroom_temp"], cfg, 35.0,
+            forecast_temps=[45.0, 55.0, 65.0, 75.0, 75.0, 75.0],
+            solar_elevations=[0.0] * 72,
+            solar_fractions=[0.0] * 7,
         )
-        piano_pref = adjusted[0].entries[0].comfort.preferred_lo
-        bath_pref = adjusted[1].entries[0].comfort.preferred_lo
-        assert abs(piano_pref - 72.75) < 0.01
-        assert abs(bath_pref - 74.25) < 0.01
+        assert abs(result["bedroom_temp"][12] - 0.5) < 0.01   # 1h: 45°F
+        assert abs(result["bedroom_temp"][24] - (-0.5)) < 0.01  # 2h: 55°F
 
-    def test_mrt_weight_default_backward_compat(self) -> None:
-        """No weights dict (None) produces same behavior as uniform weight=1.0."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adj_none, off_none, _ = apply_mrt_correction(schedules, 35.0, self._cfg())
-        adj_ones, off_ones, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(), mrt_weights={"bedroom": 1.0},
+    def test_horizon_offsets_differ_from_current(self) -> None:
+        """Horizon offsets can differ significantly from current-moment offset."""
+        cfg = self._cfg()
+        current = compute_mrt_offset(35.0, cfg)  # 1.5
+        horizon = compute_horizon_mrt_offsets(
+            ["s"], cfg, 35.0,
+            forecast_temps=[50.0, 60.0, 70.0, 80.0, 80.0, 80.0],
+            solar_elevations=[0.0] * 72,
+            solar_fractions=[0.0] * 7,
         )
-        assert off_none == off_ones
-        assert adj_none[0].entries[0].comfort.preferred_lo == adj_ones[0].entries[0].comfort.preferred_lo
+        # At 1h: outdoor=50 → offset=0. Very different from current 1.5
+        assert abs(current - 1.5) < 0.01
+        assert abs(horizon["s"][12]) < 0.01
 
 
-# ── Derived MRT weight tests ─────────────────────────────────────────────
+# ── Sun-aware MRT tests ─────────────────────────────────────────────────
 
 
 class TestSunAwareMrt:
-    """Test dynamic sun-aware MRT correction."""
+    """Test solar-aware MRT offset computation."""
 
     def _cfg(self) -> MrtCorrectionConfig:
         return MrtCorrectionConfig(alpha=0.1, reference_temp=50.0, max_offset=3.0, solar_response=2.0)
 
-    def test_sunny_day_reduces_cold_correction(self) -> None:
-        """High solar gain sensor gets less MRT correction on sunny cold day."""
-        schedules = [ComfortSchedule(
-            sensor="piano_temp",
-            label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        # Cloudy: no solar → full cold correction
-        adj_cloudy, _, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(),
-            solar_elevation_gains={"piano_temp": 3.0},
-            current_solar_elev=0.7, current_solar_fraction=0.0,
+    def test_sunny_day_reduces_offset(self) -> None:
+        """High solar gain reduces MRT offset on sunny cold day."""
+        cloudy = compute_mrt_offset(
+            35.0, self._cfg(), solar_gain=3.0, solar_elev=0.7, solar_frac=0.0,
         )
-        # Sunny: solar warms walls → reduced correction
-        adj_sunny, _, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(),
-            solar_elevation_gains={"piano_temp": 3.0},
-            current_solar_elev=0.7, current_solar_fraction=1.0,
+        sunny = compute_mrt_offset(
+            35.0, self._cfg(), solar_gain=3.0, solar_elev=0.7, solar_frac=1.0,
         )
-        cloudy_pref = adj_cloudy[0].entries[0].comfort.preferred_lo
-        sunny_pref = adj_sunny[0].entries[0].comfort.preferred_lo
-        # Sunny day needs less heating → lower preferred target
-        assert sunny_pref < cloudy_pref
+        # Sunny: solar warms walls → smaller offset (less cold correction)
+        assert sunny < cloudy
 
     def test_no_solar_gains_same_as_base(self) -> None:
-        """Without solar elevation gains, sun state doesn't matter."""
-        schedules = [ComfortSchedule(
-            sensor="bedroom_temp",
-            label="bedroom",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adj_no_gains, offset, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(),
-            solar_elevation_gains=None,
-            current_solar_elev=0.7, current_solar_fraction=1.0,
+        """Without solar gain, sun state doesn't affect offset."""
+        offset = compute_mrt_offset(
+            35.0, self._cfg(), solar_gain=0.0, solar_elev=0.7, solar_frac=1.0,
         )
-        entry = adj_no_gains[0].entries[0]
-        # Should be base offset: 0.1 * (50 - 35) = 1.5°F
-        assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
+        assert abs(offset - 1.5) < 0.01
 
     def test_night_no_solar_effect(self) -> None:
-        """At night (elev=0), solar gains don't change MRT correction."""
-        schedules = [ComfortSchedule(
-            sensor="piano_temp",
-            label="piano",
-            entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-        )]
-        adj_night, _, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(),
-            solar_elevation_gains={"piano_temp": 5.0},
-            current_solar_elev=0.0, current_solar_fraction=1.0,
+        """At night (elev=0), solar gain doesn't affect offset."""
+        offset = compute_mrt_offset(
+            35.0, self._cfg(), solar_gain=5.0, solar_elev=0.0, solar_frac=1.0,
         )
-        entry = adj_night[0].entries[0]
-        # sin⁺=0 → no solar wall warming → full base offset
-        assert abs(entry.comfort.preferred_lo - 73.5) < 0.01
+        assert abs(offset - 1.5) < 0.01
 
     def test_per_sensor_solar_differentiation(self) -> None:
-        """Sensors with different solar gains get different MRT offsets."""
-        schedules = [
-            ComfortSchedule(
-                sensor="piano_temp",
-                label="piano",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("piano", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-            ),
-            ComfortSchedule(
-                sensor="bedroom_temp",
-                label="bedroom",
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 72.0, 72.0, 70.0, 74.0, 67.0, 77.0)),),
-            ),
-        ]
-        adjusted, _, _ = apply_mrt_correction(
-            schedules, 35.0, self._cfg(),
+        """Sensors with different solar gains get different offsets."""
+        result = compute_current_mrt_offsets(
+            ["piano_temp", "bedroom_temp"], 35.0, self._cfg(),
             solar_elevation_gains={"piano_temp": 5.0, "bedroom_temp": 0.5},
-            current_solar_elev=0.7, current_solar_fraction=1.0,
+            solar_elev=0.7, solar_frac=1.0,
         )
-        piano_pref = adjusted[0].entries[0].comfort.preferred_lo
-        bedroom_pref = adjusted[1].entries[0].comfort.preferred_lo
-        # Piano has more solar → more wall warming → less cold correction → lower target
-        assert piano_pref < bedroom_pref
+        # Piano has more solar → more wall warming → smaller offset
+        assert result["piano_temp"] < result["bedroom_temp"]
+
+    def test_horizon_solar_elevation_changes(self) -> None:
+        """Per-horizon offsets capture sunset (solar elevation drops to 0)."""
+        cfg = self._cfg()
+        # Constant outdoor temp, but solar elevation fades from 0.7 to 0
+        solar_elevations = [0.7] * 12 + [0.3] * 12 + [0.0] * 48
+        result = compute_horizon_mrt_offsets(
+            ["piano_temp"], cfg, 35.0,
+            forecast_temps=[35.0] * 6,
+            solar_elevations=solar_elevations,
+            solar_fractions=[1.0] * 7,
+            solar_elevation_gains={"piano_temp": 3.0},
+        )
+        # At 1h (step 12): solar high → reduced offset
+        # At 6h (step 72): solar zero → full offset (1.5)
+        offset_1h = result["piano_temp"][12]
+        offset_6h = result["piano_temp"][72]
+        assert offset_1h < offset_6h  # more solar relief at 1h
+        assert abs(offset_6h - 1.5) < 0.01  # full offset at night
 
 
 # ── Quiet hours tests ─────────────────────────────────────────────────────
@@ -1396,8 +1328,11 @@ class TestExtractAdvisoryPlan:
         )
         assert plan.baseline_idx == 0
         assert len(plan.backup_breaches) > 0
-        assert "63.0" in plan.backup_breaches[0]
-        assert "65" in plan.backup_breaches[0]
+        breach = plan.backup_breaches[0]
+        assert breach.sensor == "room_temp"
+        assert breach.direction == "lo"
+        assert "63.0" in breach.message
+        assert "65" in breach.message
 
     def test_multiple_devices_independent_marginals(self) -> None:
         """Each device gets its own best-change/best-hold pair independently."""
@@ -1514,13 +1449,18 @@ class TestWriteCommandJsonAdvisory:
             baseline_idx=0,
             baseline_cost=5.0,
             opportunities=(),
-            backup_breaches=("room_temp projected 63.0 at 6h, below backup minimum 65",),
+            backup_breaches=(BackupBreach(
+                sensor="room_temp",
+                direction="lo",
+                message="room_temp projected 63.0 at 6h, below backup minimum 65",
+            ),),
         )
         with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
             path = write_command_json(decision, advisory_plan=plan)
         data = _json.loads(path.read_text())
         assert "advisoryWarnings" in data
         assert len(data["advisoryWarnings"]) == 1
+        assert data["advisoryWarnings"][0]["sensor"] == "room_temp"
         assert "63.0" in data["advisoryWarnings"][0]["message"]
 
     def test_proactive_opportunity_with_duration(self, tmp_path: object) -> None:

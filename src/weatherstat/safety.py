@@ -126,16 +126,21 @@ def check_device_health() -> list[SafetyAlert]:
     return alerts
 
 
-def _check_when_condition(check: HealthCheck) -> bool:
-    """Return True if the check's ``when`` condition is satisfied (or absent).
+def _check_when_condition(check: HealthCheck) -> tuple[bool, datetime | None]:
+    """Return ``(satisfied, when_started_at)`` for the check's ``when`` condition.
 
     Fetches the conditioning entity from HA.  The condition passes when:
     1. The entity's current state matches ``when_state``, AND
     2. It has been in that state for at least ``when_for_minutes`` (compared
        against the ``last_changed`` timestamp in the HA state response).
+
+    When satisfied, ``when_started_at`` is the HA ``last_changed`` timestamp
+    — the moment the precondition became true.  Callers use it to clip the
+    sustained window so samples from before the precondition don't count.
+    Returns ``(True, None)`` if no condition is configured.
     """
     if check.when_entity is None:
-        return True  # no condition — always evaluate
+        return True, None  # no condition — always evaluate
 
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
@@ -147,25 +152,31 @@ def _check_when_condition(check: HealthCheck) -> bool:
         timeout=5,
     )
     if resp.status_code != 200:
-        return False  # can't verify condition — skip the check
+        return False, None  # can't verify condition — skip the check
 
     when_data = resp.json()
     if when_data.get("state", "") != check.when_state:
-        return False
+        return False, None
+
+    last_changed = when_data.get("last_changed", "")
+    if not last_changed:
+        # No timestamp means we can't clip the sustained window or verify
+        # for_minutes — treat as not-yet-satisfied.
+        return False, None
+    try:
+        changed_at = datetime.fromisoformat(last_changed)
+    except (ValueError, TypeError):
+        return False, None
 
     if check.when_for_minutes > 0:
-        last_changed = when_data.get("last_changed", "")
-        if not last_changed:
-            return False
-        changed_at = datetime.fromisoformat(last_changed)
         elapsed_min = (datetime.now(UTC) - changed_at).total_seconds() / 60
         if elapsed_min < check.when_for_minutes:
-            return False
+            return False, None
 
-    return True
+    return True, changed_at
 
 
-def _check_sustained(check: HealthCheck) -> bool:
+def _check_sustained(check: HealthCheck, *, not_before: datetime | None = None) -> bool:
     """Return True if enough 1-minute samples in the sustain window violate the threshold.
 
     Fetches HA history for the entity over the last ``sustain_minutes``,
@@ -173,6 +184,14 @@ def _check_sustained(check: HealthCheck) -> bool:
     and counts how many samples violate.  This handles both high-frequency
     oscillations (many state changes, few violations) and sustained flat
     violations (one state change held for many minutes).
+
+    ``not_before``: clip the sample window so samples from before this time
+    are not evaluated.  Used to align the sustained check with a precondition
+    (e.g. the boiler entering Space Heating mode) — samples from before the
+    precondition became true shouldn't count as violations.  If the clipped
+    window would contain fewer samples than ``sustain_samples`` can ever
+    reach, the check returns False (alert deferred until enough time has
+    elapsed to potentially satisfy the threshold).
     """
     min_required = check.sustain_samples
     if min_required <= 0:
@@ -180,6 +199,15 @@ def _check_sustained(check: HealthCheck) -> bool:
 
     now = datetime.now(UTC)
     window_start = now - timedelta(minutes=check.sustain_minutes)
+    if not_before is not None and not_before > window_start:
+        window_start = not_before
+
+    window_minutes = (now - window_start).total_seconds() / 60
+    n_samples = int(window_minutes)
+    if n_samples < min_required:
+        # Precondition hasn't been true long enough to accumulate a
+        # threshold-sized violation — defer.
+        return False
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
         "Content-Type": "application/json",
@@ -222,7 +250,6 @@ def _check_sustained(check: HealthCheck) -> bool:
 
     # Resample at 1-minute intervals, forward-filling the last known value.
     violating = 0
-    n_samples = int(check.sustain_minutes)
     for i in range(n_samples):
         sample_time = window_start + timedelta(minutes=i + 0.5)  # sample at :30s marks
         # Find last transition at or before sample_time.
@@ -243,7 +270,8 @@ def _check_sustained(check: HealthCheck) -> bool:
 def _check_health_threshold(check: HealthCheck) -> SafetyAlert | None:
     """Fetch an entity from HA and compare against configured thresholds."""
     # Evaluate optional precondition first.
-    if not _check_when_condition(check):
+    when_ok, when_started = _check_when_condition(check)
+    if not when_ok:
         return None
 
     headers = {
@@ -294,8 +322,10 @@ def _check_health_threshold(check: HealthCheck) -> SafetyAlert | None:
     if not violated:
         return None
 
-    # Sustained threshold: require all readings over the window to violate.
-    if check.sustain_minutes > 0 and not _check_sustained(check):
+    # Sustained threshold: require enough readings in the window to violate.
+    # Clip the window to when the precondition became true so samples from
+    # before (e.g. Zone Pump / Idle mode) don't count.
+    if check.sustain_minutes > 0 and not _check_sustained(check, not_before=when_started):
         return None
 
     return SafetyAlert(

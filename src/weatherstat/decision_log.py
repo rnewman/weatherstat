@@ -88,6 +88,7 @@ def log_decision(
     active_profile: str | None = None,
     mrt_base_offset: float = 0.0,
     mrt_weights: dict[str, float] | None = None,
+    mrt_per_sensor: dict[str, float] | None = None,
     ineligible: dict[str, str] | None = None,
     blocked_effectors: dict[str, str] | None = None,
     db_path: Path | None = None,
@@ -163,11 +164,18 @@ def log_decision(
 
     # MRT offsets: base offset + per-sensor applied offsets
     mrt_offsets_data: dict[str, float] = {"_base": round(mrt_base_offset, 3)}
-    if mrt_weights and abs(mrt_base_offset) >= 0.05:
+    if mrt_per_sensor:
+        for sensor_col, offset in mrt_per_sensor.items():
+            if abs(offset) >= 0.01:
+                label = SENSOR_LABELS.get(sensor_col, sensor_col)
+                mrt_offsets_data[label] = round(offset, 3)
+    elif mrt_weights and abs(mrt_base_offset) >= 0.05:
+        # Backward compat: compute from base × weight if per-sensor not provided
         for sensor_col, weight in mrt_weights.items():
             label = SENSOR_LABELS.get(sensor_col, sensor_col)
             mrt_offsets_data[label] = round(mrt_base_offset * weight, 3)
-    mrt_offsets_json = json.dumps(mrt_offsets_data) if abs(mrt_base_offset) >= 0.05 else None
+    has_offsets = any(abs(v) >= 0.05 for v in mrt_offsets_data.values())
+    mrt_offsets_json = json.dumps(mrt_offsets_data) if has_offsets else None
 
     # Blocked: merge ineligible effectors + physically blocked effectors
     blocked_data: dict[str, str] = {}

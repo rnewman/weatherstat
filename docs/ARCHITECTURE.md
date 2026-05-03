@@ -218,10 +218,12 @@ Two-layer comfort cost model with dead-band preferred:
 
 ```
 score = sum over (sensors, horizons) of:
-    dead_band_cost(T_predicted, preferred_lo, preferred_hi)  # zero inside band
-  + hard_rail_penalty(T_predicted, min, max)                  # steep outside bounds
+    dead_band_cost(T_feels_like, preferred_lo, preferred_hi)  # zero inside band
+  + hard_rail_penalty(T_feels_like, min, max)                  # steep outside bounds
   + energy_cost(actions, duration)
 ```
+
+**MRT (feels-like) correction:** Before scoring, predicted air temperatures are converted to operative (feels-like) temperatures: `T_feels_like = T_predicted - mrt_offset`. The MRT offset varies per sensor and per prediction horizon, using that horizon's forecast outdoor temp, solar elevation, and solar fraction. Comfort bounds stay at user-configured values. See `docs/mrt-correction.md`.
 
 **Comfort profiles** (Home/Away) apply global offsets to all schedules: `preferred_offset` shifts the band, `preferred_widen` expands it (±half into a dead band), `min_offset`/`max_offset` shift hard rails, and `penalty_scale` multiplies penalties. A typical Away profile widens the preferred band so the optimizer maintains safety limits without spending energy on optimization within the band.
 
@@ -339,8 +341,8 @@ Records every control decision with full context.
 - Selected action (setpoints, blowers, mini-splits) and trajectory info.
 - Comfort cost, energy cost, total cost.
 - Active comfort profile name (Home/Away/etc.).
-- Resolved comfort bounds per sensor (min, max, preferred_lo, preferred_hi, cold/hot penalties) — the actual targets after profile offsets, MRT correction, and environment adjustments.
-- MRT correction offsets (base offset + per-sensor applied offsets).
+- Resolved comfort bounds per sensor (min, max, preferred_lo, preferred_hi, cold/hot penalties) — user-configured values after profile offsets and environment adjustments (not MRT-corrected; MRT is applied to predictions).
+- MRT correction offsets (per-sensor applied offsets at current conditions).
 - Blocked effectors (ineligible + physically blocked, with reasons).
 
 **Outcome backfill:** At the start of each control cycle, the system checks whether enough time has elapsed to compare predictions to actual temperatures. For each horizon (1h, 2h, 4h, 6h), it finds the closest collector snapshot and records prediction error. Retroactive comfort cost uses the full two-layer model (preferred band + hard rails) with the enriched bounds logged at decision time.
@@ -362,7 +364,7 @@ Answers "is the system working as designed?" at a glance. Run via `just comfort`
 - **Outdoor + effector panel:** Outdoor temperature with heating state overlays.
 - **Prediction accuracy** (optional, `--predictions`): Error histogram by horizon with MAE and bias.
 
-**Historical comfort bands:** When decision log data is available, comfort bands are derived from the logged comfort_bounds per decision (reflecting the actual profile, MRT correction, and environment adjustments active at the time) rather than the current config. This means the plot accurately shows what the system was targeting, even if profiles or config changed during the period.
+**Historical comfort bands:** When decision log data is available, comfort bands are derived from the logged comfort_bounds per decision (reflecting the actual profile and environment adjustments active at the time) rather than the current config. Since MRT correction is applied to predictions (not bounds), the logged bounds are user-configured values — stable and intuitive for plotting.
 
 **Capacity analysis:** Violations are classified as "capacity exceeded" (all dedicated effectors at max — building physics problem) vs "control opportunity" (dedicated effectors had headroom). Dedicated effectors are identified per sensor: zone thermostat (from coupling matrix) plus any name-matched mini split or blower. Cross-talk gains from effectors that primarily serve other sensors are excluded — the optimizer already balances those trade-offs.
 

@@ -281,7 +281,7 @@ class TUIController:
         )
         from weatherstat.control import (
             apply_comfort_profile,
-            apply_mrt_correction,
+            compute_current_mrt_offsets,
             default_comfort_schedules,
             fetch_active_comfort_profile,
         )
@@ -310,7 +310,7 @@ class TUIController:
                     outdoor_temp = float(values[col])
                     break
 
-        # Sun-aware MRT correction
+        # Sun-aware MRT correction (per-sensor offsets for display)
         mrt_per_sensor: dict[str, float] = {}
         if outdoor_temp is not None and cfg.mrt_correction:
             try:
@@ -332,14 +332,13 @@ class TUIController:
                 _solar_frac = _csf(_condition) if _condition else 0.5
                 with self._lock:
                     solar_gains = dict(self._solar_elevation_gains)
-                schedules, _mrt_offset, mrt_per_sensor = apply_mrt_correction(
-                    schedules,
-                    outdoor_temp,
-                    cfg.mrt_correction,
-                    mrt_weights or None,
+                sensor_cols = [s.sensor for s in schedules]
+                mrt_per_sensor = compute_current_mrt_offsets(
+                    sensor_cols, outdoor_temp, cfg.mrt_correction,
                     solar_elevation_gains=solar_gains or None,
-                    current_solar_elev=_solar_elev,
-                    current_solar_fraction=_solar_frac,
+                    solar_elev=_solar_elev,
+                    solar_frac=_solar_frac,
+                    mrt_weights=mrt_weights or None,
                 )
             except Exception as e:
                 self._log(f"[mrt] [red]MRT correction failed: {e}[/]")

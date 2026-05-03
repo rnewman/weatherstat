@@ -155,10 +155,12 @@ class TestCheckDeviceHealth:
         assert len(alerts) == 0
 
     def test_alert_when_outlet_low_and_heating(self) -> None:
-        """Outlet temp below threshold while heating for 5 min → critical alert."""
+        """Outlet temp below threshold while heating long enough → critical alert."""
         states = {
             "binary_sensor.combi_connection_status": "on",
-            "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(5)},
+            # Heating for 30 min — well past the 15-min sustain window so
+            # clip-to-when leaves the full window intact.
+            "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(30)},
             "sensor.combi_outlet_temp": "100.0",
         }
         # Sustained check: low since start of window (single transition held 15 min).
@@ -168,6 +170,26 @@ class TestCheckDeviceHealth:
         assert len(alerts) == 1
         assert alerts[0].key == "combi_outlet_fault"
         assert alerts[0].severity == "critical"
+
+    def test_no_alert_when_heating_started_after_low_period(self) -> None:
+        """Outlet was low for 15 min but heating only started 5 min ago → no alert.
+
+        Regression test for the "heating just started after Zone Pump mode"
+        false positive: the precondition gate was satisfied (heating for 5 min
+        > 3-min grace) but the sustained window looked 15 min back, counting
+        non-heating samples as violations.  With clip-to-when, only the 5 min
+        since heating started are sampled — fewer than sustain_samples=12, so
+        the check defers.
+        """
+        states = {
+            "binary_sensor.combi_connection_status": "on",
+            "sensor.combi_heating_mode": {"state": "Space Heating", "last_changed": self._heating_since(5)},
+            "sensor.combi_outlet_temp": "100.0",
+        }
+        history = {"sensor.combi_outlet_temp": [(15, "100")]}
+        with patch("weatherstat.safety.requests.get", side_effect=self._mock_by_entity(states, history_readings=history)):
+            alerts = check_device_health()
+        assert alerts == []
 
     def test_no_alert_when_not_heating(self) -> None:
         """Outlet temp low but boiler is idle → when condition fails, no alert."""
@@ -343,6 +365,27 @@ class TestCheckSustained:
         resp.json.return_value = [[]]
         with patch("weatherstat.safety.requests.get", return_value=resp):
             assert _check_sustained(check) is False
+
+    def test_not_before_clips_window(self) -> None:
+        """not_before shrinks the evaluation window.
+
+        History shows a full 15 minutes of violating data, but not_before
+        clips to the last 5 minutes — only 5 samples possible, can't reach
+        sustain_samples=12.  Check defers.
+        """
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        entries = [(15, "100")]  # 100°F held for the full 15 min
+        not_before = datetime.now(UTC) - timedelta(minutes=5)
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check, not_before=not_before) is False
+
+    def test_not_before_in_past_has_no_effect(self) -> None:
+        """not_before older than sustain window is ignored — full window evaluated."""
+        check = self._make_check(min_value=110, sustain_samples=12, sustain_minutes=15)
+        entries = [(15, "100")]
+        not_before = datetime.now(UTC) - timedelta(hours=1)  # older than window_start
+        with patch("weatherstat.safety.requests.get", return_value=self._mock_history_resp(entries)):
+            assert _check_sustained(check, not_before=not_before) is True
 
 
 # ── process_safety_alerts ────────────────────────────────────────────────

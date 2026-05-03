@@ -44,6 +44,7 @@ from weatherstat.extract import fetch_recent_history
 from weatherstat.types import (
     AdvisoryDecision,
     AdvisoryPlan,
+    BackupBreach,
     ComfortSchedule,
     ComfortScheduleEntry,
     ControlDecision,
@@ -214,95 +215,152 @@ def apply_comfort_profile(
     return adjusted
 
 
-def apply_mrt_correction(
-    schedules: list[ComfortSchedule],
+def compute_mrt_offset(
     outdoor_temp: float,
-    mrt_config: MrtCorrectionConfig | None,
-    mrt_weights: dict[str, float] | None = None,
-    solar_elevation_gains: dict[str, float] | None = None,
-    current_solar_elev: float = 0.0,
-    current_solar_fraction: float = 0.0,
-) -> tuple[list[ComfortSchedule], float, dict[str, float]]:
-    """Adjust comfort targets for mean radiant temperature effects.
+    mrt_config: MrtCorrectionConfig,
+    *,
+    solar_gain: float = 0.0,
+    solar_elev: float = 0.0,
+    solar_frac: float = 0.0,
+    mrt_weight: float = 1.0,
+) -> float:
+    """Compute MRT offset for a single sensor at a single point in time.
 
-    Cold exterior surfaces (walls, windows) lower operative temperature below
-    the air temperature reading. This shifts comfort targets up when it's cold
-    outside to compensate, and down when warm walls make the air feel warmer.
+    MRT correction bridges the gap between air temperature (what sensors read)
+    and operative temperature (what humans feel).  Cold exterior surfaces lower
+    perceived temp; warm/sunny surfaces raise it.
 
-    Sun streaming through windows heats interior surfaces, raising MRT above
-    what outdoor temp alone suggests. Per sensor, the effective outdoor temp
-    is increased by the current solar forcing × solar_response, reducing the
-    cold-wall correction on sunny days while preserving it on cloudy days.
+    The offset is **subtracted** from air temperature to get "feels-like":
 
-    Per-sensor mrt_weights (from YAML) still apply as a multiplier on the
-    final offset for manual adjustments (e.g., rooms with unusual window area).
+        feels_like = air_temp - offset
+
+    Positive offset → cold outside → air feels colder than measured.
+    Negative offset → warm outside → air feels warmer than measured.
+
+    For comfort scoring, this means ``(pred - offset) > bound`` is equivalent
+    to the old approach of ``pred > (bound + offset)``.
+
+    Per-sensor solar wall warming raises the effective outdoor temp, reducing
+    the cold-wall correction on sunny days.  ``mrt_weight`` is a per-sensor
+    YAML multiplier for rooms with unusual window area.
 
     Args:
-        schedules: Comfort schedules for all constrained sensors.
-        outdoor_temp: Current outdoor temperature (in configured unit).
-        mrt_config: Correction parameters, or None to skip.
-        mrt_weights: Per-sensor column → weight multiplier (default 1.0).
-        solar_elevation_gains: Per-sensor β_solar from sysid.
-        current_solar_elev: sin⁺(elevation) right now (0 at night, ~0.7 at noon).
-        current_solar_fraction: Weather condition fraction (1.0=sunny, 0.15=cloudy).
+        outdoor_temp: Outdoor temperature at this moment (configured unit).
+        mrt_config: Correction parameters (alpha, reference_temp, max_offset, solar_response).
+        solar_gain: β_solar for this sensor from sysid (0.0 if unknown).
+        solar_elev: sin⁺(solar elevation) at this moment (0 at night, ~0.7 noon).
+        solar_frac: Weather condition fraction (1.0 sunny, 0.15 overcast).
+        mrt_weight: Per-sensor weight multiplier from YAML (default 1.0).
 
     Returns:
-        (adjusted_schedules, base_offset, per_sensor_offsets). Base offset is
-        from raw outdoor temp (before per-sensor solar adjustment).
-        per_sensor_offsets maps sensor column → applied offset (after solar + weight).
+        MRT offset in configured temperature unit.
+    """
+    solar_wall_warming = solar_gain * solar_elev * solar_frac * mrt_config.solar_response
+    effective_outdoor = outdoor_temp + solar_wall_warming
+    raw_offset = mrt_config.alpha * (mrt_config.reference_temp - effective_outdoor)
+    clamped = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_offset))
+    return clamped * mrt_weight
+
+
+def compute_current_mrt_offsets(
+    sensors: list[str],
+    outdoor_temp: float,
+    mrt_config: MrtCorrectionConfig | None,
+    *,
+    solar_elevation_gains: dict[str, float] | None = None,
+    solar_elev: float = 0.0,
+    solar_frac: float = 0.0,
+    mrt_weights: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Compute per-sensor MRT offsets at the current moment.
+
+    Convenience wrapper over ``compute_mrt_offset`` for all constrained sensors.
+    Used for current-moment needs: regulating effector target adjustment,
+    cold-room override, and display.
+
+    Returns:
+        {sensor_col: offset} for each sensor.  Empty dict if mrt_config is None.
     """
     if mrt_config is None:
-        return schedules, 0.0, {}
-
-    # Base offset from outdoor temp only (reported for logging)
-    raw_offset = mrt_config.alpha * (mrt_config.reference_temp - outdoor_temp)
-    base_offset = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_offset))
-
-    # Fast path: no correction needed when at reference temp and no solar forcing
-    if abs(base_offset) < 0.05 and current_solar_elev * current_solar_fraction < 0.001:
-        return schedules, 0.0, {}
-
-    adjusted: list[ComfortSchedule] = []
-    per_sensor_offsets: dict[str, float] = {}
-    for schedule in schedules:
-        # Per-sensor solar wall warming raises effective outdoor temp
-        solar_gain = (solar_elevation_gains or {}).get(schedule.sensor, 0.0)
-        solar_wall_warming = solar_gain * current_solar_elev * current_solar_fraction * mrt_config.solar_response
-        effective_outdoor = outdoor_temp + solar_wall_warming
-
-        raw_sensor_offset = mrt_config.alpha * (mrt_config.reference_temp - effective_outdoor)
-        sensor_offset = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_sensor_offset))
-
-        # Manual weight from YAML (for non-solar adjustments like window area)
-        weight = (mrt_weights or {}).get(schedule.sensor, 1.0)
-        sensor_offset *= weight
-
-        per_sensor_offsets[schedule.sensor] = sensor_offset
-
-        if abs(sensor_offset) < 0.05:
-            adjusted.append(schedule)
-            continue
-
-        new_entries = tuple(
-            ComfortScheduleEntry(
-                e.start_hour,
-                e.end_hour,
-                RoomComfort(
-                    e.comfort.label,
-                    e.comfort.preferred_lo + sensor_offset,
-                    e.comfort.preferred_hi + sensor_offset,
-                    e.comfort.acceptable_lo + sensor_offset,
-                    e.comfort.acceptable_hi + sensor_offset,
-                    e.comfort.backup_lo + sensor_offset,
-                    e.comfort.backup_hi + sensor_offset,
-                    e.comfort.cold_penalty,
-                    e.comfort.hot_penalty,
-                ),
-            )
-            for e in schedule.entries
+        return {}
+    result: dict[str, float] = {}
+    for sensor in sensors:
+        result[sensor] = compute_mrt_offset(
+            outdoor_temp, mrt_config,
+            solar_gain=(solar_elevation_gains or {}).get(sensor, 0.0),
+            solar_elev=solar_elev,
+            solar_frac=solar_frac,
+            mrt_weight=(mrt_weights or {}).get(sensor, 1.0),
         )
-        adjusted.append(ComfortSchedule(sensor=schedule.sensor, label=schedule.label, entries=new_entries))
-    return adjusted, base_offset, per_sensor_offsets
+    return result
+
+
+def compute_horizon_mrt_offsets(
+    sensors: list[str],
+    mrt_config: MrtCorrectionConfig | None,
+    outdoor_temp: float,
+    forecast_temps: list[float],
+    solar_elevations: list[float],
+    solar_fractions: list[float],
+    *,
+    solar_elevation_gains: dict[str, float] | None = None,
+    mrt_weights: dict[str, float] | None = None,
+) -> dict[str, dict[int, float]]:
+    """Compute per-sensor, per-horizon MRT offsets using forecast data.
+
+    Each prediction horizon uses that horizon's forecast outdoor temp, solar
+    elevation, and solar fraction — capturing transitions like afternoon sun
+    fading at sunset, or overnight cooling.
+
+    Args:
+        sensors: List of sensor column names to compute offsets for.
+        mrt_config: Correction parameters, or None to skip.
+        outdoor_temp: Current outdoor temperature (for horizon 0 / fallback).
+        forecast_temps: Hourly forecast outdoor temps [h+1, h+2, ..., h+N].
+        solar_elevations: sin⁺(elevation) at each 5-min step [step1, step2, ...].
+        solar_fractions: Per-hour solar fractions [now, h+1, h+2, ...].
+        solar_elevation_gains: Per-sensor β_solar from sysid.
+        mrt_weights: Per-sensor YAML weight multiplier.
+
+    Returns:
+        {sensor_col: {horizon_step: offset}}.  Horizon steps are in 5-min
+        intervals (12=1h, 24=2h, 48=4h, 72=6h).  Empty dict if mrt_config
+        is None.
+    """
+    if mrt_config is None:
+        return {}
+
+    horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
+    result: dict[str, dict[int, float]] = {}
+
+    for sensor in sensors:
+        s_gain = (solar_elevation_gains or {}).get(sensor, 0.0)
+        weight = (mrt_weights or {}).get(sensor, 1.0)
+        offsets: dict[int, float] = {}
+        for h_step, h_hours in horizon_hours.items():
+            # Outdoor temp at this horizon: forecast_temps is 0-indexed [h+1, h+2, ...]
+            forecast_idx = h_hours - 1
+            if forecast_idx < len(forecast_temps):
+                out_t = forecast_temps[forecast_idx]
+            else:
+                out_t = forecast_temps[-1] if forecast_temps else outdoor_temp
+
+            # Solar elevation at this horizon step (5-min indexed)
+            elev_idx = min(h_step - 1, len(solar_elevations) - 1) if solar_elevations else -1
+            s_elev = solar_elevations[max(0, elev_idx)] if elev_idx >= 0 else 0.0
+
+            # Solar fraction at this horizon's hour
+            sf_idx = min(h_hours, len(solar_fractions) - 1) if solar_fractions else -1
+            s_frac = solar_fractions[max(0, sf_idx)] if sf_idx >= 0 else 0.0
+
+            offsets[h_step] = compute_mrt_offset(
+                out_t, mrt_config,
+                solar_gain=s_gain, solar_elev=s_elev, solar_frac=s_frac,
+                mrt_weight=weight,
+            )
+        result[sensor] = offsets
+
+    return result
 
 
 def _in_quiet_hours(hour: int, quiet: tuple[int, int]) -> bool:
@@ -325,6 +383,7 @@ def compute_comfort_cost(
     predictions: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
+    mrt_offsets: dict[str, dict[int, float]] | None = None,
 ) -> float:
     """Compute total comfort cost across all rooms and horizons.
 
@@ -333,13 +392,16 @@ def compute_comfort_cost(
        weighted asymmetrically by cold_penalty (below) and hot_penalty (above).
     2. Acceptable rails: steep additional penalty (configurable, default 3×) outside acceptable bounds.
 
-    This gives the optimizer a gradient everywhere — it always prefers
-    temperatures closer to preferred, not just "anywhere in the band".
+    Predicted air temperatures are converted to feels-like (operative)
+    temperatures by subtracting the per-sensor, per-horizon MRT offset
+    before comparing to comfort bounds.
 
     Args:
         predictions: Model predictions keyed like "upstairs_temp_t+12".
-        schedules: Comfort schedules for all rooms.
+        schedules: Comfort schedules (uncorrected user-configured values).
         base_hour: Current hour of day (0-23).
+        mrt_offsets: Per-sensor, per-horizon MRT offsets from
+            ``compute_horizon_mrt_offsets``.
 
     Returns:
         Total weighted comfort cost.
@@ -361,6 +423,12 @@ def compute_comfort_cost(
             if pred_temp is None:
                 continue
 
+            # MRT feels-like: subtract offset so cold walls → lower perceived temp
+            if mrt_offsets:
+                sensor_offsets = mrt_offsets.get(schedule.sensor)
+                if sensor_offsets:
+                    pred_temp = pred_temp - sensor_offsets.get(h, 0.0)
+
             # Continuous cost: quadratic deviation from preferred band.
             # Zero cost within [preferred_lo, preferred_hi] (dead band).
             if pred_temp < comfort.preferred_lo:
@@ -381,6 +449,7 @@ def compute_comfort_cost_by_sensor(
     predictions: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
+    mrt_offsets: dict[str, dict[int, float]] | None = None,
 ) -> dict[str, float]:
     """Compute comfort cost per sensor for decision rationale.
 
@@ -404,6 +473,12 @@ def compute_comfort_cost_by_sensor(
             pred_temp = predictions.get(f"{schedule.sensor}_t+{h}")
             if pred_temp is None:
                 continue
+
+            # MRT feels-like correction
+            if mrt_offsets:
+                sensor_off = mrt_offsets.get(schedule.sensor)
+                if sensor_off:
+                    pred_temp = pred_temp - sensor_off.get(h, 0.0)
 
             if pred_temp < comfort.preferred_lo:
                 sensor_cost += (comfort.preferred_lo - pred_temp) ** 2 * comfort.cold_penalty * weight
@@ -474,6 +549,15 @@ class _ComfortSpec:
 
     Each array has shape (n_active,) where n_active is the number of
     (schedule × horizon) pairs with valid comfort bounds and prediction columns.
+
+    ``mrt_offsets`` holds the per-entry MRT feels-like offset.  In
+    ``_batch_comfort_cost``, predicted air temperatures are adjusted by
+    subtracting this offset before comparing to comfort bounds:
+
+        feels_like = air_temp - mrt_offset
+
+    Positive offset (cold outside) → feels_like < air_temp → colder perceived.
+    Comfort bounds stay at user-configured values.
     """
 
     col_indices: np.ndarray  # indices into pred_matrix columns
@@ -484,16 +568,27 @@ class _ComfortSpec:
     cold_pen: np.ndarray
     hot_pen: np.ndarray
     weights: np.ndarray
+    mrt_offsets: np.ndarray  # per-entry MRT offset (subtracted from temps)
 
     @staticmethod
     def build(
         schedules: list[ComfortSchedule],
         base_hour: int,
         target_name_index: dict[str, int],
+        mrt_offsets: dict[str, dict[int, float]] | None = None,
     ) -> _ComfortSpec:
-        """Build comfort spec from schedules and prediction column index."""
+        """Build comfort spec from schedules and prediction column index.
+
+        Args:
+            schedules: Comfort schedules (uncorrected — user-configured values).
+            base_hour: Current hour of day (0–23).
+            target_name_index: Maps prediction column names to indices.
+            mrt_offsets: Per-sensor, per-horizon MRT offsets from
+                ``compute_horizon_mrt_offsets``.  Applied as feels-like
+                correction in ``_batch_comfort_cost``.
+        """
         horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
-        specs: list[tuple[int, float, float, float, float, float, float, float]] = []
+        specs: list[tuple[int, float, float, float, float, float, float, float, float]] = []
         for schedule in schedules:
             for h in CONTROL_HORIZONS:
                 future_hour = (base_hour + horizon_hours[h]) % 24
@@ -502,11 +597,17 @@ class _ComfortSpec:
                 col_idx = target_name_index.get(col_key)
                 if comfort is None or col_idx is None:
                     continue
+                mrt = 0.0
+                if mrt_offsets:
+                    sensor_offsets = mrt_offsets.get(schedule.sensor)
+                    if sensor_offsets:
+                        mrt = sensor_offsets.get(h, 0.0)
                 specs.append((
                     col_idx, comfort.preferred_lo, comfort.preferred_hi,
                     comfort.acceptable_lo, comfort.acceptable_hi,
                     comfort.cold_penalty, comfort.hot_penalty,
                     HORIZON_WEIGHTS.get(h, 0.5),
+                    mrt,
                 ))
         if not specs:
             empty = np.array([], dtype=np.float64)
@@ -516,6 +617,7 @@ class _ComfortSpec:
                 acc_lo=empty, acc_hi=empty,
                 cold_pen=empty, hot_pen=empty,
                 weights=empty,
+                mrt_offsets=empty,
             )
         arr = np.array(specs)
         return _ComfortSpec(
@@ -524,6 +626,7 @@ class _ComfortSpec:
             acc_lo=arr[:, 3], acc_hi=arr[:, 4],
             cold_pen=arr[:, 5], hot_pen=arr[:, 6],
             weights=arr[:, 7],
+            mrt_offsets=arr[:, 8],
         )
 
 
@@ -531,10 +634,18 @@ def _batch_comfort_cost(
     pred_matrix: np.ndarray,
     spec: _ComfortSpec,
 ) -> np.ndarray:
-    """Vectorized comfort cost for all scenarios. Returns (n_scenarios,) array."""
+    """Vectorized comfort cost for all scenarios. Returns (n_scenarios,) array.
+
+    Predicted air temperatures are converted to "feels-like" (operative)
+    temperatures by subtracting the per-entry MRT offset before comparing
+    to comfort bounds.  Comfort bounds are user-configured values, not
+    MRT-adjusted.
+    """
     if len(spec.col_indices) == 0:
         return np.zeros(pred_matrix.shape[0])
     temps = pred_matrix[:, spec.col_indices]  # (N, n_active)
+    # MRT feels-like correction: subtract offset so cold walls → lower perceived temp
+    temps = temps - spec.mrt_offsets  # broadcasts (n_active,) over (N, n_active)
     # Continuous: quadratic deviation from preferred band
     dev_lo = np.maximum(0.0, spec.pref_lo - temps)
     dev_hi = np.maximum(0.0, temps - spec.pref_hi)
@@ -703,19 +814,38 @@ def _regulating_sweep_options(
     gains: dict[tuple[str, str], tuple[float, float]] | None = None,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
+    current_mrt_offsets: dict[str, float] | None = None,
 ) -> list[EffectorDecision]:
     """Generate sweep options for a regulating effector from all affected sensors.
 
     Instead of deriving mode/target from one sensor, we:
     1. Find all constrained sensors this effector has meaningful sysid gain on.
     2. Collect their preferred temps (pref_lo for heat targets, pref_hi for cool).
-    3. Generate off + heat@each_pref_lo + cool@each_pref_hi.
-    4. Idle suppression prunes options where the effector would be inactive
+    3. **Adjust targets for MRT**: the user's comfort preference is an operative
+       (perceived) temperature, but the effector target is an air temperature.
+       When cold walls lower perceived temp, the effector must target a higher
+       air temp to achieve the desired perceived comfort:
+       ``target_air = preferred_operative + mrt_offset``.
+       Uses current-moment MRT offset (not per-horizon) because the target is
+       set immediately and held for the sweep duration.
+    4. Generate off + heat@each_pref_lo + cool@each_pref_hi.
+    5. Idle suppression prunes options where the effector would be inactive
        (room already past target by more than the proportional band).
-    5. Mode hold window locks to previous mode during quiet hours.
+    6. Mode hold window locks to previous mode during quiet hours.
 
     The trajectory sweep scores every surviving option across ALL sensors,
     so the optimizer picks whichever mode/target minimizes total comfort cost.
+
+    Args:
+        eff: EffectorConfig for the regulating effector.
+        schedules: Comfort schedules (uncorrected user-configured values).
+        base_hour: Current hour of day (0-23).
+        gains: Sysid gains keyed by (effector, sensor).
+        prev_state: Previous control state for mode hold.
+        current_temps: Current sensor temperatures.
+        current_mrt_offsets: Per-sensor MRT offsets at current moment from
+            ``compute_current_mrt_offsets``.  Positive when cold (need higher
+            air temp for same perceived comfort).
     """
     from weatherstat.config import EffectorConfig
 
@@ -732,15 +862,18 @@ def _regulating_sweep_options(
                 affected_sensors.append(sensor_name)
 
     # ── Collect preferred temps from all affected sensors ──
-    heat_targets: list[float] = []  # pref_lo values
-    cool_targets: list[float] = []  # pref_hi values
+    # Targets are air temperatures that produce the desired operative (perceived)
+    # comfort.  MRT offset bridges the gap: target_air = preferred + mrt_offset.
+    heat_targets: list[float] = []  # pref_lo + mrt_offset values
+    cool_targets: list[float] = []  # pref_hi + mrt_offset values
     for sensor_col in affected_sensors:
+        mrt_adj = (current_mrt_offsets or {}).get(sensor_col, 0.0)
         for sched in schedules:
             if sched.sensor == sensor_col:
                 comfort = sched.comfort_at(base_hour)
                 if comfort is not None:
-                    heat_targets.append(comfort.preferred_lo)
-                    cool_targets.append(comfort.preferred_hi)
+                    heat_targets.append(comfort.preferred_lo + mrt_adj)
+                    cool_targets.append(comfort.preferred_hi + mrt_adj)
                 break
 
     if not heat_targets and not cool_targets:
@@ -985,6 +1118,7 @@ def _enumerate_options(
     current_temps: dict[str, float] | None,
     ineligible_effectors: set[str] | None,
     gains: dict[tuple[str, str], tuple[float, float]] | None,
+    current_mrt_offsets: dict[str, float] | None = None,
 ) -> tuple[dict[str, list[EffectorDecision]], list]:
     """Enumerate per-effector sweep options (shared by scenario generation and option groups).
 
@@ -1025,6 +1159,7 @@ def _enumerate_options(
             if schedules is not None:
                 per_effector_options[eff.name] = _regulating_sweep_options(
                     eff, schedules, base_hour, gains, prev_state, current_temps,
+                    current_mrt_offsets=current_mrt_offsets,
                 )
             else:
                 per_effector_options[eff.name] = [
@@ -1373,13 +1508,15 @@ def _check_backup_breaches(
     predictions: dict[str, float],
     schedules: list[ComfortSchedule],
     base_hour: int,
-) -> list[str]:
+    mrt_offsets: dict[str, dict[int, float]] | None = None,
+) -> list[BackupBreach]:
     """Check if any sensor predictions breach backup bounds.
 
-    Returns list of "label (Xtemp < Ybackup)" strings for breached sensors.
+    Predicted air temps are converted to feels-like by subtracting the
+    per-horizon MRT offset before comparing to (uncorrected) backup bounds.
     """
     horizon_hours = {12: 1, 24: 2, 48: 4, 72: 6}
-    breaches: list[str] = []
+    breaches: list[BackupBreach] = []
 
     for schedule in schedules:
         for h in CONTROL_HORIZONS:
@@ -1391,16 +1528,31 @@ def _check_backup_breaches(
             pred = predictions.get(f"{schedule.sensor}_t+{h}")
             if pred is None:
                 continue
-            if pred < comfort.backup_lo:
-                breaches.append(
-                    f"{schedule.label} projected {pred:.1f}{UNIT_SYMBOL} at "
-                    f"{HORIZON_LABELS.get(h, f't+{h}')}, below backup {comfort.backup_lo:.0f}{UNIT_SYMBOL}"
-                )
-            elif pred > comfort.backup_hi:
-                breaches.append(
-                    f"{schedule.label} projected {pred:.1f}{UNIT_SYMBOL} at "
-                    f"{HORIZON_LABELS.get(h, f't+{h}')}, above backup {comfort.backup_hi:.0f}{UNIT_SYMBOL}"
-                )
+            # MRT feels-like correction
+            feels_like = pred
+            if mrt_offsets:
+                sensor_off = mrt_offsets.get(schedule.sensor)
+                if sensor_off:
+                    feels_like = pred - sensor_off.get(h, 0.0)
+            horizon_label = HORIZON_LABELS.get(h, f"t+{h}")
+            if feels_like < comfort.backup_lo:
+                breaches.append(BackupBreach(
+                    sensor=schedule.sensor,
+                    direction="lo",
+                    message=(
+                        f"{schedule.label} projected {feels_like:.1f}{UNIT_SYMBOL} at "
+                        f"{horizon_label}, below backup {comfort.backup_lo:.1f}{UNIT_SYMBOL}"
+                    ),
+                ))
+            elif feels_like > comfort.backup_hi:
+                breaches.append(BackupBreach(
+                    sensor=schedule.sensor,
+                    direction="hi",
+                    message=(
+                        f"{schedule.label} projected {feels_like:.1f}{UNIT_SYMBOL} at "
+                        f"{horizon_label}, above backup {comfort.backup_hi:.1f}{UNIT_SYMBOL}"
+                    ),
+                ))
 
     return breaches
 
@@ -1413,6 +1565,7 @@ def extract_advisory_plan(
     target_name_index: dict[str, int],
     schedules: list[ComfortSchedule],
     base_hour: int,
+    mrt_offsets: dict[str, dict[int, float]] | None = None,
 ) -> AdvisoryPlan:
     """Extract the advisory plan from sweep results.
 
@@ -1468,7 +1621,7 @@ def extract_advisory_plan(
     if baseline_idx is not None:
         baseline_preds = _pred_dict(pred_matrix, baseline_idx, target_name_index)
         backup_breaches = tuple(_check_backup_breaches(
-            baseline_preds, schedules, base_hour,
+            baseline_preds, schedules, base_hour, mrt_offsets=mrt_offsets,
         ))
 
     opportunities: list[DeviceOpportunity] = []
@@ -1521,6 +1674,8 @@ def sweep_scenarios_physics(
     *,
     solar_fractions: list[float],
     solar_elevations: list[float],
+    current_mrt_offsets: dict[str, float] | None = None,
+    horizon_mrt_offsets: dict[str, dict[int, float]] | None = None,
 ) -> tuple[ControlDecision, Scenario, dict[str, str], AdvisoryPlan | None]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -1556,6 +1711,7 @@ def sweep_scenarios_physics(
     # ── Option enumeration ──
     per_effector_options, dependent_effectors = _enumerate_options(
         schedules, base_hour, prev_state, current_temps, _ineligible, gains=sim_params.gains,
+        current_mrt_offsets=current_mrt_offsets,
     )
 
     # ── Physical constraints: block trajectory effectors at/above comfort max ──
@@ -1614,7 +1770,9 @@ def sweep_scenarios_physics(
     ) -> tuple[np.ndarray, int, float]:
         """Score scenarios (vectorized). Returns (costs, best_idx, best_cost)."""
         tidx = {t: j for j, t in enumerate(tnames)}
-        comfort = _batch_comfort_cost(pred, _ComfortSpec.build(schedules, base_hour, tidx))
+        comfort = _batch_comfort_cost(pred, _ComfortSpec.build(
+            schedules, base_hour, tidx, mrt_offsets=horizon_mrt_offsets,
+        ))
         energy = _batch_energy_cost(scens, current_temps)
         total = comfort + energy
         best_idx = int(np.argmin(total))
@@ -1627,7 +1785,9 @@ def sweep_scenarios_physics(
     marginals = _compute_marginals(sweep_state, groups, sim_params, CONTROL_HORIZONS)
 
     # Build comfort spec with target name index from marginals
-    comfort_spec_indexed = _ComfortSpec.build(schedules, base_hour, marginals.target_name_index)
+    comfort_spec_indexed = _ComfortSpec.build(
+        schedules, base_hour, marginals.target_name_index, mrt_offsets=horizon_mrt_offsets,
+    )
 
     # Score all combinations approximately
     approx_costs, combo_indices, n_combos = _score_combinations(
@@ -1661,12 +1821,15 @@ def sweep_scenarios_physics(
             comfort_entry = schedule.comfort_at(base_hour)
             if comfort_entry is None:
                 continue
-            if temp < comfort_entry.acceptable_lo - COLD_ROOM_OVERRIDE:
+            # MRT feels-like: cold walls make the room feel colder than measured
+            mrt_adj = (current_mrt_offsets or {}).get(schedule.sensor, 0.0)
+            feels_like = temp - mrt_adj
+            if feels_like < comfort_entry.acceptable_lo - COLD_ROOM_OVERRIDE:
                 eff_name = emergency.get(schedule.sensor)
                 if eff_name:
                     cold_effectors.add(eff_name)
                     cold_info.append(
-                        f"{schedule.label} ({temp:.1f}{UNIT_SYMBOL}"
+                        f"{schedule.label} ({feels_like:.1f}{UNIT_SYMBOL}"
                         f" < {comfort_entry.acceptable_lo:.0f}{UNIT_SYMBOL})"
                     )
 
@@ -1752,6 +1915,7 @@ def sweep_scenarios_physics(
             target_name_index=target_idx,
             schedules=schedules,
             base_hour=base_hour,
+            mrt_offsets=horizon_mrt_offsets,
         )
 
         # Backup breach override: when holding current state breaches comfort
@@ -1768,7 +1932,7 @@ def sweep_scenarios_physics(
                 ed.mode != "off" for ed in scenarios[best_idx].effectors.values()
             )
             if baseline_has_heating and not best_has_heating:
-                print(f"  [advisory] Backup breach override: {advisory_plan.backup_breaches[0]}")
+                print(f"  [advisory] Backup breach override: {advisory_plan.backup_breaches[0].message}")
                 best_idx = advisory_plan.baseline_idx
 
     # ── Cold-sensor safety override (exact) ──
@@ -1794,7 +1958,7 @@ def sweep_scenarios_physics(
     scenario = scenarios[best_idx]
     predictions = _pred_dict(pred_matrix, best_idx, target_idx)
     # Recompute comfort/energy split for the winner (cheap: single scenario)
-    comfort = compute_comfort_cost(predictions, schedules, base_hour)
+    comfort = compute_comfort_cost(predictions, schedules, base_hour, mrt_offsets=horizon_mrt_offsets)
     energy = compute_energy_cost(scenario, current_temps)
     total = comfort + energy
 
@@ -2101,7 +2265,8 @@ def write_command_json(
 
         if advisory_plan.backup_breaches:
             command["advisoryWarnings"] = [
-                {"message": breach} for breach in advisory_plan.backup_breaches
+                {"sensor": breach.sensor, "message": breach.message}
+                for breach in advisory_plan.backup_breaches
             ]
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2271,12 +2436,18 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     _mrt_cond = str(latest.get("weather_condition", "unknown")) if hasattr(latest, "get") else "unknown"
     _mrt_solar_frac = _csf(_mrt_cond)
     _mrt_solar_elev = _sse(_CFG.location.latitude, _CFG.location.longitude, datetime.now(UTC))
-    schedules, mrt_offset, _mrt_per_sensor = apply_mrt_correction(
-        schedules, _mrt_outdoor, _CFG.mrt_correction, _mrt_weights or None,
+    _sensor_cols = [s.sensor for s in schedules]
+    _mrt_per_sensor = compute_current_mrt_offsets(
+        _sensor_cols, _mrt_outdoor, _CFG.mrt_correction,
         solar_elevation_gains=sim_params.solar_elevation_gains,
-        current_solar_elev=_mrt_solar_elev,
-        current_solar_fraction=_mrt_solar_frac,
+        solar_elev=_mrt_solar_elev,
+        solar_frac=_mrt_solar_frac,
+        mrt_weights=_mrt_weights or None,
     )
+    # Base offset (no solar, for logging)
+    mrt_offset = compute_mrt_offset(
+        _mrt_outdoor, _CFG.mrt_correction,
+    ) if _CFG.mrt_correction else 0.0
     if abs(mrt_offset) >= 0.05:
         _solar_note = f", solar sin⁺={_mrt_solar_elev:.2f}×{_mrt_solar_frac:.0%}" if _mrt_solar_elev > 0 else ""
         print(f"  MRT:         {mrt_offset:+.1f}{UNIT_SYMBOL} base (outdoor {_mrt_outdoor:.0f}{UNIT_SYMBOL}{_solar_note})")
@@ -2333,6 +2504,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for step in range(1, max_steps + 1)
     ]
 
+    # Per-horizon MRT offsets using forecast data at each horizon
+    _horizon_mrt = compute_horizon_mrt_offsets(
+        _sensor_cols, _CFG.mrt_correction, _mrt_outdoor,
+        forecast_temp_list, solar_elevations, solar_fractions,
+        solar_elevation_gains=sim_params.solar_elevation_gains,
+        mrt_weights=_mrt_weights or None,
+    )
+
     # Load previous state for mode hold enforcement
     prev_state = load_control_state()
 
@@ -2367,6 +2546,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         ineligible_effectors,
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
+        current_mrt_offsets=_mrt_per_sensor,
+        horizon_mrt_offsets=_horizon_mrt,
     )
     elapsed_ms = (time.monotonic() - t0) * 1000
     print(f"  Sweep completed in {elapsed_ms:.0f}ms")
@@ -2392,7 +2573,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     all_off = Scenario({e.name: EffectorDecision(e.name) for e in EFFECTORS})
     off_targets, off_matrix = _predict(sim_state, [all_off], sim_params, CONTROL_HORIZONS)
     off_preds = {t: float(off_matrix[0, j]) for j, t in enumerate(off_targets)}
-    off_comfort = compute_comfort_cost(off_preds, schedules, base_hour)
+    off_comfort = compute_comfort_cost(off_preds, schedules, base_hour, mrt_offsets=_horizon_mrt)
 
     # Per-device counterfactuals: winning scenario with each active device removed.
     # This gives true per-device attribution (what does THIS device contribute?).
@@ -2414,7 +2595,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for idx, key in enumerate(cf_device_keys):
             preds = {t: float(cf_matrix[idx, j]) for j, t in enumerate(cf_targets)}
             cf_preds[key] = preds
-            cf_comfort_costs[key] = compute_comfort_cost(preds, schedules, base_hour)
+            cf_comfort_costs[key] = compute_comfort_cost(preds, schedules, base_hour, mrt_offsets=_horizon_mrt)
 
     # Decision predictions in flat format for per-sensor breakdown
     dec_flat: dict[str, float] = {}
@@ -2423,8 +2604,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             h_label = HORIZON_LABELS[h]
             if h_label in preds:
                 dec_flat[f"{label}_t+{h}"] = preds[h_label]
-    dec_sensor_costs = compute_comfort_cost_by_sensor(dec_flat, schedules, base_hour)
-    off_sensor_costs = compute_comfort_cost_by_sensor(off_preds, schedules, base_hour)
+    dec_sensor_costs = compute_comfort_cost_by_sensor(dec_flat, schedules, base_hour, mrt_offsets=_horizon_mrt)
+    off_sensor_costs = compute_comfort_cost_by_sensor(off_preds, schedules, base_hour, mrt_offsets=_horizon_mrt)
 
     # ── Print decision with counterfactual rationale ──
     print("\n[control] Decision:")
@@ -2441,7 +2622,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             return ""
 
         # Per-sensor comfort costs for counterfactual
-        cf_sensor = compute_comfort_cost_by_sensor(without, schedules, base_hour)
+        cf_sensor = compute_comfort_cost_by_sensor(without, schedules, base_hour, mrt_offsets=_horizon_mrt)
 
         # Total comfort saving from this device
         total_saving = cf_comfort_costs.get(device_key, decision.comfort_cost) - decision.comfort_cost
@@ -2593,7 +2774,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if advisory_plan.backup_breaches:
             print("\n  [advisory] BACKUP BREACH WARNINGS:")
             for breach in advisory_plan.backup_breaches:
-                print(f"    WARNING: {breach}")
+                print(f"    WARNING: {breach.message}")
 
         beneficial = sorted(
             (o for o in advisory_plan.opportunities if o.cost_delta < 0),
@@ -2675,16 +2856,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         current_hour=base_hour,
     )
 
-    # ── Advisory breach notifications (urgent — sent immediately) ──
-    if advisory_plan and advisory_plan.backup_breaches and live:
-        from weatherstat.advisory import send_ha_notification
+    # ── Advisory breach notifications (per-sensor cooldown) ──
+    if advisory_plan and advisory_plan.backup_breaches:
+        from weatherstat.advisory import process_comfort_breaches
 
-        body = "\n".join(advisory_plan.backup_breaches)
-        send_ha_notification(
-            "Comfort warning",
-            body,
-            "weatherstat_advisory_warning",
-            _CFG.notification_target,
+        process_comfort_breaches(
+            list(advisory_plan.backup_breaches),
+            live=live,
+            notification_target=_CFG.notification_target,
         )
 
     # ── Infrastructure safety checks ──
@@ -2716,6 +2895,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         active_profile=active_profile.name if active_profile else None,
         mrt_base_offset=mrt_offset,
         mrt_weights=_mrt_weights,
+        mrt_per_sensor=_mrt_per_sensor,
         ineligible=ineligible,
         blocked_effectors=blocked_dict,
     )

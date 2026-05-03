@@ -102,13 +102,14 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
     """
     values: dict[str, str] = {}
 
-    def _attr_num(entity_id: str, attr: str, fallback: float = 0) -> str:
+    def _attr_num(entity_id: str, attr: str) -> str | None:
+        """Return numeric attribute as string, or None if entity/attr is missing."""
         entity = states.get(entity_id)
         if entity:
             val = entity.get("attributes", {}).get(attr)
             if isinstance(val, (int, float)):
                 return str(val)
-        return str(fallback)
+        return None
 
     def _attr_str(entity_id: str, attr: str, fallback: str = "") -> str:
         entity = states.get(entity_id)
@@ -118,16 +119,21 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
                 return val
         return fallback
 
-    def _sensor_num(entity_id: str, fallback: float = 0) -> str:
+    def _sensor_num(entity_id: str) -> str | None:
+        """Return numeric state as string, or None if entity is missing/unavailable."""
         entity = states.get(entity_id)
-        if entity:
-            try:
-                val = float(entity.get("state", ""))
-                if val == val:  # not NaN
-                    return str(val)
-            except (ValueError, TypeError):
-                pass
-        return str(fallback)
+        if not entity:
+            return None
+        state_str = entity.get("state", "")
+        if state_str in ("unavailable", "unknown", ""):
+            return None
+        try:
+            val = float(state_str)
+            if val == val:  # not NaN
+                return str(val)
+        except (ValueError, TypeError):
+            pass
+        return None
 
     def _entity_state(entity_id: str, fallback: str = "") -> str:
         entity = states.get(entity_id)
@@ -147,8 +153,12 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
     # 1. Effectors
     for name, cfg in _CFG.effectors.items():
         if cfg.domain == "climate":
-            values[f"{name}_temp"] = _attr_num(cfg.entity_id, "current_temperature")
-            values[f"{name}_target"] = _attr_num(cfg.entity_id, "temperature")
+            cur = _attr_num(cfg.entity_id, "current_temperature")
+            if cur is not None:
+                values[f"{name}_temp"] = cur
+            tgt = _attr_num(cfg.entity_id, "temperature")
+            if tgt is not None:
+                values[f"{name}_target"] = tgt
             if cfg.mode_control == "manual":
                 values[f"{name}_action"] = _attr_str(cfg.entity_id, "hvac_action", "idle")
             else:
@@ -164,7 +174,9 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
 
     # 3. Power sensors (numeric)
     for col, sensor_cfg in _CFG.power_sensors.items():
-        values[col] = _sensor_num(sensor_cfg.entity_id)
+        v = _sensor_num(sensor_cfg.entity_id)
+        if v is not None:
+            values[col] = v
 
     # 4. Weather entity
     weather_id = _CFG.weather_entity
@@ -189,12 +201,16 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
     if outdoor_col:
         for col_name, sensor_cfg in _CFG.temp_sensors.items():
             if col_name == outdoor_col:
-                values[outdoor_col] = _sensor_num(sensor_cfg.entity_id)
+                v = _sensor_num(sensor_cfg.entity_id)
+                if v is not None:
+                    values[outdoor_col] = v
                 break
 
     # 6. Humidity sensors
     for col, sensor_cfg in _CFG.humidity_sensors.items():
-        values[col] = _sensor_num(sensor_cfg.entity_id)
+        v = _sensor_num(sensor_cfg.entity_id)
+        if v is not None:
+            values[col] = v
 
     # 7. Environment factors (windows, doors, shades, etc.)
     # Column semantics: "active fraction" — 1.0 = fully in active (non-default) state.
@@ -220,7 +236,9 @@ def _extract_snapshot(states: dict[str, dict]) -> dict[str, str]:
     # 8. Per-room temperature sensors (non-thermostat, non-outdoor)
     for col, sensor_cfg in _CFG.temp_sensors.items():
         if col != outdoor_col and not col.startswith("thermostat_"):
-            values[col] = _sensor_num(sensor_cfg.entity_id)
+            v = _sensor_num(sensor_cfg.entity_id)
+            if v is not None:
+                values[col] = v
 
     return values
 

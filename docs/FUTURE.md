@@ -139,7 +139,7 @@ effective_outdoor = outdoor + β_solar × sin⁺(elev) × SF × solar_response
    collector (last ~4×τ_wall hours). Compute historical `sin⁺(elev)` for
    each timestamp analytically (no data dependency — just lat/lon/time).
 2. Weight by exponential decay with time constant `τ_wall`.
-3. Pass the scalar `accumulated_solar` to `apply_mrt_correction` in place
+3. Pass the scalar `accumulated_solar` to `compute_mrt_offset` in place
    of (or alongside) the instantaneous `current_solar_elev × SF`.
 4. Add `tau_wall` as a configurable parameter in `MrtCorrectionConfig`
    (default ~4 hours).
