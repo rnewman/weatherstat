@@ -31,7 +31,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from weatherstat.config import SNAPSHOTS_DB  # noqa: E402
 from weatherstat.extract import (  # noqa: E402
     CLIMATE_ENTITIES,
-    ENVIRONMENT_SENSORS,
     FAN_ENTITIES,
     NUMERIC_SENSOR_ENTITIES,
     SENSOR_ENTITIES,
@@ -73,9 +72,6 @@ def _fetch_and_build_df(start: datetime, end: datetime) -> pd.DataFrame:
     print(f"Fetching climate/fan/weather history (with attributes)...")
     attr_ids = list(CLIMATE_ENTITIES.values()) + list(FAN_ENTITIES.values()) + [WEATHER_ENTITY]
     attr_history = fetch_history_with_attributes(attr_ids, start, end)
-
-    print(f"Fetching environment sensor history...")
-    env_history = fetch_history(ENVIRONMENT_SENSORS, start, end)
 
     # Build 5-minute time index
     time_index = pd.date_range(start=start, end=end, freq="5min", tz=UTC)
@@ -129,24 +125,68 @@ def _fetch_and_build_df(start: datetime, end: datetime) -> pd.DataFrame:
     weather_records = attr_history.get(WEATHER_ENTITY, [])
     if weather_records:
         weather_dict = _weather_to_series(weather_records)
-        _weather_col_map = {"condition": "weather_condition", "temperature": "met_outdoor_temp"}
+        _weather_col_map = {
+            "condition": "weather_condition",
+            "temperature": "met_outdoor_temp",
+            "cloud_coverage": "cloud_coverage",
+        }
         for suffix, series in weather_dict.items():
             col = _weather_col_map.get(suffix, f"outdoor_{suffix}")
             s = series[~series.index.duplicated(keep="last")]
             result[col] = s.reindex(time_index, method="ffill")
 
-    # Process environment sensors
+    # Process environment sensors. Mirrors collector._extract_snapshot (collector.py
+    # § "Environment factors"): continuous covers use current_position/100 as openness;
+    # binary entries use state == active_state. Attributes are required for
+    # current_position, so this branch uses fetch_history_with_attributes (the
+    # default fetch_history strips attributes via no_attributes=).
+    env_attr_history = fetch_history_with_attributes(_CFG.environment_sensors, start, end)
     for _name, env_cfg in _CFG.environment.items():
         entity_id = env_cfg.entity_id
         col_name = env_cfg.column
         active_state = env_cfg.active_state
-        records = env_history.get(entity_id, [])
-        if records:
-            s = _history_to_series(records, value_fn=lambda s, _as=active_state: s == _as)
-            s = s[~s.index.duplicated(keep="last")]
-            result[col_name] = s.reindex(time_index, method="ffill").astype(bool)
-        else:
-            result[col_name] = False
+        is_continuous = env_cfg.value_type == "continuous"
+        records = env_attr_history.get(entity_id, [])
+        if not records:
+            # No history: let the load-path ffill carry the prior state across the gap.
+            continue
+
+        times: list[pd.Timestamp] = []
+        values: list[str] = []
+        for rec in records:
+            ts_str = str(rec.get("last_changed") or rec.get("last_updated", ""))
+            state = str(rec.get("state", ""))
+            if state in ("unavailable", "unknown"):
+                continue
+            try:
+                ts = pd.to_datetime(ts_str, utc=True, format="ISO8601")
+            except (ValueError, TypeError):
+                continue
+
+            if is_continuous:
+                attrs = rec.get("attributes", {})
+                if not isinstance(attrs, dict):
+                    attrs = {}
+                raw_pos = attrs.get("current_position")
+                if raw_pos is not None:
+                    try:
+                        openness = float(raw_pos) / 100.0
+                    except (ValueError, TypeError):
+                        openness = 1.0 if state == "open" else 0.0
+                else:
+                    openness = 1.0 if state == "open" else 0.0
+                active_frac = openness if active_state == "open" else 1.0 - openness
+                values.append(str(round(active_frac, 2)))
+            else:
+                values.append("1" if state == active_state else "0")
+            times.append(ts)
+
+        if not times:
+            continue
+
+        s = pd.Series(values, index=pd.DatetimeIndex(times), dtype=object)
+        s = s[~s.index.duplicated(keep="last")]
+        result[col_name] = s.reindex(time_index, method="ffill")
 
     # Finalize
     result = result.reset_index()
