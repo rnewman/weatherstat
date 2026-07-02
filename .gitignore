@@ -16,6 +16,13 @@ node_modules/
 data/
 weatherstat.yaml
 
+# Local experiment outputs (sysid A/B baselines, regenerable via
+# `just experiment-sysid --save-baseline`)
+experiments/
+
+# Editor/backup artifacts
+*.bak
+
 # Logs
 logs/
 !logs/.gitkeep
