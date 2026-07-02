@@ -98,6 +98,7 @@ class StatusSnapshot:
     predictions: dict[str, dict[str, float]]
     opportunities: list[dict]
     warnings: list[dict]
+    ha_error: str | None  # None when HA is reachable; one-line error otherwise
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,7 @@ class TUIController:
         self._overrides: dict[str, str] = {}
         self._next_cycle_at: datetime | None = None
         self._solar_elevation_gains: dict[str, float] = {}
+        self._last_ha_error: str | None = None
 
         # Cached snapshot, refreshed by build_snapshot()
         self._latest_snapshot: StatusSnapshot | None = None
@@ -281,6 +283,7 @@ class TUIController:
         )
         from weatherstat.control import (
             apply_comfort_profile,
+            check_ha_connectivity,
             compute_current_mrt_offsets,
             default_comfort_schedules,
             fetch_active_comfort_profile,
@@ -291,13 +294,25 @@ class TUIController:
         cfg = load_config()
         values = latest_snapshot_values()
 
+        # HA connectivity (skip the comfort fetch when unreachable to avoid stacking timeouts).
+        ha_error = check_ha_connectivity()
+        with self._lock:
+            prev_ha_error = self._last_ha_error
+            self._last_ha_error = ha_error
+        if ha_error and ha_error != prev_ha_error:
+            self._log(f"[ha] [bold red]{ha_error}[/]")
+        elif prev_ha_error and not ha_error:
+            self._log("[ha] [green]HA reachable again[/]")
+
         # Comfort schedules: base → profile offsets → MRT correction
         schedules = default_comfort_schedules()
-        try:
-            active_profile = fetch_active_comfort_profile()
-        except Exception as e:
-            self._log(f"[profile] [red]Failed to fetch active profile: {e}[/]")
-            active_profile = None
+        active_profile = None
+        if ha_error is None:
+            try:
+                active_profile = fetch_active_comfort_profile()
+            except Exception as e:
+                self._log(f"[profile] [red]Failed to fetch active profile: {e}[/]")
+                active_profile = None
         schedules = apply_comfort_profile(schedules, active_profile)
         profile_name = active_profile.name if active_profile else None
 
@@ -492,6 +507,7 @@ class TUIController:
             predictions=predictions,
             opportunities=opportunities,
             warnings=warnings,
+            ha_error=ha_error,
         )
         with self._lock:
             self._latest_snapshot = snap

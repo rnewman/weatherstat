@@ -81,6 +81,7 @@ def _make_snapshot(**overrides) -> StatusSnapshot:
             }
         ],
         "warnings": [{"message": "bedroom predicted below floor in 4h"}],
+        "ha_error": None,
     }
     base.update(overrides)
     return StatusSnapshot(**base)

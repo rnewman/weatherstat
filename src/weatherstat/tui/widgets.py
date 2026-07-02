@@ -23,6 +23,7 @@ class StatusHeader(Static):
         self._cycle_running = False
         self._sysid_running = False
         self._local_tz = ""
+        self._ha_error: str | None = None
 
     def set_state(
         self,
@@ -37,6 +38,8 @@ class StatusHeader(Static):
         cycle_running: bool | None = None,
         sysid_running: bool | None = None,
         local_tz: str | None = None,
+        ha_error: str | None = None,
+        clear_ha_error: bool = False,
     ) -> None:
         if profile is not None:
             self._profile = profile
@@ -58,6 +61,10 @@ class StatusHeader(Static):
             self._sysid_running = sysid_running
         if local_tz is not None:
             self._local_tz = local_tz
+        if clear_ha_error:
+            self._ha_error = None
+        elif ha_error is not None:
+            self._ha_error = ha_error
         self._refresh()
 
     def _refresh(self) -> None:
@@ -67,7 +74,10 @@ class StatusHeader(Static):
         tz = f" {self._local_tz}" if self._local_tz else ""
 
         mode_str = "[bold red]LIVE[/]" if self._live else "[bold green]DRY-RUN[/]"
-        profile_str = self._profile.upper()
+        if self._ha_error:
+            profile_str = "[bold red]HA?[/]"
+        else:
+            profile_str = self._profile.upper()
 
         out_str = f"{self._outdoor_temp:.0f}{UNIT_SYMBOL}" if self._outdoor_temp is not None else "?"
 
@@ -83,7 +93,11 @@ class StatusHeader(Static):
 
         line1 = f"[bold]Weatherstat HVAC Control[/]                              {profile_str} | {mode_str} | {now_str}{tz}"
         line2 = f"Collector: {self._collector_age} ago ({row_k} rows) | Sysid: {sysid_str} | Next cycle: {cycle_str} | Outdoor: {out_str}"
-        self.update(f"{line1}\n{line2}")
+        if self._ha_error:
+            line3 = f"[bold white on red] HA ERROR [/] [bold red]{self._ha_error}[/]"
+            self.update(f"{line1}\n{line2}\n{line3}")
+        else:
+            self.update(f"{line1}\n{line2}")
 
 
 def _comfort_bar(

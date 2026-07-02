@@ -171,6 +171,37 @@ def default_comfort_schedules() -> list[ComfortSchedule]:
     return schedules
 
 
+def check_ha_connectivity() -> str | None:
+    """Check Home Assistant env vars and basic reachability.
+
+    Returns None when HA_URL and HA_TOKEN are set and the API responds 200 to
+    `GET /api/`. Otherwise returns a one-line, human-readable error string.
+    """
+    from weatherstat.config import HA_TOKEN, HA_URL
+
+    if not HA_URL:
+        return "HA_URL not set in environment (.env)"
+    if not HA_TOKEN:
+        return "HA_TOKEN not set in environment (.env)"
+    try:
+        resp = requests.get(
+            f"{HA_URL}/api/",
+            headers={"Authorization": f"Bearer {HA_TOKEN}"},
+            timeout=5,
+        )
+    except requests.exceptions.ConnectionError:
+        return f"HA unreachable at {HA_URL}"
+    except requests.exceptions.Timeout:
+        return f"HA timed out at {HA_URL}"
+    except Exception as e:
+        return f"HA error: {e}"
+    if resp.status_code == 401:
+        return "HA authentication failed (check HA_TOKEN)"
+    if resp.status_code != 200:
+        return f"HA returned HTTP {resp.status_code}"
+    return None
+
+
 def fetch_active_comfort_profile() -> ComfortProfile | None:
     """Fetch the active comfort profile from Home Assistant.
 
@@ -180,8 +211,6 @@ def fetch_active_comfort_profile() -> ComfortProfile | None:
     """
     if _CFG.comfort_entity is None:
         return None
-
-    import requests
 
     from weatherstat.config import HA_TOKEN, HA_URL
 

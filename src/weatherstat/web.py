@@ -361,10 +361,18 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
         opps_html = "<section><h2>Opportunities</h2><p class='dim'>None</p></section>"
 
     # ── Header bar ──
+    ha_banner = (
+        f"<div class='ha-error'><b>HA ERROR</b> {escape(snap.ha_error)}</div>"
+        if snap.ha_error
+        else ""
+    )
+    profile_display = "HA?" if snap.ha_error else profile
+    profile_class = " profile-err" if snap.ha_error else ""
     header = f"""
     <header>
+      {ha_banner}
       <div class="row1">
-        <span class="profile">{escape(profile)}</span>
+        <span class="profile{profile_class}">{escape(profile_display)}</span>
         <span class="mode {mode_class}">{mode_label}</span>
         <span class="outdoor">{outdoor}</span>
         <span class="time">{now_local}</span>
@@ -489,6 +497,7 @@ def _snapshot_to_dict(snap: StatusSnapshot) -> dict:
         "predictions": snap.predictions,
         "opportunities": snap.opportunities,
         "warnings": snap.warnings,
+        "ha_error": snap.ha_error,
     }
 
 
@@ -563,6 +572,17 @@ header .row2 {
   color: var(--dim);
 }
 .profile { padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; }
+.profile-err { background: var(--red); color: #fff; border-color: var(--red); }
+.ha-error {
+  background: var(--red);
+  color: #fff;
+  padding: 8px 10px;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.ha-error b { letter-spacing: 0.04em; margin-right: 6px; }
 .mode { padding: 2px 8px; border-radius: 6px; font-weight: 700; }
 .mode.live { background: var(--red); color: #fff; }
 .mode.dry { background: var(--green); color: #fff; }

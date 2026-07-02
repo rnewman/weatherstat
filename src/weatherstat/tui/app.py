@@ -143,6 +143,7 @@ class WeatherstatApp(App):
 
         # Initial population — synchronous from UI thread
         self._refresh_snapshot_now()
+        self._check_startup_ha()
         self._collect_snapshot()
         self._refresh_history()
 
@@ -267,6 +268,24 @@ class WeatherstatApp(App):
         """Called by the controller (possibly from a worker thread)."""
         self.call_from_thread(self._apply_snapshot, snap)
 
+    def _check_startup_ha(self) -> None:
+        """Surface HA connectivity problems at startup with a notify popup.
+
+        The header always reflects the latest snapshot's `ha_error`, but a
+        notify pulls the user's attention so the issue isn't missed amid the
+        busy status bar on first launch.
+        """
+        snap = self.controller.latest_snapshot()
+        if snap is None or snap.ha_error is None:
+            return
+        self._log(f"[startup] [bold red]HA error:[/] {snap.ha_error}")
+        self.notify(
+            snap.ha_error,
+            title="Home Assistant unreachable",
+            severity="error",
+            timeout=15,
+        )
+
     def _refresh_snapshot_now(self) -> None:
         """Build and apply a snapshot synchronously. Call from UI thread only."""
         try:
@@ -308,6 +327,8 @@ class WeatherstatApp(App):
             cycle_running=snap.cycle_running,
             sysid_running=snap.sysid_running,
             local_tz=snap.local_tz,
+            ha_error=snap.ha_error,
+            clear_ha_error=snap.ha_error is None,
         )
 
     def _update_temperatures(self, snap: StatusSnapshot) -> None:

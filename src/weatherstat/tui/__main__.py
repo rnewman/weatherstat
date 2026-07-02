@@ -1,8 +1,14 @@
 """Entry point for the Weatherstat TUI dashboard."""
 
 import argparse
+import os
 
-from weatherstat.tui.app import WeatherstatApp
+from weatherstat._data_dir import load_env_file, resolve_data_dir
+
+if not os.environ.get("HA_URL") or not os.environ.get("HA_TOKEN"):
+    load_env_file(resolve_data_dir() / ".env")
+
+from weatherstat.tui.app import WeatherstatApp  # noqa: E402
 
 
 def main() -> None:
