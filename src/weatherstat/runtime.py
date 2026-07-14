@@ -52,9 +52,19 @@ def sysid_refit() -> SysidOutcome:
         return SysidOutcome(False, "Rejected: no significant gains found", time.monotonic() - t0)
 
     save_sysid_result(result, sensor_diagnostics=diagnostics)
+
+    # Update multi-timescale residual trackers against the fresh batch fit.
+    # Tracker failure must not fail the refit — batch params are already saved.
+    try:
+        from weatherstat.tracker import update_trackers
+
+        tracker_msg = update_trackers(log=lambda _msg: None)
+    except Exception as e:  # noqa: BLE001 — isolate tracker faults from the refit
+        tracker_msg = f"tracker: error — {e}"
+
     return SysidOutcome(
         True,
-        f"Complete. {result.n_snapshots} snapshots, {n_taus} sensors, {n_gains} gains.",
+        f"Complete. {result.n_snapshots} snapshots, {n_taus} sensors, {n_gains} gains. {tracker_msg}",
         time.monotonic() - t0,
     )
 

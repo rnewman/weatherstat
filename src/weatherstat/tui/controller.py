@@ -169,6 +169,7 @@ class TUIController:
         self._overrides: dict[str, str] = {}
         self._next_cycle_at: datetime | None = None
         self._solar_elevation_gains: dict[str, float] = {}
+        self._solar_plane_gains: dict[str, dict[str, float]] = {}
         self._last_ha_error: str | None = None
 
         # Cached snapshot, refreshed by build_snapshot()
@@ -217,8 +218,25 @@ class TUIController:
             return
         try:
             data = json.loads(params_file.read_text())
+            elevation_gains = data.get("solar_elevation_gains", {}) or {}
+            plane_gains = data.get("solar_plane_gains", {}) or {}
+            # Tracked coefficients override batch values when fresh (parity
+            # with simulator.load_sim_params)
+            from weatherstat.tracker import load_tracked_solar_gains
+
+            for sensor, coefs in load_tracked_solar_gains().items():
+                if "_solar_elev" in coefs and sensor in elevation_gains:
+                    elevation_gains[sensor] = max(0.0, float(coefs["_solar_elev"]))
+                planes = {
+                    n.removeprefix("_solar_"): max(0.0, float(v))
+                    for n, v in coefs.items()
+                    if n.startswith("_solar_") and n != "_solar_elev"
+                }
+                if planes:
+                    plane_gains[sensor] = planes
             with self._lock:
-                self._solar_elevation_gains = data.get("solar_elevation_gains", {}) or {}
+                self._solar_elevation_gains = elevation_gains
+                self._solar_plane_gains = plane_gains
         except Exception as e:
             self._log(f"[config] [red]Failed to load solar gains: {e}[/]")
 
@@ -352,6 +370,13 @@ class TUIController:
                 _solar_frac = _esf(_cc, _condition or None)
                 with self._lock:
                     solar_gains = dict(self._solar_elevation_gains)
+                    plane_gains = dict(self._solar_plane_gains)
+                from weatherstat.weather import SOLAR_PLANES, plane_incidence
+
+                plane_factors = {
+                    name: plane_incidence(cfg.location.latitude, cfg.location.longitude, _now_utc, az)
+                    for name, az in SOLAR_PLANES.items()
+                }
                 sensor_cols = [s.sensor for s in schedules]
                 mrt_per_sensor = compute_current_mrt_offsets(
                     sensor_cols, outdoor_temp, cfg.mrt_correction,
@@ -359,6 +384,8 @@ class TUIController:
                     solar_elev=_solar_elev,
                     solar_frac=_solar_frac,
                     mrt_weights=mrt_weights or None,
+                    solar_plane_gains=plane_gains or None,
+                    plane_factors=plane_factors,
                 )
             except Exception as e:
                 self._log(f"[mrt] [red]MRT correction failed: {e}[/]")

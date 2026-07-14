@@ -818,3 +818,41 @@ class TestAdvisoryPredict:
             f"Active blinds should reduce solar warming: "
             f"no_blinds={preds[0, piano_idx]:.2f} blinds={preds[1, piano_idx]:.2f}"
         )
+
+
+def test_plane_forcing_adds_heat(sim_params: SimParams) -> None:
+    """West-plane gains warm a sensor when the west factor is nonzero."""
+    from dataclasses import replace
+
+    sensor = sim_params.sensors[0]
+    state = HouseState(
+        current_temps=dict(_CURRENT_TEMPS),
+        outdoor_temp=50.0,
+        forecast_temps=[50.0] * 12,
+        environment_states={},
+        hour_of_day=16.0,
+        solar_fractions=[1.0] * 12,
+        solar_elevations=[0.3] * 72,
+        solar_planes={"west": [0.6] * 72},
+    )
+    params_with_planes = replace(sim_params, solar_plane_gains={sensor: {"west": 1.0}})
+
+    scenario = _all_off()
+    targets, without = predict(state, [scenario], sim_params, [12])
+    _, with_planes = predict(state, [scenario], params_with_planes, [12])
+
+    idx = [i for i, t in enumerate(targets) if t.startswith(sensor)]
+    assert with_planes[0, idx[0]] > without[0, idx[0]]
+
+
+def test_empty_solar_planes_is_backward_compatible(sim_params: SimParams) -> None:
+    """No solar_planes in HouseState -> plane gains have no effect."""
+    from dataclasses import replace
+
+    sensor = sim_params.sensors[0]
+    params_with_planes = replace(sim_params, solar_plane_gains={sensor: {"west": 1.0}})
+    state = _make_state()
+
+    _, a = predict(state, [_all_off()], sim_params, [12])
+    _, b = predict(state, [_all_off()], params_with_planes, [12])
+    assert np.allclose(a, b)

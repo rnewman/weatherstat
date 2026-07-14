@@ -29,7 +29,7 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 
-from weatherstat.config import DATA_DIR, DECISION_LOG_DB, EFFECTOR_MAP, SENSOR_LABELS, SNAPSHOTS_DB
+from weatherstat.config import DATA_DIR, DECISION_LOG_DB, SENSOR_LABELS, SNAPSHOTS_DB
 from weatherstat.weather import solar_sin_elevation
 from weatherstat.yaml_config import load_config
 

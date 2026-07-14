@@ -88,6 +88,7 @@ class SimParams:
     state_gates: dict[str, StateGateInfo] = field(default_factory=dict)  # gate_name -> info
     mrt_weights: dict[str, float] = field(default_factory=dict)  # sensor -> derived MRT weight
     solar_elevation_gains: dict[str, float] = field(default_factory=dict)  # sensor -> gain per sin(elev)×frac
+    solar_plane_gains: dict[str, dict[str, float]] = field(default_factory=dict)  # sensor -> {plane -> gain}
     environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
 
 
@@ -113,6 +114,10 @@ class HouseState:
     solar_elevations: list[float] = field(default_factory=list)
     # sin+(elevation) at each 5-min step [step1, step2, ...] for the prediction
     # horizon. Precomputed from lat/lon/time.
+    solar_planes: dict[str, list[float]] = field(default_factory=dict)
+    # Per-step wall-plane incidence factors keyed by plane name ("east",
+    # "west"), same indexing as solar_elevations. Optional: empty dict means
+    # no directional solar forcing (backward compatible).
 
     def __post_init__(self) -> None:
         if not self.solar_fractions:
@@ -228,6 +233,46 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         if filtered is not None:
             solar[(sg["sensor"], sg["hour_of_day"])] = filtered
 
+    # Directional plane gains (batch fit). Planes are additive heat inputs:
+    # negative coefficients are confounded, drop them; clamp like other solar.
+    solar_plane_gains: dict[str, dict[str, float]] = {}
+    for sensor_name, planes in data.get("solar_plane_gains", {}).items():
+        if sensor_name in unreliable_tau_sensors:
+            continue
+        kept = {}
+        for plane_name, g in planes.items():
+            g = float(g)
+            if g <= 0.0:
+                continue
+            kept[str(plane_name)] = min(g, _MAX_SOLAR_GAIN_MAGNITUDE)
+        if kept:
+            solar_plane_gains[str(sensor_name)] = kept
+
+    # Tracked solar coefficients (multi-timescale residual tracker) override
+    # the batch values when fresh — the tracker follows slow directional
+    # drift (canopy, structures) that a full-history batch fit averages over.
+    from weatherstat.tracker import load_tracked_solar_gains
+
+    tracked = load_tracked_solar_gains()
+    n_tracked = 0
+    for sensor_name, coefs in tracked.items():
+        if sensor_name in unreliable_tau_sensors:
+            continue
+        elev = coefs.get("_solar_elev")
+        if elev is not None and sensor_name in solar_elevation_gains:
+            solar_elevation_gains[sensor_name] = min(max(float(elev), 0.0), _MAX_SOLAR_GAIN_MAGNITUDE)
+        planes = {
+            name.removeprefix("_solar_"): min(max(float(v), 0.0), _MAX_SOLAR_GAIN_MAGNITUDE)
+            for name, v in coefs.items()
+            if name.startswith("_solar_") and name != "_solar_elev"
+        }
+        planes = {k: v for k, v in planes.items() if v > 0.0}
+        if planes:
+            solar_plane_gains[sensor_name] = planes
+        n_tracked += 1
+    if n_tracked:
+        print(f"  [sim] Tracked solar gains active for {n_tracked} sensor(s)")
+
     filter_parts: list[str] = []
     if n_pruned_t:
         filter_parts.append(f"{n_pruned_t} pruned by |t| < {_MIN_T_STATISTIC:.1f}")
@@ -270,6 +315,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         state_gates=state_gates,
         mrt_weights=mrt_weights,
         solar_elevation_gains=solar_elevation_gains,
+        solar_plane_gains=solar_plane_gains,
         environment_solar_betas=environment_solar_betas,
     )
 
@@ -744,7 +790,17 @@ def predict(
             if sens == sensor_col:
                 sensor_gains[eff] = (gain, lag)
 
-        # Solar forcing for this sensor
+        # Solar forcing for this sensor. Cloud fraction is shared by all
+        # solar channels (horizontal + wall planes).
+        if state.solar_fractions:
+            sf = state.solar_fractions
+            sf_vec = np.array([
+                sf[min(int(step * _DT_HOURS), len(sf) - 1)]
+                for step in range(1, max_horizon + 1)
+            ])
+        else:
+            sf_vec = np.ones(max_horizon)
+
         elev_gain = params.solar_elevation_gains.get(sensor_col, 0.0)
         if elev_gain != 0.0 and state.solar_elevations:
             # Elevation-based: gain × sin+(elev) × condition_fraction per step
@@ -752,15 +808,7 @@ def predict(
                 state.solar_elevations[min(step - 1, len(state.solar_elevations) - 1)]
                 for step in range(1, max_horizon + 1)
             ])
-            if state.solar_fractions:
-                sf = state.solar_fractions
-                sf_vec = np.array([
-                    sf[min(int(step * _DT_HOURS), len(sf) - 1)]
-                    for step in range(1, max_horizon + 1)
-                ])
-                solar_vec = elev_gain * elev_arr * sf_vec
-            else:
-                solar_vec = elev_gain * elev_arr
+            solar_vec = elev_gain * elev_arr * sf_vec
         else:
             # Legacy per-hour solar profile
             solar: dict[int, float] = {}
@@ -771,15 +819,22 @@ def predict(
                 solar.get(int((state.hour_of_day + step * _DT_HOURS) % 24), 0.0)
                 for step in range(1, max_horizon + 1)
             ])
-            if state.solar_fractions:
-                sf = state.solar_fractions
-                sf_vec = np.array([
-                    sf[min(int(step * _DT_HOURS), len(sf) - 1)]
+            solar_vec = base_solar * sf_vec
+
+        # Directional wall-plane forcing (batch or tracked coefficients).
+        # Additive alongside the horizontal channel; scenario-independent, so
+        # superposition is unaffected.
+        plane_gains = params.solar_plane_gains.get(sensor_col, {})
+        if plane_gains and state.solar_planes:
+            for plane_name, plane_gain in plane_gains.items():
+                factors = state.solar_planes.get(plane_name)
+                if not factors or plane_gain == 0.0:
+                    continue
+                plane_arr = np.array([
+                    factors[min(step - 1, len(factors) - 1)]
                     for step in range(1, max_horizon + 1)
                 ])
-                solar_vec = base_solar * sf_vec
-            else:
-                solar_vec = base_solar
+                solar_vec = solar_vec + plane_gain * plane_arr * sf_vec
 
         # Advisory solar modulation: advisory effectors can amplify/attenuate
         # solar gain (e.g., blinds reduce solar, open window changes airflow).

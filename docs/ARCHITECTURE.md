@@ -128,7 +128,7 @@ Forward-simulates room temperatures by Euler-integrating the thermal dynamics of
 dT/dt = (T_outdoor - T) / tau
         + Σ gain_e * activity_e(t - lag_e)                 # effector heating, delayed
         + β_solar(sensor) × sin⁺(elevation) × SF           # solar gain (elevation-based)
-        + Σ β_solar(sensor, plane) × irradiance(plane, t)  # solar gain (future: irradiance)
+        + Σ γ(sensor, plane) × incidence(plane, t) × SF    # directional solar (east/west walls, tracked)
 ```
 
 Where:
@@ -166,6 +166,8 @@ The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). So
 - **Mode-direction clamp**: in the Euler loop for regulating effectors, heating contributions are clamped ≥ 0 and cooling contributions ≤ 0, preventing confounded gains from producing physically impossible effects.
 - **Solar gain magnitude cap** (≤ 5.0°F/hr): solar elevation gains (and legacy per-hour profiles) get the same clamp treatment as effector gains, at a higher ceiling. Sparse-data sensors have produced ±17°F/hr solar noise fits.
 - **Tau segment gate**: a tau fitted from fewer than 5 overnight segments that also lands implausibly slow (> 250h) is a regression artifact (such sensors hit the 500h fit cap and lose all cooling behavior). The sensor falls back to its YAML default tau, and its solar gain is dropped — it was regressed against the bad tau's Newton residuals.
+
+**Multi-timescale residual trackers (`src/weatherstat/tracker.py`):** every coefficient is conceptually a state with a timescale; the batch fit is the timescale-∞ case. A *tracked block* is a group of design-matrix features (selected by name prefix) re-estimated hourly on a trailing window (default 14 days) against the batch fit's context terms, with a random-walk prior (`min ‖r − Fγ‖² + λ‖γ − γ_prev‖²`, λ scaled by window information), an information gate (dark windows hold the previous estimate), and sign/magnitude bounds. A block may only track fast if its carrier is sharp and *exogenous* — solar qualifies (zero at night, plane-specific phase, astronomically scheduled, independent of controller actions); tau (broadband carrier) and effector gains (closed-loop-confounded) may not, absent excitation. The first tracked block is solar transmission (`_solar_elev`, `_solar_east`, `_solar_west`): its γ follows slow directional drift — deciduous canopy, pruning, new structures — without modeling any obstruction explicitly, and the logged γ history (`tracker_history.jsonl`) is itself a measurement (per-room canopy phenology). The simulator prefers fresh tracked coefficients (≤48h) over batch values; the batch fit remains the prior and fallback. Enabled by full per-sensor regression serialization (`regression_models` in thermal_params.json): feature names + coefficients allow window residualization against the identical design matrix (`build_design_matrix`) with no refit and no train/serve skew.
 
 **What it extracts:**
 - **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.

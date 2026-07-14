@@ -65,11 +65,11 @@ def _fetch_and_build_df(start: datetime, end: datetime) -> pd.DataFrame:
     start = _round_down_5m(start)
     end = _round_up_5m(end)
 
-    print(f"Fetching sensor history...")
+    print("Fetching sensor history...")
     sensor_ids = list(NUMERIC_SENSOR_ENTITIES.values()) + list(SENSOR_ENTITIES.values())
     sensor_history = fetch_history(sensor_ids, start, end)
 
-    print(f"Fetching climate/fan/weather history (with attributes)...")
+    print("Fetching climate/fan/weather history (with attributes)...")
     attr_ids = list(CLIMATE_ENTITIES.values()) + list(FAN_ENTITIES.values()) + [WEATHER_ENTITY]
     attr_history = fetch_history_with_attributes(attr_ids, start, end)
 
@@ -270,7 +270,7 @@ def main() -> None:
 
         if gap_hours > 240:  # 10 days
             print(f"Gap is {gap_hours:.0f}h ({gap_hours / 24:.0f}d) — HA history only retains ~10 days.")
-            print(f"Will backfill last 240h (10d). Older data is lost.")
+            print("Will backfill last 240h (10d). Older data is lost.")
             gap_hours = 240
 
         start = latest_dt

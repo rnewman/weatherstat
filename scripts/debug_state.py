@@ -121,7 +121,7 @@ def _snapshot_staleness_warning(ts: str | None) -> None:
             else:
                 age_str = f"{age_minutes:.0f}m"
             print(f"⚠ Snapshot data is {age_str} stale — temps shown here are NOT current.")
-            print(f"  Use 'just debug decisions' or 'just debug live' for current temps.")
+            print("  Use 'just debug decisions' or 'just debug live' for current temps.")
     except (ValueError, TypeError):
         pass
 
@@ -360,6 +360,28 @@ def cmd_gains(sensor_filter: str | None = None) -> None:
             neg = g.get("negligible", False)
             flag = " (negligible)" if neg else ""
             print(f"    {g['effector']:<28} {gain:+7.3f} °F/hr  t={t:5.2f}  lag={lag:4.0f}m{flag}")
+        print()
+
+    # Solar: batch (full-history fit) vs tracked (trailing-window residual tracker)
+    from weatherstat.tracker import load_tracked_solar_gains
+
+    elev = params.get("solar_elevation_gains", {})
+    planes = params.get("solar_plane_gains", {})
+    tracked = load_tracked_solar_gains()
+    if elev or planes or tracked:
+        print("  Solar response (°F/hr per unit incidence × fraction):")
+        sensors = sorted(set(elev) | set(planes) | set(tracked))
+        if sensor_filter:
+            sensors = [s for s in sensors if sensor_filter.lower() in s.lower()]
+        for sensor in sensors:
+            batch_parts = [f"elev={elev.get(sensor, 0):+.2f}"]
+            batch_parts += [f"{p}={v:+.2f}" for p, v in sorted(planes.get(sensor, {}).items())]
+            line = f"    {sensor:<28} batch: {', '.join(batch_parts)}"
+            tr = tracked.get(sensor)
+            if tr:
+                tr_parts = [f"{n.removeprefix('_solar_')}={v:+.2f}" for n, v in sorted(tr.items())]
+                line += f"  |  tracked: {', '.join(tr_parts)}"
+            print(line)
         print()
 
 
@@ -826,7 +848,7 @@ def cmd_decision_why(n: int = 1) -> None:
             print()
             continue
 
-        print(f"  Gains → constrained sensors:")
+        print("  Gains → constrained sensors:")
         for g in sig_gains:
             sensor = g["sensor"]
             gain = g.get("gain_f_per_hour", 0)

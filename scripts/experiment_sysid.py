@@ -22,8 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from weatherstat.sysid import fit_sysid
-from weatherstat.validate import RegressionDiagnostics, compute_sensor_health
-
+from weatherstat.validate import compute_sensor_health
 
 # ── Data structures ──────────────────────────────────────────────────────
 
@@ -248,7 +247,7 @@ def _print_report(report: ExperimentReport) -> None:
     print(f"{'=' * 72}")
 
     # Summary scores
-    print(f"\n── Summary Metrics ──")
+    print("\n── Summary Metrics ──")
     print(f"  Mean R²:              {report.mean_r2:.4f}")
     print(f"  Mean DW:              {report.mean_dw:.4f}")
     print(f"  Mean direct gain:     {report.mean_direct_gain:.4f} °F/hr")
@@ -258,7 +257,7 @@ def _print_report(report: ExperimentReport) -> None:
         print(f"  Target (ms_lr→tu):    {report.target_ms_lr_to_tu:+.4f} °F/hr")
 
     # Per-sensor quality
-    print(f"\n── Sensor Regression Quality ──")
+    print("\n── Sensor Regression Quality ──")
     print(f"  {'Sensor':<32s}   R²      DW    Holdout  Feats  Grade")
     print(f"  {'─' * 32}  ─────  ─────  ───────  ─────  ─────")
     for s in sorted(report.sensors, key=lambda x: x.sensor):
@@ -266,7 +265,7 @@ def _print_report(report: ExperimentReport) -> None:
         print(f"  {s.sensor:<32s}  {s.r_squared:.3f}  {s.durbin_watson:.3f}  {ho}  {s.n_features:5d}  {s.grade:>5s}")
 
     # Per-effector gain analysis
-    print(f"\n── Effector Gain Analysis ──")
+    print("\n── Effector Gain Analysis ──")
     print(f"  {'Effector':<30s}  {'Direct Sensor':<32s}  {'Gain':>7s}  {'t':>5s}  {'#Xr':>3s}  {'MnXr':>6s}  {'Ratio':>5s}")
     print(f"  {'─' * 30}  {'─' * 32}  {'─' * 7}  {'─' * 5}  {'─' * 3}  {'─' * 6}  {'─' * 5}")
     for es in sorted(report.effector_summaries, key=lambda x: x.effector):
@@ -280,7 +279,7 @@ def _print_report(report: ExperimentReport) -> None:
     cross_gains = [g for g in report.gains if g.classification == "cross"]
     if cross_gains:
         cross_gains.sort(key=lambda g: abs(g.gain), reverse=True)
-        print(f"\n── Cross-Room Gains (top 20) ──")
+        print("\n── Cross-Room Gains (top 20) ──")
         print(f"  {'Effector':<28s}  →  {'Sensor':<30s}  {'Gain':>7s}  {'t':>6s}")
         print(f"  {'─' * 28}     {'─' * 30}  {'─' * 7}  {'─' * 6}")
         for g in cross_gains[:20]:
@@ -303,7 +302,7 @@ def _compare_reports(baseline: ExperimentReport, variant: ExperimentReport) -> N
     print(f"{'=' * 80}")
 
     # Summary comparison
-    print(f"\n── Summary ──")
+    print("\n── Summary ──")
     print(f"  {'Metric':<25s}  {'Baseline':>10s}  {'Variant':>10s}  {'Change':>10s}  {'OK?':>3s}")
     print(f"  {'─' * 25}  {'─' * 10}  {'─' * 10}  {'─' * 10}  {'─' * 3}")
 
@@ -337,7 +336,7 @@ def _compare_reports(baseline: ExperimentReport, variant: ExperimentReport) -> N
     var_sensors = {s.sensor: s for s in variant.sensors}
     common = sorted(set(base_sensors) & set(var_sensors))
     if common:
-        print(f"\n── Per-Sensor Quality ──")
+        print("\n── Per-Sensor Quality ──")
         print(f"  {'Sensor':<32s}  {'R²(b)':>6s}  {'R²(v)':>6s}  {'Δ':>7s}  {'DW(b)':>6s}  {'DW(v)':>6s}  {'Δ':>7s}  {'Grade':>5s}")
         print(f"  {'─' * 32}  {'─' * 6}  {'─' * 6}  {'─' * 7}  {'─' * 6}  {'─' * 6}  {'─' * 7}  {'─' * 5}")
         for name in common:
@@ -355,7 +354,7 @@ def _compare_reports(baseline: ExperimentReport, variant: ExperimentReport) -> N
     var_effs = {e.effector: e for e in variant.effector_summaries}
     common_effs = sorted(set(base_effs) & set(var_effs))
     if common_effs:
-        print(f"\n── Direct Gain Stability ──")
+        print("\n── Direct Gain Stability ──")
         print(f"  {'Effector':<28s}  {'Gain(b)':>8s}  {'Gain(v)':>8s}  {'Δ':>7s}  {'t(b)':>6s}  {'t(v)':>6s}  {'OK?':>3s}")
         print(f"  {'─' * 28}  {'─' * 8}  {'─' * 8}  {'─' * 7}  {'─' * 6}  {'─' * 6}  {'─' * 3}")
         for name in common_effs:
@@ -380,7 +379,7 @@ def _compare_reports(baseline: ExperimentReport, variant: ExperimentReport) -> N
             changes.append((key, bg, vg, delta))
         changes.sort(key=lambda x: x[3])  # biggest decreases first
 
-        print(f"\n── Cross-Room Gain Changes (top 15) ──")
+        print("\n── Cross-Room Gain Changes (top 15) ──")
         print(f"  {'Effector → Sensor':<60s}  {'Base':>7s}  {'Var':>7s}  {'Δ':>7s}")
         print(f"  {'─' * 60}  {'─' * 7}  {'─' * 7}  {'─' * 7}")
         for (eff, sens), bg, vg, delta in changes[:15]:

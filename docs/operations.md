@@ -238,6 +238,8 @@ All runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR
   executor_state.json          # executor override tracking
   advisory_state.json          # per-environment-entry advisory cooldown timestamps
   .retention_last_run          # marker file: last daily retention run
+  tracker_state.json           # residual tracker: current tracked coefficients
+  tracker_history.jsonl        # tracker update log (per-room drift time series)
   comfort_*.png                # comfort dashboard output
 ```
 

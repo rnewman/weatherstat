@@ -271,6 +271,7 @@ def compute_mrt_offset(
     solar_elev: float = 0.0,
     solar_frac: float = 0.0,
     mrt_weight: float = 1.0,
+    solar_forcing: float | None = None,
 ) -> float:
     """Compute MRT offset for a single sensor at a single point in time.
 
@@ -303,7 +304,11 @@ def compute_mrt_offset(
     Returns:
         MRT offset in configured temperature unit.
     """
-    solar_wall_warming = solar_gain * solar_elev * solar_frac * mrt_config.solar_response
+    # solar_forcing (when provided) is the full directional sum
+    # Σ_channel γ_channel × incidence_channel; otherwise the single
+    # horizontal channel gain × sin⁺(elev) is used.
+    forcing = solar_forcing if solar_forcing is not None else solar_gain * solar_elev
+    solar_wall_warming = forcing * solar_frac * mrt_config.solar_response
     effective_outdoor = outdoor_temp + solar_wall_warming
     raw_offset = mrt_config.alpha * (mrt_config.reference_temp - effective_outdoor)
     clamped = max(-mrt_config.max_offset, min(mrt_config.max_offset, raw_offset))
@@ -319,6 +324,8 @@ def compute_current_mrt_offsets(
     solar_elev: float = 0.0,
     solar_frac: float = 0.0,
     mrt_weights: dict[str, float] | None = None,
+    solar_plane_gains: dict[str, dict[str, float]] | None = None,
+    plane_factors: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Compute per-sensor MRT offsets at the current moment.
 
@@ -333,12 +340,14 @@ def compute_current_mrt_offsets(
         return {}
     result: dict[str, float] = {}
     for sensor in sensors:
+        forcing = (solar_elevation_gains or {}).get(sensor, 0.0) * solar_elev
+        for plane_name, plane_gain in ((solar_plane_gains or {}).get(sensor) or {}).items():
+            forcing += plane_gain * (plane_factors or {}).get(plane_name, 0.0)
         result[sensor] = compute_mrt_offset(
             outdoor_temp, mrt_config,
-            solar_gain=(solar_elevation_gains or {}).get(sensor, 0.0),
-            solar_elev=solar_elev,
             solar_frac=solar_frac,
             mrt_weight=(mrt_weights or {}).get(sensor, 1.0),
+            solar_forcing=forcing,
         )
     return result
 
@@ -353,6 +362,8 @@ def compute_horizon_mrt_offsets(
     *,
     solar_elevation_gains: dict[str, float] | None = None,
     mrt_weights: dict[str, float] | None = None,
+    solar_plane_gains: dict[str, dict[str, float]] | None = None,
+    solar_planes: dict[str, list[float]] | None = None,
 ) -> dict[str, dict[int, float]]:
     """Compute per-sensor, per-horizon MRT offsets using forecast data.
 
@@ -401,10 +412,17 @@ def compute_horizon_mrt_offsets(
             sf_idx = min(h_hours, len(solar_fractions) - 1) if solar_fractions else -1
             s_frac = solar_fractions[max(0, sf_idx)] if sf_idx >= 0 else 0.0
 
+            forcing = s_gain * s_elev
+            for plane_name, plane_gain in ((solar_plane_gains or {}).get(sensor) or {}).items():
+                factors = (solar_planes or {}).get(plane_name)
+                if factors:
+                    forcing += plane_gain * factors[max(0, min(h_step - 1, len(factors) - 1))]
+
             offsets[h_step] = compute_mrt_offset(
                 out_t, mrt_config,
-                solar_gain=s_gain, solar_elev=s_elev, solar_frac=s_frac,
+                solar_frac=s_frac,
                 mrt_weight=weight,
+                solar_forcing=forcing,
             )
         result[sensor] = offsets
 
@@ -1722,6 +1740,7 @@ def sweep_scenarios_physics(
     *,
     solar_fractions: list[float],
     solar_elevations: list[float],
+    solar_planes: dict[str, list[float]] | None = None,
     current_mrt_offsets: dict[str, float] | None = None,
     horizon_mrt_offsets: dict[str, dict[int, float]] | None = None,
 ) -> tuple[ControlDecision, Scenario, dict[str, str], AdvisoryPlan | None]:
@@ -1811,6 +1830,7 @@ def sweep_scenarios_physics(
         recent_history=recent_history,
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
+        solar_planes=solar_planes or {},
     )
 
     def _score_all(
@@ -2491,6 +2511,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     _mrt_cc = _row_cloud_coverage(latest)
     _mrt_solar_frac = _esf_mrt(_mrt_cc, _mrt_cond)
     _mrt_solar_elev = _sse(_CFG.location.latitude, _CFG.location.longitude, datetime.now(UTC))
+    from weatherstat.weather import SOLAR_PLANES as _PLANES
+    from weatherstat.weather import plane_incidence as _pinc
+
+    _mrt_plane_factors = {
+        name: _pinc(_CFG.location.latitude, _CFG.location.longitude, datetime.now(UTC), az)
+        for name, az in _PLANES.items()
+    }
     _sensor_cols = [s.sensor for s in schedules]
     _mrt_per_sensor = compute_current_mrt_offsets(
         _sensor_cols, _mrt_outdoor, _CFG.mrt_correction,
@@ -2498,6 +2525,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         solar_elev=_mrt_solar_elev,
         solar_frac=_mrt_solar_frac,
         mrt_weights=_mrt_weights or None,
+        solar_plane_gains=sim_params.solar_plane_gains,
+        plane_factors=_mrt_plane_factors,
     )
     # Base offset (no solar, for logging)
     mrt_offset = compute_mrt_offset(
@@ -2521,7 +2550,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     recent_hist = extract_recent_history(df_raw, sim_params)
 
     # Build forecast temp list, solar fractions, and solar elevations for simulator
-    from weatherstat.weather import effective_solar_fraction, solar_sin_elevation
+    from weatherstat.weather import SOLAR_PLANES, effective_solar_fraction, plane_incidence, solar_sin_elevation
 
     forecast_temp_list: list[float] = []
     solar_fractions: list[float] = []
@@ -2551,7 +2580,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     fractional_hour = base_hour + local_now.minute / 60.0
 
-    # Precompute sin+(elevation) at each 5-min step for the prediction horizon
+    # Precompute sin+(elevation) at each 5-min step for the prediction horizon,
+    # plus wall-plane incidence factors for directional solar forcing.
     lat = _CFG.location.latitude
     lon = _CFG.location.longitude
     now_utc = datetime.now(UTC)
@@ -2560,6 +2590,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         solar_sin_elevation(lat, lon, now_utc + timedelta(minutes=5 * step))
         for step in range(1, max_steps + 1)
     ]
+    solar_planes: dict[str, list[float]] = {
+        plane_name: [
+            plane_incidence(lat, lon, now_utc + timedelta(minutes=5 * step), plane_az)
+            for step in range(1, max_steps + 1)
+        ]
+        for plane_name, plane_az in SOLAR_PLANES.items()
+    }
 
     # Per-horizon MRT offsets using forecast data at each horizon
     _horizon_mrt = compute_horizon_mrt_offsets(
@@ -2567,6 +2604,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         forecast_temp_list, solar_elevations, solar_fractions,
         solar_elevation_gains=sim_params.solar_elevation_gains,
         mrt_weights=_mrt_weights or None,
+        solar_plane_gains=sim_params.solar_plane_gains,
+        solar_planes=solar_planes,
     )
 
     # Load previous state for mode hold enforcement
@@ -2603,6 +2642,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         ineligible_effectors,
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
+        solar_planes=solar_planes,
         current_mrt_offsets=_mrt_per_sensor,
         horizon_mrt_offsets=_horizon_mrt,
     )
@@ -2624,6 +2664,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         recent_history=recent_hist,
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
+        solar_planes=solar_planes,
     )
 
     # All-off baseline
