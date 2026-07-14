@@ -51,11 +51,23 @@ CREATE TABLE IF NOT EXISTS decisions (
 """
 
 
+def _connect(path: Path) -> sqlite3.Connection:
+    """Open the decision log with WAL mode.
+
+    The TUI's worker threads log decisions and backfill outcomes against the
+    same file; WAL allows a reader and a writer to coexist without
+    "database is locked" errors (the collector's snapshots.db already does this).
+    """
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
 def init_db(db_path: Path | None = None) -> Path:
     """Create the decision log database and table if they don't exist."""
     path = db_path or DECISION_LOG_DB
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = _connect(path)
     conn.execute(_SCHEMA)
     # Schema migration: add trajectory column if upgrading from pre-PLAN-7
     with contextlib.suppress(sqlite3.OperationalError):
@@ -72,6 +84,9 @@ def init_db(db_path: Path | None = None) -> Path:
         conn.execute("ALTER TABLE decisions ADD COLUMN mrt_offsets TEXT")
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE decisions ADD COLUMN blocked TEXT")
+    # Schema migration: add cycle duration for performance tracking
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN cycle_seconds REAL")
     conn.commit()
     conn.close()
     return path
@@ -91,6 +106,7 @@ def log_decision(
     mrt_per_sensor: dict[str, float] | None = None,
     ineligible: dict[str, str] | None = None,
     blocked_effectors: dict[str, str] | None = None,
+    cycle_seconds: float | None = None,
     db_path: Path | None = None,
 ) -> None:
     """Record a control decision to the decision log.
@@ -188,7 +204,7 @@ def log_decision(
     # Serialize trajectory info (if present)
     trajectory_json = json.dumps(decision.trajectory_info) if decision.trajectory_info else None
 
-    conn = sqlite3.connect(str(path))
+    conn = _connect(path)
     conn.execute(
         """\
         INSERT OR REPLACE INTO decisions (
@@ -196,8 +212,8 @@ def log_decision(
             current_temps, upstairs_heating, downstairs_heating, upstairs_setpoint, downstairs_setpoint,
             blowers, mini_splits, predictions, comfort_cost, energy_cost, total_cost,
             comfort_bounds, trajectory, outcome_backfilled, effector_decisions, command_targets,
-            active_profile, mrt_offsets, blocked
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+            active_profile, mrt_offsets, blocked, cycle_seconds
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
         """,
         (
             decision.timestamp,
@@ -224,6 +240,7 @@ def log_decision(
             active_profile,
             mrt_offsets_json,
             blocked_json,
+            cycle_seconds,
         ),
     )
     conn.commit()
@@ -244,7 +261,7 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
     if not path.exists():
         return 0
 
-    conn = sqlite3.connect(str(path))
+    conn = _connect(path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT timestamp, predictions, comfort_bounds FROM decisions WHERE outcome_backfilled = 0"
@@ -436,7 +453,7 @@ def load_decision_log(db_path: Path | None = None, limit: int = 100) -> pd.DataF
     if not path.exists():
         return pd.DataFrame()
 
-    conn = sqlite3.connect(str(path))
+    conn = _connect(path)
     df = pd.read_sql(
         f"SELECT * FROM decisions ORDER BY timestamp DESC LIMIT {limit}",
         conn,
@@ -455,7 +472,7 @@ def accuracy_summary(hours: int = 24, db_path: Path | None = None) -> dict[str, 
         return {}
 
     cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
-    conn = sqlite3.connect(str(path))
+    conn = _connect(path)
     rows = conn.execute(
         "SELECT outcomes FROM decisions WHERE outcome_backfilled = 1 AND timestamp > ? AND outcomes IS NOT NULL",
         (cutoff,),

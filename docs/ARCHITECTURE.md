@@ -161,9 +161,11 @@ The regression uses selectively standardized ridge (L2 penalty λ = 0.01×n). So
 
 **Gain filtering at load time:** The simulator applies additional filters when loading gains from `thermal_params.json`:
 - **t-statistic threshold** (|t| ≥ 1.5): prunes gains that are likely confounded (e.g., bedroom split correlates with other warming sources but doesn't cause it). Without this, OLS attributes correlated warming to whichever effector happens to be active.
-- **Magnitude cap** (≤ 3.0°F/hr): catches physically implausible gains from sensors near vents, unobserved heat sources, or short data histories.
+- **Magnitude cap** (±2.0°F/hr, clamped not pruned): catches physically implausible gains from sensors near vents, unobserved heat sources, or short data histories. A large gain may be real but exaggerated by sparse data or multicollinearity, so direction is preserved.
 - **Mode-direction sign filter**: heating-only effectors (trajectory with `supported_modes: [heat]`) cannot have negative gains, and vice versa. Confounded OLS can produce these nonsensical cross-coupling effects.
 - **Mode-direction clamp**: in the Euler loop for regulating effectors, heating contributions are clamped ≥ 0 and cooling contributions ≤ 0, preventing confounded gains from producing physically impossible effects.
+- **Solar gain magnitude cap** (≤ 5.0°F/hr): solar elevation gains (and legacy per-hour profiles) get the same clamp treatment as effector gains, at a higher ceiling. Sparse-data sensors have produced ±17°F/hr solar noise fits.
+- **Tau segment gate**: a tau fitted from fewer than 5 overnight segments that also lands implausibly slow (> 250h) is a regression artifact (such sensors hit the 500h fit cap and lose all cooling behavior). The sensor falls back to its YAML default tau, and its solar gain is dropped — it was regressed against the bad tau's Newton residuals.
 
 **What it extracts:**
 - **Effector × sensor gain matrix**: heating rate (°F/hr) and effective delay for each (effector, sensor) pair. Multiple effectors active simultaneously? The regression decomposes their contributions.
@@ -344,6 +346,9 @@ Records every control decision with full context.
 - Resolved comfort bounds per sensor (min, max, preferred_lo, preferred_hi, cold/hot penalties) — user-configured values after profile offsets and environment adjustments (not MRT-corrected; MRT is applied to predictions).
 - MRT correction offsets (per-sensor applied offsets at current conditions).
 - Blocked effectors (ineligible + physically blocked, with reasons).
+- Cycle duration (`cycle_seconds`) for performance tracking across deployments.
+
+**Retention:** command JSON files and decision log rows are pruned daily (defaults: 14 and 365 days, configurable via `defaults.command_retention_days` / `defaults.decision_retention_days`, 0 = keep forever). The collector's EAV snapshots are never pruned — they are training data. Retention runs from whichever loop is up (TUI or headless), tracked by a shared marker file.
 
 **Outcome backfill:** At the start of each control cycle, the system checks whether enough time has elapsed to compare predictions to actual temperatures. For each horizon (1h, 2h, 4h, 6h), it finds the closest collector snapshot and records prediction error. Retroactive comfort cost uses the full two-layer model (preferred band + hard rails) with the enriched bounds logged at decision time.
 
@@ -447,4 +452,4 @@ We built a full LightGBM pipeline: 8 rooms x 5 horizons = 40 models trained on c
 
 **The lesson:** ML is a powerful function approximator, but for a physical system with known structure, encoding that structure directly produces better predictions with less data, better extrapolation, and — crucially — reliable counterfactual reasoning. ML remains the right tool for components that are genuinely hard to model (solar gain, occupancy effects).
 
-See `docs/EXPERIMENTS.md` for detailed experiment results and metrics. The ML training pipeline has been archived to `archive/` for reference.
+See `docs/history/EXPERIMENTS.md` for detailed experiment results and metrics. The ML training pipeline has been archived to `archive/ml/` for reference.

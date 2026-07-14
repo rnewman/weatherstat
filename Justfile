@@ -36,9 +36,13 @@ test:
 validate:
     uv run pytest tests/test_validate.py -q
 
-# Control cycle (flags: --live, --loop)
+# Control cycle (flags: --live; --loop runs the headless loop with periodic sysid + retention)
 control *ARGS:
     uv run python -m weatherstat.control {{ARGS}}
+
+# Prune old command JSON + decision log rows (snapshots are never pruned)
+prune:
+    uv run python -m weatherstat.retention
 
 # Execute latest command JSON via HA (flag: --force to ignore overrides)
 execute *ARGS:
@@ -46,7 +50,7 @@ execute *ARGS:
 
 # Discover HA entities and generate starter config
 discover *ARGS:
-    uv run python ../scripts/discover.py {{ARGS}}
+    uv run python ./scripts/discover.py {{ARGS}}
 
 # System identification: extract thermal parameters from collector data
 sysid *ARGS:

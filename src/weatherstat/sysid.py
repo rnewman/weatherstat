@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1146,9 +1147,11 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
 
     Use save_sysid_result() to persist.
     """
+    _fit_t0 = time.monotonic()
     print("Loading collector snapshots...")
     df = load_collector_snapshots()
-    print(f"  {len(df)} snapshots loaded")
+    _load_seconds = time.monotonic() - _fit_t0
+    print(f"  {len(df)} snapshots loaded in {_load_seconds:.1f}s")
 
     effectors = _enumerate_effectors()
     sensors = _enumerate_sensors()
@@ -1171,7 +1174,9 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
 
     # Stage 1: Fit tau_base (sealed envelope)
     print("\n── Stage 1: Fitting tau_base (sealed envelope loss) ──")
+    _stage1_t0 = time.monotonic()
     fitted_taus = _fit_tau(df, effectors, sensors, verbose)
+    _stage1_seconds = time.monotonic() - _stage1_t0
     for ft in fitted_taus:
         src = f"fitted ({ft.n_segments} seg)" if ft.n_segments > 0 else "yaml default"
         print(f"  {ft.sensor:30s}: tau_base={ft.tau_base:5.1f}h ({src})")
@@ -1183,6 +1188,7 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
 
     # Stage 2: Regression per sensor (effector gains, solar, advisory effects)
     print("\n── Stage 2: Fitting effector gains, solar, and advisory effects ──")
+    _stage2_t0 = time.monotonic()
     all_gains: list[EffectorSensorGain] = []
     solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
     all_adv_tau_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
@@ -1214,6 +1220,12 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
                         f"    {g.effector}: {g.gain_f_per_hour:+.3f} {UNIT_SYMBOL}/hr,"
                         f" lag={g.best_lag_minutes:.0f}min, t={g.t_statistic:.1f}"
                     )
+
+    _stage2_seconds = time.monotonic() - _stage2_t0
+    print(
+        f"\n  Sysid timing: load {_load_seconds:.1f}s, tau fit {_stage1_seconds:.1f}s,"
+        f" regression {_stage2_seconds:.1f}s, total {time.monotonic() - _fit_t0:.1f}s"
+    )
 
     # Merge advisory tau betas into FittedTau
     for i, ft in enumerate(fitted_taus):

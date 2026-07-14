@@ -242,6 +242,8 @@ class WeatherstatConfig:
     hard_rail_multiplier: float | None = None  # penalty multiplier outside acceptable bounds (default: 3.0)
     control_interval: int = 300  # seconds between control cycles (default: 5 min)
     sysid_interval: int = 3600  # seconds between automatic sysid runs (default: 1 hour, 0 = disabled)
+    command_retention_days: int = 14  # days to keep predictions/command_*.json (0 = keep forever)
+    decision_retention_days: int = 365  # days to keep decision log rows (0 = keep forever) — a full heating season of outcomes is analysis data
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
@@ -791,6 +793,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         backup_margin=backup_margin,
         control_interval=_opt_int("control_interval", 300),
         sysid_interval=_opt_int("sysid_interval", 3600),
+        command_retention_days=_opt_int("command_retention_days", 14),
+        decision_retention_days=_opt_int("decision_retention_days", 365),
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
         mrt_correction=mrt_correction,

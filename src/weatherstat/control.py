@@ -19,7 +19,6 @@ import argparse
 import json
 import sys
 import time
-import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,7 +28,6 @@ import pandas as pd
 import requests
 
 from weatherstat.config import (
-    CONTROL_INTERVAL,
     CONTROL_STATE_FILE,
     EFFECTOR_MAP,
     EFFECTORS,
@@ -70,7 +68,7 @@ ABSOLUTE_MIN = _CFG.setpoint_min if _CFG.setpoint_min is not None else abs_temp(
 ABSOLUTE_MAX = _CFG.setpoint_max if _CFG.setpoint_max is not None else abs_temp(78)
 
 # Minimum hold time before changing setpoints (seconds).
-# Must be less than LOOP_INTERVAL_SECONDS so every cycle produces a fresh decision.
+# Must be less than CONTROL_INTERVAL so every cycle produces a fresh decision.
 MIN_HOLD_SECONDS = 3 * 60  # 3 minutes (shorter than default 5-min control interval)
 
 # Maximum data staleness before refusing to execute (seconds)
@@ -96,9 +94,6 @@ HORIZON_WEIGHTS: dict[int, float] = {
 # this far below its comfort min. Compensates for undertrained models that
 # predict rooms warming without HVAC (because training data is all HVAC-on).
 COLD_ROOM_OVERRIDE = _CFG.cold_room_override if _CFG.cold_room_override is not None else delta_temp(1.0)
-
-# Control loop interval (from config, default 5 min)
-LOOP_INTERVAL_SECONDS = CONTROL_INTERVAL
 
 # Horizons used for control (subset of HORIZONS_5MIN, skip 12h for control)
 CONTROL_HORIZONS = [12, 24, 48, 72]
@@ -2345,6 +2340,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     _check_config()
 
+    _cycle_t0 = time.monotonic()
+
     # Backfill outcomes for previous decisions before starting this cycle
     from weatherstat.decision_log import backfill_outcomes
 
@@ -2354,7 +2351,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # Fetch data
     print("[control] Fetching recent history from Home Assistant...")
+    _fetch_t0 = time.monotonic()
     df_raw, forecast = fetch_recent_history(hours_back=14)
+    _fetch_seconds = time.monotonic() - _fetch_t0
     n_rows = len(df_raw)
     print(f"  Retrieved {n_rows} rows")
 
@@ -2607,8 +2606,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         current_mrt_offsets=_mrt_per_sensor,
         horizon_mrt_offsets=_horizon_mrt,
     )
-    elapsed_ms = (time.monotonic() - t0) * 1000
-    print(f"  Sweep completed in {elapsed_ms:.0f}ms")
+    _sweep_seconds = time.monotonic() - t0
+    print(f"  Sweep completed in {_sweep_seconds * 1000:.0f}ms")
 
     # ── Compute baselines for rationale ──
     horizons = [HORIZON_LABELS[h] for h in CONTROL_HORIZONS]
@@ -2948,6 +2947,12 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     # Log decision for outcome tracking
     from weatherstat.decision_log import log_decision
 
+    _cycle_seconds = time.monotonic() - _cycle_t0
+    print(
+        f"  Cycle timing: fetch {_fetch_seconds:.1f}s,"
+        f" sweep {_sweep_seconds:.1f}s, total {_cycle_seconds:.1f}s"
+    )
+
     log_decision(
         decision, current_temps, latest, schedules, base_hour, live,
         active_profile=active_profile.name if active_profile else None,
@@ -2956,6 +2961,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         mrt_per_sensor=_mrt_per_sensor,
         ineligible=ineligible,
         blocked_effectors=blocked_dict,
+        cycle_seconds=_cycle_seconds,
     )
     print("  Decision logged")
 
@@ -2973,23 +2979,14 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
 
 def run_control_loop(live: bool = False) -> None:
-    """Run the control loop indefinitely at 15-minute intervals."""
-    mode_str = "LIVE" if live else "DRY-RUN"
-    print(f"[control] Starting control loop ({mode_str}, interval: {LOOP_INTERVAL_SECONDS}s)")
-    print("  Press Ctrl+C to stop\n")
+    """Run the full headless loop: control cycles + periodic sysid + retention.
 
-    while True:
-        try:
-            decision = run_control_cycle(live=live)
-            if live and decision:
-                from weatherstat.executor import execute
+    Delegates to weatherstat.runtime so headless operation gets the same
+    periodic sysid refitting (with quality gate) the TUI provides.
+    """
+    from weatherstat.runtime import run_headless_loop
 
-                execute()
-        except Exception as e:
-            print(f"[control] Error in control cycle: {e}", file=sys.stderr)
-            traceback.print_exc()
-        print(f"\n[control] Next cycle in {LOOP_INTERVAL_SECONDS // 60} minutes...\n")
-        time.sleep(LOOP_INTERVAL_SECONDS)
+    run_headless_loop(live=live)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────

@@ -29,6 +29,21 @@ _MIN_T_STATISTIC = 1.5
 # Typical real gains (°F/hr): thermostats 0.3-1.0, mini splits 1.0-1.5, blowers 0.1-0.5.
 _MAX_GAIN_MAGNITUDE = delta_temp(2.0)
 
+# Maximum plausible solar gain magnitude (per hour at full sin⁺(elev)×fraction).
+# Observed real elevation gains are 0.3-1.3°F/hr; sensors with sparse tau data
+# have produced ±17°F/hr noise fits (docs/debugging-notes.md § "Ridge
+# Regularization Effects"). Applies to both elevation gains and legacy per-hour
+# solar profiles.
+_MAX_SOLAR_GAIN_MAGNITUDE = delta_temp(5.0)
+
+# A tau fitted from too few overnight segments that also lands implausibly slow
+# is a regression artifact (sensors with <5 segments hit the 500h fit cap and
+# lose all cooling behavior — docs/debugging-notes.md § "Prediction Sanity
+# Failures"). Such sensors fall back to the YAML default tau, and their solar
+# gains are dropped (they were fitted against the bad tau's Newton residuals).
+_MIN_TAU_SEGMENTS = 5
+_SUSPECT_TAU_HOURS = 250.0
+
 # ── SimParams: loaded once from thermal_params.json ──────────────────────
 
 
@@ -118,14 +133,35 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     with open(p) as f:
         data = json.load(f)
 
-    # Tau lookup: build TauModel from fitted_taus
+    # Tau lookup: build TauModel from fitted_taus. Sensors whose tau came from
+    # too few segments AND landed implausibly slow fall back to the YAML
+    # default tau; their solar gains are dropped below.
+    yaml_tau_lookup = {s["name"]: s.get("yaml_tau_base") for s in data["sensors"]}
+    unreliable_tau_sensors: set[str] = set()
     taus: dict[str, TauModel] = {}
     for ft in data["fitted_taus"]:
         sensor = ft["sensor"]
         # Backward compat: old files use advisory_tau_betas or window_betas
         tau_betas = ft.get("environment_tau_betas", ft.get("advisory_tau_betas", ft.get("window_betas", {})))
+        tau_base = ft["tau_base"]
+        n_segments = ft.get("n_segments")
+        yaml_tau = yaml_tau_lookup.get(sensor)
+        # n_segments == 0 already means "yaml default" upstream; None means an
+        # old params file that predates the field — trust it rather than guess.
+        if (
+            n_segments is not None
+            and 0 < n_segments < _MIN_TAU_SEGMENTS
+            and tau_base > _SUSPECT_TAU_HOURS
+            and yaml_tau
+        ):
+            print(
+                f"  [sim] {sensor}: tau_base={tau_base:.0f}h from only {n_segments} "
+                f"segment(s) — using YAML default {yaml_tau:.0f}h, dropping solar gain"
+            )
+            tau_base = yaml_tau
+            unreliable_tau_sensors.add(sensor)
         taus[sensor] = TauModel(
-            tau_base=ft["tau_base"],
+            tau_base=tau_base,
             environment_tau_betas=tau_betas,
         )
 
@@ -163,6 +199,35 @@ def load_sim_params(path: Path | None = None) -> SimParams:
             gain_val = _MAX_GAIN_MAGNITUDE if gain_val > 0 else -_MAX_GAIN_MAGNITUDE
             n_clamped_mag += 1
         gains[(g["effector"], g["sensor"])] = (gain_val, g["best_lag_minutes"])
+
+    # Solar lookup: elevation-based gains (preferred) and legacy per-hour.
+    # Solar gains get the same magnitude clamp as effector gains (at a higher
+    # ceiling), and are dropped entirely for sensors whose tau fit was rejected
+    # above — they were regressed against that tau's Newton residuals.
+    n_solar_clamped = 0
+    n_solar_dropped = 0
+
+    def _filter_solar(sensor: str, gain: float) -> float | None:
+        nonlocal n_solar_clamped, n_solar_dropped
+        if sensor in unreliable_tau_sensors:
+            n_solar_dropped += 1
+            return None
+        if abs(gain) > _MAX_SOLAR_GAIN_MAGNITUDE:
+            n_solar_clamped += 1
+            return _MAX_SOLAR_GAIN_MAGNITUDE if gain > 0 else -_MAX_SOLAR_GAIN_MAGNITUDE
+        return gain
+
+    solar_elevation_gains: dict[str, float] = {}
+    for k, v in data.get("solar_elevation_gains", {}).items():
+        filtered = _filter_solar(str(k), float(v))
+        if filtered is not None:
+            solar_elevation_gains[str(k)] = filtered
+    solar: dict[tuple[str, int], float] = {}
+    for sg in data.get("solar_gains", []):
+        filtered = _filter_solar(sg["sensor"], sg["gain_f_per_hour"])
+        if filtered is not None:
+            solar[(sg["sensor"], sg["hour_of_day"])] = filtered
+
     filter_parts: list[str] = []
     if n_pruned_t:
         filter_parts.append(f"{n_pruned_t} pruned by |t| < {_MIN_T_STATISTIC:.1f}")
@@ -170,14 +235,12 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         filter_parts.append(f"{n_clamped_mag} clamped to ±{_MAX_GAIN_MAGNITUDE:.1f}{UNIT_SYMBOL}/hr")
     if n_pruned_sign:
         filter_parts.append(f"{n_pruned_sign} pruned by wrong sign for mode")
+    if n_solar_clamped:
+        filter_parts.append(f"{n_solar_clamped} solar clamped to ±{_MAX_SOLAR_GAIN_MAGNITUDE:.1f}{UNIT_SYMBOL}/hr")
+    if n_solar_dropped:
+        filter_parts.append(f"{n_solar_dropped} solar dropped (unreliable tau)")
     if filter_parts:
         print(f"  [sim] Gain filters: {', '.join(filter_parts)}")
-
-    # Solar lookup: elevation-based gains (preferred) and legacy per-hour
-    solar_elevation_gains = {str(k): float(v) for k, v in data.get("solar_elevation_gains", {}).items()}
-    solar: dict[tuple[str, int], float] = {}
-    for sg in data.get("solar_gains", []):
-        solar[(sg["sensor"], sg["hour_of_day"])] = sg["gain_f_per_hour"]
 
     sensors = [s["name"] for s in data["sensors"]]
 

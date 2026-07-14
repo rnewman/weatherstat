@@ -49,6 +49,8 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 32. **Per-horizon MRT correction on predictions** (done) — Moved MRT correction from bound-shifting to prediction-shifting ("feels-like"). `apply_mrt_correction` (which mutated comfort schedules) replaced by three functions: `compute_mrt_offset` (single sensor, single moment), `compute_current_mrt_offsets` (per-sensor at current conditions), `compute_horizon_mrt_offsets` (per-sensor, per-horizon using forecast data). Comfort bounds stay at user-configured values throughout. Scoring applies per-horizon MRT offsets to predicted temps before comparing to bounds: `feels_like = air_temp - offset`. Each horizon uses that step's forecast outdoor temp, solar elevation, and solar fraction — capturing transitions like sunset or overnight cooling. Regulating effector targets (mini split setpoints) adjusted by current-moment MRT offset: `target_air = preferred_operative + mrt_offset`, because the target is an air temperature but the user's preference is operative. Cold-room override uses feels-like temp. Decision log stores per-sensor offsets directly. Fixes false comfort warnings where MRT-shifted bounds caused confusing display ("76.7°F above backup 77°F" when backup was shifted to 76.5°F). See `docs/plans/PLAN-32-MRT-rework.md` and `docs/mrt-correction.md`.
 33. **Continuous solar fraction from cloud_coverage** (done) — Replaced the categorical `SOLAR_FRACTION` step function (`sunny → 1.0`, `partlycloudy → 0.5`, `cloudy → 0.15`) with a continuous transfer derived from `cloud_coverage` (0–100%) via the Kasten-Czeplak formula `f = 1 − 0.75·(cc/100)^3.4`. Empirical analysis showed family_room over-predicting on sunny weather only (4h p90 +3.15°F, 6h max +5.73°F vs near-zero or negative bias on every other condition) — sunny days span cc=0–30% but all collapsed to `1.0`, so the regression averaged them and over-extrapolated on truly clear days. New `effective_solar_fraction(cloud_coverage, condition)` helper in `weather.py` is the single entry point used by sysid, control, TUI, and replay/bundle scripts; categorical `condition_to_solar_fraction` remains as the fallback path for snapshots predating April 2026 cloud-coverage collection. After refit, `solar_elevation_gains[family_room]` dropped from 2.02 to 1.17 °F/hr (-42%); other rooms saw -15-20% drops, consistent with the model now distinguishing within-bucket variation. Data plumbing: `_weather_to_series` now extracts `cloud_coverage` from the HA REST history attribute path (was previously only collected, not surfaced at runtime), and `snapshot_column_defs` declares `cloud_coverage` and `forecast_cloud_{1,2,4,6,12}h` as `REAL` so the EAV pivot coerces them to float64. The simulator is unchanged — it consumes the precomputed `solar_fractions` list whose construction is the only thing that changed. Old data falls back to the categorical map row-by-row via `Series.combine_first`.
 
+34. **Load-time quality gates, retention, headless runtime** (done) — Simulator load gates extended per the March guard-rail notes: solar elevation gains (and legacy per-hour profiles) clamped to ±5°F/hr; sensors whose tau came from <5 segments AND landed >250h (the 500h-cap pathology) fall back to YAML default tau with their solar gain dropped. WAL mode on decision_log.db (was collector-only), closing the TUI worker-thread lock hazard. Retention system (`retention.py`): command JSON pruned after 14 days (newest always kept), decision log rows after 365 days (a full heating season of outcomes is analysis data; VACUUM after bulk deletes), both configurable via `defaults.command_retention_days`/`decision_retention_days`, 0 = keep forever; EAV snapshots are never pruned. Shared runtime (`runtime.py`): quality-gated `sysid_refit()` extracted from the TUI; `run_retention_if_due()` daily via marker file; `run_headless_loop()` gives `just control --loop` the same periodic sysid + retention the TUI has — headless deployment no longer loses refitting. Timing instrumentation: control cycle prints fetch/sweep/total and logs `cycle_seconds` to the decision log (new column); sysid prints load/tau/regression stage timings. Fixed `just discover` path (`../scripts/` → `./scripts/`).
+
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
 ## Commands
@@ -62,10 +64,11 @@ just health           # Check if collector data is fresh
 just sysid            # System identification (fit thermal params from data)
 just control          # Single control cycle (dry-run)
 just control --live   # Single cycle with live execution + HA commands
-just control --loop   # 5-min control loop (dry-run)
-just control --live --loop  # Live control loop (production)
+just control --loop   # Headless loop: control cycles + hourly sysid + daily retention (dry-run)
+just control --live --loop  # Live headless loop (production)
 just execute          # Apply latest command JSON to HA
 just execute --force  # Apply ignoring manual overrides
+just prune            # Prune old command JSON + decision log rows (snapshots never pruned)
 just tui              # Interactive TUI dashboard
 just tui --live       # TUI starting in live mode
 just tui-web          # TUI with embedded mobile web frontend (default 0.0.0.0:8765)
@@ -79,8 +82,13 @@ just debug why        # Explain why active effectors are on (snapshot DB temps)
 just debug decision-why  # Explain latest decision (live temps from decision log)
 just debug advisory   # Advisory states + compound tau effects
 just debug decisions  # Recent decision log
+just replay           # Replay an environment opportunity evaluation
+just bundle           # Create or replay a point-in-time debug bundle
+just experiment-sysid # Sysid experiment harness (A/B vs frozen baseline)
+just discover         # Discover HA entities, generate starter config
 just lint             # Lint src + tests
 just lint-fix         # Lint and fix src + tests
+just fmt              # Format src + tests
 just test             # Run full test suite
 just validate         # Quick sysid + prediction validation smoke test
 ```
@@ -120,6 +128,7 @@ Runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR` en
   control_state.json          # last decision state
   executor_state.json         # executor override tracking
   advisory_state.json         # environment entry advisory cooldowns
+  .retention_last_run         # marker: last daily retention run
 ```
 
 First-time setup: `just init` creates the directory and copies `weatherstat.yaml.example`.

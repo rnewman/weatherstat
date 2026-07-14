@@ -63,7 +63,7 @@ just sysid --output custom_path.json  # custom output path
 
 ### When to rerun
 
-- **Automatically:** The TUI runs sysid periodically (default: hourly, configurable via `sysid_interval` in the `defaults` section). A quality gate rejects bad fits (zero taus or zero significant gains), so the existing params are preserved if the new fit is worse.
+- **Automatically:** Both the TUI and the headless loop (`just control --loop`) run sysid periodically (default: hourly, configurable via `sysid_interval` in the `defaults` section). A quality gate rejects bad fits (zero taus or zero significant gains), so the existing params are preserved if the new fit is worse.
 - **Manually:** After physical changes (new insulation, window replacement, new HVAC device) or seasonally — spring/summer solar profiles differ from winter.
 
 Sysid uses all available collector data. More data = tighter parameter estimates. The two-phase API (`fit_sysid()` + `save_sysid_result()`) allows callers to validate before writing.
@@ -84,8 +84,13 @@ executed, then re-planned with fresh data.
 
 ```bash
 just control           # single cycle, prints decision + writes command JSON
-just control --loop    # 5-min loop, writes command JSON but doesn't execute
+just control --loop    # headless loop: control cycles + hourly sysid + daily retention
 ```
+
+The `--loop` form is the full headless runtime: control cycles every
+`control_interval`, sysid refits every `sysid_interval` (quality-gated, 0 =
+disabled), and daily retention. Running the TUI provides the same periodic
+behaviors — run one or the other, not both.
 
 ### Live execution
 
@@ -112,8 +117,7 @@ detection (respects manual changes for 30 minutes).
 
 - Setpoints clamped to [62, 78]°F (absolute bounds, configurable)
 - 3-minute minimum hold time between thermostat setpoint changes
-- 2-hour minimum hold time between mini-split mode changes
-- Per-device mode hold window (e.g., 10pm–7am): no mini-split mode changes during quiet hours, only target temperature adjustments
+- Per-device mode hold window (e.g., 10pm–7am via `mode_hold_window`): no mini-split mode changes during quiet hours, only target temperature adjustments
 - Refuses to execute if data is >15 minutes stale
 - Cold-sensor override: forces immediate trajectory-effector activation when any sensor is significantly below comfort minimum
 - Dry-run is always the default
@@ -123,7 +127,8 @@ detection (respects manual changes for 30 minutes).
 Defined in `weatherstat.yaml` under `constraints.schedules`. Per-sensor, per-time-of-day
 comfort profiles with `preferred` temperature, hard `min`/`max` rails, and asymmetric
 `cold_penalty`/`hot_penalty` weights. The optimizer uses a two-layer cost: continuous
-quadratic from preferred + 10× steep penalty outside min/max.
+quadratic from preferred + a steep penalty outside min/max (3× by default, configurable
+via `defaults.hard_rail_multiplier`).
 
 ### Decision logging
 
@@ -136,6 +141,24 @@ snapshots, using the enriched bounds for accurate retroactive cost computation.
 
 ```bash
 sqlite3 ~/.weatherstat/decision_log.db "SELECT timestamp, comfort_cost, energy_cost, trajectory FROM decisions ORDER BY timestamp DESC LIMIT 10;"
+```
+
+Each decision also records its cycle duration (`cycle_seconds`) and the cycle
+prints a timing breakdown (`fetch`, `sweep`, `total`) — useful for spotting
+performance regressions, especially on slower deployment targets.
+
+### Retention
+
+Command JSON files and decision log rows are pruned automatically, at most
+once per day, by whichever loop is running (TUI or headless). Defaults: 14
+days for `predictions/command_*.json`, 365 days for decision log rows —
+configurable via `command_retention_days` / `decision_retention_days` in the
+`defaults` section (0 = keep forever). **Collector snapshots are never
+pruned** — the EAV database is training data and grows unbounded by design
+(~60MB/month). Run retention manually with:
+
+```bash
+just prune
 ```
 
 ## 4. Comfort Dashboard
@@ -214,6 +237,7 @@ All runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR
   control_state.json           # last decision state (anti-cycling, mode hold times)
   executor_state.json          # executor override tracking
   advisory_state.json          # per-environment-entry advisory cooldown timestamps
+  .retention_last_run          # marker file: last daily retention run
   comfort_*.png                # comfort dashboard output
 ```
 

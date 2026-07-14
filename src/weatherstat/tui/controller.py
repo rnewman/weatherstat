@@ -578,6 +578,14 @@ class TUIController:
             if live:
                 self._run_executor_inline(force=False)
 
+        try:
+            from weatherstat.runtime import run_retention_if_due
+
+            run_retention_if_due(log=self._log)
+        except Exception as e:
+            self._log(f"[retention] [red]Error: {e}[/]")
+            self._log(traceback.format_exc())
+
         with self._lock:
             self._cycle_running = False
             self._next_cycle_at = datetime.now(UTC) + timedelta(
@@ -599,24 +607,15 @@ class TUIController:
 
         buf = io.StringIO()
         try:
-            from weatherstat.sysid import fit_sysid, save_sysid_result
+            from weatherstat.runtime import sysid_refit
 
             with contextlib.redirect_stdout(buf):
-                result, diagnostics = fit_sysid()
+                outcome = sysid_refit()
 
-            n_taus = len(result.fitted_taus)
-            n_gains = sum(1 for g in result.effector_sensor_gains if not g.negligible)
-            if n_taus == 0:
-                self._log("[sysid] [red]Rejected: no sensors fitted[/]")
-            elif n_gains == 0:
-                self._log("[sysid] [red]Rejected: no significant gains found[/]")
+            if outcome.saved:
+                self._log(f"[sysid] {outcome.message} ({outcome.duration_seconds:.1f}s)")
             else:
-                with contextlib.redirect_stdout(buf):
-                    save_sysid_result(result, sensor_diagnostics=diagnostics)
-                self._log(
-                    f"[sysid] Complete. {result.n_snapshots} snapshots,"
-                    f" {n_taus} sensors, {n_gains} gains."
-                )
+                self._log(f"[sysid] [red]{outcome.message}[/]")
         except Exception as e:
             self._log(f"[sysid] [red]Error: {e}[/]")
             self._log(traceback.format_exc())

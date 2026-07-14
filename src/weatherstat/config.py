@@ -124,6 +124,12 @@ ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
 CONTROL_INTERVAL: int = _CFG.control_interval  # seconds between control cycles
 SYSID_INTERVAL: int = _CFG.sysid_interval  # seconds between automatic sysid (0 = disabled)
 
+# ── Retention (days, 0 = keep forever) ───────────────────────────────────
+# The collector's EAV snapshots.db is never pruned — it is training data.
+
+COMMAND_RETENTION_DAYS: int = _CFG.command_retention_days
+DECISION_RETENTION_DAYS: int = _CFG.decision_retention_days
+
 # ── Temperature unit helpers ─────────────────────────────────────────────
 
 UNIT_SYMBOL: str = _CFG.unit_symbol

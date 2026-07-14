@@ -236,9 +236,10 @@ already shows error distributions by horizon.
 
 ## Online Learning
 
-Sysid now runs automatically in the TUI (default hourly, configurable via
-`sysid_interval`), with a quality gate that rejects bad fits. This handles
-gradual seasonal drift but doesn't yet do incremental parameter updates.
+Sysid now runs automatically in both the TUI and the headless loop
+(default hourly, configurable via `sysid_interval`), with a quality gate
+that rejects bad fits. This handles gradual seasonal drift but doesn't yet
+do incremental parameter updates.
 
 The next step beyond periodic refitting is automatic parameter adjustment
 (exponential moving averages on gain/delay/tau) when systematic prediction
@@ -253,25 +254,22 @@ increasing with horizon) — this likely represents underestimated heat loss
 
 ## Sweep Scalability
 
-Batch prediction gives ~160ms per sweep (~14K scenarios). The unified effector
-model generates scenarios as the cartesian product of per-effector options,
-so count grows as `|options|^N_independent`.
+**Status update (Stage 30, May 2026):** Marginal screening has been
+implemented via superposition decomposition — the sweep simulates ~170
+marginals (all-off baseline + one per effector option), reconstructs all
+combination temperatures via array addition, and Euler-refines only the
+top-K (~100). Full HVAC sweeps now complete in well under a second on the
+dev machine; the timing line in each control cycle tracks this. Advisory
+combinatorics are still managed by the coarsening caps (reduce at >50K,
+two-stage at >100K).
 
-**Current:** All effector types sweep delay × duration grids (9 combos per
-mode). 2 trajectory (10 each) × 2 regulating (1 + modes×targets×9 delay/dur
-each, ~37 with idle suppression) × 3 binary (1 + modes×9, ~19 each) —
-potentially large cross products, managed by the existing coarsening logic
-(reduce at >50K, hold-all at >100K).
-Adding a 3rd trajectory effector: ~100K+ scenarios, ~1s sweep.
-
-**Future approaches (in priority order):**
+**Remaining approaches if scenario counts outgrow superposition:**
 - **Trajectory grid reduction** — Coarser delay/duration grid for N>2
   trajectory effectors. Receding horizon compensates.
 - **Window decomposition** — O(N) vs O(2^N). Independent per-window toggle.
   Needed at 10+ windows.
 - **Greedy coordinate descent** — O(Σ levels) vs O(∏ levels). Iterative
   single-device optimization. Needed at 6+ blowers.
-- **Marginal screening** — Fast linear approximation, full eval on top-K.
 - **Spatial decomposition** — Only re-predict sensors affected by each device
   change. Composes with all above.
 
@@ -306,17 +304,6 @@ data, which produces confounded estimates. Examples observed (Mar 2026):
   and cold air flow differently — convection patterns differ)
 - Instrumental variable approaches if sufficient data accumulates
 - Per-sensor data quality flags (short history, known unobserved heat sources)
-
----
-
-## Solar Irradiance Estimation
-
-Approximate solar irradiance from existing + forecast data:
-- `solar_elevation` (already computed per-row)
-- Weather-conditioned solar fractions (already implemented: sunny=1.0,
-  cloudy=0.15, etc.) modulate the per-hour solar gain profiles.
-- Future extension: continuous irradiance model from cloud cover percentage
-  (if available from met.no) rather than discrete condition codes.
 
 ---
 

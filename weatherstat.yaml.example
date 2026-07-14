@@ -316,3 +316,6 @@ defaults:
   # backup_margin: 3         # backup bounds = acceptable ± this margin (default: 3°F / 1.7°C)
   # control_interval: 300    # seconds between control cycles (default: 300 = 5 min)
   # sysid_interval: 3600     # seconds between automatic sysid runs (default: 3600 = 1 hr, 0 = disabled)
+  # Retention (days, 0 = keep forever). Collector snapshots are never pruned.
+  # command_retention_days: 14    # predictions/command_*.json files
+  # decision_retention_days: 365  # decision_log.db rows (keep a full heating season)

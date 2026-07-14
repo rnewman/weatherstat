@@ -89,6 +89,89 @@ def test_tau_values_reasonable(sim_params: SimParams) -> None:
             assert beta >= 0, f"{sensor} advisory {dev} beta must be >= 0"
 
 
+# ── Quality gates: tau segment gate + solar magnitude cap ────────────────
+
+
+def _write_params(tmp_path, fitted_taus: list[dict], solar_elevation_gains: dict[str, float]):
+    """Write a minimal thermal_params.json exercising the load-time gates."""
+    import json
+
+    params = {
+        "effectors": [],
+        "sensors": [{"name": ft["sensor"], "yaml_tau_base": 45.0} for ft in fitted_taus],
+        "fitted_taus": fitted_taus,
+        "effector_sensor_gains": [],
+        "solar_gains": [],
+        "solar_elevation_gains": solar_elevation_gains,
+    }
+    p = tmp_path / "thermal_params.json"
+    p.write_text(json.dumps(params))
+    return p
+
+
+def test_tau_gate_rejects_sparse_cap_hit(tmp_path) -> None:
+    """<5 segments + implausibly slow tau falls back to YAML default; solar dropped."""
+    p = _write_params(
+        tmp_path,
+        [{"sensor": "bad_temp", "tau_base": 500.0, "n_segments": 3}],
+        {"bad_temp": 1.2},
+    )
+    sp = load_sim_params(p)
+    assert sp.taus["bad_temp"].tau_base == 45.0
+    assert "bad_temp" not in sp.solar_elevation_gains
+
+
+def test_tau_gate_keeps_well_fitted_slow_tau(tmp_path) -> None:
+    """Slow tau with plenty of segments is trusted (e.g., bathroom at 130h/60 seg)."""
+    p = _write_params(
+        tmp_path,
+        [{"sensor": "bathroom_temp", "tau_base": 300.0, "n_segments": 60}],
+        {"bathroom_temp": 0.4},
+    )
+    sp = load_sim_params(p)
+    assert sp.taus["bathroom_temp"].tau_base == 300.0
+    assert sp.solar_elevation_gains["bathroom_temp"] == 0.4
+
+
+def test_tau_gate_keeps_sparse_but_plausible_tau(tmp_path) -> None:
+    """Few segments alone isn't disqualifying — only combined with a cap-adjacent fit."""
+    p = _write_params(
+        tmp_path,
+        [{"sensor": "new_temp", "tau_base": 60.0, "n_segments": 3}],
+        {"new_temp": 0.8},
+    )
+    sp = load_sim_params(p)
+    assert sp.taus["new_temp"].tau_base == 60.0
+    assert sp.solar_elevation_gains["new_temp"] == 0.8
+
+
+def test_tau_gate_ignores_legacy_params_without_segments(tmp_path) -> None:
+    """Params files predating n_segments are trusted as-is."""
+    p = _write_params(
+        tmp_path,
+        [{"sensor": "old_temp", "tau_base": 500.0}],
+        {"old_temp": 1.0},
+    )
+    sp = load_sim_params(p)
+    assert sp.taus["old_temp"].tau_base == 500.0
+    assert sp.solar_elevation_gains["old_temp"] == 1.0
+
+
+def test_solar_gain_magnitude_clamped(tmp_path) -> None:
+    """Implausible solar elevation gains are clamped, preserving sign."""
+    p = _write_params(
+        tmp_path,
+        [
+            {"sensor": "spiky_temp", "tau_base": 50.0, "n_segments": 20},
+            {"sensor": "negative_temp", "tau_base": 50.0, "n_segments": 20},
+        ],
+        {"spiky_temp": 17.0, "negative_temp": -8.0},
+    )
+    sp = load_sim_params(p)
+    assert sp.solar_elevation_gains["spiky_temp"] == pytest.approx(5.0)
+    assert sp.solar_elevation_gains["negative_temp"] == pytest.approx(-5.0)
+
+
 # ── Integration tests (require live thermal_params.json) ─────────────
 
 

@@ -11,8 +11,9 @@ weatherstat control loop. Updated as new oddities arise.
 
 **Root cause taxonomy:**
 
-1. **No effective gains** — all sysid-learned effector gains filtered by
-   |t| < 1.5 or magnitude > 3.0°F/hr in the simulator. The sensor
+1. **No effective gains** — all sysid-learned effector gains pruned by
+   |t| < 1.5 in the simulator (gains over 2.0°F/hr are clamped, not
+   pruned). The sensor
    becomes pure Newton cooling toward outdoor temp, losing all HVAC
    influence. Check `thermal_params.json`: look for the sensor's gains
    and count how many pass the simulator's filter.
@@ -103,14 +104,15 @@ over-penalization while maintaining full regularization on confounded
 effector gains. Coefficients are transformed back to original units
 after the solve.
 
-### Known issue: living_room_climate solar spikes
+### Known issue: living_room_climate solar spikes — FIXED (Jul 2026)
 
-`living_room_climate_temp` shows ±17°F/hr solar gains (h=8, h=10).
+`living_room_climate_temp` showed ±17°F/hr solar gains (h=8, h=10).
 Root cause: only 3 tau segments, tau_base=500h cap. The solar
-coefficients are fitting noise in sparse data. Solar gains are NOT
-filtered by the simulator's magnitude cap (only effector gains are).
-Guard rail: add a solar gain magnitude cap in the simulator, or
-filter at sysid time for sensors with < N tau segments.
+coefficients were fitting noise in sparse data. Both proposed guard
+rails now exist in `simulator.load_sim_params()`: solar gains are
+clamped to ±5°F/hr, and sensors whose tau came from <5 segments AND
+landed >250h fall back to the YAML default tau with their solar gain
+dropped entirely (it was regressed against the bad tau's residuals).
 
 ### Tuning notes
 
@@ -194,9 +196,11 @@ The 35-minute smoothing kernel means adjacent derivative estimates share data, i
 ### "Why is sensor X predicted at Y°F?"
 
 1. Check `thermal_params.json` for the sensor's gains, tau, environment tau betas
-2. Count how many gains pass simulator filter (|t| ≥ 1.5, magnitude ≤ 3.0)
-3. If zero gains pass: prediction is pure Newton + solar. Check tau_base
-   and forecast outdoor temp.
+2. Count how many gains pass simulator filter (|t| ≥ 1.5, magnitude ≤ 2.0;
+   solar gains clamped to ±5.0, dropped entirely if the tau fit was rejected)
+3. If zero gains pass: prediction is pure Newton + solar. Check tau_base,
+   n_segments (a rejected tau falls back to the YAML default), and forecast
+   outdoor temp.
 4. Run a single predict with verbose logging to see per-term contributions.
 5. Check window states — open windows with learned betas increase cooling.
 
