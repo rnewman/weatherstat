@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from weatherstat.extract import load_collector_snapshots
+from weatherstat.identification import transition_weights, weighted_ridge
 from weatherstat.sysid import (
     _enumerate_effectors,
     _enumerate_sensors,
@@ -43,50 +44,6 @@ from weatherstat.sysid import (
 SIGMAS_HOURS = [None, 8.0, 4.0, 2.0, 1.0]  # None = uniform weights (batch replication)
 DEVICES = ["moss_garden_shade", "bedroom_upper_blinds"]
 SENSORS = ["piano_temp", "bedroom_temp", "bathroom_temp", "family_room_temp"]
-
-
-def transition_weights(state: np.ndarray, ts_hours: np.ndarray, sigma_hours: float) -> np.ndarray:
-    """Gaussian bump around each state transition, two-sided, max over transitions."""
-    change = np.zeros(len(state), dtype=bool)
-    change[1:] = state[1:] != state[:-1]
-    t_transitions = ts_hours[change]
-    if len(t_transitions) == 0:
-        return np.zeros(len(state))
-    # For each row, distance to nearest transition (both arrays sorted)
-    idx = np.searchsorted(t_transitions, ts_hours)
-    d_prev = np.where(idx > 0, ts_hours - t_transitions[np.clip(idx - 1, 0, None)], np.inf)
-    d_next = np.where(idx < len(t_transitions), t_transitions[np.clip(idx, None, len(t_transitions) - 1)] - ts_hours, np.inf)
-    d = np.minimum(np.abs(d_prev), np.abs(d_next))
-    return np.exp(-(d**2) / (2 * sigma_hours**2))
-
-
-def weighted_ridge(X: np.ndarray, y: np.ndarray, w: np.ndarray, feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    """Selectively standardized ridge, replicating _fit_sensor_model's solve with weights."""
-    scale = np.ones(X.shape[1])
-    for j, name in enumerate(feature_names):
-        if name.startswith("_solar_") or name.startswith("_adv_"):
-            s = np.std(X[:, j])
-            if s > 0:
-                scale[j] = s
-    Xs = X / scale
-    sw = np.sqrt(w)
-    Xw = Xs * sw[:, None]
-    yw = y * sw
-    n_eff = float(w.sum())
-    lam = 0.01 * n_eff
-    A = Xw.T @ Xw + lam * np.eye(X.shape[1])
-    beta_s = np.linalg.solve(A, Xw.T @ yw)
-    beta = beta_s / scale
-    resid = yw - Xw @ (beta * scale)
-    dof = max(n_eff - X.shape[1], 1.0)
-    s2 = float(resid @ resid) / dof
-    try:
-        cov = s2 * np.linalg.inv(A)
-        se = np.sqrt(np.abs(np.diag(cov))) / scale
-    except np.linalg.LinAlgError:
-        se = np.full(len(beta), np.nan)
-    t = np.where(se > 0, beta / se, 0.0)
-    return beta, t
 
 
 def main() -> None:

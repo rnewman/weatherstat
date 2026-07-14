@@ -137,6 +137,7 @@ class SysIdResult:
     environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
     solar_plane_gains: dict[str, dict[str, float]] = field(default_factory=dict)  # sensor -> {plane -> gain}
     regression_models: dict[str, dict] = field(default_factory=dict)  # sensor -> {tau_base, feature_names, coefficients}
+    coupling_identification: dict[str, dict[str, dict[str, dict]]] = field(default_factory=dict)  # family -> device -> sensor -> record
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
@@ -1028,6 +1029,47 @@ def _fit_sensor_model(
             elif verbose:
                 print(f"    advisory_solar {dev_name}: β={b:.6f}, t={t:.1f}{cv_str} → dropped (|t|<{_T_STAT_THRESHOLD})")
 
+    # ── Stage 2.5: causal identification for advisory-device couplings ──
+    # Kept env×tau / env×solar betas on *advisory* devices are used
+    # counterfactually by the sweep, but they are fitted from observational
+    # user behavior — the weakest identification in the regression. Classify
+    # each via transition-weighted refit (see identification.py); the
+    # simulator excludes correlational couplings from counterfactual toggles
+    # while keeping them for observed-state prediction.
+    from dataclasses import asdict as _asdict
+
+    from weatherstat.identification import classify_coupling
+
+    identification: dict[str, dict[str, dict]] = {"tau": {}, "solar": {}}
+    _advisory_devs = set(_CFG.advisory_environment)
+    _kept_advisory = [
+        ("tau", dev) for dev in environment_tau_betas if dev in _advisory_devs
+    ] + [
+        ("solar", dev) for dev in environment_solar_betas if dev in _advisory_devs
+    ]
+    if _kept_advisory:
+        ts_hours_valid = (
+            (df["_ts"] - df["_ts"].iloc[0]).dt.total_seconds().values / 3600.0
+        )[valid]
+        for family, dev in _kept_advisory:
+            feature = f"_adv_{family}_{dev}"
+            if feature not in feature_names:
+                continue
+            env_cfg = _CFG.environment.get(dev)
+            if env_cfg is None or env_cfg.column not in df.columns:
+                continue
+            dev_state = (
+                df[env_cfg.column].astype("float64").ffill().fillna(0.0) > 0.5
+            ).values[valid]
+            fj = feature_names.index(feature)
+            result = classify_coupling(
+                X, y, feature_names, feature, dev_state, ts_hours_valid,
+                beta_batch=float(beta[fj]), t_batch=float(t_stats[fj]),
+            )
+            identification[family][dev] = _asdict(result)
+            if verbose or result.tag != "causal":
+                print(f"    identification {family} {dev}: {result.tag}")
+
     # Extract solar elevation gain (single coefficient per sensor)
     solar_elev_gain: float = 0.0
     solar_elev_t: float = 0.0
@@ -1048,6 +1090,7 @@ def _fit_sensor_model(
         "tau_base": tau_base,
         "feature_names": list(feature_names),
         "coefficients": [round(float(b), 6) for b in beta],
+        "identification": identification,
     }
 
     return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_solar_betas, diagnostics, model
@@ -1293,6 +1336,7 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
     solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
     solar_plane_gains: dict[str, dict[str, float]] = {}  # sensor -> {plane -> gain}
     regression_models: dict[str, dict] = {}  # sensor -> serialized fit
+    coupling_identification: dict[str, dict[str, dict[str, dict]]] = {}  # family -> device -> sensor
     all_adv_tau_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
     all_adv_solar_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
     sensor_diagnostics: dict[str, RegressionDiagnostics] = {}  # for health summary
@@ -1304,6 +1348,10 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
         )
         all_gains.extend(gains)
         if model is not None:
+            ident = model.pop("identification", {})
+            for family, devs in ident.items():
+                for dev, record in devs.items():
+                    coupling_identification.setdefault(family, {}).setdefault(dev, {})[sensor.name] = record
             regression_models[sensor.name] = model
             plane_gains = {
                 p: model["coefficients"][model["feature_names"].index(f"_solar_{p}")]
@@ -1337,6 +1385,14 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
         f"\n  Sysid timing: load {_load_seconds:.1f}s, tau fit {_stage1_seconds:.1f}s,"
         f" regression {_stage2_seconds:.1f}s, total {time.monotonic() - _fit_t0:.1f}s"
     )
+
+    n_corr = sum(
+        1 for fam in coupling_identification.values() for dev in fam.values()
+        for rec in dev.values() if rec.get("tag") == "correlational"
+    )
+    n_ident = sum(len(dev) for fam in coupling_identification.values() for dev in fam.values())
+    if n_ident:
+        print(f"  Identification: {n_ident} advisory coupling(s) classified, {n_corr} correlational (prediction-only)")
 
     # Merge advisory tau betas into FittedTau
     for i, ft in enumerate(fitted_taus):
@@ -1379,6 +1435,7 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
         environment_solar_betas=environment_solar_betas,
         solar_plane_gains=solar_plane_gains,
         regression_models=regression_models,
+        coupling_identification=coupling_identification,
     )
     return sysid_result, sensor_diagnostics
 

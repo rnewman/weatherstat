@@ -414,6 +414,21 @@ def cmd_taus() -> None:
                 print(f"    {s:<30} {w:.3f}")
 
 
+    # Causal identification of advisory-device couplings (Stage 2.5)
+    ci = params.get("coupling_identification", {})
+    if ci:
+        print("  Coupling identification (advisory devices; correlational = prediction-only):")
+        for family in sorted(ci):
+            for dev in sorted(ci[family]):
+                for sensor, rec in sorted(ci[family][dev].items()):
+                    tag = rec.get("tag", "?")
+                    marker = {"causal": "✓", "correlational": "✗", "underpowered": "?"}.get(tag, "?")
+                    print(
+                        f"    {marker} {family:<5} {dev:<24} -> {sensor:<28}"
+                        f" {tag:<14} β={rec.get('beta_batch', 0):+.3f}"
+                    )
+        print()
+
 def cmd_decisions(n: int = 5) -> None:
     """Show recent decisions."""
     p = _paths()

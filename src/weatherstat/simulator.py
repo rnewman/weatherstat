@@ -89,6 +89,10 @@ class SimParams:
     mrt_weights: dict[str, float] = field(default_factory=dict)  # sensor -> derived MRT weight
     solar_elevation_gains: dict[str, float] = field(default_factory=dict)  # sensor -> gain per sin(elev)×frac
     solar_plane_gains: dict[str, dict[str, float]] = field(default_factory=dict)  # sensor -> {plane -> gain}
+    correlational_couplings: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
+    # family ("tau"/"solar") -> {(device, sensor)}: couplings tagged correlational
+    # by transition-weighted identification. Used for observed-state prediction
+    # but excluded from counterfactual advisory toggles (see PLAN-36).
     environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
 
 
@@ -300,6 +304,23 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     # MRT weights (derived from solar gain profiles by sysid)
     mrt_weights = {str(k): float(v) for k, v in data.get("mrt_weights", {}).items()}
 
+    # Correlational couplings: identified by transition-weighted refit at fit
+    # time. These stay active for observed-state prediction but must not be
+    # credited when the sweep counterfactually toggles the device.
+    correlational_couplings: dict[str, frozenset[tuple[str, str]]] = {}
+    for family, devs in data.get("coupling_identification", {}).items():
+        pairs = {
+            (dev, sensor)
+            for dev, sensors_ in devs.items()
+            for sensor, record in sensors_.items()
+            if record.get("tag") == "correlational"
+        }
+        if pairs:
+            correlational_couplings[family] = frozenset(pairs)
+    n_correlational = sum(len(v) for v in correlational_couplings.values())
+    if n_correlational:
+        print(f"  [sim] {n_correlational} correlational coupling(s): prediction-only, excluded from advisory counterfactuals")
+
     # Environment solar betas (device modulates solar gain for sensor)
     raw_solar_betas = data.get("environment_solar_betas", data.get("advisory_solar_betas", {}))
     environment_solar_betas: dict[str, dict[str, float]] = {}
@@ -317,6 +338,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         solar_elevation_gains=solar_elevation_gains,
         solar_plane_gains=solar_plane_gains,
         environment_solar_betas=environment_solar_betas,
+        correlational_couplings=correlational_couplings,
     )
 
 
@@ -772,12 +794,17 @@ def predict(
         tau_matrix: np.ndarray | None = None
         if per_step_tau:
             inv_tau = np.full((n_scenarios, max_horizon), 1.0 / tau_model.tau_base)
+            corr_tau = params.correlational_couplings.get("tau", frozenset())
             for dev, beta in tau_model.environment_tau_betas.items():
                 af = advisory_future.get(dev)
-                if af is not None:
+                if af is not None and (dev, sensor_col) not in corr_tau:
                     inv_tau += beta * af
                 elif state.environment_states.get(dev, False):
-                    inv_tau += beta  # passive device, constant contribution
+                    # Passive device — or a correlational coupling, which is
+                    # pinned to the observed state: toggling it in a scenario
+                    # earns no credit (identification says the effect is
+                    # habit correlation, not causation).
+                    inv_tau += beta
             tau_matrix = 1.0 / np.maximum(inv_tau, 0.01)
         else:
             tau_scalar = tau_model.effective_tau(state.environment_states)
@@ -844,15 +871,17 @@ def predict(
         if advisory_future and params.environment_solar_betas:
             solar_mod = np.zeros((n_scenarios, max_horizon))
             has_solar_mod = False
+            corr_solar = params.correlational_couplings.get("solar", frozenset())
             for dev, sensor_betas in params.environment_solar_betas.items():
                 beta = sensor_betas.get(sensor_col, 0.0)
                 if beta == 0.0:
                     continue
                 af = advisory_future.get(dev)
-                if af is not None:
+                if af is not None and (dev, sensor_col) not in corr_solar:
                     solar_mod += beta * af
                     has_solar_mod = True
                 elif state.environment_states.get(dev, False):
+                    # Correlational couplings pinned to observed state (see tau)
                     solar_mod += beta
                     has_solar_mod = True
             if has_solar_mod:
