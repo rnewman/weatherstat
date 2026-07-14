@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 import pytest
 
@@ -10,6 +11,9 @@ from weatherstat.weather import (
     condition_to_solar_fraction,
     effective_solar_fraction,
     kasten_czeplak,
+    plane_incidence,
+    solar_azimuth,
+    solar_sin_elevation,
 )
 
 
@@ -99,3 +103,43 @@ class TestEffectiveSolarFraction:
     def test_cloud_coverage_with_unknown_condition(self) -> None:
         # Even if condition is bogus, cloud_coverage drives the result.
         assert effective_solar_fraction(20.0, "moonshine") == pytest.approx(kasten_czeplak(20.0))
+
+
+class TestSolarAzimuthAndPlanes:
+    """Solar azimuth and wall-plane incidence (Seattle: 47.66N, -122.40W)."""
+
+    LAT, LON = 47.66, -122.40
+
+    def _utc(self, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+        return datetime(2026, month, day, hour, minute, tzinfo=UTC)
+
+    def test_azimuth_south_at_solar_noon(self) -> None:
+        # Solar noon at lon -122.4 is ~12:00 + 122.4/15 h = ~20:10 UTC
+        az = solar_azimuth(self.LAT, self.LON, self._utc(6, 21, 20, 10))
+        assert 170 <= az <= 190
+
+    def test_azimuth_east_in_morning_west_in_evening(self) -> None:
+        morning = solar_azimuth(self.LAT, self.LON, self._utc(6, 21, 15, 0))  # ~7am local
+        evening = solar_azimuth(self.LAT, self.LON, self._utc(6, 22, 1, 0))  # ~6pm local
+        assert 60 <= morning <= 120
+        assert 240 <= evening <= 300
+
+    def test_horizontal_plane_matches_sin_elevation(self) -> None:
+        dt = self._utc(6, 21, 20, 10)
+        assert plane_incidence(self.LAT, self.LON, dt, None) == pytest.approx(
+            solar_sin_elevation(self.LAT, self.LON, dt)
+        )
+
+    def test_west_wall_dark_in_morning_lit_in_evening(self) -> None:
+        morning = self._utc(6, 21, 15, 0)
+        evening = self._utc(6, 22, 1, 0)
+        assert plane_incidence(self.LAT, self.LON, morning, 270.0) == 0.0
+        assert plane_incidence(self.LAT, self.LON, evening, 270.0) > 0.3
+        # And the east wall mirrors it
+        assert plane_incidence(self.LAT, self.LON, morning, 90.0) > 0.3
+        assert plane_incidence(self.LAT, self.LON, evening, 90.0) == 0.0
+
+    def test_night_is_zero_everywhere(self) -> None:
+        midnight = self._utc(6, 21, 9, 0)  # ~1am local (PDT = UTC-7)
+        for plane in (None, 90.0, 180.0, 270.0):
+            assert plane_incidence(self.LAT, self.LON, midnight, plane) == 0.0

@@ -133,3 +133,51 @@ def solar_sin_elevation(lat_deg: float, lon_deg: float, dt: datetime) -> float:
     """
     elev = solar_elevation(lat_deg, lon_deg, dt)
     return max(0.0, math.sin(math.radians(elev)))
+
+
+def solar_azimuth(lat_deg: float, lon_deg: float, dt: datetime) -> float:
+    """Solar azimuth in degrees from north (clockwise) for a UTC time.
+
+    Uses the same declination and hour-angle conventions as solar_elevation
+    (accuracy ~1-2°). Validated against forecast.solar per-plane estimates:
+    east planes peak near az≈90-110°, west near az≈250-280°.
+    """
+    day_of_year = dt.timetuple().tm_yday
+    declination = 23.45 * math.sin(math.radians(360.0 / 365.0 * (day_of_year - 81)))
+    utc_hour = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+    hour_angle = 15.0 * (utc_hour + lon_deg / 15.0 - 12.0)
+    lat_r = math.radians(lat_deg)
+    dec_r = math.radians(declination)
+    ha_r = math.radians(hour_angle)
+    # Azimuth measured from south, positive toward west; convert to from-north
+    az_south = math.atan2(
+        math.sin(ha_r),
+        math.cos(ha_r) * math.sin(lat_r) - math.tan(dec_r) * math.cos(lat_r),
+    )
+    return (math.degrees(az_south) + 180.0) % 360.0
+
+
+def plane_incidence(lat_deg: float, lon_deg: float, dt: datetime, plane_azimuth_deg: float | None) -> float:
+    """Clamped solar incidence factor for a surface, in [0, 1].
+
+    plane_azimuth_deg None means horizontal (returns sin⁺(elevation), identical
+    to solar_sin_elevation). Otherwise a vertical wall facing that azimuth:
+    cos(elevation) x cos(sun_azimuth - plane_azimuth), clamped at zero. Like
+    sin⁺(elevation), this is a pure-geometry irradiance proxy — multiply by
+    the cloud fraction to get a forcing feature; the per-sensor regression
+    coefficient absorbs window area, transmission, and obstructions.
+    """
+    elev = solar_elevation(lat_deg, lon_deg, dt)
+    if elev <= 0.0:
+        return 0.0
+    if plane_azimuth_deg is None:
+        return math.sin(math.radians(elev))
+    az = solar_azimuth(lat_deg, lon_deg, dt)
+    cos_inc = math.cos(math.radians(elev)) * math.cos(math.radians(az - plane_azimuth_deg))
+    return max(0.0, cos_inc)
+
+
+# Wall planes used for directional solar features. East/west are measured
+# near-orthogonal (r = -0.05 on forecast.solar data); south is nearly
+# redundant with horizontal (r = 0.96) and is deliberately omitted.
+SOLAR_PLANES: dict[str, float] = {"east": 90.0, "west": 270.0}
