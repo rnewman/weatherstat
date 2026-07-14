@@ -32,6 +32,7 @@ from scipy.optimize import curve_fit
 
 from weatherstat.config import DATA_DIR, UNIT_SYMBOL, delta_temp
 from weatherstat.extract import load_collector_snapshots
+from weatherstat.weather import SOLAR_PLANES
 from weatherstat.yaml_config import load_config
 
 if TYPE_CHECKING:
@@ -134,6 +135,8 @@ class SysIdResult:
     state_gates: dict[str, StateGate] = field(default_factory=dict)
     mrt_weights: dict[str, float] = field(default_factory=dict)
     environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
+    solar_plane_gains: dict[str, dict[str, float]] = field(default_factory=dict)  # sensor -> {plane -> gain}
+    regression_models: dict[str, dict] = field(default_factory=dict)  # sensor -> {tau_base, feature_names, coefficients}
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
@@ -570,6 +573,16 @@ def _preprocess(
 
     df["_solar_elev"] = df["_ts"].apply(lambda dt: solar_sin_elevation(lat, lon, dt)) * solar_frac
 
+    # Directional wall-plane features (east/west; south is ~redundant with
+    # horizontal). Same geometry-x-fraction construction as _solar_elev, so
+    # the per-sensor coefficients decompose the solar response by direction.
+    from weatherstat.weather import plane_incidence
+
+    for plane_name, plane_az in SOLAR_PLANES.items():
+        df[f"_solar_{plane_name}"] = (
+            df["_ts"].apply(lambda dt, az=plane_az: plane_incidence(lat, lon, dt, az)) * solar_frac
+        )
+
     return df
 
 
@@ -615,37 +628,53 @@ def _lag_label_to_minutes(label: str) -> float:
     return 0.0
 
 
-def _fit_sensor_model(
+@dataclass
+class DesignMatrix:
+    """Stage-2 feature matrix for one sensor, reusable outside the batch fit.
+
+    X rows align with df rows (no NaN filtering; callers mask). Feature
+    blocks are identified by name prefix (_lag_, _weather_, _tod_,
+    _adv_tau_, _solar_, _adv_solar_) — the residual tracker selects the
+    block it owns by prefix and treats the rest as context.
+    """
+
+    feature_names: list[str]
+    X: np.ndarray
+    effector_feature_ranges: dict[str, tuple[int, int]]
+    adv_tau_feature_start: int
+    adv_tau_feature_names: list[str]
+    adv_solar_feature_start: int
+    adv_solar_feature_names: list[str]
+    solar_start: int
+
+
+def newton_residual(df: pd.DataFrame, sensor: SensorSpec, tau_base: float) -> np.ndarray | None:
+    """Smoothed dT/dt minus Newton envelope loss — the Stage-2 target."""
+    dTdt_col = f"_dTdt_{sensor.name}"
+    if sensor.temp_column not in df.columns or dTdt_col not in df.columns or "_outdoor_best" not in df.columns:
+        return None
+    outdoor = df["_outdoor_best"].values
+    sensor_temp = df[sensor.temp_column].values
+    newton_dTdt = (outdoor - sensor_temp) / tau_base
+    return df[dTdt_col].values - newton_dTdt
+
+
+def build_design_matrix(
     df: pd.DataFrame,
     sensor: SensorSpec,
     effectors: list[EffectorSpec],
-    tau_base: float,
     verbose: bool = False,
-) -> tuple[list[EffectorSensorGain], float, float, dict[str, float], dict[str, float], RegressionDiagnostics | None]:
-    """Stage 2: Fit regression for one sensor.
+) -> DesignMatrix | None:
+    """Assemble the Stage-2 feature matrix for one sensor.
 
-    Returns (gains, solar_elev_gain, solar_elev_t, environment_tau_betas,
-    environment_solar_betas, diagnostics).
-    solar_elev_gain is °F/hr per unit sin(elevation)×solar_fraction.
-    Advisory tau betas are per-device additional cooling rate coefficients,
-    learned as regression coefficients on advisory_state × (T_out - T).
-    Advisory solar betas model how advisory state modulates solar gain.
-    diagnostics is None for early returns (missing columns, insufficient data).
+    Extracted from _fit_sensor_model so the residual tracker can rebuild
+    the identical design on a trailing window (no train/serve skew within
+    the tracker).
     """
-    temp_col = sensor.temp_column
-    dTdt_col = f"_dTdt_{sensor.name}"
-
-    if temp_col not in df.columns or dTdt_col not in df.columns:
-        return [], 0.0, 0.0, {}, {}, None
-    if "_outdoor_best" not in df.columns:
-        return [], 0.0, 0.0, {}, {}, None
-
+    if sensor.temp_column not in df.columns or "_outdoor_best" not in df.columns:
+        return None
     outdoor = df["_outdoor_best"].values
-    sensor_temp = df[temp_col].values
-
-    # Newton residual using tau_base (all rows, not split by window state)
-    newton_dTdt = (outdoor - sensor_temp) / tau_base
-    residual = df[dTdt_col].values - newton_dTdt
+    sensor_temp = df[sensor.temp_column].values
 
     # Build feature matrix
     feature_names: list[str] = []
@@ -754,6 +783,15 @@ def _fit_sensor_model(
         feature_names.append("_solar_elev")
         feature_cols.append(solar_elev_arr)
 
+    # Directional wall-plane features (see _preprocess). Selectively
+    # standardized like all _solar_* features; east/west are near-orthogonal
+    # to each other, so they add little collinearity.
+    for plane_name in SOLAR_PLANES:
+        plane_col = f"_solar_{plane_name}"
+        if plane_col in df.columns:
+            feature_names.append(plane_col)
+            feature_cols.append(df[plane_col].values.astype(float))
+
     # Advisory × solar interaction: advisory state modulates solar gain.
     # Only for kinds that physically modulate solar (shades, blinds) — not
     # windows/doors, which affect tau (already modeled) but not solar gain.
@@ -772,9 +810,59 @@ def _fit_sensor_model(
             adv_solar_feature_names.append(dev_name)
 
     if not feature_cols:
-        return [], 0.0, 0.0, {}, {}, None
+        return None
 
     X = np.column_stack(feature_cols)
+    return DesignMatrix(
+        feature_names=feature_names,
+        X=X,
+        effector_feature_ranges=effector_feature_ranges,
+        adv_tau_feature_start=adv_tau_feature_start,
+        adv_tau_feature_names=adv_tau_feature_names,
+        adv_solar_feature_start=adv_solar_feature_start,
+        adv_solar_feature_names=adv_solar_feature_names,
+        solar_start=solar_start,
+    )
+
+
+def _fit_sensor_model(
+    df: pd.DataFrame,
+    sensor: SensorSpec,
+    effectors: list[EffectorSpec],
+    tau_base: float,
+    verbose: bool = False,
+) -> tuple[
+    list[EffectorSensorGain], float, float, dict[str, float], dict[str, float],
+    RegressionDiagnostics | None, dict | None,
+]:
+    """Stage 2: Fit regression for one sensor.
+
+    Returns (gains, solar_elev_gain, solar_elev_t, environment_tau_betas,
+    environment_solar_betas, diagnostics, model). model is the full fitted
+    regression record ({tau_base, feature_names, coefficients}) — serialized
+    to thermal_params.json so the residual tracker can residualize a
+    trailing window against the batch fit's context terms.
+    solar_elev_gain is °F/hr per unit sin(elevation)×solar_fraction.
+    Advisory tau betas are per-device additional cooling rate coefficients,
+    learned as regression coefficients on advisory_state × (T_out - T).
+    Advisory solar betas model how advisory state modulates solar gain.
+    diagnostics is None for early returns (missing columns, insufficient data).
+    """
+    residual = newton_residual(df, sensor, tau_base)
+    if residual is None:
+        return [], 0.0, 0.0, {}, {}, None, None
+
+    dm = build_design_matrix(df, sensor, effectors, verbose)
+    if dm is None:
+        return [], 0.0, 0.0, {}, {}, None, None
+    X = dm.X
+    feature_names = dm.feature_names
+    effector_feature_ranges = dm.effector_feature_ranges
+    adv_tau_feature_start = dm.adv_tau_feature_start
+    adv_tau_feature_names = dm.adv_tau_feature_names
+    adv_solar_feature_start = dm.adv_solar_feature_start
+    adv_solar_feature_names = dm.adv_solar_feature_names
+    solar_start = dm.solar_start
 
     # Drop rows with NaN in residual or any feature
     valid = ~np.isnan(residual)
@@ -794,7 +882,7 @@ def _fit_sensor_model(
             )
             for e in effectors
         ]
-        return gains, 0.0, 0.0, {}, {}, None
+        return gains, 0.0, 0.0, {}, {}, None, None
 
     # Selectively standardized ridge regularization.
     # OLS on observational HVAC data produces confounded gains: heating
@@ -950,7 +1038,19 @@ def _fit_sensor_model(
             solar_se = round(float(se[solar_start]), 4) if not np.isnan(se[solar_start]) else 0.0
             print(f"    solar_elev: β={solar_elev_gain:.4f}, se={solar_se:.4f}, t={solar_elev_t:.1f}")
 
-    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_solar_betas, diagnostics
+    if verbose:
+        for plane_feature_name in (f"_solar_{p}" for p in SOLAR_PLANES):
+            if plane_feature_name in feature_names:
+                j = feature_names.index(plane_feature_name)
+                print(f"    {plane_feature_name.removeprefix('_')}: β={beta[j]:+.4f}, t={t_stats[j]:.1f}")
+
+    model = {
+        "tau_base": tau_base,
+        "feature_names": list(feature_names),
+        "coefficients": [round(float(b), 6) for b in beta],
+    }
+
+    return gains, solar_elev_gain, solar_elev_t, environment_tau_betas, environment_solar_betas, diagnostics, model
 
 
 # ── Derived MRT weights ──────────────────────────────────────────────────
@@ -1191,16 +1291,27 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
     _stage2_t0 = time.monotonic()
     all_gains: list[EffectorSensorGain] = []
     solar_elevation_gains: dict[str, float] = {}  # sensor -> elevation-based gain
+    solar_plane_gains: dict[str, dict[str, float]] = {}  # sensor -> {plane -> gain}
+    regression_models: dict[str, dict] = {}  # sensor -> serialized fit
     all_adv_tau_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
     all_adv_solar_betas: dict[str, dict[str, float]] = {}  # sensor -> {device -> beta}
     sensor_diagnostics: dict[str, RegressionDiagnostics] = {}  # for health summary
 
     for sensor in sensors:
         tau_base = tau_lookup.get(sensor.name, sensor.yaml_tau_base)
-        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_solar_b, diag = _fit_sensor_model(
+        gains, solar_elev_gain, solar_elev_t, adv_tau_b, adv_solar_b, diag, model = _fit_sensor_model(
             df, sensor, effectors, tau_base, verbose,
         )
         all_gains.extend(gains)
+        if model is not None:
+            regression_models[sensor.name] = model
+            plane_gains = {
+                p: model["coefficients"][model["feature_names"].index(f"_solar_{p}")]
+                for p in SOLAR_PLANES
+                if f"_solar_{p}" in model["feature_names"]
+            }
+            if any(abs(g) > 1e-9 for g in plane_gains.values()):
+                solar_plane_gains[sensor.name] = plane_gains
         if diag is not None:
             sensor_diagnostics[sensor.name] = diag
         if solar_elev_gain != 0.0:
@@ -1266,6 +1377,8 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
         solar_elevation_gains=solar_elevation_gains,
         state_gates=state_gates,
         environment_solar_betas=environment_solar_betas,
+        solar_plane_gains=solar_plane_gains,
+        regression_models=regression_models,
     )
     return sysid_result, sensor_diagnostics
 
