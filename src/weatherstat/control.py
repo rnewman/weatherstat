@@ -2474,10 +2474,21 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     _cc_note = f", cc={_current_cc:.0f}%" if _current_cc is not None else ""
     print(f"  Weather:     {_current_cond}{_cc_note} ({_sf_note})")
 
-    # Comfort schedules: base → profile offsets → MRT correction → window adjustments
+    # Comfort schedules: base → profile offsets → overlays → MRT correction (on predictions)
     schedules = default_comfort_schedules()
     active_profile = fetch_active_comfort_profile()
     schedules = apply_comfort_profile(schedules, active_profile)
+    # Temporary user requests ("bedroom is too cold"), expiry-aware at hour granularity.
+    from weatherstat.overlay import OverlayStore, active_overlay_labels, apply_overlays, overlay_summary
+
+    _now_utc = datetime.now(UTC)
+    _overlay_store = OverlayStore.load()
+    for _expired in _overlay_store.prune_expired(_now_utc):
+        print(f"  Overlay expired: {_expired.label} {_expired.delta:+.1f}{UNIT_SYMBOL}")
+    active_overlays = _overlay_store.active(_now_utc)
+    schedules = apply_overlays(schedules, active_overlays, _now_utc, ZoneInfo(TIMEZONE))
+    if active_overlays:
+        print(f"  Overlays:    {overlay_summary(active_overlays, _now_utc)}")
     if active_profile is not None:
         parts = [f"{active_profile.name} profile"]
         offset_items = [
@@ -3003,6 +3014,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         ineligible=ineligible,
         blocked_effectors=blocked_dict,
         cycle_seconds=_cycle_seconds,
+        overlays=active_overlay_labels(active_overlays, _now_utc) or None,
     )
     print("  Decision logged")
 

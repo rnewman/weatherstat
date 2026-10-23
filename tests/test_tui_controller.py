@@ -11,6 +11,8 @@ import dataclasses
 import threading
 from unittest.mock import patch
 
+import pytest
+
 from weatherstat.tui.controller import (
     ActionResult,
     StatusSnapshot,
@@ -53,6 +55,7 @@ def _make_controller(*, live: bool = False, worker=_sync_worker) -> tuple[TUICon
         log=cap.log,
         worker=worker,
         on_snapshot=cap.on_snapshot,
+        overlay_triggers_cycle=False,
     )
     return ctrl, cap
 
@@ -308,3 +311,63 @@ class TestThreading:
 
         statuses = sorted(r.status for r in results)
         assert statuses == ["already_running", "started"]
+
+
+# ── Comfort overlays ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def overlay_sandbox(tmp_path, monkeypatch):
+    """Point the overlay state file and event log at a per-test directory."""
+    import weatherstat.decision_log as dl
+    import weatherstat.overlay as ov
+
+    monkeypatch.setattr(ov, "OVERLAY_STATE_FILE", tmp_path / "overlays.json")
+    monkeypatch.setattr(dl, "DECISION_LOG_DB", tmp_path / "decision_log.db")
+    return tmp_path
+
+
+class TestOverlays:
+    def test_bump_then_snapshot_shifts_bounds(self, overlay_sandbox) -> None:
+        ctrl, cap = _make_controller()
+        before = ctrl.build_snapshot().comfort["bedroom"]
+
+        result = ctrl.bump_overlay("bedroom", 2.0, source="web")
+        assert result.status == "ok", result.message
+        assert result.detail["delta"] == 2.0
+        assert any("[overlay]" in line and "bedroom +2.0" in line for line in cap.logs)
+
+        snap = ctrl.build_snapshot()
+        after = snap.comfort["bedroom"]
+        assert after.preferred_lo == before.preferred_lo + 2.0
+        assert after.acceptable_hi == before.acceptable_hi + 2.0
+        assert snap.overlays["bedroom_temp"].delta == 2.0
+        assert snap.overlays["bedroom_temp"].source == "web"
+        # Unrelated rooms untouched
+        assert snap.comfort["office"] == ctrl.build_snapshot().comfort["office"]
+
+    def test_overlay_command_and_clear(self, overlay_sandbox) -> None:
+        ctrl, _ = _make_controller()
+        assert ctrl.overlay_command("office -1 2h").status == "ok"
+        assert ctrl.build_snapshot().overlays["office_temp"].delta == -1.0
+        result = ctrl.clear_overlay("office")
+        assert result.status == "ok"
+        assert "office_temp" not in ctrl.build_snapshot().overlays
+
+    def test_bad_command_is_error(self, overlay_sandbox) -> None:
+        ctrl, cap = _make_controller()
+        result = ctrl.overlay_command("attic +1")
+        assert result.status == "error"
+        assert "unknown sensor" in result.message
+        assert any("[overlay]" in line and "attic" in line for line in cap.logs)
+
+    def test_bump_triggers_cycle_when_enabled(self, overlay_sandbox) -> None:
+        cap = _Capture()
+        deferred: list = []
+        ctrl = TUIController(
+            live=False, log=cap.log, worker=deferred.append, on_snapshot=cap.on_snapshot,
+            overlay_triggers_cycle=True,
+        )
+        ctrl.bump_overlay("bedroom", 1.0)
+        assert ctrl.is_cycle_running() is True
+        assert len(deferred) == 1

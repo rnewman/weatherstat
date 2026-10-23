@@ -144,3 +144,11 @@ def delta_temp(fahrenheit_delta: float) -> float:
     """Convert a temperature delta from canonical °F to the configured unit."""
     return _CFG.delta_temp(fahrenheit_delta)
 
+
+
+# ── Comfort overlays ("bedroom is too cold") ──────────────────────────────
+# Temporary per-sensor comfort shifts layered on schedules + profile. All in the configured unit.
+
+OVERLAY_DURATION_HOURS: float = _CFG.overlay_duration_hours
+OVERLAY_STEP: float = _CFG.overlay_step if _CFG.overlay_step is not None else delta_temp(1.0)
+OVERLAY_MAX_DELTA: float = _CFG.overlay_max_delta if _CFG.overlay_max_delta is not None else delta_temp(5.0)

@@ -244,6 +244,10 @@ class WeatherstatConfig:
     sysid_interval: int = 3600  # seconds between automatic sysid runs (default: 1 hour, 0 = disabled)
     command_retention_days: int = 14  # days to keep predictions/command_*.json (0 = keep forever)
     decision_retention_days: int = 365  # days to keep decision log rows (0 = keep forever) — a full heating season of outcomes is analysis data
+    # Comfort overlays ("bedroom is too cold"): temporary per-sensor shifts on top of schedules + profile
+    overlay_duration_hours: float = 3.0  # how long a bump lasts unless a duration is given
+    overlay_step: float | None = None  # size of one +/- press in the TUI/web (default: 1°F / 0.6°C)
+    overlay_max_delta: float | None = None  # cap on |delta| per sensor (default: 5°F / 2.8°C)
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
@@ -795,6 +799,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         sysid_interval=_opt_int("sysid_interval", 3600),
         command_retention_days=_opt_int("command_retention_days", 14),
         decision_retention_days=_opt_int("decision_retention_days", 365),
+        overlay_duration_hours=float(defaults.get("overlay_duration_hours", 3.0)),
+        overlay_step=_opt_float("overlay_step"),
+        overlay_max_delta=_opt_float("overlay_max_delta"),
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
         mrt_correction=mrt_correction,

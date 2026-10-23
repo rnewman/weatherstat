@@ -19,6 +19,7 @@ from weatherstat.tui.controller import (
     CycleCosts,
     EffectorView,
     EnvEntry,
+    OverlayView,
     StatusSnapshot,
 )
 from weatherstat.web import start_web_server
@@ -134,6 +135,14 @@ class FakeController:
     def set_live(self, live: bool) -> ActionResult:
         self.calls.append(("set_live", {"live": live}))
         return ActionResult("ok", f"Switched to {'LIVE' if live else 'DRY-RUN'}", {"live": live})
+
+    def bump_overlay(self, sensor: str, delta: float, *, hours: float | None = None, source: str = "web") -> ActionResult:
+        self.calls.append(("bump_overlay", {"sensor": sensor, "delta": delta, "hours": hours, "source": source}))
+        return ActionResult("ok", f"Overlay: {sensor} {delta:+.1f}", {"sensor": sensor, "delta": delta})
+
+    def clear_overlay(self, sensor: str, *, source: str = "web") -> ActionResult:
+        self.calls.append(("clear_overlay", {"sensor": sensor, "source": source}))
+        return ActionResult("ok", f"Cleared overlay on {sensor}", {"sensor": sensor, "delta": 0.0})
 
 
 @pytest.fixture
@@ -269,6 +278,34 @@ class TestPostRoutes:
         assert ("set_live", {"live": True}) in ctrl.calls
         assert ("set_live", {"live": False}) in ctrl.calls
 
+    def test_post_overlay_bump(self, server_and_ctrl) -> None:
+        server, ctrl = server_and_ctrl
+        status, _, headers = _post(server, "/action/overlay", {"sensor": "kitchen_temp", "delta": "1"})
+        assert status == 303
+        assert headers.get("location") == "/"
+        assert ("bump_overlay", {"sensor": "kitchen_temp", "delta": 1.0, "hours": None, "source": "web"}) in ctrl.calls
+
+    def test_post_overlay_with_hours(self, server_and_ctrl) -> None:
+        server, ctrl = server_and_ctrl
+        status, _, _ = _post(server, "/action/overlay", {"sensor": "kitchen", "delta": "-2", "hours": "4"})
+        assert status == 303
+        assert ("bump_overlay", {"sensor": "kitchen", "delta": -2.0, "hours": 4.0, "source": "web"}) in ctrl.calls
+
+    def test_post_overlay_clear(self, server_and_ctrl) -> None:
+        server, ctrl = server_and_ctrl
+        status, _, _ = _post(server, "/action/overlay", {"sensor": "kitchen_temp", "clear": "1"})
+        assert status == 303
+        assert ("clear_overlay", {"sensor": "kitchen_temp", "source": "web"}) in ctrl.calls
+
+    def test_post_overlay_bad_input_json(self, server_and_ctrl) -> None:
+        server, ctrl = server_and_ctrl
+        status, body, _ = _post(
+            server, "/action/overlay", {"sensor": "kitchen_temp", "delta": "warm"}, headers={"Accept": "application/json"},
+        )
+        payload = json.loads(body)
+        assert payload["status"] == "error"
+        assert not any(c[0] == "bump_overlay" for c in ctrl.calls)
+
     def test_post_unknown_action_404(self, server_and_ctrl) -> None:
         server, _ = server_and_ctrl
         status, _, _ = _post(server, "/action/teleport")
@@ -309,6 +346,40 @@ class TestMethodHandling:
             assert resp.status == 405
         finally:
             conn.close()
+
+
+# ── Overlay rendering ──────────────────────────────────────────────────────
+
+
+class TestOverlayRendering:
+    def test_bump_buttons_rendered_per_room(self, server_and_ctrl) -> None:
+        server, _ = server_and_ctrl
+        _, body = _get(server, "/")
+        assert body.count("action='/action/overlay'") == 4  # − and + for each of two rooms
+        assert "name='sensor' value='kitchen_temp'" in body
+        assert "name='clear'" not in body  # no active overlays → no × button
+
+    def test_active_overlay_badge_and_clear(self) -> None:
+        snap = _make_snapshot(
+            overlays={
+                "kitchen_temp": OverlayView(
+                    delta=2.0, expires_at=datetime.now(UTC) + timedelta(hours=2, minutes=30), source="web",
+                )
+            }
+        )
+        ctrl = FakeController(snap)
+        server = start_web_server(ctrl, host="127.0.0.1", port=0)
+        try:
+            _, body = _get(server, "/")
+            assert "class='overlay'>+2.0°" in body
+            assert "name='clear' value='1'" in body
+            _, json_body = _get(server, "/status.json")
+            payload = json.loads(json_body)
+            assert payload["overlays"]["kitchen_temp"]["delta"] == 2.0
+            assert payload["overlays"]["kitchen_temp"]["source"] == "web"
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 # ── Edge case: button-disabled rendering ───────────────────────────────────

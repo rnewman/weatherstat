@@ -15,6 +15,8 @@ Routes:
     POST /action/force — force-execute past overrides
     POST /action/profile [name=<profile>] — toggle or set comfort profile
     POST /action/live    [mode=on|off]    — toggle or set live mode
+    POST /action/overlay sensor=<label> delta=<±N> [hours=<H>] — bump a room's comfort ("too cold")
+    POST /action/overlay sensor=<label> clear=1 — remove the room's overlay
 """
 
 from __future__ import annotations
@@ -147,6 +149,18 @@ def _make_handler(
                 if mode == "off":
                     return controller.set_live(False)
                 return controller.toggle_live()
+            if action == "overlay":
+                sensor = form.get("sensor", "")
+                if not sensor:
+                    return ActionResult("error", "overlay requires sensor=<label>")
+                if form.get("clear"):
+                    return controller.clear_overlay(sensor, source="web")
+                try:
+                    delta = float(form.get("delta", ""))
+                    hours = float(form["hours"]) if form.get("hours") else None
+                except ValueError:
+                    return ActionResult("error", "overlay requires numeric delta (and hours)")
+                return controller.bump_overlay(sensor, delta, hours=hours, source="web")
             raise _UnknownAction(action)
 
         def _render_status(self) -> None:
@@ -256,11 +270,19 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
         mrt_str = ""
         if mrt is not None and abs(mrt) >= 0.05:
             mrt_str = f"<span class='mrt'>{mrt:+.1f} mrt</span>"
+        overlay = snap.overlays.get(sensor_col)
+        overlay_str = ""
+        if overlay is not None:
+            remaining = max(0, int((overlay.expires_at - datetime.now(UTC)).total_seconds()))
+            overlay_str = (
+                f"<span class='overlay'>{overlay.delta:+.1f}° · {_format_remaining(remaining)}</span>"
+            )
         temps_rows.append(
             f"<tr><td>{escape(label)}</td>"
             f"<td class='{cell_class}'>{value:.1f}°</td>"
             f"<td class='bounds'>{bound_str}</td>"
-            f"<td>{mrt_str}</td></tr>"
+            f"<td>{overlay_str}{mrt_str}</td>"
+            f"<td class='bump'>{_overlay_buttons(sensor_col, overlay is not None)}</td></tr>"
         )
 
     temps_html = (
@@ -408,6 +430,30 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
 """
 
 
+def _overlay_buttons(sensor_col: str, has_overlay: bool) -> str:
+    """Per-room −/+ (and × when an overlay is active). Each is its own tiny form — no JavaScript."""
+    s = escape(sensor_col)
+
+    def form(fields: str, text: str, title: str) -> str:
+        return (
+            f"<form method='post' action='/action/overlay'>"
+            f"<input type='hidden' name='sensor' value='{s}'>{fields}"
+            f"<button type='submit' title='{title}'>{text}</button></form>"
+        )
+
+    out = form("<input type='hidden' name='delta' value='-1'>", "−", "Too warm: cooler for a while")
+    out += form("<input type='hidden' name='delta' value='1'>", "+", "Too cold: warmer for a while")
+    if has_overlay:
+        out += form("<input type='hidden' name='clear' value='1'>", "×", "Clear overlay")
+    return out
+
+
+def _format_remaining(secs: int) -> str:
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
 def _temp_class(value: float, bounds) -> str:
     if value < bounds.acceptable_lo or value > bounds.acceptable_hi:
         return "temp red"
@@ -464,6 +510,10 @@ def _snapshot_to_dict(snap: StatusSnapshot) -> dict:
             for label, cb in snap.comfort.items()
         },
         "mrt_offsets": snap.mrt_offsets,
+        "overlays": {
+            col: {"delta": o.delta, "expires_at": o.expires_at.isoformat(), "source": o.source}
+            for col, o in snap.overlays.items()
+        },
         "environment": [
             {"label": e.label, "kind": e.kind, "active": e.is_active}
             for e in snap.environment
@@ -645,6 +695,15 @@ tr:last-child td { border-bottom: 0; }
 .bounds { color: var(--dim); font-size: 13px; }
 .bounds .band { color: var(--dim); }
 .mrt { color: var(--dim); font-size: 12px; }
+.overlay { color: var(--accent); font-size: 12px; font-weight: 600; margin-right: 6px; white-space: nowrap; }
+td.bump { white-space: nowrap; text-align: right; }
+td.bump form { display: inline; margin: 0; }
+td.bump button {
+  min-width: 34px; height: 34px; margin-left: 4px; padding: 0;
+  font-size: 18px; line-height: 1; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); color: var(--fg); cursor: pointer;
+}
+td.bump button:active { background: var(--accent); color: #fff; }
 .mode.on { color: var(--green); font-weight: 700; }
 .mode.off { color: var(--dim); }
 .override { color: var(--red); font-weight: 700; font-size: 12px; }

@@ -55,6 +55,8 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 
 36. **Causal identification tagging** (in review, branch `identification-tagging`) — Behavior-driven couplings (env×tau, env×solar on `advisory: true` devices) are fitted from observational user habit — the weakest identification in the regression, confounded in either direction (moss_garden_shade→piano −0.39 was ~2× habit correlation; moss_garden_shade→bedroom was attenuated 3×). Stage 2.5 in sysid classifies each kept advisory coupling via transition-weighted refit (`identification.py`: Gaussian windows around state transitions, σ ∈ {8,4,2}h; causal requires sign + |t| ≥ 1.5 + ≥50% magnitude retention at every σ; low signal → underpowered, no verdict). Tags gate *use*, not existence: `coupling_identification` in thermal_params; the simulator pins correlational (device, sensor) pairs to observed state under counterfactual advisory toggles while keeping them for conditional prediction (habit predicts in-distribution; it only lies under intervention). Live acceptance: automatic tags reproduce the manual shade-transition verdicts; 19 couplings classified, 1 correlational. `just debug taus` shows tags. Declarative `affects:` scoping rejected as anti-thesis to learned-over-configured. See `docs/plans/PLAN-36-identification-tagging.md`.
 
+37. **Comfort overlays** (done) — "Bedroom is too cold" as a first-class, recorded request. `overlay.py`: a `ComfortOverlay` is a signed per-sensor delta with an expiry, layered after profile offsets: base schedules → profile → **overlays** → MRT (on predictions). The delta shifts all three tiers (preferred, acceptable, backup) so the optimizer is asked to move the room, not tolerate a new band. Expiry-aware at hour granularity: `shift_schedule_hours` expands a schedule to a 24-slot table, shifts only the hours from now to expiry, and coalesces back (merging across midnight), so the sweep sees bounds revert mid-horizon. Repeated bumps accumulate and refresh the expiry; `=±N` sets, `clear` removes; |delta| capped (`defaults.overlay_max_delta`, 5°F), default duration `defaults.overlay_duration_hours` (3h). Entry points: `just overlay bedroom +2`, TUI `O` prompt (`bedroom +1 4h`), web −/+/× per room (`POST /action/overlay`), each kicking a control cycle. Recording for learning: `overlays.json` holds current state; every set/bump/clear/expire goes to `overlay_events` in decision_log.db with room temp, outdoor temp and local hour at request time (never pruned); each decision stores the active `overlays` ({label: delta}). `just debug overlays` shows active overlays, recent events and a per-room habit summary (direction × time-of-day) — the seed for proposing schedule changes from repeated requests. See `docs/plans/PLAN-37-comfort-overlays.md`.
+
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
 ## Commands
@@ -73,6 +75,10 @@ just control --live --loop  # Live headless loop (production)
 just execute          # Apply latest command JSON to HA
 just execute --force  # Apply ignoring manual overrides
 just prune            # Prune old command JSON + decision log rows (snapshots never pruned)
+just overlay          # List active comfort overlays
+just overlay bedroom +2            # Bedroom felt cold: +2° for the default 3h (accumulates; `=+3` sets, `clear` removes)
+just overlay bedroom -1 --hours 4  # Cooler by 1° for 4h (`--note "..."` keeps the reason with the event)
+just overlay --history             # Recent overlay events
 just tui              # Interactive TUI dashboard
 just tui --live       # TUI starting in live mode
 just tui-web          # TUI with embedded mobile web frontend (default 0.0.0.0:8765)
@@ -85,6 +91,7 @@ just debug taus       # Tau models + advisory betas
 just debug why        # Explain why active effectors are on (snapshot DB temps)
 just debug decision-why  # Explain latest decision (live temps from decision log)
 just debug advisory   # Advisory states + compound tau effects
+just debug overlays   # Active comfort overlays, recent events, per-room habit summary
 just debug decisions  # Recent decision log
 just replay           # Replay an environment opportunity evaluation
 just bundle           # Create or replay a point-in-time debug bundle
@@ -112,6 +119,7 @@ just validate         # Quick sysid + prediction validation smoke test
 - All source files use explicit types — full type hints in Python
 - Temperature unit configurable via `unit` in weatherstat.yaml location block (F or C). Built-in defaults are canonical °F, converted at load time via `abs_temp()`/`delta_temp()`. All runtime values are in the configured unit.
 - Snapshot column names use snake_case
+- **Comfort pipeline order.** Anything that reads comfort bounds builds them as base schedules → `apply_comfort_profile` → `apply_overlays` (then MRT on predictions, never on bounds). Control, the TUI controller and the decision log all follow this order; a new consumer must too.
 - **TUI is the primary interface.** Any change to control logic, comfort schedules, MRT correction, sysid output, or display data must also be reflected in `src/weatherstat/tui/app.py`. The TUI reads temperatures, applies comfort profiles, computes per-sensor MRT offsets for display, and shows effector state independently from the control loop. MRT correction is a prediction adjustment (feels-like), not a schedule modification — comfort bounds stay at user-configured values. If you change how something is computed in control.py, check whether app.py computes the same thing for display.
 - **No silent exceptions in the TUI.** Every `except Exception` must log the error via `self._log()` with the exception message. Critical paths (temp refresh, control cycle, sysid) should also log `traceback.format_exc()`. The only exception is `_log()` itself (can't log a logging failure).
 - **Validation after sysid and prediction changes.** Any change to sysid regression (new features, changed regularization, feature engineering) must pass existing `test_validate.py` tests — especially VIF and holdout RMSE checks. New sysid features should be tested for collinearity (VIF <10 for advisory/solar features). Any change to simulator or control predictions must pass prediction envelope tests (absolute bounds, rate limits). Run `just validate` as a quick smoke test after sysid or prediction changes.
@@ -132,6 +140,7 @@ Runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR` en
   control_state.json          # last decision state
   executor_state.json         # executor override tracking
   advisory_state.json         # environment entry advisory cooldowns
+  overlays.json               # active comfort overlays ("bedroom +2 until 23:10"); event history in decision_log.db
   .retention_last_run         # marker: last daily retention run
   tracker_state.json          # multi-timescale tracker: current per-block coefficients
   tracker_history.jsonl       # tracker update log (γ time series = measured drift)

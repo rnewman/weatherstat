@@ -64,6 +64,15 @@ class CycleCosts:
 
 
 @dataclass(frozen=True)
+class OverlayView:
+    """An active comfort overlay ("bedroom +2 for another 2h40m")."""
+
+    delta: float
+    expires_at: datetime
+    source: str
+
+
+@dataclass(frozen=True)
 class StatusSnapshot:
     """Plain-data view of the system, rebuilt by `TUIController.build_snapshot`.
 
@@ -99,6 +108,7 @@ class StatusSnapshot:
     opportunities: list[dict]
     warnings: list[dict]
     ha_error: str | None  # None when HA is reachable; one-line error otherwise
+    overlays: dict[str, OverlayView] = field(default_factory=dict)  # sensor_col → active overlay
 
 
 @dataclass(frozen=True)
@@ -153,11 +163,14 @@ class TUIController:
         worker: WorkerFn,
         on_snapshot: OnSnapshotFn = _noop_snapshot,
         on_main: OnMainFn = _noop_main,
+        overlay_triggers_cycle: bool = True,
     ) -> None:
         self._log = log
         self._worker = worker
         self._on_snapshot = on_snapshot
         self._on_main = on_main
+        # A comfort overlay is a request for action now — kick a control cycle after each change.
+        self._overlay_triggers_cycle = overlay_triggers_cycle
 
         self._lock = threading.RLock()
 
@@ -333,6 +346,25 @@ class TUIController:
                 active_profile = None
         schedules = apply_comfort_profile(schedules, active_profile)
         profile_name = active_profile.name if active_profile else None
+
+        # Temporary comfort overlays ("bedroom is too cold"), expiry-aware
+        overlays_view: dict[str, OverlayView] = {}
+        try:
+            from weatherstat.overlay import OverlayStore, apply_overlays
+
+            _now_utc = datetime.now(UTC)
+            store = OverlayStore.load()
+            for expired in store.prune_expired(_now_utc):
+                self._log(f"[overlay] Expired: {expired.describe()}")
+            active_overlays = store.active(_now_utc)
+            schedules = apply_overlays(schedules, active_overlays, _now_utc)
+            overlays_view = {
+                o.sensor: OverlayView(delta=o.delta, expires_at=o.expires_at, source=o.source)
+                for o in active_overlays
+            }
+        except Exception as e:
+            self._log(f"[overlay] [red]Failed to apply overlays: {e}[/]")
+            self._log(traceback.format_exc())
 
         # Outdoor temp
         outdoor_temp: float | None = None
@@ -535,6 +567,7 @@ class TUIController:
             opportunities=opportunities,
             warnings=warnings,
             ha_error=ha_error,
+            overlays=overlays_view,
         )
         with self._lock:
             self._latest_snapshot = snap
@@ -750,6 +783,76 @@ class TUIController:
             self._log(f"[profile] [red]Error: {e}[/]")
             self._log(traceback.format_exc())
             return ActionResult("error", str(e))
+
+
+    # ── Comfort overlays ──────────────────────────────────────────────────
+
+    def overlay_command(self, text: str, *, source: str = "tui") -> ActionResult:
+        """Parse and apply a typed command such as 'bedroom +2', 'bedroom +1 4h', 'bedroom clear'."""
+        from weatherstat.overlay import parse_overlay_command
+
+        try:
+            cmd = parse_overlay_command(text)
+        except ValueError as e:
+            self._log(f"[overlay] [red]{e}[/]")
+            return ActionResult("error", str(e))
+        return self._apply_overlay(cmd, source=source)
+
+    def bump_overlay(
+        self, sensor: str, delta: float, *, hours: float | None = None, source: str = "web",
+    ) -> ActionResult:
+        """Shift one sensor's comfort by ``delta`` (accumulates with an active overlay)."""
+        from weatherstat.overlay import OverlayCommand, resolve_sensor
+
+        try:
+            col = resolve_sensor(sensor)
+        except ValueError as e:
+            self._log(f"[overlay] [red]{e}[/]")
+            return ActionResult("error", str(e))
+        duration = timedelta(hours=hours) if hours else None
+        return self._apply_overlay(OverlayCommand(col, "bump", delta, duration), source=source)
+
+    def clear_overlay(self, sensor: str, *, source: str = "web") -> ActionResult:
+        from weatherstat.overlay import OverlayCommand, resolve_sensor
+
+        try:
+            col = resolve_sensor(sensor)
+        except ValueError as e:
+            self._log(f"[overlay] [red]{e}[/]")
+            return ActionResult("error", str(e))
+        return self._apply_overlay(OverlayCommand(col, "clear"), source=source)
+
+    def _apply_overlay(self, cmd: Any, *, source: str) -> ActionResult:
+        from weatherstat.config import SENSOR_LABELS
+        from weatherstat.overlay import OverlayStore, capture_context
+
+        label = SENSOR_LABELS.get(cmd.sensor, cmd.sensor)
+        try:
+            now = datetime.now(UTC)
+            store = OverlayStore.load()
+            store.prune_expired(now)
+            snap = self.latest_snapshot()
+            extra = {"profile": snap.profile} if snap is not None and snap.profile else None
+            context = capture_context(cmd.sensor, extra)
+            result = store.apply_command(cmd, source=source, now=now, context=context)
+        except Exception as e:
+            self._log(f"[overlay] [red]Error: {e}[/]")
+            self._log(traceback.format_exc())
+            return ActionResult("error", str(e))
+
+        if result is None or not result.is_active(now):
+            msg = f"Cleared overlay on {label}" if cmd.action == "clear" and result is not None else f"No overlay on {label}"
+            if cmd.action != "clear" and result is not None:
+                msg = f"Overlay on {label} cleared (net zero)"
+            data = {"sensor": cmd.sensor, "delta": 0.0}
+        else:
+            msg = f"Overlay: {result.describe(now)}"
+            data = {"sensor": cmd.sensor, "delta": result.delta, "expires_at": result.expires_at.isoformat()}
+        self._log(f"[overlay] {msg} [{source}]")
+        self.publish_snapshot()
+        if self._overlay_triggers_cycle and not self.is_cycle_running():
+            self.run_cycle()
+        return ActionResult("ok", msg, data)
 
 
 def _control_interval() -> int:

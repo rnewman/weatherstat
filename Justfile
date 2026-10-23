@@ -44,6 +44,10 @@ control *ARGS:
 prune:
     uv run python -m weatherstat.retention
 
+# Comfort overlays: `just overlay bedroom +2`, `just overlay bedroom clear`, `just overlay --history` (no args: list)
+overlay *ARGS:
+    uv run python -m weatherstat.overlay {{ARGS}}
+
 # Execute latest command JSON via HA (flag: --force to ignore overrides)
 execute *ARGS:
     uv run python -m weatherstat.executor {{ARGS}}
@@ -68,7 +72,7 @@ tui-web *ARGS:
 comfort *ARGS:
     uv run python ./scripts/plot_comfort.py {{ARGS}}
 
-# Debug inspector (subcommands: temps, gains, taus, decisions, opportunities, snapshots, comfort; --bundle <dir> for bundles)
+# Debug inspector (subcommands: temps, gains, taus, decisions, opportunities, overlays, snapshots, comfort; --bundle <dir> for bundles)
 debug *ARGS:
     uv run python ./scripts/debug_state.py {{ARGS}}
 

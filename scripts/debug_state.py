@@ -10,6 +10,7 @@ Usage:
     python scripts/debug_state.py decisions [N]          # last N decisions (default 5)
     python scripts/debug_state.py decision-why [N]       # explain decision N using live temps from decision log
     python scripts/debug_state.py opportunities          # advisory state
+    python scripts/debug_state.py overlays [N]           # active comfort overlays + last N events + habit summary
     python scripts/debug_state.py snapshots              # snapshot DB stats
     python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
     python scripts/debug_state.py why [EFFECTOR]          # explain why active effectors are on
@@ -541,6 +542,88 @@ def cmd_opportunities() -> None:
             print(f"  {k:<40} {mins}m remaining")
         else:
             print(f"  {k:<40} expired")
+
+
+def cmd_overlays(n: int = 20) -> None:
+    """Active comfort overlays, recent events, and a per-room habit summary.
+
+    The habit summary is the seed of learning from overlays: rooms that are
+    bumped the same direction at the same hours are schedules asking to change.
+    """
+    from collections import defaultdict
+
+    p = _paths()
+    overlays_path = _data_dir / "overlays.json"
+    data = _load_json(overlays_path) or {}
+    now = datetime.now(UTC)
+    active = []
+    for item in data.get("overlays", []):
+        try:
+            exp = datetime.fromisoformat(item["expires_at"])
+        except (KeyError, ValueError):
+            continue
+        if exp > now:
+            active.append((item, exp))
+    print("Active overlays:")
+    if not active:
+        print("  (none)")
+    for item, exp in active:
+        remaining = int((exp - now).total_seconds() // 60)
+        label = item["sensor"].removesuffix("_temp")
+        print(f"  {label:<24} {item['delta']:+.1f}  {remaining // 60}h{remaining % 60:02d}m left  [{item.get('source', '?')}]")
+
+    if not p["decision_log"].exists():
+        print("\nNo decision log — no overlay history.")
+        return
+    conn = sqlite3.connect(str(p["decision_log"]))
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, event, label, delta, delta_change, source, note, context "
+            "FROM overlay_events ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (n,),
+        ).fetchall()
+        all_rows = conn.execute(
+            "SELECT timestamp, event, label, delta_change, context FROM overlay_events "
+            "WHERE event IN ('bump', 'set')"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows, all_rows = [], []
+    conn.close()
+
+    print(f"\nLast {len(rows)} events:")
+    if not rows:
+        print("  (none)")
+    for ts, event, label, delta, change, source, note, ctx_json in rows:
+        ctx = json.loads(ctx_json) if ctx_json else {}
+        room = f"  room {ctx['room_temp']:.1f}" if "room_temp" in ctx else ""
+        out = f"  out {ctx['outdoor_temp']:.0f}" if "outdoor_temp" in ctx else ""
+        shown = f"{delta:+.1f}" if event in ("bump", "set") else "   —"
+        chg = f" ({change:+.1f})" if event == "bump" else ""
+        note_s = f"  — {note}" if note else ""
+        print(f"  {ts[:16]}  {event:<6} {label:<14} {shown:>5}{chg:<7} [{source}]{room}{out}{note_s}")
+
+    if not all_rows:
+        return
+    # Habit summary: per room, how often and which direction, by local hour band
+    per_room: dict[str, dict] = defaultdict(lambda: {"n": 0, "up": 0, "down": 0, "sum": 0.0, "hours": defaultdict(int)})
+    for _ts, _event, label, change, ctx_json in all_rows:
+        ctx = json.loads(ctx_json) if ctx_json else {}
+        r = per_room[label]
+        r["n"] += 1
+        r["sum"] += change
+        if change > 0:
+            r["up"] += 1
+        elif change < 0:
+            r["down"] += 1
+        hour = ctx.get("local_hour")
+        if hour is not None:
+            band = ("night", "morning", "day", "evening")[int(hour) // 6]
+            r["hours"][band] += 1
+    print("\nHabit summary (bump/set requests, all time):")
+    print(f"  {'Room':<14} {'N':>3} {'Warmer':>6} {'Cooler':>6} {'Mean Δ':>7}  When")
+    for label, r in sorted(per_room.items(), key=lambda kv: -kv[1]["n"]):
+        when = ", ".join(f"{k} {v}" for k, v in sorted(r["hours"].items(), key=lambda kv: -kv[1]))
+        print(f"  {label:<14} {r['n']:>3} {r['up']:>6} {r['down']:>6} {r['sum'] / r['n']:>+7.1f}  {when}")
 
 
 def cmd_snapshots() -> None:
@@ -1082,6 +1165,7 @@ COMMANDS = {
     "decisions": lambda args: cmd_decisions(int(args[0]) if args else 5),
     "decision-why": lambda args: cmd_decision_why(int(args[0]) if args else 1),
     "opportunities": lambda args: cmd_opportunities(),
+    "overlays": lambda args: cmd_overlays(int(args[0]) if args else 20),
     "snapshots": lambda args: cmd_snapshots(),
     "comfort": lambda args: cmd_comfort(args[0] if args else None),
     "why": lambda args: cmd_why(args[0] if args else None),

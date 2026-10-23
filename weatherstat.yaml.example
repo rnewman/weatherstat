@@ -319,3 +319,8 @@ defaults:
   # Retention (days, 0 = keep forever). Collector snapshots are never pruned.
   # command_retention_days: 14    # predictions/command_*.json files
   # decision_retention_days: 365  # decision_log.db rows (keep a full heating season)
+  # Comfort overlays ("bedroom is too cold" → `just overlay bedroom +2`, or +/- in the TUI/web).
+  # Temporary per-sensor shifts of all comfort tiers, layered on schedules + profile. Overlay events are never pruned.
+  # overlay_duration_hours: 3     # how long a bump lasts unless a duration is given
+  # overlay_step: 1               # size of one +/- press (configured unit)
+  # overlay_max_delta: 5          # cap on |delta| per sensor (configured unit)

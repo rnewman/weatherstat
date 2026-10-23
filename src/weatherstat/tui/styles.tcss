@@ -109,3 +109,21 @@ TabPane {
 #log-view {
     height: 1fr;
 }
+
+/* Comfort overlay prompt (O key) */
+OverlayScreen {
+    align: center middle;
+}
+
+#overlay-dialog {
+    width: 76;
+    height: auto;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#overlay-help {
+    height: auto;
+    margin-bottom: 1;
+}

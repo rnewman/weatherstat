@@ -16,9 +16,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Static, TabbedContent, TabPane
+from textual.widgets import Footer, Input, Static, TabbedContent, TabPane
 
 from weatherstat.config import CONTROL_INTERVAL, SYSID_INTERVAL
+from weatherstat.overlay import format_remaining
 from weatherstat.tui.controller import ActionResult, StatusSnapshot, TUIController
 from weatherstat.tui.widgets import (
     AccuracyPanel,
@@ -41,6 +42,42 @@ SYSID_TIMEOUT = 300  # 5 minutes
 
 
 # ── Confirmation modal ──────────────────────────────────────────────────────
+
+
+class OverlayScreen(ModalScreen[str | None]):
+    """Prompt for a comfort overlay command: 'bedroom +2', 'bedroom +1 4h', 'bedroom clear'."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, rooms: list[str], active: list[str]) -> None:
+        super().__init__()
+        self._rooms = rooms
+        self._active = active
+
+    def compose(self) -> ComposeResult:
+        rooms = ", ".join(self._rooms)
+        active = "\n".join(f"  {a}" for a in self._active) if self._active else "  (none)"
+        with Vertical(id="overlay-dialog"):
+            yield Static(
+                "[bold]Comfort overlay[/]  —  room felt wrong? Nudge it for a while.\n\n"
+                "  [bold]room +2[/]        warmer by 2 (default duration)\n"
+                "  [bold]room -1 90m[/]    cooler by 1 for 90 minutes\n"
+                "  [bold]room =+3 4h[/]    set to exactly +3 for 4 hours\n"
+                "  [bold]room clear[/]     remove\n\n"
+                f"Rooms: {rooms}\n\nActive:\n{active}\n",
+                id="overlay-help",
+            )
+            yield Input(placeholder="bedroom +2", id="overlay-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        self.dismiss(text or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -84,6 +121,7 @@ class WeatherstatApp(App):
         Binding("r", "run_cycle", "Run Now"),
         Binding("s", "run_sysid", "Sysid"),
         Binding("p", "toggle_profile", "Profile"),
+        Binding("o", "overlay", "Overlay"),
         Binding("f", "force_execute", "Force Execute"),
         Binding("c", "reload_config", "Reload Config"),
         Binding("q", "quit_app", "Quit"),
@@ -202,6 +240,24 @@ class WeatherstatApp(App):
     def action_toggle_profile(self) -> None:
         _spawn_worker(lambda: self._notify_result_main(self.controller.toggle_profile()))
 
+    def action_overlay(self) -> None:
+        from weatherstat.config import SENSOR_LABELS
+
+        snap = self.controller.latest_snapshot()
+        active: list[str] = []
+        if snap is not None:
+            now = datetime.now(UTC)
+            for col, o in snap.overlays.items():
+                label = snap.sensor_labels.get(col, col)
+                active.append(f"{label} {o.delta:+.1f} ({format_remaining(o.expires_at - now)} left)")
+        rooms = sorted(set(SENSOR_LABELS.values()))
+        self.push_screen(OverlayScreen(rooms, active), self._on_overlay_submitted)
+
+    def _on_overlay_submitted(self, text: str | None) -> None:
+        if not text:
+            return
+        _spawn_worker(lambda: self._notify_result_main(self.controller.overlay_command(text, source="tui")))
+
     def action_reload_config(self) -> None:
         """Reload weatherstat.yaml and refresh all config-derived state."""
         import importlib
@@ -248,6 +304,7 @@ class WeatherstatApp(App):
             "  C      Reload weatherstat.yaml\n"
             "  S      Run system identification (sysid)\n"
             "  P      Toggle comfort profile (Home/Away)\n"
+            "  O      Comfort overlay (\"bedroom +2\" — room too cold/warm for a while)\n"
             "  Q      Quit\n"
             "  ?      This help\n"
         )
@@ -341,11 +398,16 @@ class WeatherstatApp(App):
             )
             for label, cb in snap.comfort.items()
         }
+        now = datetime.now(UTC)
+        overlay_tuples = {
+            col: (o.delta, format_remaining(o.expires_at - now)) for col, o in snap.overlays.items()
+        }
         self.query_one(TemperaturePanel).set_data(
             snap.temps,
             comfort_tuples,
             snap.sensor_labels,
             mrt_offsets=snap.mrt_offsets or None,
+            overlays=overlay_tuples or None,
         )
         self.query_one(EffectorPanel).set_current_temps(snap.temps)
 

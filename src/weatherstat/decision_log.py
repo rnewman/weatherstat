@@ -50,6 +50,26 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 """
 
+# User comfort requests ("bedroom is too cold"). One row per set/bump/clear/expire.
+# Never pruned by retention — this is the learning record for schedule tuning.
+_OVERLAY_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS overlay_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    event TEXT NOT NULL,
+    sensor TEXT NOT NULL,
+    label TEXT NOT NULL,
+    delta REAL NOT NULL,
+    delta_change REAL NOT NULL,
+    expires_at TEXT,
+    source TEXT,
+    note TEXT,
+    context TEXT
+);
+CREATE INDEX IF NOT EXISTS overlay_events_ts ON overlay_events (timestamp);
+CREATE INDEX IF NOT EXISTS overlay_events_sensor ON overlay_events (sensor, timestamp);
+"""
+
 
 def _connect(path: Path) -> sqlite3.Connection:
     """Open the decision log with WAL mode.
@@ -69,6 +89,7 @@ def init_db(db_path: Path | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = _connect(path)
     conn.execute(_SCHEMA)
+    conn.executescript(_OVERLAY_SCHEMA)
     # Schema migration: add trajectory column if upgrading from pre-PLAN-7
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE decisions ADD COLUMN trajectory TEXT")
@@ -87,6 +108,9 @@ def init_db(db_path: Path | None = None) -> Path:
     # Schema migration: add cycle duration for performance tracking
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE decisions ADD COLUMN cycle_seconds REAL")
+    # Schema migration: active comfort overlays at decision time ({label: delta})
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN overlays TEXT")
     conn.commit()
     conn.close()
     return path
@@ -107,6 +131,7 @@ def log_decision(
     ineligible: dict[str, str] | None = None,
     blocked_effectors: dict[str, str] | None = None,
     cycle_seconds: float | None = None,
+    overlays: dict[str, float] | None = None,
     db_path: Path | None = None,
 ) -> None:
     """Record a control decision to the decision log.
@@ -204,6 +229,9 @@ def log_decision(
     # Serialize trajectory info (if present)
     trajectory_json = json.dumps(decision.trajectory_info) if decision.trajectory_info else None
 
+    # Active comfort overlays ({label: delta}), None when there are none
+    overlays_json = json.dumps(overlays) if overlays else None
+
     conn = _connect(path)
     conn.execute(
         """\
@@ -212,8 +240,8 @@ def log_decision(
             current_temps, upstairs_heating, downstairs_heating, upstairs_setpoint, downstairs_setpoint,
             blowers, mini_splits, predictions, comfort_cost, energy_cost, total_cost,
             comfort_bounds, trajectory, outcome_backfilled, effector_decisions, command_targets,
-            active_profile, mrt_offsets, blocked, cycle_seconds
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            active_profile, mrt_offsets, blocked, cycle_seconds, overlays
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             decision.timestamp,
@@ -241,10 +269,92 @@ def log_decision(
             mrt_offsets_json,
             blocked_json,
             cycle_seconds,
+            overlays_json,
         ),
     )
     conn.commit()
     conn.close()
+
+
+# ── Overlay events ─────────────────────────────────────────────────────────
+
+
+def log_overlay_event(
+    *,
+    timestamp: datetime,
+    event: str,
+    sensor: str,
+    label: str,
+    delta: float,
+    delta_change: float,
+    expires_at: datetime | None,
+    source: str | None,
+    note: str | None,
+    context: dict | None,
+    db_path: Path | None = None,
+) -> None:
+    """Append one comfort-overlay event (set / bump / clear / expire)."""
+    path = init_db(db_path)
+    conn = _connect(path)
+    conn.execute(
+        """\
+        INSERT INTO overlay_events (
+            timestamp, event, sensor, label, delta, delta_change, expires_at, source, note, context
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            timestamp.astimezone(UTC).isoformat(),
+            event,
+            sensor,
+            label,
+            float(delta),
+            float(delta_change),
+            expires_at.astimezone(UTC).isoformat() if expires_at else None,
+            source,
+            note,
+            json.dumps(context) if context else None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_overlay_events(
+    limit: int = 100,
+    *,
+    since: datetime | None = None,
+    sensor: str | None = None,
+    db_path: Path | None = None,
+) -> list[dict]:
+    """Recent overlay events, newest first, with ``context`` decoded."""
+    path = db_path or DECISION_LOG_DB
+    if not path.exists():
+        return []
+    clauses: list[str] = []
+    params: list[object] = []
+    if since is not None:
+        clauses.append("timestamp >= ?")
+        params.append(since.astimezone(UTC).isoformat())
+    if sensor is not None:
+        clauses.append("sensor = ?")
+        params.append(sensor)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = _connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM overlay_events {where} ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["context"] = json.loads(d["context"]) if d.get("context") else {}
+        out.append(d)
+    return out
 
 
 def backfill_outcomes(db_path: Path | None = None) -> int:

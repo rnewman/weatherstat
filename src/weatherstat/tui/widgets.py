@@ -158,6 +158,7 @@ class TemperaturePanel(Static):
         self._comfort: dict[str, tuple[float, float, float, float]] = {}
         self._labels: dict[str, str] = {}  # sensor_col -> label
         self._mrt_offsets: dict[str, float] = {}  # sensor_col -> MRT offset
+        self._overlays: dict[str, tuple[float, str]] = {}  # sensor_col -> (delta, remaining text)
 
     def set_data(
         self,
@@ -165,11 +166,13 @@ class TemperaturePanel(Static):
         comfort: dict[str, tuple[float, float, float, float]],
         labels: dict[str, str],
         mrt_offsets: dict[str, float] | None = None,
+        overlays: dict[str, tuple[float, str]] | None = None,
     ) -> None:
         self._temps = temps
         self._comfort = comfort
         self._labels = labels
         self._mrt_offsets = mrt_offsets or {}
+        self._overlays = overlays or {}
         self._refresh()
 
     def _refresh(self) -> None:
@@ -183,9 +186,13 @@ class TemperaturePanel(Static):
                 band_str = f"[{min_t:.0f}-{max_t:.0f}]"
                 mrt = self._mrt_offsets.get(sensor_col, 0.0)
                 mrt_str = f" [dim]{mrt:+.1f}mrt[/]" if abs(mrt) >= 0.05 else ""
+                overlay = self._overlays.get(sensor_col)
+                overlay_str = f" [bold cyan]{overlay[0]:+.1f} {overlay[1]}[/]" if overlay else ""
                 line = f"  {label:<22} {temp:>5.1f}{UNIT_SYMBOL}  {band_str:>8} "
                 text = Text.from_markup(line)
                 text.append_text(bar)
+                if overlay_str:
+                    text.append_text(Text.from_markup(overlay_str))
                 if mrt_str:
                     text.append_text(Text.from_markup(mrt_str))
                 lines.append(text.markup if hasattr(text, "markup") else str(text))

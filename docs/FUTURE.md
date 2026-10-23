@@ -21,6 +21,33 @@ will face new challenges in summer:
 
 ---
 
+## Learning From Comfort Overlays
+
+Stage 37 made "bedroom is too cold" a recorded request: every bump/set/clear
+lands in `overlay_events` with the room temperature, outdoor temperature and
+local hour at the time, and every decision stores the active overlays. The
+record is the point; learning from it is the follow-up.
+
+- **Schedule proposals.** A room bumped the same direction in the same hour
+  band on most days is a schedule entry asking to change. Aggregate
+  `overlay_events` by (sensor, hour band, weekday/weekend); when a cell's
+  request rate and mean delta clear a threshold, propose a concrete edit to
+  `constraints.schedules` (shown in `just debug overlays`, pushed as a
+  notification, never applied silently — configuration stays the user's).
+- **MRT / feels-like calibration.** Bumps correlated with outdoor temperature
+  or solar state rather than hour of day are evidence about the MRT
+  correction (`alpha`, `reference_temp`, per-sensor `solar_response`), not
+  about the schedule. Regress request delta on the conditions captured in the
+  event context to tell the two apart.
+- **Penalty weights.** Rooms whose requests cluster while the predicted
+  comfort cost was already non-zero suggest `cold_penalty`/`hot_penalty` are
+  too low relative to other rooms, not that the targets are wrong.
+- **Expiry choice.** The right default duration is empirical: how long after a
+  bump does the next bump on the same room arrive? Clearing early vs. letting
+  it expire is also informative (the user noticed it got too warm).
+
+---
+
 ## Irradiance-Based Solar Model
 
 **Status:** Data collection started 2026-04-05. Two intermediate steps deployed
