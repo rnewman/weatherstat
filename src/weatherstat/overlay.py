@@ -30,6 +30,7 @@ import argparse
 import contextlib
 import json
 import re
+import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -519,6 +520,37 @@ def capture_context(sensor: str, extra: dict | None = None) -> dict:
     if extra:
         ctx.update(extra)
     return ctx
+
+
+# ── The shared write path ──────────────────────────────────────────────────
+
+# overlays.json is read-modify-written by the TUI, the web server and the MQTT
+# bridge from different threads of one process; serialize them.
+_STORE_LOCK = threading.Lock()
+
+
+def apply_overlay_command(
+    cmd: OverlayCommand,
+    *,
+    source: str,
+    note: str | None = None,
+    extra_context: dict | None = None,
+    now: datetime | None = None,
+    path: Path | None = None,
+    db_path: Path | None = None,
+) -> ComfortOverlay | None:
+    """Load the store, prune expired overlays, apply ``cmd`` and save.
+
+    Every entry point (TUI prompt, web buttons, MQTT number entities, CLI)
+    goes through here so events and context are recorded identically.
+    Returns the resulting overlay, or None after a clear.
+    """
+    now = now or datetime.now(UTC)
+    context = capture_context(cmd.sensor, extra_context)
+    with _STORE_LOCK:
+        store = OverlayStore.load(path)
+        store.prune_expired(now, db_path=db_path)
+        return store.apply_command(cmd, source=source, note=note, now=now, context=context, db_path=db_path)
 
 
 # ── Applying overlays to schedules ────────────────────────────────────────

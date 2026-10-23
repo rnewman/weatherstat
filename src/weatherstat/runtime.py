@@ -10,6 +10,7 @@ automatic refitting that used to live only in the TUI.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -117,6 +118,23 @@ def run_headless_loop(live: bool = False) -> None:
 
     last_sysid_at = time.monotonic()  # fresh start: params on disk are current enough
 
+    # Home Assistant comfort controls (MQTT). A change from HA wakes the loop for an immediate cycle.
+    wake = threading.Event()
+    bridge = None
+    try:
+        from weatherstat.mqtt_bridge import start_mqtt_bridge
+        from weatherstat.overlay import OverlayCommand, apply_overlay_command
+
+        def _apply_from_ha(cmd: OverlayCommand) -> None:
+            result = apply_overlay_command(cmd, source="ha")
+            print(f"[overlay] {cmd.sensor}: {result.describe() if result else 'cleared'} [ha]")
+            wake.set()
+
+        bridge = start_mqtt_bridge(apply=_apply_from_ha, log=print)
+    except Exception as e:
+        print(f"[runtime] Home Assistant bridge failed to start: {e}", file=sys.stderr)
+        traceback.print_exc()
+
     while True:
         try:
             decision = run_control_cycle(live=live)
@@ -144,5 +162,9 @@ def run_headless_loop(live: bool = False) -> None:
             print(f"[runtime] Error in retention: {e}", file=sys.stderr)
             traceback.print_exc()
 
+        if bridge is not None:
+            bridge.publish_overlays()  # expiries pruned by the cycle reach HA now
         print(f"\n[runtime] Next cycle in {CONTROL_INTERVAL // 60} minutes...\n")
-        time.sleep(CONTROL_INTERVAL)
+        if wake.wait(CONTROL_INTERVAL):
+            print("[runtime] Comfort changed from Home Assistant; running a cycle now")
+        wake.clear()

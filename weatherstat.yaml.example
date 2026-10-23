@@ -290,6 +290,18 @@ constraints:
       schedule:
         - { hours: [0, 24], preferred: 71, min: 68, max: 76, cold_penalty: 0.5, hot_penalty: 0.3 }
 
+# Home Assistant bridge (optional). With this block present, the TUI and the headless
+# loop publish a "Weatherstat" device over MQTT discovery: per room a comfort offset
+# (number.weatherstat_<room>_comfort, the −/+ in the dashboard cards), its expiry, and a
+# feels-like sensor carrying the comfort band and predictions; plus sensor.weatherstat_status.
+# Credentials go in .env (MQTT_USERNAME / MQTT_PASSWORD), never here. Cards: ha/README.md.
+# mqtt:
+#   host: homeassistant.local    # default: the host of HA_URL (e.g. the Mosquitto app on the HA box)
+#   port: 1883
+#   discovery_prefix: homeassistant
+#   topic_prefix: weatherstat
+#   debounce_seconds: 2          # quiet time after the last −/+ press before the overlay is applied
+
 notifications:
   target: notify.mobile_app_phone    # HA notify service target
 

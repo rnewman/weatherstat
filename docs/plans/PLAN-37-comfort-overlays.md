@@ -91,9 +91,10 @@ proposal would be built from.
 - Not a schedule edit. Overlays expire; the configured schedule is still the
   statement of intent. Learning from overlays should *propose* schedule
   changes (FUTURE.md § "Learning From Comfort Overlays"), not make them.
-- Not an HA entity (yet). Voice / automation entry can come through the web
-  endpoint; a native `input_number` per room was deferred until the request
-  patterns are known.
+- Not an HA helper. Home Assistant entry arrived in stage 38 as MQTT-discovered
+  entities that Weatherstat owns (`number.weatherstat_<room>_comfort`), so
+  overlays stay recorded here rather than mirrored into `input_number`s
+  (PLAN-38).
 
 ## Verification
 

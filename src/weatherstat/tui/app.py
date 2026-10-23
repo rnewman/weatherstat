@@ -143,6 +143,7 @@ class WeatherstatApp(App):
         self._web_host = web_host
         self._web_port = web_port
         self._web_server: object | None = None
+        self._mqtt: object | None = None  # MqttBridge when `mqtt:` is configured
 
         self.controller = TUIController(
             live=live,
@@ -194,6 +195,9 @@ class WeatherstatApp(App):
         # Optional embedded web server
         if self._web_enabled:
             self._start_web_server()
+
+        # Optional Home Assistant bridge (MQTT discovery), enabled by an `mqtt:` block in weatherstat.yaml
+        self._start_mqtt_bridge()
 
     # ── Tab switching ───────────────────────────────────────────────────────
 
@@ -281,6 +285,11 @@ class WeatherstatApp(App):
             self._log(f"[config] [red]Reload failed: {e}[/]")
             self.notify(f"Config reload failed: {e}", severity="error")
 
+    def on_unmount(self) -> None:
+        bridge = self._mqtt
+        if bridge is not None:
+            bridge.stop()  # type: ignore[attr-defined]  # retained "offline" → HA marks entities unavailable
+
     def action_quit_app(self) -> None:
         if self.controller.live_mode:
             self.push_screen(
@@ -323,6 +332,12 @@ class WeatherstatApp(App):
 
     def _on_snapshot(self, snap: StatusSnapshot) -> None:
         """Called by the controller (possibly from a worker thread)."""
+        bridge = self._mqtt
+        if bridge is not None:
+            try:
+                bridge.publish_snapshot(snap)  # type: ignore[attr-defined]
+            except Exception as e:
+                self._log(f"[mqtt] [red]Snapshot publish failed: {e}[/]")
         self.call_from_thread(self._apply_snapshot, snap)
 
     def _check_startup_ha(self) -> None:
@@ -532,6 +547,28 @@ class WeatherstatApp(App):
             self._log(f"[web] Listening on http://{self._web_host}:{self._web_port}")
         except Exception as e:
             self._log(f"[web] [red]Failed to start web server: {e}[/]")
+            self._log(traceback.format_exc())
+
+    # ── Home Assistant bridge ───────────────────────────────────────────────
+
+    def _start_mqtt_bridge(self) -> None:
+        try:
+            from weatherstat.mqtt_bridge import start_mqtt_bridge
+
+            controller = self.controller
+            bridge = start_mqtt_bridge(
+                apply=lambda cmd: controller.apply_overlay_command(cmd, source="ha"),
+                log=self._log,
+            )
+            if bridge is None:
+                return
+            self._mqtt = bridge
+            controller.add_overlay_listener(bridge.publish_overlays)
+            snap = controller.latest_snapshot()
+            if snap is not None:
+                bridge.publish_snapshot(snap)
+        except Exception as e:
+            self._log(f"[mqtt] [red]Failed to start Home Assistant bridge: {e}[/]")
             self._log(traceback.format_exc())
 
     # ── Logging ─────────────────────────────────────────────────────────────

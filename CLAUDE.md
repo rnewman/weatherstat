@@ -57,6 +57,8 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 
 37. **Comfort overlays** (done) — "Bedroom is too cold" as a first-class, recorded request. `overlay.py`: a `ComfortOverlay` is a signed per-sensor delta with an expiry, layered after profile offsets: base schedules → profile → **overlays** → MRT (on predictions). The delta shifts all three tiers (preferred, acceptable, backup) so the optimizer is asked to move the room, not tolerate a new band. Expiry-aware at hour granularity: `shift_schedule_hours` expands a schedule to a 24-slot table, shifts only the hours from now to expiry, and coalesces back (merging across midnight), so the sweep sees bounds revert mid-horizon. Repeated bumps accumulate and refresh the expiry; `=±N` sets, `clear` removes; |delta| capped (`defaults.overlay_max_delta`, 5°F), default duration `defaults.overlay_duration_hours` (3h). Entry points: `just overlay bedroom +2`, TUI `O` prompt (`bedroom +1 4h`), web −/+/× per room (`POST /action/overlay`), each kicking a control cycle. Recording for learning: `overlays.json` holds current state; every set/bump/clear/expire goes to `overlay_events` in decision_log.db with room temp, outdoor temp and local hour at request time (never pruned); each decision stores the active `overlays` ({label: delta}). `just debug overlays` shows active overlays, recent events and a per-room habit summary (direction × time-of-day) — the seed for proposing schedule changes from repeated requests. See `docs/plans/PLAN-37-comfort-overlays.md`.
 
+38. **Home Assistant bridge & cards** (done) — Weatherstat publishes itself as an MQTT-discovered HA device (`mqtt_bridge.py`), enabled by an `mqtt:` block (broker defaults to the HA_URL host; `MQTT_USERNAME`/`MQTT_PASSWORD` in .env). Per constrained sensor: `number.weatherstat_<label>_comfort` (the comfort overlay; absolute, 0 clears; −/+ debounced 2s into one recorded "set" with source `ha`), `sensor.weatherstat_<label>_comfort_until`, and `sensor.weatherstat_<label>` (feels-like; attributes: bands, overlay, predictions, cost, status, source sensor); plus `sensor.weatherstat_status` (plan + rationale, costs, requests, advisories, health). Last will marks everything unavailable when Weatherstat stops. `overlay.apply_overlay_command` is now the single locked write path (TUI controller, MQTT, headless). TUI publishes snapshots and comfort controls; headless publishes comfort controls and wakes for an immediate cycle on an HA change. Lovelace cards in `ha/weatherstat-cards.js` (room, rooms list, status), installed as an inline resource by `just ha-cards`. Chosen over polled `input_number` helpers, `rest_command`, or a custom integration — see `docs/plans/PLAN-38-home-assistant-bridge.md` and `ha/README.md`.
+
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
 ## Commands
@@ -79,6 +81,7 @@ just overlay          # List active comfort overlays
 just overlay bedroom +2            # Bedroom felt cold: +2° for the default 3h (accumulates; `=+3` sets, `clear` removes)
 just overlay bedroom -1 --hours 4  # Cooler by 1° for 4h (`--note "..."` keeps the reason with the event)
 just overlay --history             # Recent overlay events
+just ha-cards         # Register/update the Weatherstat Lovelace cards in HA (--dry-run to preview)
 just tui              # Interactive TUI dashboard
 just tui --live       # TUI starting in live mode
 just tui-web          # TUI with embedded mobile web frontend (default 0.0.0.0:8765)
@@ -132,7 +135,7 @@ Runtime data lives in `~/.weatherstat/` (override with `WEATHERSTAT_DATA_DIR` en
 ```
 ~/.weatherstat/
   weatherstat.yaml            # house config (from weatherstat.yaml.example)
-  .env                        # HA credentials (HA_URL, HA_TOKEN)
+  .env                        # HA credentials (HA_URL, HA_TOKEN; MQTT_USERNAME, MQTT_PASSWORD for the bridge)
   snapshots/snapshots.db      # collector output (SQLite EAV)
   predictions/command_*.json  # control decisions
   thermal_params.json         # sysid output

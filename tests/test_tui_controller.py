@@ -371,3 +371,26 @@ class TestOverlays:
         ctrl.bump_overlay("bedroom", 1.0)
         assert ctrl.is_cycle_running() is True
         assert len(deferred) == 1
+
+
+class TestOverlayListeners:
+    def test_listener_called_after_change(self, overlay_sandbox) -> None:
+        from weatherstat.overlay import OverlayCommand
+
+        ctrl, _ = _make_controller()
+        calls: list[int] = []
+        ctrl.add_overlay_listener(lambda: calls.append(1))
+        result = ctrl.apply_overlay_command(OverlayCommand("bedroom_temp", "set", 2.0), source="ha")
+        assert result.status == "ok", result.message
+        assert calls == [1]
+        assert ctrl.build_snapshot().overlays["bedroom_temp"].source == "ha"
+
+    def test_listener_error_is_logged(self, overlay_sandbox) -> None:
+        ctrl, cap = _make_controller()
+
+        def boom() -> None:
+            raise RuntimeError("broker gone")
+
+        ctrl.add_overlay_listener(boom)
+        assert ctrl.bump_overlay("bedroom", 1.0).status == "ok"
+        assert any("broker gone" in line for line in cap.logs)

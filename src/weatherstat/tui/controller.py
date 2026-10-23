@@ -184,6 +184,7 @@ class TUIController:
         self._solar_elevation_gains: dict[str, float] = {}
         self._solar_plane_gains: dict[str, dict[str, float]] = {}
         self._last_ha_error: str | None = None
+        self._overlay_listeners: list[Callable[[], None]] = []
 
         # Cached snapshot, refreshed by build_snapshot()
         self._latest_snapshot: StatusSnapshot | None = None
@@ -822,19 +823,25 @@ class TUIController:
             return ActionResult("error", str(e))
         return self._apply_overlay(OverlayCommand(col, "clear"), source=source)
 
+    def apply_overlay_command(self, cmd: Any, *, source: str) -> ActionResult:
+        """Apply an already-parsed OverlayCommand (used by the MQTT bridge)."""
+        return self._apply_overlay(cmd, source=source)
+
+    def add_overlay_listener(self, fn: Callable[[], None]) -> None:
+        """Call ``fn`` after every overlay change made through this controller."""
+        with self._lock:
+            self._overlay_listeners.append(fn)
+
     def _apply_overlay(self, cmd: Any, *, source: str) -> ActionResult:
         from weatherstat.config import SENSOR_LABELS
-        from weatherstat.overlay import OverlayStore, capture_context
+        from weatherstat.overlay import apply_overlay_command
 
         label = SENSOR_LABELS.get(cmd.sensor, cmd.sensor)
         try:
             now = datetime.now(UTC)
-            store = OverlayStore.load()
-            store.prune_expired(now)
             snap = self.latest_snapshot()
             extra = {"profile": snap.profile} if snap is not None and snap.profile else None
-            context = capture_context(cmd.sensor, extra)
-            result = store.apply_command(cmd, source=source, now=now, context=context)
+            result = apply_overlay_command(cmd, source=source, extra_context=extra, now=now)
         except Exception as e:
             self._log(f"[overlay] [red]Error: {e}[/]")
             self._log(traceback.format_exc())
@@ -850,6 +857,11 @@ class TUIController:
             data = {"sensor": cmd.sensor, "delta": result.delta, "expires_at": result.expires_at.isoformat()}
         self._log(f"[overlay] {msg} [{source}]")
         self.publish_snapshot()
+        for listener in list(self._overlay_listeners):
+            try:
+                listener()
+            except Exception as e:
+                self._log(f"[overlay] [red]Listener error: {e}[/]")
         if self._overlay_triggers_cycle and not self.is_cycle_running():
             self.run_cycle()
         return ActionResult("ok", msg, data)

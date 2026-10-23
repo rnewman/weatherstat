@@ -217,6 +217,21 @@ class SafetyConfig:
 
 
 @dataclass(frozen=True)
+class MqttConfig:
+    """MQTT bridge to Home Assistant (discovery entities for comfort overlays).
+
+    Present only when weatherstat.yaml has an ``mqtt:`` block. Credentials come
+    from the environment (``MQTT_USERNAME`` / ``MQTT_PASSWORD`` in .env), never YAML.
+    """
+
+    host: str | None = None  # broker host; None → the host of HA_URL
+    port: int = 1883
+    discovery_prefix: str = "homeassistant"
+    topic_prefix: str = "weatherstat"
+    debounce_seconds: float = 2.0  # quiet time after the last −/+ press before the overlay is applied
+
+
+@dataclass(frozen=True)
 class WeatherstatConfig:
     """Top-level config parsed from weatherstat.yaml."""
 
@@ -253,6 +268,7 @@ class WeatherstatConfig:
     mrt_correction: MrtCorrectionConfig | None = None
     advisory: AdvisoryConfig = field(default_factory=lambda: AdvisoryConfig(cooldowns={}))
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    mqtt: MqttConfig | None = None  # HA bridge via MQTT discovery (None = disabled)
 
     # ── Temperature unit helpers ────────────────────────────────────
 
@@ -763,6 +779,18 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         cooldowns={str(k): int(v) for k, v in safety_data.get("cooldowns", {}).items()},
     )
 
+    # ── MQTT bridge (optional) ───────────────────────────────────────
+    mqtt_config: MqttConfig | None = None
+    if "mqtt" in data:
+        mqtt_data = data.get("mqtt") or {}  # "mqtt: {}" or bare "mqtt:" enables with defaults
+        mqtt_config = MqttConfig(
+            host=mqtt_data.get("host"),
+            port=int(mqtt_data.get("port", 1883)),
+            discovery_prefix=str(mqtt_data.get("discovery_prefix", "homeassistant")),
+            topic_prefix=str(mqtt_data.get("topic_prefix", "weatherstat")),
+            debounce_seconds=float(mqtt_data.get("debounce_seconds", 2.0)),
+        )
+
     # ── Defaults ─────────────────────────────────────────────────────
     defaults = data.get("defaults", {})
     default_tau = float(defaults.get("tau", 45.0))
@@ -807,6 +835,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         mrt_correction=mrt_correction,
         advisory=advisory_config,
         safety=safety_config,
+        mqtt=mqtt_config,
     )
 
 
