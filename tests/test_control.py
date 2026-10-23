@@ -766,6 +766,78 @@ class TestModeHoldWindow:
         )
         assert any(o.mode == "off" for o in options)
 
+    @staticmethod
+    def _held_heat_state(setpoint: float = 71.2) -> ControlState:
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        return ControlState(
+            last_decision_time=now,
+            modes={"mini_split_bedroom": "heat"},
+            setpoints={"mini_split_bedroom": setpoint},
+            mode_times={"mini_split_bedroom": now},
+        )
+
+    def _lowered_schedule(self) -> list[ComfortSchedule]:
+        """Bedroom after a −4 comfort request: preferred 67, room far above it."""
+        return [ComfortSchedule(
+            sensor="bedroom_temp",
+            label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 67.0, 69.0, 65.0, 70.0, 62.0, 73.0)),),
+        )]
+
+    def test_held_target_follows_comfort_down(self) -> None:
+        """Regression: held in heat with the room well above the (lowered) band, the target
+        must drop to the new preferred — not freeze at the previous setpoint."""
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
+        options = _regulating_sweep_options(
+            eff, self._lowered_schedule(), 23,
+            gains=self._bedroom_gains(), prev_state=self._held_heat_state(71.2),
+            current_temps={"bedroom_temp": 72.5},
+        )
+        assert options, "hold must still yield options"
+        assert all(o.mode == "heat" for o in options)  # no mode change during quiet hours
+        assert {o.target for o in options} == {67.0}
+        assert not any(o.target == 71.2 for o in options)
+
+    def test_comfort_request_lifts_hold(self) -> None:
+        """An active overlay on a sensor this split affects releases the hold: off and cool return."""
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
+        options = _regulating_sweep_options(
+            eff, self._lowered_schedule(), 23,
+            gains=self._bedroom_gains(), prev_state=self._held_heat_state(71.2),
+            current_temps={"bedroom_temp": 72.5},
+            hold_release_sensors={"bedroom_temp"},
+        )
+        modes = {o.mode for o in options}
+        assert "off" in modes and "cool" in modes
+        # Released, ordinary idle suppression applies again: heat @67 with the room at 72.5 is pruned
+        assert "heat" not in modes
+
+    def test_request_on_unaffected_sensor_keeps_hold(self) -> None:
+        """An overlay on a room this split doesn't affect leaves the hold in place."""
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
+        options = _regulating_sweep_options(
+            eff, self._lowered_schedule(), 23,
+            gains=self._bedroom_gains(), prev_state=self._held_heat_state(71.2),
+            current_temps={"bedroom_temp": 72.5},
+            hold_release_sensors={"kitchen_temp"},
+        )
+        assert {o.mode for o in options} == {"heat"}
+
+    def test_request_outside_hold_window_changes_nothing(self) -> None:
+        eff = EFFECTOR_MAP["mini_split_bedroom"]
+        kwargs = {
+            "gains": self._bedroom_gains(),
+            "prev_state": self._held_heat_state(71.2),
+            "current_temps": {"bedroom_temp": 72.5},
+        }
+        plain = _regulating_sweep_options(eff, self._lowered_schedule(), 12, **kwargs)
+        released = _regulating_sweep_options(
+            eff, self._lowered_schedule(), 12, hold_release_sensors={"bedroom_temp"}, **kwargs,
+        )
+        assert plain == released
+
     def test_cool_offered_when_room_above_target(self) -> None:
         """Cool option offered when room is above preferred."""
         eff = EFFECTOR_MAP["mini_split_bedroom"]

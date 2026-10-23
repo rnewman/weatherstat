@@ -52,6 +52,22 @@ to change: comfort scoring, regulating-effector targets
 cost breakdowns, the decision log's `comfort_bounds`, and the TUI bars all
 follow.
 
+### Overlays and the quiet-hours mode hold
+
+Regulating effectors (mini splits) have a `mode_hold_window` so the
+optimizer doesn't flip compressor modes overnight. Two interactions:
+
+- **A comfort request lifts the hold** for every regulating effector with
+  sysid gain on the overlaid sensor, for as long as the overlay is active.
+  The hold protects sleepers from mode changes; someone asking for a
+  different temperature is evidently awake.
+- **Under a hold, the target still follows comfort.** Idle suppression used
+  to prune every held-mode target the room had already passed, and the
+  fallback then re-sent the previous setpoint. Found live: bedroom −4 at
+  23:14 with the room at 72.5° left the split in heat at the old 71.2°.
+  Held-mode targets are now exempt from idle suppression, so the held split
+  gets heat @ 67° — it backs off without a mode change.
+
 ### Recording
 
 - `~/.weatherstat/overlays.json` — current overlays (one per sensor).

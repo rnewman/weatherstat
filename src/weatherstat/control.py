@@ -881,6 +881,7 @@ def _regulating_sweep_options(
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
     current_mrt_offsets: dict[str, float] | None = None,
+    hold_release_sensors: set[str] | None = None,
 ) -> list[EffectorDecision]:
     """Generate sweep options for a regulating effector from all affected sensors.
 
@@ -897,7 +898,12 @@ def _regulating_sweep_options(
     4. Generate off + heat@each_pref_lo + cool@each_pref_hi.
     5. Idle suppression prunes options where the effector would be inactive
        (room already past target by more than the proportional band).
-    6. Mode hold window locks to previous mode during quiet hours.
+    6. Mode hold window locks to previous mode during quiet hours. The held
+       mode's targets are exempt from idle suppression, so the target still
+       follows comfort (heat @ a low target idles the unit without a mode
+       change). An active comfort overlay on any sensor this effector affects
+       lifts the hold: someone is awake and asking, which is what the quiet
+       hours exist to protect.
 
     The trajectory sweep scores every surviving option across ALL sensors,
     so the optimizer picks whichever mode/target minimizes total comfort cost.
@@ -912,6 +918,8 @@ def _regulating_sweep_options(
         current_mrt_offsets: Per-sensor MRT offsets at current moment from
             ``compute_current_mrt_offsets``.  Positive when cold (need higher
             air temp for same perceived comfort).
+        hold_release_sensors: Sensor columns with an active comfort overlay.
+            If this effector affects any of them, the mode hold is lifted.
     """
     from weatherstat.config import EffectorConfig
 
@@ -961,13 +969,23 @@ def _regulating_sweep_options(
 
     p_band = eff.proportional_band
 
+    # ── Mode hold (quiet hours): keep the current mode, unless a comfort request lifts it ──
+    held_mode: str | None = None
+    if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
+        requested = sorted(set(affected_sensors) & (hold_release_sensors or set()))
+        if requested:
+            print(f"  Mode hold lifted for {eff.name}: comfort request on {', '.join(requested)}")
+        else:
+            held_mode = prev_state.modes.get(eff.name, "off")
+
     # ── Generate options per supported mode with delay × duration ──
     max_horizon = max(CONTROL_HORIZONS)
     for mode in eff.supported_modes:
         targets = heat_targets if mode == "heat" else cool_targets if mode == "cool" else []
         for target in targets:
-            # Idle suppression: skip if effector would be idle
-            if ref_temp is not None:
+            # Idle suppression: skip if effector would be idle. Not for the held mode:
+            # there an "idle" target is exactly how the unit backs off without a mode change.
+            if ref_temp is not None and mode != held_mode:
                 if mode == "heat" and ref_temp > target + p_band:
                     continue
                 if mode == "cool" and ref_temp < target - p_band:
@@ -985,12 +1003,13 @@ def _regulating_sweep_options(
     options = [options[0]] + list(dict.fromkeys(options[1:]))
 
     # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
-    if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
-        prev_mode = prev_state.modes.get(eff.name, "off")
-        options = [o for o in options if o.mode == prev_mode]
+    if held_mode is not None and prev_state is not None:
+        options = [o for o in options if o.mode == held_mode]
         if not options:
+            # Held mode has no comfort-derived targets (e.g. heat held but the schedule only yields
+            # cool targets). Keep the previous setpoint rather than inventing one.
             prev_target = prev_state.setpoints.get(eff.name, 0.0)
-            options = [EffectorDecision(eff.name, mode=prev_mode, target=prev_target)]
+            options = [EffectorDecision(eff.name, mode=held_mode, target=prev_target)]
 
     return options
 
@@ -1185,6 +1204,7 @@ def _enumerate_options(
     ineligible_effectors: set[str] | None,
     gains: dict[tuple[str, str], tuple[float, float]] | None,
     current_mrt_offsets: dict[str, float] | None = None,
+    hold_release_sensors: set[str] | None = None,
 ) -> tuple[dict[str, list[EffectorDecision]], list]:
     """Enumerate per-effector sweep options (shared by scenario generation and option groups).
 
@@ -1226,6 +1246,7 @@ def _enumerate_options(
                 per_effector_options[eff.name] = _regulating_sweep_options(
                     eff, schedules, base_hour, gains, prev_state, current_temps,
                     current_mrt_offsets=current_mrt_offsets,
+                    hold_release_sensors=hold_release_sensors,
                 )
             else:
                 per_effector_options[eff.name] = [
@@ -1743,6 +1764,7 @@ def sweep_scenarios_physics(
     solar_planes: dict[str, list[float]] | None = None,
     current_mrt_offsets: dict[str, float] | None = None,
     horizon_mrt_offsets: dict[str, dict[int, float]] | None = None,
+    hold_release_sensors: set[str] | None = None,
 ) -> tuple[ControlDecision, Scenario, dict[str, str], AdvisoryPlan | None]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -1779,6 +1801,7 @@ def sweep_scenarios_physics(
     per_effector_options, dependent_effectors = _enumerate_options(
         schedules, base_hour, prev_state, current_temps, _ineligible, gains=sim_params.gains,
         current_mrt_offsets=current_mrt_offsets,
+        hold_release_sensors=hold_release_sensors,
     )
 
     # ── Physical constraints: block trajectory effectors at/above comfort max ──
@@ -2656,6 +2679,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         solar_planes=solar_planes,
         current_mrt_offsets=_mrt_per_sensor,
         horizon_mrt_offsets=_horizon_mrt,
+        hold_release_sensors={o.sensor for o in active_overlays},
     )
     _sweep_seconds = time.monotonic() - t0
     print(f"  Sweep completed in {_sweep_seconds * 1000:.0f}ms")
