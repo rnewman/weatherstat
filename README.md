@@ -1,6 +1,7 @@
 # Weatherstat
 
-<img width="1798" height="1229" alt="Screenshot 2026-03-24 at 9 41 10 PM" src="https://github.com/user-attachments/assets/f48ce427-c7ae-4ba3-a89f-c9c86cfbbd9d" />
+<img width="1155" height="626" alt="weatherstat" src="https://github.com/user-attachments/assets/67639972-717d-48d5-ae4b-65e6a2976fd2" />
+
 
 ## Docs
 
