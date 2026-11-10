@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import requests
@@ -29,6 +30,15 @@ CREATE TABLE IF NOT EXISTS readings (
   PRIMARY KEY (timestamp, name)
 )
 """
+
+# Name-first index for per-column lookups: the sparse-storage "did it change?"
+# query below, and the history scripts. The primary key leads with timestamp,
+# so finding one column's latest value walked the key back to that column's
+# last write — the whole table for a sparse column that rarely changes
+# (~0.3s per column per collection at 5M readings; 0.01ms with this index).
+# Costs ~45% more file size. Applied by _apply_schema on collector start.
+_NAME_INDEX = "readings_name_ts"
+_CREATE_NAME_INDEX_SQL = f"CREATE INDEX IF NOT EXISTS {_NAME_INDEX} ON readings (name, timestamp)"
 
 
 # ── HA REST helpers ─────────────────────────────────────────────────────────
@@ -307,9 +317,30 @@ def _get_db() -> sqlite3.Connection:
     SNAPSHOTS_DB.parent.mkdir(parents=True, exist_ok=True)
     _db = sqlite3.connect(str(SNAPSHOTS_DB), check_same_thread=False)
     _db.execute("PRAGMA journal_mode = WAL")
-    _db.execute(_CREATE_READINGS_SQL)
-    _db.commit()
+    _apply_schema(_db)
     return _db
+
+
+def _apply_schema(db: sqlite3.Connection, log: Callable[[str], None] = print) -> None:
+    """Create the readings table and its indexes; migrate an existing database in place.
+
+    Idempotent. On a database from before the name index, the first collector
+    start builds it once (a few seconds per few million readings; readers keep
+    working under WAL).
+    """
+    db.execute(_CREATE_READINGS_SQL)
+    has_index = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (_NAME_INDEX,),
+    ).fetchone()
+    if not has_index:
+        n = db.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+        t0 = time.monotonic()
+        if n:
+            log(f"[collector] Migration: indexing {n:,} readings by (name, timestamp), one time...")
+        db.execute(_CREATE_NAME_INDEX_SQL)
+        if n:
+            log(f"[collector] Migration done in {time.monotonic() - t0:.1f}s")
+    db.commit()
 
 
 def _close_db() -> None:
