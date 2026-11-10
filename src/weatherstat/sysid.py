@@ -456,7 +456,11 @@ def _preprocess(
 
     # Local hour for nighttime detection and solar features
     tz = _CFG.location.timezone
-    df["_local_hour"] = df["_ts"].dt.tz_convert(tz).dt.hour
+    local_ts = df["_ts"].dt.tz_convert(tz)
+    df["_local_hour"] = local_ts.dt.hour
+    # Local calendar day as a chronological integer label: the resampling
+    # block for the bootstrap stability check (see validate.py).
+    df["_local_day"] = pd.factorize(local_ts.dt.tz_localize(None).dt.floor("D"))[0]
 
     # Best outdoor temp: prefer configured outdoor sensor, fall back to
     # met.no weather data. Interpolate to fill gaps in hourly met data.
@@ -958,8 +962,10 @@ def _fit_sensor_model(
     # Per-sensor regression diagnostics (R², DW, VIF, holdout, bootstrap stability)
     from weatherstat.validate import validate_sysid_regression
 
+    # Bootstrap whole local days (block bootstrap), not 5-minute rows.
+    day_blocks = df["_local_day"].to_numpy()[valid] if "_local_day" in df.columns else None
     diagnostics = validate_sysid_regression(
-        sensor.name, X, y, feature_names, scale, lam, beta, resid,
+        sensor.name, X, y, feature_names, scale, lam, beta, resid, blocks=day_blocks,
     )
     bootstrap_cvs = diagnostics.bootstrap_cvs
     for issue in diagnostics.issues:

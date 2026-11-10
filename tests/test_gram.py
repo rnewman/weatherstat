@@ -13,9 +13,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from weatherstat.gram import bootstrap_counts, weighted_grams
+from weatherstat.gram import block_bootstrap_counts, block_grams, bootstrap_counts, weighted_grams
 from weatherstat.identification import weighted_ridge
-from weatherstat.validate import compute_bootstrap_stability, compute_vif
+from weatherstat.validate import compute_bootstrap_stability, compute_vif, validate_sysid_regression
 
 
 def _design(n: int = 3000, p: int = 9, seed: int = 3) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -112,3 +112,83 @@ class TestMatchesPreviousImplementations:
         beta, t = weighted_ridge(X, y, w, names)
         np.testing.assert_allclose(beta, beta_ref, rtol=1e-9, atol=1e-12)
         np.testing.assert_allclose(t, beta_ref / se, rtol=1e-9, atol=1e-9)
+
+
+class TestBlockBootstrap:
+    """Resampling whole days: per-block Grams, count-weighted sums."""
+
+    def _days(self, n: int, rows_per_day: int = 100) -> np.ndarray:
+        return np.arange(n) // rows_per_day
+
+    def test_block_grams_match_direct_products(self) -> None:
+        X, y, _ = _design(n=1050)
+        labels = np.random.default_rng(4).integers(0, 7, size=len(y))  # not contiguous
+        G, b, rows = block_grams(X, y, labels)
+        for k, lab in enumerate(np.unique(labels)):
+            m = labels == lab
+            np.testing.assert_allclose(G[k], X[m].T @ X[m], rtol=1e-12, atol=1e-9)
+            np.testing.assert_allclose(b[k], X[m].T @ y[m], rtol=1e-12, atol=1e-9)
+            assert rows[k] == m.sum()
+
+    def test_matches_gathered_day_resamples(self) -> None:
+        X, y, names = _design()
+        scale = _scale(X, names)
+        lam = 0.01 * len(y)
+        days = self._days(len(y))
+        n_days = days.max() + 1
+        # Reference: gather the rows of each drawn day and solve directly.
+        rng = np.random.RandomState(42)
+        X_s = X / scale
+        betas = []
+        for _ in range(50):
+            drawn = rng.randint(0, n_days, size=n_days)
+            idx = np.concatenate([np.flatnonzero(days == d) for d in drawn])
+            Xb, yb = X_s[idx], y[idx]
+            lam_b = lam * len(idx) / len(y)  # λ per row, as in the batch fit
+            betas.append(np.linalg.solve(Xb.T @ Xb + lam_b * np.eye(X.shape[1]), Xb.T @ yb) / scale)
+        betas = np.array(betas)
+        means, stds = betas.mean(axis=0), betas.std(axis=0)
+        ref = np.where(np.abs(means) > 1e-10, stds / np.abs(means), 0.0)
+        got = compute_bootstrap_stability(X, y, scale, lam, blocks=days)
+        np.testing.assert_allclose(got, ref, rtol=1e-8, atol=1e-12)
+
+    def test_one_row_per_block_is_the_row_bootstrap(self) -> None:
+        X, y, names = _design(n=800)
+        scale = _scale(X, names)
+        lam = 0.01 * len(y)
+        np.testing.assert_allclose(
+            compute_bootstrap_stability(X, y, scale, lam, blocks=np.arange(len(y))),
+            compute_bootstrap_stability(X, y, scale, lam),
+            rtol=1e-9,
+        )
+
+    def test_block_counts_draw_whole_blocks(self) -> None:
+        counts = block_bootstrap_counts(np.random.RandomState(0), 30, 5)
+        assert counts.shape == (5, 30)
+        assert (counts.sum(axis=1) == 30).all()
+
+    def test_day_correlation_widens_the_interval(self) -> None:
+        """Within-day correlation: rows are not independent, and the block bootstrap says so."""
+        rng = np.random.default_rng(11)
+        n_days, per_day = 60, 288
+        days = np.repeat(np.arange(n_days), per_day)
+        x = np.repeat(rng.normal(size=n_days), per_day) + 0.1 * rng.normal(size=n_days * per_day)
+        noise = np.repeat(rng.normal(size=n_days), per_day) + 0.1 * rng.normal(size=n_days * per_day)
+        X = np.column_stack([x, np.ones_like(x)])
+        y = 0.3 * x + noise
+        scale = np.ones(2)
+        lam = 0.01 * len(y)
+        cv_rows = compute_bootstrap_stability(X, y, scale, lam)[0]
+        cv_days = compute_bootstrap_stability(X, y, scale, lam, blocks=days)[0]
+        assert cv_days > 5 * cv_rows  # ~√288 fewer independent observations than rows
+
+    def test_too_few_days_gives_no_verdict(self) -> None:
+        X, y, names = _design(n=1800)
+        scale = _scale(X, names)
+        lam = 0.01 * len(y)
+        beta = np.linalg.solve(X.T @ X + lam * np.eye(X.shape[1]), X.T @ y)
+        resid = y - X @ beta
+        few = validate_sysid_regression("s", X, y, names, scale, lam, beta, resid, blocks=np.arange(len(y)) // 200)
+        assert few.bootstrap_cvs == {}  # 9 days
+        enough = validate_sysid_regression("s", X, y, names, scale, lam, beta, resid, blocks=np.arange(len(y)) // 150)
+        assert set(enough.bootstrap_cvs) == {"_solar_elev", "_adv_tau_w"}  # 12 days

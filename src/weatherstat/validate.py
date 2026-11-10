@@ -87,6 +87,7 @@ _ENV_SOLAR_BETA_MAX_RATIO = 2.0  # |β_solar_env| < 2 × base_solar_gain
 _HOLDOUT_DEGRADATION = 0.20  # holdout RMSE > 20% worse than in-sample → warning
 _BOOTSTRAP_CV_WARNING = 1.0  # coefficient of variation (std/|mean|) > 1 → unstable
 _BOOTSTRAP_N = 50  # number of bootstrap resamples
+_BOOTSTRAP_MIN_BLOCKS = 10  # fewer whole blocks (days) than this: no stability verdict
 
 # Health grade thresholds.
 # R² is low by design: the dependent variable is the Newton cooling residual,
@@ -203,23 +204,39 @@ def compute_bootstrap_stability(
     lam: float,
     n_boot: int = _BOOTSTRAP_N,
     seed: int = 42,
+    blocks: np.ndarray | None = None,
 ) -> np.ndarray:
     """Bootstrap coefficient stability: CV = std(β) / |mean(β)| per feature.
 
     Returns array of CVs (one per feature). CV > 1 means the coefficient
     changes sign or magnitude across resamples — it's not identified.
 
-    Each resample is solved from its Gram: drawing row i c_i times gives
-    Xᵀdiag(c)X, so all n_boot Grams come from one batched product instead
-    of n_boot gathered copies of X (same draws, same solves).
+    ``blocks`` labels each row (sysid passes the local calendar day) and
+    makes this a block bootstrap: each resample draws whole blocks with
+    replacement. Rows within a day are strongly autocorrelated — 15-min
+    smoothing, hours of thermal lag, daily habits — so resampling 5-minute
+    rows independently treats ~288 correlated rows as 288 independent ones
+    and understates coefficient variance. Each resample's ridge penalty is
+    scaled to its row count (the batch fit's λ per row). It is also nearly
+    free: one pass builds per-block Grams, and a resample's Gram is their
+    count-weighted sum. None resamples rows independently, solved from
+    Xᵀdiag(counts)X in one batched product.
     """
-    from weatherstat.gram import bootstrap_counts, weighted_grams
+    from weatherstat.gram import block_bootstrap_counts, block_grams, bootstrap_counts, weighted_grams
 
     rng = np.random.RandomState(seed)
     n, p = X.shape
     X_s = X / scale
-    G, b, _ = weighted_grams(X_s, y, bootstrap_counts(rng, n, n_boot))
-    A = G + lam * np.eye(p)
+    if blocks is None:
+        G, b, _ = weighted_grams(X_s, y, bootstrap_counts(rng, n, n_boot))
+        lam_k = np.full(n_boot, lam)
+    else:
+        G_d, b_d, rows_d = block_grams(X_s, y, blocks)
+        counts = block_bootstrap_counts(rng, len(rows_d), n_boot)
+        G = (counts @ G_d.reshape(len(rows_d), p * p)).reshape(n_boot, p, p)
+        b = counts @ b_d
+        lam_k = lam * (counts @ rows_d) / n
+    A = G + lam_k[:, None, None] * np.eye(p)
     betas = np.full((n_boot, p), np.nan)
     try:
         betas = np.linalg.solve(A, b[..., None])[..., 0] / scale
@@ -316,8 +333,12 @@ def validate_sysid_regression(
     lam: float,
     beta: np.ndarray,
     residuals: np.ndarray,
+    blocks: np.ndarray | None = None,
 ) -> RegressionDiagnostics:
     """Per-sensor regression diagnostics. Called from _fit_sensor_model.
+
+    ``blocks`` (a label per row, e.g. local day) makes the stability check a
+    block bootstrap — see compute_bootstrap_stability.
 
     Computes:
     1. R² — fraction of Newton residual explained by effectors + solar + environment
@@ -341,8 +362,9 @@ def validate_sysid_regression(
     # Computed for all adv/solar features; caller decides which matter.
     bootstrap_cvs: dict[str, float] = {}
     adv_solar_indices = [i for i, n in enumerate(feature_names) if n.startswith("_adv_") or n.startswith("_solar_")]
-    if adv_solar_indices and len(y) >= 500:
-        cvs = compute_bootstrap_stability(X, y, scale, lam)
+    enough_blocks = blocks is None or len(np.unique(blocks)) >= _BOOTSTRAP_MIN_BLOCKS
+    if adv_solar_indices and len(y) >= 500 and enough_blocks:
+        cvs = compute_bootstrap_stability(X, y, scale, lam, blocks=blocks)
         for idx in adv_solar_indices:
             bootstrap_cvs[feature_names[idx]] = float(cvs[idx])
 

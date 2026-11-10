@@ -7,7 +7,8 @@ built without materializing a resampled or reweighted copy of X per solve.
 
 A bootstrap resample is the special case of integer weights: drawing row i
 c_i times contributes c_i·xᵢxᵢᵀ, so ``Σ_resampled xxᵀ = Xᵀ diag(c) X``
-exactly (up to float summation order).
+exactly (up to float summation order). Resampling whole blocks (days) is
+cheaper still: the resample's Gram is Σ_d c_d·G_d over per-block Grams.
 """
 
 from __future__ import annotations
@@ -76,4 +77,40 @@ def bootstrap_counts(rng: np.random.RandomState, n: int, n_boot: int) -> np.ndar
     counts = np.empty((n_boot, n))
     for i in range(n_boot):
         counts[i] = np.bincount(rng.randint(0, n, size=n), minlength=n)
+    return counts
+
+
+def block_grams(
+    X: np.ndarray, y: np.ndarray, blocks: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-block (XᵀX, Xᵀy, row count) for each distinct label in ``blocks``, in sorted label order.
+
+    One pass over the rows; any resample of whole blocks is then a weighted
+    sum of these p×p pieces, never another pass over X.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    _, codes = np.unique(np.asarray(blocks), return_inverse=True)
+    order = np.argsort(codes, kind="stable")
+    sorted_codes = codes[order]
+    edges = np.flatnonzero(np.r_[True, sorted_codes[1:] != sorted_codes[:-1], True])
+    n_blocks, p = len(edges) - 1, X.shape[1]
+    G = np.empty((n_blocks, p, p))
+    b = np.empty((n_blocks, p))
+    rows = np.diff(edges).astype(float)
+    contiguous = bool(np.all(order == np.arange(len(order))))  # chronological days: slices, no copies
+    for i in range(n_blocks):
+        lo, hi = edges[i], edges[i + 1]
+        idx = slice(lo, hi) if contiguous else order[lo:hi]
+        Xb = X[idx]
+        G[i] = Xb.T @ Xb
+        b[i] = Xb.T @ y[idx]
+    return G, b, rows
+
+
+def block_bootstrap_counts(rng: np.random.RandomState, n_blocks: int, n_boot: int) -> np.ndarray:
+    """(n_boot × n_blocks) multiplicities: each resample draws n_blocks whole blocks with replacement."""
+    counts = np.empty((n_boot, n_blocks))
+    for i in range(n_boot):
+        counts[i] = np.bincount(rng.randint(0, n_blocks, size=n_blocks), minlength=n_blocks)
     return counts
