@@ -431,8 +431,13 @@ class TUIController:
                 with contextlib.suppress(ValueError, TypeError):
                     temps[sensor_col] = float(val)
 
-        # Comfort bounds at the current hour
-        now_hour = datetime.now().hour
+        # Comfort bounds at the current house-local hour — the same clock control.py
+        # and apply_overlays use. The host clock is wrong when it runs in UTC (a
+        # container, a server): the display would read a different hour than the
+        # one the overlay shifted and the sweep scored.
+        from zoneinfo import ZoneInfo
+
+        now_hour = (datetime.now(ZoneInfo(TIMEZONE)) if TIMEZONE else datetime.now().astimezone()).hour
         comfort: dict[str, ComfortBounds] = {}
         for s in schedules:
             c = s.comfort_at(now_hour)

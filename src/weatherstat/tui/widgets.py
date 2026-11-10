@@ -69,8 +69,14 @@ class StatusHeader(Static):
 
     def _refresh(self) -> None:
         from datetime import datetime
+        from zoneinfo import ZoneInfo
 
-        now_str = datetime.now().strftime("%H:%M")
+        # The label names the house's zone, so show the house's clock, not the host's.
+        try:
+            now = datetime.now(ZoneInfo(self._local_tz)) if self._local_tz else datetime.now()
+        except (KeyError, ValueError):
+            now = datetime.now()
+        now_str = now.strftime("%H:%M")
         tz = f" {self._local_tz}" if self._local_tz else ""
 
         mode_str = "[bold red]LIVE[/]" if self._live else "[bold green]DRY-RUN[/]"

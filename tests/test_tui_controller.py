@@ -327,6 +327,18 @@ def overlay_sandbox(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def host_clock_far_from_house(monkeypatch):
+    """Put the host clock 21–22h away from the house (example config: America/Los_Angeles)."""
+    import time
+
+    monkeypatch.setenv("TZ", "Pacific/Kiritimati")  # UTC+14
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
 class TestOverlays:
     def test_bump_then_snapshot_shifts_bounds(self, overlay_sandbox) -> None:
         ctrl, cap = _make_controller()
@@ -345,6 +357,20 @@ class TestOverlays:
         assert snap.overlays["bedroom_temp"].source == "web"
         # Unrelated rooms untouched
         assert snap.comfort["office"] == ctrl.build_snapshot().comfort["office"]
+
+    def test_bounds_follow_house_clock_not_host_clock(self, overlay_sandbox, host_clock_far_from_house) -> None:
+        """The snapshot reads bounds at the house-local hour the overlay shifted.
+
+        Regression: it read the host's hour, so on a UTC host (container,
+        server) a 1h overlay shifted LA hours while the display showed some
+        other hour's unshifted bounds.
+        """
+        ctrl, _ = _make_controller()
+        before = ctrl.build_snapshot().comfort["bedroom"]
+        assert ctrl.bump_overlay("bedroom", 2.0, hours=1.0).status == "ok"
+        after = ctrl.build_snapshot().comfort["bedroom"]
+        assert after.preferred_lo == before.preferred_lo + 2.0
+        assert after.acceptable_lo == before.acceptable_lo + 2.0
 
     def test_overlay_command_and_clear(self, overlay_sandbox) -> None:
         ctrl, _ = _make_controller()
