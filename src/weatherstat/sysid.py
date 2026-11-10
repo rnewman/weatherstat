@@ -255,8 +255,32 @@ _MIN_SEGMENT_STEPS = 12  # 1 hour at 5-min intervals
 _MAX_SOLAR_ELEV_FOR_TAU = 5.0
 
 
+# A segment's tau is a pure function of its samples, and past nights never
+# change (append-only data), so a long-running process (TUI, headless loop)
+# re-fits only segments it hasn't seen — on an hourly refit, the newest one or
+# two out of thousands. Keyed by the exact bytes, so a segment that grew or
+# whose data changed simply misses. Bounded: cleared if it ever gets large.
+_TAU_CURVE_MEMO: dict[tuple[bytes, bytes, float], float | None] = {}
+_TAU_CURVE_MEMO_MAX = 50_000
+
+
 def _fit_tau_curve(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> float | None:
     """Fit tau from a single cooling segment. Returns None on failure."""
+    key = (
+        np.ascontiguousarray(t_hours, dtype=float).tobytes(),
+        np.ascontiguousarray(temps, dtype=float).tobytes(),
+        float(t_outdoor),
+    )
+    if key in _TAU_CURVE_MEMO:
+        return _TAU_CURVE_MEMO[key]
+    tau = _fit_tau_curve_uncached(t_hours, temps, t_outdoor)
+    if len(_TAU_CURVE_MEMO) >= _TAU_CURVE_MEMO_MAX:
+        _TAU_CURVE_MEMO.clear()
+    _TAU_CURVE_MEMO[key] = tau
+    return tau
+
+
+def _fit_tau_curve_uncached(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> float | None:
     t_0 = temps[0]
     if abs(t_0 - t_outdoor) < 1.0:
         return None
@@ -289,6 +313,9 @@ def _find_uncontrolled_segments(
     Window/door states must be constant within each segment (no transitions)
     but need not all be closed. The fitted tau includes whatever window
     effects are present; Stage 2 regression decomposes them.
+
+    Each segment is a frame of the rows' ``_ts``, temperature column and
+    ``_outdoor_best`` (index = row labels in ``df``), in chronological order.
     """
     # Identify low-solar rows: sun below threshold elevation.
     # Replaces hardcoded nighttime hours — adapts to season and latitude.
@@ -316,35 +343,37 @@ def _find_uncontrolled_segments(
         return []
     mask &= df[temp_col].notna() & df["_outdoor_best"].notna()
 
-    qualifying = df[mask].copy()
-    if len(qualifying) < _MIN_SEGMENT_STEPS:
+    rows = np.flatnonzero(mask.to_numpy(dtype=bool))
+    if len(rows) < _MIN_SEGMENT_STEPS:
         return []
 
-    # Split into contiguous segments (gaps > 10 min break segments)
-    dt = qualifying["_ts"].diff()
-    breaks = dt > pd.Timedelta(minutes=10)
-    seg_ids = breaks.cumsum()
+    # Split into contiguous segments (gaps > 10 min break segments). A single
+    # skipped 5-min row does not break a segment — same rule as always.
+    breaks = (df["_ts"].iloc[rows].diff() > pd.Timedelta(minutes=10)).to_numpy()
+    seg_ids = np.cumsum(breaks)
 
     # Only keep segments where all window/door states are constant
     # (no transitions mid-segment). NaN (sensor didn't exist) is treated
     # as a constant unknown state and does not disqualify the segment.
+    # One grouped nunique (dropna) over the qualifying rows replaces a
+    # Python loop over every segment × column.
     all_env_cols = [cfg.column for cfg in _CFG.environment.values()]
     existing_env_cols = [c for c in all_env_cols if c in df.columns]
+    if existing_env_cols:
+        n_unique = df[existing_env_cols].iloc[rows].groupby(seg_ids).nunique()
+        unstable = (n_unique > 1).any(axis=1).to_numpy()
+    else:
+        unstable = np.zeros(int(seg_ids[-1]) + 1, dtype=bool)
 
+    # Segments come back narrow — only what the tau fit reads — so building
+    # them doesn't copy hundreds of feature columns per segment.
+    fit_cols = df[["_ts", temp_col, "_outdoor_best"]]
+    starts = np.flatnonzero(np.r_[True, seg_ids[1:] != seg_ids[:-1]])
+    ends = np.r_[starts[1:], len(rows)]
     segments: list[pd.DataFrame] = []
-    for _, seg_df in qualifying.groupby(seg_ids):
-        if len(seg_df) < _MIN_SEGMENT_STEPS:
-            continue
-        # Check window stability: each column must have at most 1 unique
-        # non-null value within the segment
-        stable = True
-        for wc in existing_env_cols:
-            n_unique = seg_df[wc].dropna().nunique()
-            if n_unique > 1:
-                stable = False
-                break
-        if stable:
-            segments.append(seg_df)
+    for seg, (a, b) in enumerate(zip(starts, ends, strict=True)):
+        if b - a >= _MIN_SEGMENT_STEPS and not unstable[seg]:
+            segments.append(fit_cols.iloc[rows[a:b]])
 
     return segments
 
@@ -427,7 +456,11 @@ def _preprocess(
 
     # Local hour for nighttime detection and solar features
     tz = _CFG.location.timezone
-    df["_local_hour"] = df["_ts"].dt.tz_convert(tz).dt.hour
+    local_ts = df["_ts"].dt.tz_convert(tz)
+    df["_local_hour"] = local_ts.dt.hour
+    # Local calendar day as a chronological integer label: the resampling
+    # block for the bootstrap stability check (see validate.py).
+    df["_local_day"] = pd.factorize(local_ts.dt.tz_localize(None).dt.floor("D"))[0]
 
     # Best outdoor temp: prefer configured outdoor sensor, fall back to
     # met.no weather data. Interpolate to fill gaps in hourly met data.
@@ -542,17 +575,22 @@ def _preprocess(
     # sin⁺(elevation) × solar_fraction (for regression feature).
     from weatherstat.weather import (
         condition_to_solar_fraction,
-        kasten_czeplak,
-        solar_elevation,
-        solar_sin_elevation,
+        kasten_czeplak_array,
+        plane_incidence_from,
+        sin_elevation_from,
+        solar_position_arrays,
     )
 
     lat = _CFG.location.latitude
     lon = _CFG.location.longitude
 
+    # Solar position once for the whole history (vectorized; the per-row
+    # scalar calls were ~4 × 10⁵ Python calls per refit at a year of data).
+    elev_deg, azimuth_deg = solar_position_arrays(lat, lon, df["_ts"])
+
     # Raw elevation in degrees — used by _find_uncontrolled_segments() to
     # replace hardcoded nighttime hours. Negative = sun below horizon.
-    df["_solar_elev_deg"] = df["_ts"].apply(lambda dt: solar_elevation(lat, lon, dt))
+    df["_solar_elev_deg"] = elev_deg
 
     # Solar fraction: prefer continuous cloud_coverage (April 2026+) via the
     # Kasten-Czeplak transfer function; fall back to the categorical condition
@@ -561,7 +599,7 @@ def _preprocess(
     # feature and the per-sensor β absorbs any residual unit difference.
     if "cloud_coverage" in df.columns:
         cc = pd.to_numeric(df["cloud_coverage"], errors="coerce")
-        continuous = cc.apply(lambda v: kasten_czeplak(v) if pd.notna(v) else None)
+        continuous = pd.Series(kasten_czeplak_array(cc.to_numpy(dtype=float)), index=df.index)
         if "weather_condition" in df.columns:
             cat = df["weather_condition"].map(condition_to_solar_fraction).fillna(0.3)
             solar_frac = continuous.combine_first(cat)
@@ -572,17 +610,13 @@ def _preprocess(
     else:
         solar_frac = pd.Series(0.3, index=df.index)
 
-    df["_solar_elev"] = df["_ts"].apply(lambda dt: solar_sin_elevation(lat, lon, dt)) * solar_frac
+    df["_solar_elev"] = sin_elevation_from(elev_deg) * solar_frac
 
     # Directional wall-plane features (east/west; south is ~redundant with
     # horizontal). Same geometry-x-fraction construction as _solar_elev, so
     # the per-sensor coefficients decompose the solar response by direction.
-    from weatherstat.weather import plane_incidence
-
     for plane_name, plane_az in SOLAR_PLANES.items():
-        df[f"_solar_{plane_name}"] = (
-            df["_ts"].apply(lambda dt, az=plane_az: plane_incidence(lat, lon, dt, az)) * solar_frac
-        )
+        df[f"_solar_{plane_name}"] = plane_incidence_from(elev_deg, azimuth_deg, plane_az) * solar_frac
 
     return df
 
@@ -928,8 +962,10 @@ def _fit_sensor_model(
     # Per-sensor regression diagnostics (R², DW, VIF, holdout, bootstrap stability)
     from weatherstat.validate import validate_sysid_regression
 
+    # Bootstrap whole local days (block bootstrap), not 5-minute rows.
+    day_blocks = df["_local_day"].to_numpy()[valid] if "_local_day" in df.columns else None
     diagnostics = validate_sysid_regression(
-        sensor.name, X, y, feature_names, scale, lam, beta, resid,
+        sensor.name, X, y, feature_names, scale, lam, beta, resid, blocks=day_blocks,
     )
     bootstrap_cvs = diagnostics.bootstrap_cvs
     for issue in diagnostics.issues:
@@ -1285,16 +1321,32 @@ def _compute_gain_drift(
     return changes
 
 
-def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionDiagnostics]]:
-    """Run system identification and return the result + per-sensor diagnostics.
-
-    Use save_sysid_result() to persist.
-    """
-    _fit_t0 = time.monotonic()
+def load_snapshots_timed() -> tuple[pd.DataFrame, float]:
+    """Load the collector snapshots with sysid's progress output. Returns (df, seconds)."""
+    t0 = time.monotonic()
     print("Loading collector snapshots...")
     df = load_collector_snapshots()
-    _load_seconds = time.monotonic() - _fit_t0
-    print(f"  {len(df)} snapshots loaded in {_load_seconds:.1f}s")
+    seconds = time.monotonic() - t0
+    print(f"  {len(df)} snapshots loaded in {seconds:.1f}s")
+    return df, seconds
+
+
+def fit_sysid(
+    verbose: bool = False,
+    snapshots: pd.DataFrame | None = None,
+) -> tuple[SysIdResult, dict[str, RegressionDiagnostics]]:
+    """Run system identification and return the result + per-sensor diagnostics.
+
+    Use save_sysid_result() to persist. ``snapshots`` is a frame from
+    load_collector_snapshots() that the caller already loaded (the periodic
+    refit shares one load between the batch fit and the tracker update); it
+    is not modified. None loads here.
+    """
+    _fit_t0 = time.monotonic()
+    if snapshots is None:
+        df, _load_seconds = load_snapshots_timed()
+    else:
+        df, _load_seconds = snapshots, 0.0
 
     effectors = _enumerate_effectors()
     sensors = _enumerate_sensors()
@@ -1382,7 +1434,8 @@ def fit_sysid(verbose: bool = False) -> tuple[SysIdResult, dict[str, RegressionD
 
     _stage2_seconds = time.monotonic() - _stage2_t0
     print(
-        f"\n  Sysid timing: load {_load_seconds:.1f}s, tau fit {_stage1_seconds:.1f}s,"
+        f"\n  Sysid timing: load {f'{_load_seconds:.1f}s' if snapshots is None else '(preloaded)'},"
+        f" tau fit {_stage1_seconds:.1f}s,"
         f" regression {_stage2_seconds:.1f}s, total {time.monotonic() - _fit_t0:.1f}s"
     )
 

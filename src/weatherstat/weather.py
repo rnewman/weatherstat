@@ -9,6 +9,8 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
+import numpy as np
+
 from weatherstat.types import WeatherCondition
 
 # Map all met.no weather conditions to numeric codes for ML features.
@@ -175,6 +177,64 @@ def plane_incidence(lat_deg: float, lon_deg: float, dt: datetime, plane_azimuth_
     az = solar_azimuth(lat_deg, lon_deg, dt)
     cos_inc = math.cos(math.radians(elev)) * math.cos(math.radians(az - plane_azimuth_deg))
     return max(0.0, cos_inc)
+
+
+# ── Vectorized twins (sysid preprocessing over the whole history) ──────────
+#
+# Same formulas, same operation order as the scalar functions above, so the
+# results agree to the last bit or two of float64 (numpy and libm trig can
+# differ by an ulp). Sysid calls these once over ~10⁵ rows instead of
+# ~4×10⁵ Python calls; the control loop keeps the scalar versions.
+
+
+def solar_position_arrays(lat_deg: float, lon_deg: float, times) -> tuple[np.ndarray, np.ndarray]:
+    """(elevation°, azimuth° from north) for each timestamp — vectorized solar_elevation/solar_azimuth.
+
+    ``times`` is anything pandas.DatetimeIndex accepts (a Series of aware
+    timestamps). Like the scalar versions, calendar fields are read in the
+    timestamps' own zone, so pass UTC.
+    """
+    import pandas as pd
+
+    idx = pd.DatetimeIndex(times)
+    day_of_year = idx.day_of_year.to_numpy(dtype=float)
+    declination = 23.45 * np.sin(np.radians(360.0 / 365.0 * (day_of_year - 81)))
+    utc_hour = (
+        idx.hour.to_numpy(dtype=float)
+        + idx.minute.to_numpy(dtype=float) / 60.0
+        + idx.second.to_numpy(dtype=float) / 3600.0
+    )
+    hour_angle = 15.0 * (utc_hour + lon_deg / 15.0 - 12.0)
+    lat_r = math.radians(lat_deg)
+    dec_r = np.radians(declination)
+    ha_r = np.radians(hour_angle)
+    sin_elev = math.sin(lat_r) * np.sin(dec_r) + math.cos(lat_r) * np.cos(dec_r) * np.cos(ha_r)
+    elevation = np.degrees(np.arcsin(np.clip(sin_elev, -1.0, 1.0)))
+    az_south = np.arctan2(np.sin(ha_r), np.cos(ha_r) * math.sin(lat_r) - np.tan(dec_r) * math.cos(lat_r))
+    azimuth = np.mod(np.degrees(az_south) + 180.0, 360.0)
+    return elevation, azimuth
+
+
+def sin_elevation_from(elevation_deg: np.ndarray) -> np.ndarray:
+    """max(0, sin(elevation)) — vectorized solar_sin_elevation from precomputed elevations."""
+    return np.maximum(0.0, np.sin(np.radians(elevation_deg)))
+
+
+def plane_incidence_from(
+    elevation_deg: np.ndarray, azimuth_deg: np.ndarray, plane_azimuth_deg: float | None,
+) -> np.ndarray:
+    """Vectorized plane_incidence from precomputed solar positions."""
+    if plane_azimuth_deg is None:
+        return np.where(elevation_deg > 0.0, np.sin(np.radians(elevation_deg)), 0.0)
+    cos_inc = np.cos(np.radians(elevation_deg)) * np.cos(np.radians(azimuth_deg - plane_azimuth_deg))
+    return np.where(elevation_deg > 0.0, np.maximum(0.0, cos_inc), 0.0)
+
+
+def kasten_czeplak_array(cloud_coverage_pct: np.ndarray) -> np.ndarray:
+    """Vectorized kasten_czeplak; NaN in → NaN out (no observation)."""
+    cc = np.asarray(cloud_coverage_pct, dtype=float)
+    frac = np.maximum(0.0, 1.0 - 0.75 * (np.clip(cc, 0.0, 100.0) / 100.0) ** 3.4)
+    return np.where(np.isnan(cc), np.nan, frac)
 
 
 # Wall planes used for directional solar features. East/west are measured

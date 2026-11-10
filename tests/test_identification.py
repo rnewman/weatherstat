@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pytest
 
@@ -10,6 +12,9 @@ from weatherstat.identification import (
     classify_coupling,
     transition_weights,
 )
+
+if TYPE_CHECKING:
+    from weatherstat.simulator import HouseState, SimParams
 
 _RNG = np.random.default_rng(7)
 
@@ -88,8 +93,6 @@ class TestClassifyCoupling:
     def test_night_only_transitions_underpowered(self) -> None:
         """Toggles at night give no solar contrast — no verdict, not a false one."""
         ts, state, solar, _ = _scenario(toggles_per_day=0.0)
-        # Toggle at 2am each day
-        hour = ts % 24.0
         day = (ts // 24.0).astype(int)
         state = (day % 2 == 0)  # flips at midnight boundaries only
         state = state & True

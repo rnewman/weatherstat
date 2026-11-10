@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -268,14 +271,8 @@ def _weather_to_series(
 # ── Collector SQLite reader ───────────────────────────────────────────────
 
 
-def _load_from_readings(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Load from the EAV readings table and pivot to wide format."""
-    df_long = pd.read_sql(
-        "SELECT timestamp, name, value FROM readings ORDER BY timestamp", conn
-    )
-    if df_long.empty:
-        return pd.DataFrame()
-
+def _pivot_typed(df_long: pd.DataFrame) -> pd.DataFrame:
+    """Long (timestamp, name, value) rows → wide frame indexed by timestamp, typed from config."""
     df = df_long.pivot(index="timestamp", columns="name", values="value")
     df.columns.name = None  # remove "name" label from columns axis
 
@@ -285,8 +282,161 @@ def _load_from_readings(conn: sqlite3.Connection) -> pd.DataFrame:
         sql_type = col_types.get(col)
         if sql_type in ("REAL", "INTEGER"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
-    return df.reset_index()
+
+def _load_from_readings(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Load from the EAV readings table and pivot to wide format (full read, no cache)."""
+    # No ORDER BY: pivot sorts its index anyway, and ordering by timestamp walks
+    # the (timestamp, name) primary-key index with a table lookup per row.
+    df_long = pd.read_sql("SELECT timestamp, name, value FROM readings", conn)
+    if df_long.empty:
+        return pd.DataFrame()
+    return _pivot_typed(df_long).reset_index()
+
+
+# ── Incremental load (long-running processes) ─────────────────────────────
+#
+# A periodic refit re-reads the whole table — millions of rows, several
+# seconds — to pick up one hour of new readings. The collector only ever
+# appends, and SQLite hands appended rows ascending rowids, so a process that
+# loaded once can keep the wide frame and read just the rows past its
+# high-water mark. Guards, in order of what they catch:
+#   - COUNT(rowid ≤ mark) must still equal what was read: catches deletes and
+#     the rowid renumbering a VACUUM may do after them.
+#   - A full re-read at least every _CACHE_MAX_AGE_SECONDS: bounds how long an
+#     in-place edit (a rename migration) can go unseen by a running process.
+#   - Anything the typed merge can't reproduce exactly falls back to a full read.
+# The merge reproduces what a full pivot + typing would give (tests compare it
+# with a full load after appends, late names, new names and junk values).
+
+_CACHE_MAX_AGE_SECONDS = 6 * 3600
+
+
+@dataclass
+class _SnapshotCache:
+    wide: pd.DataFrame  # _pivot_typed output (indexed by timestamp)
+    max_rowid: int
+    n_rows: int  # readings with rowid ≤ max_rowid that `wide` was built from
+    loaded_at: float  # time.monotonic() of the last full read
+
+
+_cache_lock = threading.Lock()
+_snapshot_cache: dict[Path, _SnapshotCache] = {}
+
+
+def clear_snapshot_cache() -> None:
+    """Forget cached snapshots; the next load re-reads the whole table."""
+    with _cache_lock:
+        _snapshot_cache.clear()
+
+
+def _read_rows(conn: sqlite3.Connection, hi: int, lo: int | None = None) -> pd.DataFrame:
+    """Readings with lo < rowid ≤ hi (no lower bound when lo is None)."""
+    if lo is None:
+        return pd.read_sql("SELECT timestamp, name, value FROM readings WHERE rowid <= ?", conn, params=(hi,))
+    return pd.read_sql(
+        "SELECT timestamp, name, value FROM readings WHERE rowid > ? AND rowid <= ?", conn, params=(lo, hi),
+    )
+
+
+def _load_incremental(conn: sqlite3.Connection, path: Path) -> pd.DataFrame:
+    max_rowid = conn.execute("SELECT MAX(rowid) FROM readings").fetchone()[0]
+    with _cache_lock:
+        if max_rowid is None:
+            _snapshot_cache.pop(path, None)
+            return pd.DataFrame()
+        entry = _snapshot_cache.get(path)
+        if entry is not None and (
+            time.monotonic() - entry.loaded_at > _CACHE_MAX_AGE_SECONDS
+            or max_rowid < entry.max_rowid
+            or conn.execute("SELECT COUNT(*) FROM readings WHERE rowid <= ?", (entry.max_rowid,)).fetchone()[0]
+            != entry.n_rows
+        ):
+            entry = None
+
+        if entry is not None and max_rowid > entry.max_rowid:
+            tail = _read_rows(conn, max_rowid, lo=entry.max_rowid)
+            merged = _merge_wide(entry.wide, _pivot_typed(tail)) if not tail.empty else entry.wide
+            if merged is None:
+                entry = None
+            else:
+                entry = _SnapshotCache(merged, max_rowid, entry.n_rows + len(tail), entry.loaded_at)
+
+        if entry is None:
+            df_long = _read_rows(conn, max_rowid)
+            if df_long.empty:
+                _snapshot_cache.pop(path, None)
+                return pd.DataFrame()
+            entry = _SnapshotCache(_share_text_values(_pivot_typed(df_long)), max_rowid, len(df_long), time.monotonic())
+
+        _snapshot_cache[path] = entry
+        # A real copy: callers modify the frame (ffill, dtype changes), and
+        # copy-on-write sharing is only guaranteed from pandas 3.
+        return entry.wide.copy(deep=True).reset_index()
+
+
+def _merge_wide(old: pd.DataFrame, tail: pd.DataFrame) -> pd.DataFrame | None:
+    """Merge newly read rows into a cached wide frame, as a full re-pivot would.
+
+    New timestamps add rows; names written late for an existing timestamp
+    fill that row's cells (the primary key means a cell is never written
+    twice). Numeric columns get the dtype pd.to_numeric gives the whole
+    column: int64 only when every row has an integer value, else float64.
+    Returns None for anything else — the caller re-reads in full.
+    """
+    index = old.index.union(tail.index)
+    if not index.is_monotonic_increasing:
+        return None
+    index.name = "timestamp"
+    # Row positions once (hashing ~10⁵ timestamp strings per column was the cost).
+    pos_old = index.get_indexer(old.index)
+    pos_tail = index.get_indexer(tail.index)
+    n = len(index)
+    columns: dict[str, object] = {}
+    for col in sorted(set(old.columns) | set(tail.columns)):
+        parts = [(s, pos) for s, pos in ((old.get(col), pos_old), (tail.get(col), pos_tail)) if s is not None]
+        dtypes = [s.dtype for s, _ in parts]
+        if all(isinstance(d, np.dtype) and d.kind in "if" for d in dtypes):
+            values = np.full(n, np.nan)
+            for s, pos in parts:
+                v = s.to_numpy(dtype="float64", na_value=np.nan)
+                ok = ~np.isnan(v)
+                values[pos[ok]] = v[ok]
+            if all(d.kind == "i" for d in dtypes) and not np.isnan(values).any():
+                columns[col] = values.astype("int64")
+            else:
+                columns[col] = values
+        elif len({str(d) for d in dtypes}) == 1 and _is_text(dtypes[0]):
+            values = np.full(n, np.nan, dtype=object)
+            for s, pos in parts:
+                v = s.to_numpy(dtype=object)
+                ok = ~pd.isna(v)
+                values[pos[ok]] = v[ok]
+            columns[col] = pd.array(values, dtype=dtypes[0]) if isinstance(dtypes[0], pd.StringDtype) else values
+        else:
+            return None
+    return pd.DataFrame(columns, index=index)
+
+
+def _is_text(dtype: object) -> bool:
+    return isinstance(dtype, pd.StringDtype) or (isinstance(dtype, np.dtype) and dtype.kind == "O")
+
+
+def _share_text_values(wide: pd.DataFrame) -> pd.DataFrame:
+    """Point each text column at one object per distinct value.
+
+    SQLite returns a fresh Python string per cell, so a year of "idle" /
+    "heating" is ~10⁶ separate objects. Same values and dtype; a fraction
+    of the memory for a frame a long-running process keeps.
+    """
+    out = wide.copy(deep=False)
+    for col in wide.columns:
+        s = wide[col]
+        if _is_text(s.dtype):
+            codes, uniques = pd.factorize(s, use_na_sentinel=True)
+            out[col] = pd.Series(uniques.take(codes, allow_fill=True), index=wide.index, name=col)
+    return out
 
 
 def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
@@ -306,8 +456,11 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
         sys.exit(1)
 
     conn = sqlite3.connect(str(path))
-    df = _load_from_readings(conn)
-    conn.close()
+    try:
+        # Incremental after the first load in this process (see _load_incremental).
+        df = _load_incremental(conn, path.resolve())
+    finally:
+        conn.close()
 
     # Forward-fill environment columns: sparse storage means only state
     # changes are written, so fill gaps with the last known value.
@@ -335,10 +488,10 @@ def snapshot_status(db_path: Path | None = None) -> tuple[str, int]:
         return ("", 0)
     conn = sqlite3.connect(str(path))
     try:
-        row = conn.execute("SELECT MAX(timestamp), COUNT(*) FROM readings").fetchone()
-        if row and row[0]:
-            return (str(row[0]), int(row[1]))
-        return ("", 0)
+        ts = latest_timestamp(conn)
+        if ts is None:
+            return ("", 0)
+        return (ts, int(conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]))
     finally:
         conn.close()
 
@@ -353,14 +506,30 @@ def latest_snapshot_values(db_path: Path | None = None) -> dict[str, str]:
         return {}
     conn = sqlite3.connect(str(path))
     try:
-        row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
-        if not row or not row[0]:
+        ts = latest_timestamp(conn)
+        if ts is None:
             return {}
-        ts = row[0]
         rows = conn.execute("SELECT name, value FROM readings WHERE timestamp = ?", (ts,)).fetchall()
         return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
+
+
+def latest_timestamp(conn: sqlite3.Connection) -> str | None:
+    """MAX(timestamp) over readings, fast whichever way the key is ordered.
+
+    Plain MAX(timestamp) is a single seek on a timestamp-first key but a full
+    index scan on the (name, timestamp) key (~0.3s at 5M readings — on every
+    TUI refresh). The newest-inserted row is almost always the latest
+    snapshot, so: take its timestamp, then look only for anything later (a
+    skip-scan on the name-first key, a range seek on the old one). Exact even
+    after a backfill inserted older rows last.
+    """
+    row = conn.execute("SELECT timestamp FROM readings ORDER BY rowid DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    later = conn.execute("SELECT MAX(timestamp) FROM readings WHERE timestamp > ?", (row[0],)).fetchone()[0]
+    return str(later or row[0])
 
 
 # ── Live state fetch ─────────────────────────────────────────────────────────

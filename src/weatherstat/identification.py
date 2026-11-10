@@ -90,23 +90,40 @@ def weighted_ridge(
     standardization, λ scaled by effective sample size) so weighted and
     batch coefficients are directly comparable.
     """
+    scale = _selective_scale(X, feature_names)
+    return _weighted_ridge_scaled(X / scale, scale, y, w)
+
+
+def _selective_scale(X: np.ndarray, feature_names: list[str]) -> np.ndarray:
+    """Column scales for the selective standardization (solar/advisory by std, the rest 1)."""
     scale = np.ones(X.shape[1])
     for j, name in enumerate(feature_names):
         if name.startswith("_solar_") or name.startswith("_adv_"):
             s = np.std(X[:, j])
             if s > 0:
                 scale[j] = s
-    sw = np.sqrt(w)
-    Xw = (X / scale) * sw[:, None]
-    yw = y * sw
+    return scale
+
+
+def _weighted_ridge_scaled(
+    X_s: np.ndarray, scale: np.ndarray, y: np.ndarray, w: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """weighted_ridge on an already-scaled design (X_s = X / scale).
+
+    Solved from the weighted Gram XᵀWX rather than a √w-reweighted copy of X;
+    the scaling is shared across the σ sweep of one coupling.
+    """
+    from weatherstat.gram import weighted_grams
+
+    G, b, _ = weighted_grams(X_s, y, w[None, :])
     n_eff = float(w.sum())
     lam = 0.01 * n_eff
-    A = Xw.T @ Xw + lam * np.eye(X.shape[1])
-    beta_s = np.linalg.solve(A, Xw.T @ yw)
+    A = G[0] + lam * np.eye(X_s.shape[1])
+    beta_s = np.linalg.solve(A, b[0])
     beta = beta_s / scale
-    resid = yw - Xw @ beta_s
-    dof = max(n_eff - X.shape[1], 1.0)
-    s2 = float(resid @ resid) / dof
+    r = y - X_s @ beta_s
+    dof = max(n_eff - X_s.shape[1], 1.0)
+    s2 = float(w @ (r * r)) / dof
     try:
         cov = s2 * np.linalg.inv(A)
         se = np.sqrt(np.abs(np.diag(cov))) / scale
@@ -133,6 +150,8 @@ def classify_coupling(
     ts_hours are the device state and timestamps filtered identically.
     """
     j = feature_names.index(feature)
+    scale = _selective_scale(X, feature_names)
+    X_s = X / scale
     sign_batch = np.sign(beta_batch)
     by_sigma: dict[str, dict[str, float]] = {}
     holds = True
@@ -145,7 +164,7 @@ def classify_coupling(
             return IdentificationResult(
                 IdentificationTag.UNDERPOWERED, round(beta_batch, 4), round(t_batch, 2), by_sigma,
             )
-        beta, t = weighted_ridge(X, y, w, feature_names)
+        beta, t = _weighted_ridge_scaled(X_s, scale, y, w)
         by_sigma[key] = {"beta": round(float(beta[j]), 4), "t": round(float(t[j]), 2), "info": round(info, 1)}
         if (
             np.sign(beta[j]) != sign_batch

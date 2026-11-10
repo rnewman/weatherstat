@@ -92,6 +92,14 @@ bundle *ARGS:
 experiment-sysid *ARGS:
     uv run python ./scripts/experiment_sysid.py {{ARGS}}
 
+# Build a synthetic collector DB at production scale (args: <out_dir> [--days N] [--seed S] [--force])
+synth-db *ARGS:
+    uv run python ./scripts/synthetic_snapshots.py {{ARGS}}
+
+# Benchmark the hourly refit on a copy (refit|periodic <data_dir>, compare <a.json> <b.json>)
+bench-sysid *ARGS:
+    uv run python ./scripts/bench_sysid.py {{ARGS}}
+
 # Verify live config parses correctly
 verify:
     #!/usr/bin/env bash
@@ -131,6 +139,6 @@ init:
     fi
     echo "Ready: $DATA_DIR"
 
-# Install all dependencies (including dev tools: pytest, ruff)
+# Install all dependencies (dev tools pytest + ruff are a default group; --all-extras adds the TUI)
 install:
-    uv sync --extra dev
+    uv sync --all-extras

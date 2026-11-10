@@ -40,10 +40,13 @@ def sysid_refit() -> SysidOutcome:
     preserving the previous thermal_params.json. Callers own logging and
     stdout capture (sysid prints its own progress).
     """
-    from weatherstat.sysid import fit_sysid, save_sysid_result
+    from weatherstat.sysid import fit_sysid, load_snapshots_timed, save_sysid_result
 
     t0 = time.monotonic()
-    result, diagnostics = fit_sysid()
+    # One load serves both the batch fit and the tracker: at millions of
+    # readings the EAV read + pivot is several seconds each time.
+    snapshots, _ = load_snapshots_timed()
+    result, diagnostics = fit_sysid(snapshots=snapshots)
     n_taus = len(result.fitted_taus)
     n_gains = sum(1 for g in result.effector_sensor_gains if not g.negligible)
 
@@ -59,7 +62,7 @@ def sysid_refit() -> SysidOutcome:
     try:
         from weatherstat.tracker import update_trackers
 
-        tracker_msg = update_trackers(log=lambda _msg: None)
+        tracker_msg = update_trackers(log=lambda _msg: None, snapshots=snapshots)
     except Exception as e:  # noqa: BLE001 — isolate tracker faults from the refit
         tracker_msg = f"tracker: error — {e}"
 

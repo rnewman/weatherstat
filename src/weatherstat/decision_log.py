@@ -388,10 +388,23 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
 
     snap_conn = sqlite3.connect(str(SNAPSHOTS_DB))
 
-    # Get distinct timestamps for efficient lookup
-    ts_df = pd.read_sql("SELECT DISTINCT timestamp FROM readings ORDER BY timestamp", snap_conn)
-    if ts_df.empty:
-        snap_conn.close()
+    # Snapshot timestamps a pending decision could match: an outcome uses the
+    # snapshot within 10 min of decision_time + horizon, so nothing before the
+    # oldest pending decision (minus that margin) can be chosen. Bounding the
+    # read keeps this per-cycle query to the last few hours instead of every
+    # timestamp in history (~0.3s at 5M readings, ~1.4s on the name-first key).
+    oldest = min(
+        (
+            dt if (dt := datetime.fromisoformat(r["timestamp"])).tzinfo else dt.replace(tzinfo=UTC)
+            for r in rows
+        ),
+    )
+    since = (oldest - timedelta(minutes=15)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    ts_df = pd.read_sql(
+        "SELECT DISTINCT timestamp FROM readings WHERE timestamp >= ? ORDER BY timestamp", snap_conn, params=(since,),
+    )
+    if ts_df.empty and snap_conn.execute("SELECT 1 FROM readings LIMIT 1").fetchone() is None:
+        snap_conn.close()  # no snapshots at all
         conn.close()
         return 0
 
@@ -421,6 +434,8 @@ def backfill_outcomes(db_path: Path | None = None) -> int:
 
             # Find the snapshot timestamp closest to decision_time + horizon
             target_time = decision_time + timedelta(minutes=horizon_min)
+            if ts_df.empty:
+                continue  # no snapshot near any pending decision (e.g. collector outage) — as if > 10 min away
             diffs = (ts_df["_ts"] - target_time).abs()
             closest_idx = diffs.idxmin()
             closest_diff_min = diffs.iloc[closest_idx].total_seconds() / 60
