@@ -22,23 +22,31 @@ from weatherstat.yaml_config import load_config
 
 _CFG = load_config()
 
+# The key is (name, timestamp), name first. Per-column lookups — the
+# sparse-storage "did it change?" query below, the history scripts — seek
+# straight to a column's rows; with the old timestamp-first key they walked
+# back to that column's last write, the whole table for a rarely-changing
+# sparse column (~0.3s per column per collection at 5M readings; now 0.01ms).
+# Timestamp lookups still use this one index: with ~60 distinct names, SQLite
+# skip-scans it (one seek per name) once ANALYZE has recorded the
+# distribution, which _apply_schema and the collect loop keep current.
+# Readers write their timestamp queries to stay fast on either key order
+# (extract._latest_timestamp), since they may meet a not-yet-migrated file.
 _CREATE_READINGS_SQL = """\
 CREATE TABLE IF NOT EXISTS readings (
   timestamp TEXT NOT NULL,
   name      TEXT NOT NULL,
   value     TEXT NOT NULL,
-  PRIMARY KEY (timestamp, name)
+  PRIMARY KEY (name, timestamp)
 )
 """
-
-# Name-first index for per-column lookups: the sparse-storage "did it change?"
-# query below, and the history scripts. The primary key leads with timestamp,
-# so finding one column's latest value walked the key back to that column's
-# last write — the whole table for a sparse column that rarely changes
-# (~0.3s per column per collection at 5M readings; 0.01ms with this index).
-# Costs ~45% more file size. Applied by _apply_schema on collector start.
-_NAME_INDEX = "readings_name_ts"
-_CREATE_NAME_INDEX_SQL = f"CREATE INDEX IF NOT EXISTS {_NAME_INDEX} ON readings (name, timestamp)"
+# A separate (name, timestamp) index briefly preceded the re-keyed table; the
+# key now provides it, so it is dropped wherever it exists.
+_INTERIM_NAME_INDEX = "readings_name_ts"
+_ANALYZE_INTERVAL_SECONDS = 24 * 3600
+# Re-keying copies the table and VACUUM rewrites it: peak disk use measured at
+# ~2.3× the database (db + WAL). Skip (and say so) without that much free.
+_MIGRATION_FREE_SPACE_FACTOR = 2.5
 
 
 # ── HA REST helpers ─────────────────────────────────────────────────────────
@@ -322,25 +330,72 @@ def _get_db() -> sqlite3.Connection:
 
 
 def _apply_schema(db: sqlite3.Connection, log: Callable[[str], None] = print) -> None:
-    """Create the readings table and its indexes; migrate an existing database in place.
+    """Create the readings table; migrate an existing database in place; refresh planner stats.
 
-    Idempotent. On a database from before the name index, the first collector
-    start builds it once (a few seconds per few million readings; readers keep
-    working under WAL).
+    Idempotent. A database with the old (timestamp, name) key is re-keyed on
+    the first collector start (~16s at 5M readings, readers keep working
+    under WAL); if that cannot complete, the old layout stays and works.
     """
     db.execute(_CREATE_READINGS_SQL)
-    has_index = db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (_NAME_INDEX,),
-    ).fetchone()
-    if not has_index:
-        n = db.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        t0 = time.monotonic()
-        if n:
-            log(f"[collector] Migration: indexing {n:,} readings by (name, timestamp), one time...")
-        db.execute(_CREATE_NAME_INDEX_SQL)
-        if n:
-            log(f"[collector] Migration done in {time.monotonic() - t0:.1f}s")
     db.commit()
+    if _primary_key_columns(db) == ["timestamp", "name"]:
+        _rekey_name_first(db, log)
+    db.execute(f"DROP INDEX IF EXISTS {_INTERIM_NAME_INDEX}")
+    db.execute("ANALYZE readings")
+    db.commit()
+
+
+def _primary_key_columns(db: sqlite3.Connection) -> list[str]:
+    for _seq, index, _unique, origin, _partial in db.execute("PRAGMA index_list(readings)").fetchall():
+        if origin == "pk":
+            return [row[2] for row in db.execute(f'PRAGMA index_info("{index}")').fetchall()]
+    return []
+
+
+def _rekey_name_first(db: sqlite3.Connection, log: Callable[[str], None]) -> None:
+    """Rebuild readings with the (name, timestamp) key, keeping every row and its rowid.
+
+    One transaction: on any failure nothing changes. Rowids are copied, not
+    reassigned, so a running process's incremental snapshot cache stays valid.
+    """
+    import shutil
+    from pathlib import Path
+
+    path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    n = db.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+    size = path.stat().st_size if path.exists() else 0
+    free = shutil.disk_usage(path.parent).free if path.exists() else 0
+    if size and free < _MIGRATION_FREE_SPACE_FACTOR * size:
+        log(
+            f"[collector] Migration skipped: re-keying needs ~{_MIGRATION_FREE_SPACE_FACTOR * size / 1e9:.1f} GB free, "
+            f"{free / 1e9:.1f} GB available. The old layout keeps working; retried on next start."
+        )
+        return
+    log(f"[collector] Migration: re-keying {n:,} readings by (name, timestamp), one time...")
+    t0 = time.monotonic()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DROP TABLE IF EXISTS readings_rekey")
+        db.execute(_CREATE_READINGS_SQL.replace("IF NOT EXISTS readings", "readings_rekey"))
+        db.execute(
+            "INSERT INTO readings_rekey (rowid, timestamp, name, value) SELECT rowid, timestamp, name, value FROM readings"
+        )
+        db.execute("DROP TABLE readings")
+        db.execute("ALTER TABLE readings_rekey RENAME TO readings")
+        db.commit()
+    except sqlite3.Error as e:
+        db.rollback()
+        log(f"[collector] Migration failed, old layout kept (retried on next start): {e}")
+        return
+    try:  # reclaim the old table's pages; the data is already safe
+        db.execute("ANALYZE readings")
+        db.commit()
+        db.execute("VACUUM")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as e:
+        log(f"[collector] VACUUM skipped ({e}); the freed space is reused by new readings")
+    after = path.stat().st_size if path.exists() else 0
+    log(f"[collector] Migration done in {time.monotonic() - t0:.1f}s ({size / 1e6:.0f} → {after / 1e6:.0f} MB)")
 
 
 def _close_db() -> None:
@@ -419,11 +474,21 @@ def collect_loop(*, log: print = print) -> None:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    last_analyze = time.monotonic()
     while True:
         try:
             collect_once(log=log)
         except Exception as e:
             print(f"[collector] Error: {e}", file=sys.stderr)
+        if time.monotonic() - last_analyze > _ANALYZE_INTERVAL_SECONDS:
+            # Keep the planner's picture of the key current (timestamp lookups
+            # skip-scan it); <1s at millions of readings.
+            try:
+                _get_db().execute("ANALYZE readings")
+                _get_db().commit()
+            except sqlite3.Error as e:
+                print(f"[collector] ANALYZE failed: {e}", file=sys.stderr)
+            last_analyze = time.monotonic()
         time.sleep(interval)
 
 

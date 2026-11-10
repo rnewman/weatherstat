@@ -209,6 +209,7 @@ def main() -> None:
     con.executemany("INSERT OR IGNORE INTO readings (timestamp, name, value) VALUES (?, ?, ?)", batch)
     total += len(batch)
     con.commit()
+    _apply_schema(con, log=lambda _m: None)  # planner statistics now that there is data (timestamp skip-scans)
     con.close()
     print(f"{out}: {n:,} snapshots × {len(names)} names = {total:,} readings")
 

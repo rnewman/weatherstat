@@ -488,10 +488,10 @@ def snapshot_status(db_path: Path | None = None) -> tuple[str, int]:
         return ("", 0)
     conn = sqlite3.connect(str(path))
     try:
-        row = conn.execute("SELECT MAX(timestamp), COUNT(*) FROM readings").fetchone()
-        if row and row[0]:
-            return (str(row[0]), int(row[1]))
-        return ("", 0)
+        ts = latest_timestamp(conn)
+        if ts is None:
+            return ("", 0)
+        return (ts, int(conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]))
     finally:
         conn.close()
 
@@ -506,14 +506,30 @@ def latest_snapshot_values(db_path: Path | None = None) -> dict[str, str]:
         return {}
     conn = sqlite3.connect(str(path))
     try:
-        row = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()
-        if not row or not row[0]:
+        ts = latest_timestamp(conn)
+        if ts is None:
             return {}
-        ts = row[0]
         rows = conn.execute("SELECT name, value FROM readings WHERE timestamp = ?", (ts,)).fetchall()
         return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
+
+
+def latest_timestamp(conn: sqlite3.Connection) -> str | None:
+    """MAX(timestamp) over readings, fast whichever way the key is ordered.
+
+    Plain MAX(timestamp) is a single seek on a timestamp-first key but a full
+    index scan on the (name, timestamp) key (~0.3s at 5M readings — on every
+    TUI refresh). The newest-inserted row is almost always the latest
+    snapshot, so: take its timestamp, then look only for anything later (a
+    skip-scan on the name-first key, a range seek on the old one). Exact even
+    after a backfill inserted older rows last.
+    """
+    row = conn.execute("SELECT timestamp FROM readings ORDER BY rowid DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    later = conn.execute("SELECT MAX(timestamp) FROM readings WHERE timestamp > ?", (row[0],)).fetchone()[0]
+    return str(later or row[0])
 
 
 # ── Live state fetch ─────────────────────────────────────────────────────────
