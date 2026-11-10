@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 
+import weatherstat.sysid as sysid
 from weatherstat.sysid import _MIN_SEGMENT_STEPS, SensorSpec, _find_uncontrolled_segments
 
 _SENSOR = SensorSpec(name="bedroom_temp", temp_column="bedroom_temp", yaml_tau_base=45.0)
@@ -74,3 +77,31 @@ class TestUncontrolledSegments:
         assert list(segs[0].columns) == ["_ts", "bedroom_temp", "_outdoor_best"]
         assert segs[0]["_ts"].is_monotonic_increasing
 
+
+class TestTauCurveMemo:
+    def _segment(self, tau: float = 42.0):
+        t = np.arange(24) * (5 / 60)
+        return t, 40.0 + 25.0 * np.exp(-t / tau)
+
+    def test_memo_matches_fit_and_skips_refit(self) -> None:
+        sysid._TAU_CURVE_MEMO.clear()
+        t, temps = self._segment()
+        expected = sysid._fit_tau_curve_uncached(t, temps, 40.0)
+        assert sysid._fit_tau_curve(t, temps, 40.0) == expected
+        with patch.object(sysid, "curve_fit", side_effect=AssertionError("refit")):
+            assert sysid._fit_tau_curve(t.copy(), temps.copy(), 40.0) == expected  # equal content → hit
+
+    def test_changed_samples_refit(self) -> None:
+        sysid._TAU_CURVE_MEMO.clear()
+        t, temps = self._segment()
+        first = sysid._fit_tau_curve(t, temps, 40.0)
+        temps2 = temps.copy()
+        temps2[-1] += 0.3
+        assert sysid._fit_tau_curve(t, temps2, 40.0) == sysid._fit_tau_curve_uncached(t, temps2, 40.0) != first
+        assert len(sysid._TAU_CURVE_MEMO) == 2
+
+    def test_failures_are_memoized_too(self) -> None:
+        sysid._TAU_CURVE_MEMO.clear()
+        t, temps = self._segment()
+        assert sysid._fit_tau_curve(t, temps, temps[0] - 0.5) is None  # too close to outdoor: no fit
+        assert len(sysid._TAU_CURVE_MEMO) == 1

@@ -255,8 +255,32 @@ _MIN_SEGMENT_STEPS = 12  # 1 hour at 5-min intervals
 _MAX_SOLAR_ELEV_FOR_TAU = 5.0
 
 
+# A segment's tau is a pure function of its samples, and past nights never
+# change (append-only data), so a long-running process (TUI, headless loop)
+# re-fits only segments it hasn't seen — on an hourly refit, the newest one or
+# two out of thousands. Keyed by the exact bytes, so a segment that grew or
+# whose data changed simply misses. Bounded: cleared if it ever gets large.
+_TAU_CURVE_MEMO: dict[tuple[bytes, bytes, float], float | None] = {}
+_TAU_CURVE_MEMO_MAX = 50_000
+
+
 def _fit_tau_curve(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> float | None:
     """Fit tau from a single cooling segment. Returns None on failure."""
+    key = (
+        np.ascontiguousarray(t_hours, dtype=float).tobytes(),
+        np.ascontiguousarray(temps, dtype=float).tobytes(),
+        float(t_outdoor),
+    )
+    if key in _TAU_CURVE_MEMO:
+        return _TAU_CURVE_MEMO[key]
+    tau = _fit_tau_curve_uncached(t_hours, temps, t_outdoor)
+    if len(_TAU_CURVE_MEMO) >= _TAU_CURVE_MEMO_MAX:
+        _TAU_CURVE_MEMO.clear()
+    _TAU_CURVE_MEMO[key] = tau
+    return tau
+
+
+def _fit_tau_curve_uncached(t_hours: np.ndarray, temps: np.ndarray, t_outdoor: float) -> float | None:
     t_0 = temps[0]
     if abs(t_0 - t_outdoor) < 1.0:
         return None
