@@ -11,8 +11,13 @@ from weatherstat.weather import (
     condition_to_solar_fraction,
     effective_solar_fraction,
     kasten_czeplak,
+    kasten_czeplak_array,
     plane_incidence,
+    plane_incidence_from,
+    sin_elevation_from,
     solar_azimuth,
+    solar_elevation,
+    solar_position_arrays,
     solar_sin_elevation,
 )
 
@@ -143,3 +148,46 @@ class TestSolarAzimuthAndPlanes:
         midnight = self._utc(6, 21, 9, 0)  # ~1am local (PDT = UTC-7)
         for plane in (None, 90.0, 180.0, 270.0):
             assert plane_incidence(self.LAT, self.LON, midnight, plane) == 0.0
+
+
+class TestVectorizedTwins:
+    """Sysid's vectorized solar features must match the scalar functions control uses."""
+
+    LAT, LON = 47.6, -122.3
+
+    def _year(self):
+        import pandas as pd
+
+        return pd.Series(pd.date_range("2026-01-01", "2026-12-31 23:55", freq="17min", tz="UTC"))
+
+    def test_position_matches_scalar(self) -> None:
+        import numpy as np
+
+        ts = self._year()
+        elev, az = solar_position_arrays(self.LAT, self.LON, ts)
+        elev_s = np.array([solar_elevation(self.LAT, self.LON, t) for t in ts])
+        az_s = np.array([solar_azimuth(self.LAT, self.LON, t) for t in ts])
+        assert np.max(np.abs(elev - elev_s)) < 1e-12
+        az_diff = np.abs(az - az_s)
+        assert np.max(np.minimum(az_diff, 360.0 - az_diff)) < 1e-9  # wraps at 0/360
+
+    def test_features_match_scalar(self) -> None:
+        import numpy as np
+
+        ts = self._year()
+        elev, az = solar_position_arrays(self.LAT, self.LON, ts)
+        sin_s = np.array([solar_sin_elevation(self.LAT, self.LON, t) for t in ts])
+        assert np.max(np.abs(sin_elevation_from(elev) - sin_s)) < 1e-12
+        for plane in (None, 90.0, 270.0):
+            vec = plane_incidence_from(elev, az, plane)
+            ref = np.array([plane_incidence(self.LAT, self.LON, t, plane) for t in ts])
+            assert np.max(np.abs(vec - ref)) < 1e-12, plane
+            assert np.array_equal(vec == 0.0, ref == 0.0), plane  # night/back-facing rows agree exactly
+
+    def test_kasten_czeplak_array(self) -> None:
+        import numpy as np
+
+        cc = np.array([-10.0, 0.0, 20.0, 50.0, 80.0, 100.0, 130.0, np.nan])
+        out = kasten_czeplak_array(cc)
+        assert np.isnan(out[-1])
+        assert out[:-1] == pytest.approx([kasten_czeplak(v) for v in cc[:-1]], abs=1e-15)

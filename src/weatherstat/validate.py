@@ -111,20 +111,26 @@ def compute_vif(X: np.ndarray, feature_names: list[str]) -> dict[str, float]:
 
     VIF_j = 1 / (1 - R²_j) where R²_j is from regressing feature j on all others.
     Uses ridge-stabilized regression to avoid singular matrices.
+
+    Every auxiliary regression is solved from one Gram matrix G = XᵀX:
+    regressing column j on the others needs only G's blocks, and its
+    residual sum of squares is G_jj − 2βᵀc + βᵀG₋ⱼβ. That is O(p³) per
+    feature instead of a copy of X and an O(N·p²) product per feature.
     """
-    n_features = X.shape[1]
+    n, n_features = X.shape
+    G = X.T @ X
+    ss_tot_all = np.sum((X - X.mean(axis=0)) ** 2, axis=0)
+    # Ridge-stabilized to handle collinear features without blowing up
+    lam = 0.001 * n
     vifs: dict[str, float] = {}
     for j in range(n_features):
-        y_j = X[:, j]
-        X_other = np.delete(X, j, axis=1)
-        # Ridge-stabilized to handle collinear features without blowing up
-        lam = 0.001 * len(y_j)
-        XtX = X_other.T @ X_other + lam * np.eye(X_other.shape[1])
+        others = np.r_[0:j, j + 1 : n_features]
+        G_oo = G[np.ix_(others, others)]
+        c = G[others, j]
         try:
-            beta = np.linalg.solve(XtX, X_other.T @ y_j)
-            y_hat = X_other @ beta
-            ss_res = np.sum((y_j - y_hat) ** 2)
-            ss_tot = np.sum((y_j - np.mean(y_j)) ** 2)
+            beta = np.linalg.solve(G_oo + lam * np.eye(len(others)), c)
+            ss_res = G[j, j] - 2.0 * (beta @ c) + beta @ G_oo @ beta
+            ss_tot = ss_tot_all[j]
             r_sq = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
             vifs[feature_names[j]] = 1.0 / (1.0 - min(r_sq, 0.9999))
         except np.linalg.LinAlgError:
@@ -202,21 +208,27 @@ def compute_bootstrap_stability(
 
     Returns array of CVs (one per feature). CV > 1 means the coefficient
     changes sign or magnitude across resamples — it's not identified.
+
+    Each resample is solved from its Gram: drawing row i c_i times gives
+    Xᵀdiag(c)X, so all n_boot Grams come from one batched product instead
+    of n_boot gathered copies of X (same draws, same solves).
     """
+    from weatherstat.gram import bootstrap_counts, weighted_grams
+
     rng = np.random.RandomState(seed)
     n, p = X.shape
-    betas = np.zeros((n_boot, p))
     X_s = X / scale
-    for i in range(n_boot):
-        idx = rng.randint(0, n, size=n)
-        X_boot = X_s[idx]
-        y_boot = y[idx]
-        XtX = X_boot.T @ X_boot + lam * np.eye(p)
-        try:
-            beta_s = np.linalg.solve(XtX, X_boot.T @ y_boot)
-            betas[i] = beta_s / scale
-        except np.linalg.LinAlgError:
-            betas[i] = np.nan
+    G, b, _ = weighted_grams(X_s, y, bootstrap_counts(rng, n, n_boot))
+    A = G + lam * np.eye(p)
+    betas = np.full((n_boot, p), np.nan)
+    try:
+        betas = np.linalg.solve(A, b[..., None])[..., 0] / scale
+    except np.linalg.LinAlgError:  # a singular resample: solve the rest one by one
+        for i in range(n_boot):
+            try:
+                betas[i] = np.linalg.solve(A[i], b[i]) / scale
+            except np.linalg.LinAlgError:
+                betas[i] = np.nan
 
     means = np.nanmean(betas, axis=0)
     stds = np.nanstd(betas, axis=0)

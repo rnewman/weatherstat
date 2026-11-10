@@ -34,10 +34,14 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from weatherstat.config import DATA_DIR, delta_temp
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 TRACKER_STATE_FILE = DATA_DIR / "tracker_state.json"
 TRACKER_HISTORY_FILE = DATA_DIR / "tracker_history.jsonl"
@@ -181,12 +185,19 @@ def update_block_for_sensor(
     return BlockUpdate(coefficients, round(information, 2), int(valid.sum()), updated)
 
 
-def update_trackers(log=print, params_path: Path | None = None, now: datetime | None = None) -> str:
+def update_trackers(
+    log=print,
+    params_path: Path | None = None,
+    now: datetime | None = None,
+    snapshots: pd.DataFrame | None = None,
+) -> str:
     """Update all tracked blocks from recent collector data.
 
-    Called after each quality-gated sysid refit (hourly). Loads the trailing
+    Called after each quality-gated sysid refit (hourly). Takes the trailing
     window (longest window across blocks), preprocesses once, and updates
-    every block × sensor. Returns a one-line summary.
+    every block × sensor. ``snapshots`` is the refit's already-loaded
+    load_collector_snapshots() frame (not modified); None loads here.
+    Returns a one-line summary.
     """
     import pandas as pd
 
@@ -204,7 +215,7 @@ def update_trackers(log=print, params_path: Path | None = None, now: datetime | 
     max_window = max(b.window_days for b in TRACKED_BLOCKS)
     cutoff = pd.Timestamp(now or datetime.now(UTC)) - pd.Timedelta(days=max_window)
 
-    df = load_collector_snapshots()
+    df = load_collector_snapshots() if snapshots is None else snapshots
     ts = pd.to_datetime(df["timestamp"], format="ISO8601", utc=True)
     df = df[ts >= cutoff].reset_index(drop=True)
     if len(df) < 500:

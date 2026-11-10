@@ -270,9 +270,9 @@ def _weather_to_series(
 
 def _load_from_readings(conn: sqlite3.Connection) -> pd.DataFrame:
     """Load from the EAV readings table and pivot to wide format."""
-    df_long = pd.read_sql(
-        "SELECT timestamp, name, value FROM readings ORDER BY timestamp", conn
-    )
+    # No ORDER BY: pivot sorts its index anyway, and ordering by timestamp walks
+    # the (timestamp, name) primary-key index with a table lookup per row.
+    df_long = pd.read_sql("SELECT timestamp, name, value FROM readings", conn)
     if df_long.empty:
         return pd.DataFrame()
 
