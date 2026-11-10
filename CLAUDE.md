@@ -101,6 +101,8 @@ just debug decisions  # Recent decision log
 just replay           # Replay an environment opportunity evaluation
 just bundle           # Create or replay a point-in-time debug bundle
 just experiment-sysid # Sysid experiment harness (A/B vs frozen baseline)
+just synth-db /tmp/ws-synth        # Synthetic collector DB, ~5M readings with known ground truth (--days N for smaller)
+just bench-sysid periodic <dir>    # Cold → +1h → warm refit timings on a copy of <dir> (also: refit, compare a.json b.json)
 just discover         # Discover HA entities, generate starter config
 just lint             # Lint src + tests
 just lint-fix         # Lint and fix src + tests

@@ -92,6 +92,14 @@ bundle *ARGS:
 experiment-sysid *ARGS:
     uv run python ./scripts/experiment_sysid.py {{ARGS}}
 
+# Build a synthetic collector DB at production scale (args: <out_dir> [--days N] [--seed S] [--force])
+synth-db *ARGS:
+    uv run python ./scripts/synthetic_snapshots.py {{ARGS}}
+
+# Benchmark the hourly refit on a copy (refit|periodic <data_dir>, compare <a.json> <b.json>)
+bench-sysid *ARGS:
+    uv run python ./scripts/bench_sysid.py {{ARGS}}
+
 # Verify live config parses correctly
 verify:
     #!/usr/bin/env bash
