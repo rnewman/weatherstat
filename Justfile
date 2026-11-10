@@ -131,6 +131,6 @@ init:
     fi
     echo "Ready: $DATA_DIR"
 
-# Install all dependencies (including dev tools: pytest, ruff)
+# Install all dependencies (dev tools pytest + ruff are a default group; --all-extras adds the TUI)
 install:
-    uv sync --extra dev
+    uv sync --all-extras

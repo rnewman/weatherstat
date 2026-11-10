@@ -18,13 +18,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "ruff>=0.8",
-]
 tui = [
     "textual>=1.0",
 ]
+
+# A dependency group (not an extra) so every `uv run` syncs it: `just test` works
+# on a fresh checkout instead of falling through to whatever pytest is on PATH.
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.17",
+]
+
+[tool.uv]
+# Only resolve releases that have been public for a week (supply-chain cooldown).
+# Project-level so every machine locks the same way and none strips it from uv.lock.
+exclude-newer = "7 days"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/weatherstat"]
