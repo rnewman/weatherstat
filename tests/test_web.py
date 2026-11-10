@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
@@ -22,7 +23,7 @@ from weatherstat.tui.controller import (
     OverlayView,
     StatusSnapshot,
 )
-from weatherstat.web import start_web_server
+from weatherstat.web import _comfort_bar, _house_now, _render_html, _span, start_web_server
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -203,7 +204,7 @@ class TestGetRoutes:
         assert "Upstairs" in body
         assert "Kitchen" in body
         assert 'class="actions"' in body
-        assert "thermostat_upstairs" in body
+        assert "thermostat_<wbr>upstairs" in body  # names wrap after underscores, not mid-word
         assert "DRY-RUN" in body
 
     def test_status_json_renders(self, server_and_ctrl) -> None:
@@ -380,6 +381,83 @@ class TestOverlayRendering:
         finally:
             server.shutdown()
             server.server_close()
+
+
+# ── Room layout (mobile) ──────────────────────────────────────────────────
+
+
+def _html(snap: StatusSnapshot) -> str:
+    return _render_html(snap, FakeController(snap))
+
+
+def _bump_groups(body: str) -> list[str]:
+    return re.findall(r"<div class='bump'>.*?</div>", body)
+
+
+class TestRoomLayout:
+    def test_rooms_are_grids_not_table_rows(self) -> None:
+        body = _html(_make_snapshot())
+        assert "<table" not in body  # a shared table let one room's overlay squeeze every column
+        assert body.count("<div class='room'>") == 2
+        assert body.count("<div class='bar'") == 2
+
+    def test_overlay_does_not_change_bump_column(self) -> None:
+        """Starting an overlay reflows only its own room's detail line, never the −/+ column."""
+        plain = _html(_make_snapshot())
+        overlaid = _html(_make_snapshot(overlays={
+            "kitchen_temp": OverlayView(delta=1.0, expires_at=datetime.now(UTC) + timedelta(hours=3), source="web"),
+        }))
+        assert _bump_groups(plain) == _bump_groups(overlaid)
+        assert all("name='clear'" not in g for g in _bump_groups(overlaid))
+        # The clear (×) lives in the overlay chip instead
+        chip = re.search(r"<form method='post' action='/action/overlay' class='chip overlay'>.*?</form>", overlaid)
+        assert chip is not None
+        assert "name='sensor' value='kitchen_temp'" in chip.group(0)
+        assert "name='clear' value='1'" in chip.group(0)
+        assert "+1.0° · " in chip.group(0)
+
+    def test_comfort_bar_geometry(self) -> None:
+        # Scale = band ± 2° → 58..82 (24° span)
+        bar = _comfort_bar(68.0, ComfortBounds(60.0, 65.0, 72.0, 80.0))
+        assert "class='bar-ok' style='left:8.3%;width:83.3%'" in bar
+        assert "class='bar-pref' style='left:29.2%;width:29.2%'" in bar
+        assert "class='bar-now green' style='left:41.7%'" in bar
+
+    def test_comfort_bar_clamps_off_scale_marker(self) -> None:
+        bounds = ComfortBounds(60.0, 65.0, 72.0, 80.0)
+        assert "class='bar-now red' style='left:100.0%'" in _comfort_bar(95.0, bounds)
+        assert "class='bar-now red' style='left:0.0%'" in _comfort_bar(40.0, bounds)
+
+    def test_comfort_bar_draws_widened_preferred_as_reported(self) -> None:
+        """A profile's preferred_widen can push preferred past acceptable; the scale includes it."""
+        bar = _comfort_bar(69.5, ComfortBounds(67.0, 66.0, 74.0, 76.0))  # scale 64..78
+        assert "class='bar-pref' style='left:14.3%" in bar
+        assert "class='bar-ok' style='left:21.4%" in bar
+
+    def test_band_text(self) -> None:
+        assert _span(70.0, 70.0) == "70"
+        assert _span(66.0, 74.0) == "66–74"
+        assert _span(66.5, 74.0) == "66.5–74"  # half-degree overlays stay visible
+        body = _html(_make_snapshot())
+        assert "<span class='band-k'>pref</span> 65–72°" in body
+        assert "<span class='band-k'>ok</span> 60–80°" in body
+
+    def test_names_wrap_after_underscores(self) -> None:
+        snap = _make_snapshot(
+            temps={"living_room_climate_temp": 70.0},
+            sensor_labels={"living_room_climate_temp": "living_room_climate"},
+            comfort={},
+        )
+        assert "<div class='room-name'>living_<wbr>room_<wbr>climate</div>" in _html(snap)
+
+
+class TestHouseClock:
+    def test_uses_configured_zone(self) -> None:
+        assert _house_now("Pacific/Kiritimati").utcoffset() == timedelta(hours=14)
+
+    def test_bad_or_missing_zone_falls_back_to_host(self) -> None:
+        assert _house_now("Not/AZone").tzinfo is not None
+        assert _house_now("").tzinfo is not None
 
 
 # ── Edge case: button-disabled rendering ───────────────────────────────────

@@ -29,6 +29,7 @@ from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 from weatherstat.tui.controller import (
     ActionResult,
@@ -206,7 +207,7 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
     mode_class = "live" if snap.live else "dry"
     mode_label = "LIVE" if snap.live else "DRY-RUN"
     outdoor = f"{snap.outdoor_temp:.0f}°" if snap.outdoor_temp is not None else "?"
-    now_local = datetime.now().strftime("%H:%M")
+    now_local = _house_now(snap.local_tz).strftime("%H:%M")
 
     cycle_pill = _pill(
         "running" if snap.cycle_running else "idle",
@@ -253,72 +254,33 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
     """
 
     # ── Temperatures ──
-    temps_rows: list[str] = []
-    for sensor_col, value in snap.temps.items():
-        label = snap.sensor_labels.get(sensor_col, sensor_col.removesuffix("_temp"))
-        bounds = snap.comfort.get(label)
-        cell_class = "temp"
-        bound_str = ""
-        if bounds:
-            cell_class = _temp_class(value, bounds)
-            bound_str = (
-                f"{bounds.acceptable_lo:.0f}°"
-                f"<span class='band'> · {bounds.preferred_lo:.0f}–{bounds.preferred_hi:.0f}° · </span>"
-                f"{bounds.acceptable_hi:.0f}°"
-            )
-        mrt = snap.mrt_offsets.get(sensor_col)
-        mrt_str = ""
-        if mrt is not None and abs(mrt) >= 0.05:
-            mrt_str = f"<span class='mrt'>{mrt:+.1f} mrt</span>"
-        overlay = snap.overlays.get(sensor_col)
-        overlay_str = ""
-        if overlay is not None:
-            remaining = max(0, int((overlay.expires_at - datetime.now(UTC)).total_seconds()))
-            overlay_str = (
-                f"<span class='overlay'>{overlay.delta:+.1f}° · {_format_remaining(remaining)}</span>"
-            )
-        temps_rows.append(
-            f"<tr><td>{escape(label)}</td>"
-            f"<td class='{cell_class}'>{value:.1f}°</td>"
-            f"<td class='bounds'>{bound_str}</td>"
-            f"<td>{overlay_str}{mrt_str}</td>"
-            f"<td class='bump'>{_overlay_buttons(sensor_col, overlay is not None)}</td></tr>"
-        )
-
+    rooms = [_room_html(snap, sensor_col, value) for sensor_col, value in snap.temps.items()]
     temps_html = (
-        "<section><h2>Temperatures</h2><table>"
-        + "".join(temps_rows)
-        + "</table></section>"
-    ) if temps_rows else ""
+        "<section><h2>Temperatures</h2><div class='rooms'>" + "".join(rooms) + "</div></section>"
+    ) if rooms else ""
 
     # ── Effectors ──
     effector_rows: list[str] = []
     for e in snap.effectors:
         mode_str = e.mode.upper() if e.mode else "OFF"
-        target_str = f"{e.target:.0f}°" if e.target is not None else ""
-        timing_parts = []
+        target_str = f" {_deg(e.target)}°" if e.target is not None else ""
+        meta_parts = []
         if e.delay_steps:
-            timing_parts.append(f"delay {e.delay_steps * 5}m")
+            meta_parts.append(f"delay {e.delay_steps * 5}m")
         if e.duration_steps is not None:
-            timing_parts.append(f"dur {e.duration_steps * 5}m")
-        timing = " · ".join(timing_parts)
-        override = (
-            f"<span class='override'>OVERRIDE: {escape(e.override)}</span>"
-            if e.override
-            else ""
-        )
+            meta_parts.append(f"dur {e.duration_steps * 5}m")
+        meta = escape(" · ".join(meta_parts))
+        if e.override:
+            meta += f" <span class='override'>OVERRIDE: {escape(e.override)}</span>"
         rationale = snap.rationale.get(e.name, "")
-        rationale_html = (
-            f"<div class='rationale'>{escape(rationale)}</div>" if rationale else ""
-        )
         mode_class = "off" if mode_str == "OFF" else "on"
         effector_rows.append(
-            f"<tr><td>{escape(e.name)}</td>"
-            f"<td class='mode {mode_class}'>{mode_str}</td>"
-            f"<td>{target_str}</td>"
-            f"<td>{escape(timing)}</td>"
-            f"<td>{override}</td></tr>"
-            + (f"<tr class='detail'><td colspan='5'>{rationale_html}</td></tr>" if rationale else "")
+            f"<div class='eff'>"
+            f"<div class='eff-name'>{_breakable(e.name)}</div>"
+            f"<div class='eff-state'><span class='mode {mode_class}'>{mode_str}</span>{target_str}</div>"
+            + (f"<div class='eff-meta'>{meta}</div>" if meta else "")
+            + (f"<div class='rationale'>{escape(rationale)}</div>" if rationale else "")
+            + "</div>"
         )
     if effector_rows:
         cost_str = ""
@@ -331,9 +293,9 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
                 cost_str += f" · all-off {snap.costs.baseline:.1f}"
             cost_str += "</p>"
         effectors_html = (
-            "<section><h2>Effectors</h2><table>"
+            "<section><h2>Effectors</h2><div class='effs'>"
             + "".join(effector_rows)
-            + "</table>"
+            + "</div>"
             + cost_str
             + "</section>"
         )
@@ -430,22 +392,124 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
 """
 
 
-def _overlay_buttons(sensor_col: str, has_overlay: bool) -> str:
-    """Per-room −/+ (and × when an overlay is active). Each is its own tiny form — no JavaScript."""
-    s = escape(sensor_col)
+def _room_html(snap: StatusSnapshot, sensor_col: str, value: float) -> str:
+    """One room: name · temp · −/+ on top, comfort bar and band/overlay/MRT below.
 
-    def form(fields: str, text: str, title: str) -> str:
-        return (
-            f"<form method='post' action='/action/overlay'>"
-            f"<input type='hidden' name='sensor' value='{s}'>{fields}"
-            f"<button type='submit' title='{title}'>{text}</button></form>"
+    Each room is its own small grid rather than a row of a shared table, so a
+    long label or an active overlay can only reflow its own room. The −/+
+    column never changes width: the overlay's clear (×) lives inside the
+    overlay chip, not beside the bump buttons.
+    """
+    label = snap.sensor_labels.get(sensor_col, sensor_col.removesuffix("_temp"))
+    bounds = snap.comfort.get(label)
+    temp_class = _temp_class(value, bounds) if bounds else "temp"
+
+    chips: list[str] = []
+    overlay = snap.overlays.get(sensor_col)
+    if overlay is not None:
+        remaining = max(0, int((overlay.expires_at - datetime.now(UTC)).total_seconds()))
+        chips.append(
+            _overlay_form(
+                sensor_col, "<input type='hidden' name='clear' value='1'>",
+                "×", "Clear overlay", cls="chip overlay",
+                before=f"<span class='overlay'>{overlay.delta:+.1f}° · {_format_remaining(remaining)}</span>",
+            )
         )
+    mrt = snap.mrt_offsets.get(sensor_col)
+    if mrt is not None and abs(mrt) >= 0.05:
+        chips.append(f"<span class='chip mrt' title='Mean radiant temperature offset'>{mrt:+.1f} mrt</span>")
 
-    out = form("<input type='hidden' name='delta' value='-1'>", "−", "Too warm: cooler for a while")
-    out += form("<input type='hidden' name='delta' value='1'>", "+", "Too cold: warmer for a while")
-    if has_overlay:
-        out += form("<input type='hidden' name='clear' value='1'>", "×", "Clear overlay")
-    return out
+    detail = ""
+    if bounds:
+        band = (
+            f"<span class='band'><span class='band-k'>pref</span> {_span(bounds.preferred_lo, bounds.preferred_hi)}°"
+            f" <span class='band-k'>ok</span> {_span(bounds.acceptable_lo, bounds.acceptable_hi)}°</span>"
+        )
+        detail = f"{_comfort_bar(value, bounds)}<div class='room-meta'>{band}{''.join(chips)}</div>"
+    elif chips:
+        detail = f"<div class='room-meta'>{''.join(chips)}</div>"
+
+    bump = (
+        _overlay_form(sensor_col, "<input type='hidden' name='delta' value='-1'>", "−", "Too warm: cooler for a while")
+        + _overlay_form(sensor_col, "<input type='hidden' name='delta' value='1'>", "+", "Too cold: warmer for a while")
+    )
+    return (
+        f"<div class='room'>"
+        f"<div class='room-name'>{_breakable(label)}</div>"
+        f"<div class='{temp_class}'>{value:.1f}°</div>"
+        f"<div class='bump'>{bump}</div>"
+        + (f"<div class='room-detail'>{detail}</div>" if detail else "")
+        + "</div>"
+    )
+
+
+def _overlay_form(sensor_col: str, fields: str, text: str, title: str, *, cls: str = "", before: str = "") -> str:
+    """A tiny POST form for one overlay action — no JavaScript."""
+    cls_attr = f" class='{cls}'" if cls else ""
+    return (
+        f"<form method='post' action='/action/overlay'{cls_attr}>"
+        f"<input type='hidden' name='sensor' value='{escape(sensor_col)}'>{fields}{before}"
+        f"<button type='submit' title='{title}' aria-label='{title}'>{text}</button></form>"
+    )
+
+
+def _comfort_bar(value: float, bounds) -> str:
+    """Where the room sits in its band, like the TUI's bar: scale = band ± 2°.
+
+    Server-side percentages in inline styles keep the page JavaScript-free.
+    The preferred band is drawn as reported even when a profile's widen has
+    pushed it past the acceptable range.
+    """
+    lo = min(bounds.acceptable_lo, bounds.preferred_lo) - 2.0
+    hi = max(bounds.acceptable_hi, bounds.preferred_hi) + 2.0
+    span = hi - lo
+
+    def pct(x: float) -> float:
+        return max(0.0, min(100.0, (x - lo) / span * 100.0)) if span > 0 else 50.0
+
+    ok_l, ok_r = pct(bounds.acceptable_lo), pct(bounds.acceptable_hi)
+    pref_l, pref_r = pct(bounds.preferred_lo), pct(bounds.preferred_hi)
+    mark = _temp_class(value, bounds).removeprefix("temp ")
+    title = (
+        f"ok {_span(bounds.acceptable_lo, bounds.acceptable_hi)}°, "
+        f"preferred {_span(bounds.preferred_lo, bounds.preferred_hi)}°, now {value:.1f}°"
+    )
+    return (
+        f"<div class='bar' role='img' aria-label='{title}' title='{title}'>"
+        f"<span class='bar-ok' style='left:{ok_l:.1f}%;width:{ok_r - ok_l:.1f}%'></span>"
+        f"<span class='bar-pref' style='left:{pref_l:.1f}%;width:{pref_r - pref_l:.1f}%'></span>"
+        f"<span class='bar-now {mark}' style='left:{pct(value):.1f}%'></span>"
+        f"</div>"
+    )
+
+
+def _breakable(name: str) -> str:
+    """Escape an identifier and let it wrap after underscores ("living_room_<wbr>climate").
+
+    Underscores are not line-break opportunities, so a long label in a narrow
+    column would otherwise break mid-word ("climat|e").
+    """
+    return escape(name).replace("_", "_<wbr>")
+
+
+def _deg(x: float) -> str:
+    """Whole degrees stay whole ("70"); half-degree overlays stay visible ("70.5")."""
+    return f"{x:.0f}" if abs(x - round(x)) < 0.05 else f"{x:.1f}"
+
+
+def _span(lo: float, hi: float) -> str:
+    """A band as "66–74", or "70" for a point target."""
+    return _deg(lo) if abs(hi - lo) < 0.05 else f"{_deg(lo)}–{_deg(hi)}"
+
+
+def _house_now(tz_name: str) -> datetime:
+    """Now on the house's clock (the configured zone), not the host's."""
+    if tz_name:
+        try:
+            return datetime.now(ZoneInfo(tz_name))
+        except (KeyError, ValueError):
+            pass
+    return datetime.now().astimezone()
 
 
 def _format_remaining(secs: int) -> str:
@@ -574,6 +638,9 @@ _CSS = """
   --red: #f85149;
   --panel: #161b22;
   --border: #30363d;
+  --track: #30363d;
+  --ok-band: #2f6b40;
+  --pref-band: #3fb950;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -586,6 +653,9 @@ _CSS = """
     --red: #cf222e;
     --panel: #f6f8fa;
     --border: #d0d7de;
+    --track: #dde2e8;
+    --ok-band: #b4dfbf;
+    --pref-band: #1a7f37;
   }
 }
 * { box-sizing: border-box; }
@@ -597,6 +667,9 @@ body {
   padding: 0 12px 24px;
   font-size: 16px;
   line-height: 1.4;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  overflow-wrap: break-word;
 }
 header {
   position: sticky;
@@ -608,15 +681,16 @@ header {
 }
 header .row1 {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
+  gap: 8px 14px;
   font-size: 18px;
   font-weight: 600;
 }
 header .row2 {
   display: flex;
   flex-wrap: wrap;
-  gap: 14px;
+  gap: 2px 14px;
   margin-top: 4px;
   font-size: 13px;
   color: var(--dim);
@@ -649,14 +723,14 @@ header .row2 {
 .pill.running { background: var(--yellow); color: #fff; border-color: var(--yellow); }
 .actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
   margin: 16px 0;
 }
 .actions form { margin: 0; }
 .actions button {
   width: 100%;
-  min-height: 56px;
+  min-height: 48px;
   font-size: 16px;
   font-weight: 600;
   background: var(--panel);
@@ -678,6 +752,7 @@ section {
   margin: 12px 0;
   padding: 10px 12px;
 }
+section p { margin: 0; }
 section h2 {
   margin: 0 0 6px;
   font-size: 14px;
@@ -685,30 +760,112 @@ section h2 {
   letter-spacing: 0.04em;
   color: var(--dim);
 }
-table { width: 100%; border-collapse: collapse; }
-td { padding: 4px 0; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
-tr:last-child td { border-bottom: 0; }
-.temp { text-align: right; font-weight: 600; padding-right: 8px; }
+/* Rooms: one small grid per room, so nothing in one room can widen another.
+   name · temp · [−][+]
+   bar ──────── · [−][+]   (buttons span both rows; fixed width)
+   pref · ok · overlay chip(×) · mrt   (wraps freely) */
+.room {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "name   temp   bump"
+    "detail detail bump";
+  align-items: center;
+  column-gap: 12px;
+  row-gap: 2px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.room:last-child { border-bottom: 0; }
+.room-name { grid-area: name; font-weight: 600; overflow-wrap: anywhere; }
+.temp {
+  grid-area: temp;
+  text-align: right;
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 .temp.green { color: var(--green); }
 .temp.yellow { color: var(--yellow); }
 .temp.red { color: var(--red); }
-.bounds { color: var(--dim); font-size: 13px; }
-.bounds .band { color: var(--dim); }
-.mrt { color: var(--dim); font-size: 12px; }
-.overlay { color: var(--accent); font-size: 12px; font-weight: 600; margin-right: 6px; white-space: nowrap; }
-td.bump { white-space: nowrap; text-align: right; }
-td.bump form { display: inline; margin: 0; }
-td.bump button {
-  min-width: 34px; height: 34px; margin-left: 4px; padding: 0;
-  font-size: 18px; line-height: 1; border: 1px solid var(--border); border-radius: 8px;
-  background: var(--panel); color: var(--fg); cursor: pointer;
+.room-detail { grid-area: detail; min-width: 0; }
+.bump { grid-area: bump; display: flex; gap: 8px; }
+.bump form { margin: 0; }
+.bump button {
+  width: 44px; height: 44px; padding: 0;
+  font-size: 22px; line-height: 1; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg); color: var(--fg); cursor: pointer;
+  -webkit-appearance: none; appearance: none; touch-action: manipulation;
 }
-td.bump button:active { background: var(--accent); color: #fff; }
+.bump button:active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.bar {
+  position: relative;
+  height: 8px;
+  margin: 8px 0;
+  border-radius: 4px;
+  background: var(--track);
+}
+.bar span { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+.bar .bar-ok { background: var(--ok-band); }
+.bar .bar-pref { background: var(--pref-band); min-width: 3px; }
+.bar .bar-now {
+  top: -4px; bottom: -4px; width: 4px; margin-left: -2px; border-radius: 2px;
+  background: var(--fg); box-shadow: 0 0 0 2px var(--panel);
+}
+.bar .bar-now.yellow { background: var(--yellow); }
+.bar .bar-now.red { background: var(--red); }
+.room-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: 13px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.band { white-space: nowrap; }
+.band-k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.75; }
+.band-k ~ .band-k { margin-left: 6px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin: 0;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.chip.overlay { color: var(--accent); border-color: var(--accent); font-weight: 600; padding-right: 0; }
+.chip.overlay button {
+  width: 28px; height: 24px; padding: 0; border: 0; border-radius: 999px;
+  background: transparent; color: inherit; font-size: 16px; line-height: 1; cursor: pointer;
+  -webkit-appearance: none; appearance: none; touch-action: manipulation;
+}
+.chip.overlay button:active { background: var(--accent); color: #fff; }
+.chip.mrt { color: var(--dim); }
+/* Effectors: name · mode+target on top, timing/override and rationale below. */
+.eff {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name state"
+    "meta meta"
+    "why  why";
+  column-gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.eff:last-child { border-bottom: 0; }
+.eff-name { grid-area: name; font-weight: 600; overflow-wrap: anywhere; }
+.eff-state { grid-area: state; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.eff-state .mode { padding: 0; }
+.eff-meta { grid-area: meta; font-size: 13px; color: var(--dim); }
 .mode.on { color: var(--green); font-weight: 700; }
 .mode.off { color: var(--dim); }
 .override { color: var(--red); font-weight: 700; font-size: 12px; }
-tr.detail td { border-bottom: 0; padding-top: 0; }
-.rationale { color: var(--dim); font-size: 12px; padding-left: 8px; }
+.rationale { grid-area: why; color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
 .cost { color: var(--dim); font-size: 13px; margin: 6px 0 0; }
 .fc { display: inline-block; margin-right: 10px; }
 .fc b { color: var(--accent); font-weight: 600; }
