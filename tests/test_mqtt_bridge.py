@@ -352,3 +352,42 @@ class TestConfig:
         assert broker_host(MqttConfig(), "https://ha.example.com:8123") == "ha.example.com"
         assert broker_host(MqttConfig(host="mq"), "https://ha.example.com") == "mq"
         assert broker_host(MqttConfig(), "") is None
+
+
+# ── Frozen sensors and planned delays ─────────────────────────────────────
+
+
+class TestFrozenAndDelayed:
+    def _frozen_snapshot(self) -> StatusSnapshot:
+        from weatherstat.sensor_health import FrozenSensor
+
+        return _snapshot(
+            temps={"family_room_temp": 72.0},
+            frozen={"bedroom_temp": FrozenSensor("bedroom_temp", 69.8, "2026-11-10T04:55:00.000Z", 233.4, 16.2)},
+        )
+
+    def test_frozen_room_publishes_no_temperature(self) -> None:
+        """The HA entity goes unknown instead of showing a dead device's last value."""
+        p = room_payload(self._frozen_snapshot(), "bedroom_temp", "bedroom", source_entity="sensor.x", unit="°F")
+        assert p is not None
+        assert p["temperature"] is None and p["feels_like"] is None and p["status"] == "frozen"
+        assert p["frozen"]["value"] == 69.8 and p["frozen"]["hours"] == 233.4
+        assert p["acceptable_lo"] == 69  # bands kept for the card
+        json.dumps(p)
+
+    def test_status_lists_frozen_sensors(self) -> None:
+        p = status_payload(self._frozen_snapshot())
+        assert p["frozen_sensors"] == [
+            {"label": "bedroom", "sensor": "bedroom_temp", "value": 69.8, "since": "2026-11-10T04:55:00.000Z", "hours": 233.4}
+        ]
+
+    def test_delayed_plan_is_not_active_now(self) -> None:
+        snap = _snapshot(effectors=(
+            EffectorView("mini_split_bedroom", "cool", 73.3, 12, 24, None, command_mode="off"),
+            EffectorView("thermostat_upstairs", "heating", None, 0, 12, None),
+        ))
+        p = status_payload(snap)
+        assert p["active_count"] == 1  # the thermostat; the split starts in an hour
+        split = p["effectors"][0]
+        assert split["mode"] == "cool" and split["delay_minutes"] == 60 and split["command_mode"] == "off"
+        assert p["effectors"][1]["command_mode"] == "heating"

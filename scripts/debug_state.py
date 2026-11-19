@@ -12,6 +12,7 @@ Usage:
     python scripts/debug_state.py opportunities          # advisory state
     python scripts/debug_state.py overlays [N]           # active comfort overlays + last N events + habit summary
     python scripts/debug_state.py snapshots              # snapshot DB stats
+    python scripts/debug_state.py frozen                 # frozen sensors now + frozen spans in history (sysid excludes them)
     python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
     python scripts/debug_state.py why [EFFECTOR]          # explain why active effectors are on
     python scripts/debug_state.py advisory               # advisory states + compound tau effects
@@ -652,6 +653,39 @@ def cmd_snapshots() -> None:
     print(f"  Last:  {ts_max} ({_ago(ts_max)})")
 
 
+def cmd_frozen() -> None:
+    """Frozen sensors: per-sensor limits, current state, and every frozen span in history."""
+    p = _paths()
+    if not p["snapshots_db"].exists():
+        print("No snapshots.db found.")
+        return
+    from weatherstat.config import UNIT_SYMBOL
+    from weatherstat.extract import load_collector_snapshots
+    from weatherstat.sensor_health import (
+        db_flat_run_limits,
+        detect_frozen_spans,
+        frozen_sensors_now,
+        monitored_sensors,
+        summarize_spans,
+    )
+
+    db = p["snapshots_db"]
+    sensors = monitored_sensors()
+    limits = db_flat_run_limits(db, sensors)
+    now = frozen_sensors_now(db, sensors, limits)
+    print("Frozen-sensor limits (max(floor, multiplier × p99.9 of the sensor's own flat runs)):")
+    for col in sensors:
+        state = f"FROZEN at {now[col].describe(UNIT_SYMBOL)}" if col in now else "ok"
+        print(f"  {col:<30} limit {limits.get(col, 0):>6.1f}h  {state}")
+
+    df = load_collector_snapshots(db, quarantine=False)
+    spans = detect_frozen_spans(df, sensors)
+    hours = sum(s.hours for s in spans)
+    print(f"\nFrozen spans in history ({len(spans)}, {hours:.0f} sensor-hours; masked at load, raw readings kept):")
+    for line in summarize_spans(spans, UNIT_SYMBOL):
+        print(f"  {line}")
+
+
 def cmd_why(effector_filter: str | None = None) -> None:
     """Explain why each active effector is on: gains, affected sensors, current temps, predictions."""
     p = _paths()
@@ -1167,6 +1201,7 @@ COMMANDS = {
     "opportunities": lambda args: cmd_opportunities(),
     "overlays": lambda args: cmd_overlays(int(args[0]) if args else 20),
     "snapshots": lambda args: cmd_snapshots(),
+    "frozen": lambda args: cmd_frozen(),
     "comfort": lambda args: cmd_comfort(args[0] if args else None),
     "why": lambda args: cmd_why(args[0] if args else None),
     "advisory": lambda args: cmd_advisory(),

@@ -255,6 +255,7 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
 
     # ── Temperatures ──
     rooms = [_room_html(snap, sensor_col, value) for sensor_col, value in snap.temps.items()]
+    rooms += [_frozen_room_html(snap, sensor_col) for sensor_col in snap.frozen]
     temps_html = (
         "<section><h2>Temperatures</h2><div class='rooms'>" + "".join(rooms) + "</div></section>"
     ) if rooms else ""
@@ -265,7 +266,11 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
         mode_str = e.mode.upper() if e.mode else "OFF"
         target_str = f" {_deg(e.target)}°" if e.target is not None else ""
         meta_parts = []
-        if e.delay_steps:
+        if e.delay_steps and e.commanded == "off" and e.mode != "off":
+            # Planned for later: commanded off this cycle.
+            target_str = f" <span class='dim'>→ {escape(mode_str)}{target_str} in {e.delay_steps * 5}m</span>"
+            mode_str = "OFF"
+        elif e.delay_steps:
             meta_parts.append(f"delay {e.delay_steps * 5}m")
         if e.duration_steps is not None:
             meta_parts.append(f"dur {e.duration_steps * 5}m")
@@ -443,6 +448,23 @@ def _room_html(snap: StatusSnapshot, sensor_col: str, value: float) -> str:
     )
 
 
+def _frozen_room_html(snap: StatusSnapshot, sensor_col: str) -> str:
+    """A room whose sensor is frozen: its stale value, flagged, with no comfort bar."""
+    from weatherstat.config import UNIT_SYMBOL
+
+    label = snap.sensor_labels.get(sensor_col, sensor_col.removesuffix("_temp"))
+    fz = snap.frozen[sensor_col]
+    return (
+        f"<div class='room'>"
+        f"<div class='room-name'>{_breakable(label)}</div>"
+        f"<div class='temp dim'>—</div>"
+        f"<div class='bump'></div>"
+        f"<div class='room-detail'><div class='room-meta'><span class='frozen'>sensor frozen</span>"
+        f" <span class='dim'>{escape(fz.describe(UNIT_SYMBOL))} · ignored</span></div></div>"
+        "</div>"
+    )
+
+
 def _overlay_form(sensor_col: str, fields: str, text: str, title: str, *, cls: str = "", before: str = "") -> str:
     """A tiny POST form for one overlay action — no JavaScript."""
     cls_attr = f" class='{cls}'" if cls else ""
@@ -564,6 +586,10 @@ def _snapshot_to_dict(snap: StatusSnapshot) -> dict:
         "outdoor_temp": snap.outdoor_temp,
         "weather_condition": snap.weather_condition,
         "temps": snap.temps,
+        "frozen": {
+            col: {"value": fz.value, "since": fz.since, "hours": fz.hours, "limit_hours": fz.limit_hours, "reason": fz.reason}
+            for col, fz in snap.frozen.items()
+        },
         "comfort": {
             label: {
                 "acceptable_lo": cb.acceptable_lo,
@@ -591,6 +617,7 @@ def _snapshot_to_dict(snap: StatusSnapshot) -> dict:
                 "delay_steps": e.delay_steps,
                 "duration_steps": e.duration_steps,
                 "override": e.override,
+                "command_mode": e.commanded,
             }
             for e in snap.effectors
         ],
@@ -873,6 +900,7 @@ section h2 {
 .dim { color: var(--dim); }
 ul { margin: 0; padding-left: 18px; }
 ul li.warn { color: var(--red); font-weight: 700; }
+.frozen { color: var(--red); font-weight: 700; }
 ul li.active { color: var(--accent); }
 ul li.proactive { color: var(--dim); }
 footer {

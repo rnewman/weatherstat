@@ -420,3 +420,30 @@ class TestOverlayListeners:
         ctrl.add_overlay_listener(boom)
         assert ctrl.bump_overlay("bedroom", 1.0).status == "ok"
         assert any("broker gone" in line for line in cap.logs)
+
+
+# ── Frozen sensors ──────────────────────────────────────────────────────────
+
+
+class TestFrozenSensors:
+    def test_frozen_sensor_moves_out_of_temps_and_is_logged(self) -> None:
+        from weatherstat.sensor_health import FrozenSensor
+
+        fz = {"bedroom_temp": FrozenSensor("bedroom_temp", 69.8, "2026-11-10T04:55:00.000Z", 23.0, 3.0)}
+        values = {"bedroom_temp": "69.8", "office_temp": "71.0"}
+        ctrl, cap = _make_controller()
+        with (
+            patch("weatherstat.extract.latest_snapshot_values", return_value=values),
+            patch("weatherstat.sensor_health.frozen_sensors_now", return_value=fz),
+        ):
+            snap = ctrl.build_snapshot()
+            assert "bedroom_temp" not in snap.temps and snap.temps.get("office_temp") == 71.0
+            assert snap.frozen == fz
+            assert any("bedroom_temp frozen" in m for m in cap.logs)
+            n_logs = len(cap.logs)
+            ctrl.build_snapshot()  # still frozen: not logged again
+            assert not any("frozen" in m for m in cap.logs[n_logs:])
+        with patch("weatherstat.extract.latest_snapshot_values", return_value=values):
+            snap = ctrl.build_snapshot()  # no DB in the sandbox: nothing frozen
+        assert snap.temps.get("bedroom_temp") == 69.8 and snap.frozen == {}
+        assert any("bedroom_temp reading again" in m for m in cap.logs)

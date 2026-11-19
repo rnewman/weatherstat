@@ -39,6 +39,7 @@ from weatherstat.config import (
     delta_temp,
 )
 from weatherstat.extract import fetch_recent_history
+from weatherstat.sensor_health import FrozenSensor
 from weatherstat.types import (
     AdvisoryDecision,
     AdvisoryPlan,
@@ -901,9 +902,13 @@ def _regulating_sweep_options(
     6. Mode hold window locks to previous mode during quiet hours. The held
        mode's targets are exempt from idle suppression, so the target still
        follows comfort (heat @ a low target idles the unit without a mode
-       change). An active comfort overlay on any sensor this effector affects
-       lifts the hold: someone is awake and asking, which is what the quiet
-       hours exist to protect.
+       change). Held options all start now (delay 0): a delayed start is
+       commanded as off until it begins, which is a mode change; for the same
+       reason, outside the window a delayed start that would land inside it
+       is not offered (it would never begin). An active
+       comfort overlay on any sensor this effector affects lifts the hold:
+       someone is awake and asking, which is what the quiet hours exist to
+       protect.
 
     The trajectory sweep scores every surviving option across ALL sensors,
     so the optimizer picks whichever mode/target minimizes total comfort cost.
@@ -956,27 +961,38 @@ def _regulating_sweep_options(
     heat_targets = _dedup_targets(heat_targets)
     cool_targets = _dedup_targets(cool_targets)
 
-    # ── Reference temp for idle suppression: highest-gain sensor with data ──
-    ref_temp: float | None = None
-    if gains:
+    # ── Reference temp for idle suppression: the reading the unit regulates on ──
+    # The unit compares its target to its own thermistor (temp_col), not to any
+    # room sensor. Fall back to the highest-gain sensor only when that reading is
+    # missing (bundles, tests): picking a room by gain is fragile — two rooms can
+    # tie (living room split: piano 0.809 vs living room 0.806) and a warm
+    # neighbour then prunes every heat option for a cold room.
+    ref_temp: float | None = temps.get(eff.temp_col) if eff.temp_col else None
+    if ref_temp is None and gains:
         best_gain = 0.0
         for (eff_name, sensor_name), (gain, _lag) in gains.items():
             if eff_name == eff.name and abs(gain) > best_gain and sensor_name in temps:
                 best_gain = abs(gain)
                 ref_temp = temps[sensor_name]
-    if ref_temp is None and eff.temp_col:
-        ref_temp = temps.get(eff.temp_col)
 
     p_band = eff.proportional_band
 
     # ── Mode hold (quiet hours): keep the current mode, unless a comfort request lifts it ──
     held_mode: str | None = None
+    requested = sorted(set(affected_sensors) & (hold_release_sensors or set()))
+    hold_applies = bool(prev_state and eff.mode_hold_window and not requested)
     if prev_state and eff.mode_hold_window and _in_hold_window(base_hour, eff.mode_hold_window):
-        requested = sorted(set(affected_sensors) & (hold_release_sensors or set()))
         if requested:
             print(f"  Mode hold lifted for {eff.name}: comfort request on {', '.join(requested)}")
         else:
             held_mode = prev_state.modes.get(eff.name, "off")
+
+    def _starts_in_hold(delay: int) -> bool:
+        """A delayed start that lands in quiet hours would never happen: the unit is
+        commanded off until then, and the hold keeps it off."""
+        if not hold_applies or delay == 0 or eff.mode_hold_window is None:
+            return False
+        return _in_hold_window((base_hour + delay * 5 // 60) % 24, eff.mode_hold_window)
 
     # ── Generate options per supported mode with delay × duration ──
     max_horizon = max(CONTROL_HORIZONS)
@@ -991,7 +1007,7 @@ def _regulating_sweep_options(
                 if mode == "cool" and ref_temp < target - p_band:
                     continue
             for delay in TRAJECTORY_DELAYS:
-                if delay >= max_horizon:
+                if delay >= max_horizon or (mode != held_mode and _starts_in_hold(delay)):
                     continue
                 for duration in TRAJECTORY_DURATIONS:
                     effective_duration = min(duration, max_horizon - delay)
@@ -1002,9 +1018,12 @@ def _regulating_sweep_options(
     # Deduplicate (capping creates duplicates)
     options = [options[0]] + list(dict.fromkeys(options[1:]))
 
-    # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops)
+    # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops).
+    # Only options that start now: a delayed start is commanded as "off" until it
+    # begins (EffectorDecision.command_mode) — a mode change the hold forbids. The
+    # held mode backs off through its target instead (exempt from idle suppression).
     if held_mode is not None and prev_state is not None:
-        options = [o for o in options if o.mode == held_mode]
+        options = [o for o in options if o.mode == held_mode and o.delay_steps == 0]
         if not options:
             # Held mode has no comfort-derived targets (e.g. heat held but the schedule only yields
             # cool targets). Keep the previous setpoint rather than inventing one.
@@ -1786,6 +1805,12 @@ def sweep_scenarios_physics(
 
     assert isinstance(sim_params, SimParams)
 
+    # Only sensors with a current reading are scored or predicted: a missing or
+    # frozen sensor has no starting point (the simulator would start it at a
+    # placeholder). The full list still sets thermostat safety-net setpoints.
+    all_schedules = schedules
+    schedules = [s for s in all_schedules if s.sensor in current_temps]
+
     emergency = _emergency_effector(sim_params.gains, _CFG.constraints)
     _ineligible = ineligible_effectors or set()
 
@@ -2055,36 +2080,12 @@ def sweep_scenarios_physics(
 
     # Build effector decisions and command targets
     effector_decisions: list[EffectorDecision] = list(scenario.effectors.values())
-    command_targets: dict[str, float] = {}
-    trajectory_info: dict[str, dict[str, int | None]] = {}
-
-    for ed in effector_decisions:
-        eff_cfg = EFFECTOR_MAP.get(ed.name)
-        if eff_cfg is None:
-            continue
-
-        if eff_cfg.control_type == "trajectory":
-            # Trajectory effector: compute cautious setpoint
-            temp_col = eff_cfg.temp_col
-            eff_temp = current_temps.get(temp_col, abs_temp(70.0))
-            heating_now = ed.mode != "off" and ed.delay_steps == 0
-            setpoint = _cautious_setpoint(
-                eff_temp,
-                heating_now,
-                comfort_min=_comfort_min(temp_col, schedules, base_hour),
-            )
-            command_targets[ed.name] = setpoint
-            if ed.mode != "off":
-                trajectory_info[ed.name] = {
-                    "delay_steps": ed.delay_steps,
-                    "duration_steps": ed.duration_steps,
-                }
-
-        elif eff_cfg.control_type == "regulating" and ed.target is not None:
-            command_targets[ed.name] = ed.target
+    command_targets, trajectory_info = _command_targets(effector_decisions, current_temps, all_schedules, base_hour)
 
     sensor_preds: dict[str, dict[str, float]] = {}
     for sensor_col in PREDICTION_SENSORS:
+        if sensor_col not in current_temps:
+            continue  # no reading, no prediction (see the schedule filter above)
         rpred: dict[str, float] = {}
         for h in CONTROL_HORIZONS:
             key = f"{sensor_col}_t+{h}"
@@ -2105,6 +2106,60 @@ def sweep_scenarios_physics(
         trajectory_info=trajectory_info,
     )
     return decision, scenario, blocked_dict, advisory_plan
+
+
+def describe_plan(ed: EffectorDecision, unit: str = UNIT_SYMBOL) -> str:
+    """'cool @ 73.3°F' when active now; 'off now → cool @ 73.3°F in 60m for 120m' when delayed."""
+    if ed.mode == "off":
+        return "off"
+    target = f" @ {ed.target:.1f}{unit}" if ed.target is not None else ""
+    dur = f" for {ed.duration_steps * 5}m" if ed.duration_steps is not None else ""
+    if ed.active_now:
+        return f"{ed.mode}{target}{dur}"
+    return f"off now → {ed.mode}{target} in {ed.delay_steps * 5}m{dur}"
+
+
+def _command_targets(
+    effector_decisions: list[EffectorDecision],
+    current_temps: dict[str, float],
+    schedules: list[ComfortSchedule],
+    base_hour: int,
+) -> tuple[dict[str, float], dict[str, dict[str, int | None]]]:
+    """Setpoints to command now, plus trajectory plan info.
+
+    The plan's delays are honoured for every control type — a delayed start
+    is commanded as off this cycle (see ``EffectorDecision.command_mode``):
+    - trajectory: cautious setpoint, heating only when active now;
+    - regulating: the plan's target only when active now (a delayed or off
+      unit is commanded ``off``, which needs no target);
+    - binary: mode only (``command_mode``), no target.
+    """
+    command_targets: dict[str, float] = {}
+    trajectory_info: dict[str, dict[str, int | None]] = {}
+    for ed in effector_decisions:
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is None:
+            continue
+
+        if eff_cfg.control_type == "trajectory":
+            # Trajectory effector: compute cautious setpoint
+            temp_col = eff_cfg.temp_col
+            eff_temp = current_temps.get(temp_col, abs_temp(70.0))
+            setpoint = _cautious_setpoint(
+                eff_temp,
+                ed.active_now,
+                comfort_min=_comfort_min(temp_col, schedules, base_hour),
+            )
+            command_targets[ed.name] = setpoint
+            if ed.mode != "off":
+                trajectory_info[ed.name] = {
+                    "delay_steps": ed.delay_steps,
+                    "duration_steps": ed.duration_steps,
+                }
+
+        elif eff_cfg.control_type == "regulating" and ed.target is not None and ed.active_now:
+            command_targets[ed.name] = ed.target
+    return command_targets, trajectory_info
 
 
 # ── State persistence ─────────────────────────────────────────────────────
@@ -2132,7 +2187,9 @@ def save_control_state(decision: ControlDecision, prev_state: ControlState | Non
     Tracks mode change timestamps: only updated when mode actually changes.
     """
     now_iso = decision.timestamp
-    new_modes = {ed.name: ed.mode for ed in decision.effectors}
+    # What each device was commanded to, not the plan: a delayed start was sent
+    # as off, and the mode hold (quiet hours) must hold the mode the unit is in.
+    new_modes = {ed.name: ed.command_mode for ed in decision.effectors}
     new_setpoints = dict(decision.command_targets)
     prev_modes = prev_state.modes if prev_state else {}
     prev_mode_times = dict(prev_state.mode_times) if prev_state else {}
@@ -2343,7 +2400,7 @@ def write_command_json(
                 if target_val is not None:
                     command[camel_key] = target_val
             elif purpose == "mode":
-                command[camel_key] = ed.mode
+                command[camel_key] = ed.command_mode  # a delayed start is "not now"
 
     # Advisory plan data (informational — executor ignores these)
     if advisory_plan:
@@ -2368,6 +2425,17 @@ def write_command_json(
 
 
 # ── Main control cycle ────────────────────────────────────────────────────
+
+
+def _detect_frozen_sensors(current_temps: dict[str, float]) -> dict[str, FrozenSensor]:
+    """Monitored sensors whose reading is frozen (sensor_health), never failing the cycle."""
+    from weatherstat.sensor_health import frozen_sensors_now
+
+    try:
+        return frozen_sensors_now(live_values=current_temps)
+    except Exception as e:  # noqa: BLE001 — a snapshot DB problem must not stop control
+        print(f"  WARNING: frozen-sensor check failed: {e}", file=sys.stderr)
+        return {}
 
 
 def run_control_cycle(live: bool = False) -> ControlDecision | None:
@@ -2422,6 +2490,20 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         val = latest.get(sensor_col)
         if val is not None and not (isinstance(val, float) and np.isnan(val)):
             current_temps[sensor_col] = float(val)
+    # Regulating units' own thermistors (climate current_temperature): what the unit
+    # compares its target against. Used for idle suppression and energy activity;
+    # not scored, since they are not comfort sensors.
+    for eff in EFFECTORS:
+        if eff.control_type == "regulating" and eff.temp_col and eff.temp_col not in current_temps:
+            val = latest.get(eff.temp_col)
+            if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                current_temps[eff.temp_col] = float(val)
+
+    # Frozen sensors: a dead device's last value repeated for hours is missing data.
+    # Dropped here, they are not scored, get no predictions and no cold-room override.
+    frozen = _detect_frozen_sensors(current_temps)
+    for col in frozen:
+        current_temps.pop(col, None)
 
     print(f"\n[control] Current state ({now_str}):")
     # Show trajectory effector temps and setpoints
@@ -2448,6 +2530,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         t = current_temps.get(sensor_col)
         if t is not None:
             print(f"  {SENSOR_LABELS.get(sensor_col, sensor_col):<{lw}} {t:.1f}{UNIT_SYMBOL}")
+    for sensor_col, fz in frozen.items():
+        print(f"  {SENSOR_LABELS.get(sensor_col, sensor_col):<{lw}} FROZEN at {fz.describe(UNIT_SYMBOL)} — ignored")
     # Show current effector states
     for eff in EFFECTORS:
         if eff.control_type == "trajectory":
@@ -2661,6 +2745,13 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         for eff_name, reason in ineligible.items():
             print(f"  {eff_name}: INELIGIBLE — {reason}")
 
+    # Score only sensors with a current reading (missing or frozen ones have no
+    # starting point; the simulator would start them at a placeholder 70°F).
+    # The full list still goes to the sweep (thermostat safety-net setpoints use
+    # their zone's comfort floor) and to the decision log (comfort bounds).
+    all_schedules = schedules
+    schedules = [s for s in all_schedules if s.sensor in current_temps]
+
     t0 = time.monotonic()
     decision, winning_scenario, blocked_dict, advisory_plan = sweep_scenarios_physics(
         current_temps,
@@ -2670,7 +2761,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         sim_params,
         fractional_hour,
         recent_hist,
-        schedules,
+        all_schedules,
         base_hour,
         prev_state,
         ineligible_effectors,
@@ -2854,7 +2945,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         if eff_cfg.control_type == "trajectory":
             label = ed.name.removeprefix("thermostat_")
             setpoint = decision.command_targets.get(ed.name, 0)
-            on_label = "ON" if ed.mode != "off" and ed.delay_steps == 0 else "OFF"
+            on_label = "ON" if ed.active_now else "OFF"
             print(f"  {label} heating:  {on_label} -> setpoint {setpoint:.0f}{UNIT_SYMBOL}")
             if ed.mode != "off":
                 r = _counterfactual_rationale(ed.name)
@@ -2870,8 +2961,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 print(f"  {ed.name:<20} off")
                 rationale_map[ed.name] = _state_rationale(ed)
             else:
-                target_str = f" @ {ed.target:.0f}{UNIT_SYMBOL}" if ed.target is not None else ""
-                print(f"  {ed.name:<20} {ed.mode}{target_str}")
+                print(f"  {ed.name:<20} {describe_plan(ed)}")
                 r = _counterfactual_rationale(ed.name)
                 print(r)
                 r_text = r.strip().removeprefix("-> ")
@@ -2879,7 +2969,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                     r_text = _state_rationale(ed)
                 rationale_map[ed.name] = r_text
         elif eff_cfg.control_type == "binary":
-            print(f"  {ed.name:<20} {ed.mode}")
+            print(f"  {ed.name:<20} {describe_plan(ed)}")
             if ed.mode != "off":
                 r = _counterfactual_rationale(ed.name)
                 print(r)
@@ -3001,13 +3091,15 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
 
     # ── Infrastructure safety checks ──
     from weatherstat.safety import check_device_health, check_thermostat_modes, process_safety_alerts
+    from weatherstat.sensor_health import clear_recovered_alerts, frozen_sensor_alerts
 
-    safety_alerts = check_thermostat_modes(latest, decision) + check_device_health()
+    safety_alerts = check_thermostat_modes(latest, decision) + check_device_health() + frozen_sensor_alerts(frozen)
     process_safety_alerts(
         safety_alerts,
         live=live,
         notification_target=_CFG.notification_target,
     )
+    clear_recovered_alerts(frozen, live=live, notification_target=_CFG.notification_target)
 
     # Prediction sanity checks
     sane = check_prediction_sanity(decision, current_temps)
@@ -3030,7 +3122,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
     )
 
     log_decision(
-        decision, current_temps, latest, schedules, base_hour, live,
+        decision, current_temps, latest, all_schedules, base_hour, live,
         active_profile=active_profile.name if active_profile else None,
         mrt_base_offset=mrt_offset,
         mrt_weights=_mrt_weights,

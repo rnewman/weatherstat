@@ -263,6 +263,10 @@ class WeatherstatConfig:
     overlay_duration_hours: float = 3.0  # how long a bump lasts unless a duration is given
     overlay_step: float | None = None  # size of one +/- press in the TUI/web (default: 1°F / 0.6°C)
     overlay_max_delta: float | None = None  # cap on |delta| per sensor (default: 5°F / 2.8°C)
+    # Frozen sensors (sensor_health.py): a reading flat for longer than
+    # max(frozen_floor_hours, frozen_multiplier × p99.9 of its own flat runs) is treated as missing
+    frozen_floor_hours: float = 3.0
+    frozen_multiplier: float = 2.0
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
@@ -830,6 +834,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         overlay_duration_hours=float(defaults.get("overlay_duration_hours", 3.0)),
         overlay_step=_opt_float("overlay_step"),
         overlay_max_delta=_opt_float("overlay_max_delta"),
+        frozen_floor_hours=float(defaults.get("frozen_floor_hours", 3.0)),
+        frozen_multiplier=float(defaults.get("frozen_multiplier", 2.0)),
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
         mrt_correction=mrt_correction,

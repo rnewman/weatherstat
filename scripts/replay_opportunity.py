@@ -141,7 +141,9 @@ def _reconstruct_prev_state(timestamp: str) -> ControlState | None:
     setpoints: dict[str, float] = {}
     for e in effs:
         name = e.get("name", "")
-        mode = e.get("mode", "off")
+        # What was commanded (a delayed start was sent as off). Rows before
+        # command_mode was logged sent the plan's mode, so that is the fallback.
+        mode = e.get("command_mode", e.get("mode", "off"))
         target = e.get("target")
         modes[name] = mode
         if target is not None:

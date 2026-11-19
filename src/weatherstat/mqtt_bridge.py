@@ -264,9 +264,39 @@ def _r(value: float | None, ndigits: int = 2) -> float | None:
 
 
 def room_payload(snap: Any, col: str, label: str, *, source_entity: str | None, unit: str) -> dict | None:
-    """Everything the TUI knows about one room, as a flat-ish JSON object."""
+    """Everything the TUI knows about one room, as a flat-ish JSON object.
+
+    A frozen sensor (sensor_health) publishes no temperature — the HA entity
+    goes unknown rather than keep showing a dead device's last value — with
+    ``status: "frozen"`` and the stale reading under ``frozen``.
+    """
     temp = snap.temps.get(col)
     bounds = snap.comfort.get(snap.sensor_labels.get(col, label))  # snapshot comfort is keyed by display label
+    fz = getattr(snap, "frozen", {}).get(col)
+    if temp is None and fz is not None:
+        return {
+            "name": display_name(label),
+            "label": label,
+            "sensor": col,
+            "unit": unit,
+            "temperature": None,
+            "feels_like": None,
+            "status": "frozen",
+            "frozen": {
+                "value": _r(fz.value),
+                "since": fz.since,
+                "hours": _r(fz.hours, 1),
+                "limit_hours": _r(fz.limit_hours, 1),
+                "reason": fz.reason,
+            },
+            "preferred_lo": _r(bounds.preferred_lo) if bounds else None,
+            "preferred_hi": _r(bounds.preferred_hi) if bounds else None,
+            "acceptable_lo": _r(bounds.acceptable_lo) if bounds else None,
+            "acceptable_hi": _r(bounds.acceptable_hi) if bounds else None,
+            "source_entity": source_entity,
+            "comfort_entity": f"number.weatherstat_{label}_comfort",
+            "updated": snap.timestamp.isoformat(),
+        }
     if temp is None:
         return None
     offset = snap.mrt_offsets.get(col, 0.0) or 0.0
@@ -319,7 +349,7 @@ _MAX_LIST = 10  # cap advisory lists so attributes stay small enough for the rec
 
 def status_payload(snap: Any) -> dict:
     """System-level view: mode, schedule, effector plan + rationale, costs, advisories, health."""
-    active = [e for e in snap.effectors if e.mode not in ("off", "", None)]
+    active = [e for e in snap.effectors if e.commanded not in ("off", "", None)]  # on now, not just planned
     costs = snap.costs
     return {
         "mode": "live" if snap.live else "dry run",
@@ -337,7 +367,8 @@ def status_payload(snap: Any) -> dict:
             {
                 "name": e.name,
                 "title": display_name(e.name),
-                "mode": e.mode,
+                "mode": e.mode,  # the plan's mode (with delay_minutes: when it starts)
+                "command_mode": e.commanded,  # what the device is commanded to now
                 "target": _r(e.target, 1),
                 "delay_minutes": e.delay_steps * 5,
                 "duration_minutes": e.duration_steps * 5 if e.duration_steps is not None else None,
@@ -361,6 +392,16 @@ def status_payload(snap: Any) -> dict:
         "warnings": list(snap.warnings)[:_MAX_LIST],
         "overlays": {snap.sensor_labels.get(col, col): {"delta": _r(o.delta), "expires_at": o.expires_at.isoformat()} for col, o in snap.overlays.items()},
         "ha_error": snap.ha_error,
+        "frozen_sensors": [
+            {
+                "label": snap.sensor_labels.get(col, col),
+                "sensor": col,
+                "value": _r(fz.value),
+                "since": fz.since,
+                "hours": _r(fz.hours, 1),
+            }
+            for col, fz in getattr(snap, "frozen", {}).items()
+        ],
         "updated": snap.timestamp.isoformat(),
     }
 

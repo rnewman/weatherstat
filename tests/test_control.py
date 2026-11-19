@@ -684,6 +684,35 @@ class TestRegulatingSweepOptions:
         # Room is 2°F above pref_lo=70 and p_band=1.0, so heat@70 is idle-suppressed
         assert not any(o.mode == "heat" for o in options)
 
+    def test_sweep_idle_suppression_uses_unit_thermistor(self) -> None:
+        """Idle suppression follows the unit's own reading, not the highest-gain room.
+
+        Regression: the living room split's highest gain was on a warm neighbour
+        (piano, by 0.003), which pruned every heat option while the living room was cold.
+        """
+        eff = self._bedroom_eff()
+        warm, cold = "piano_temp", "bedroom_temp"
+        schedules = [
+            ComfortSchedule(
+                sensor=s, label=s.removesuffix("_temp"),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort(s, 71.0, 74.0, 70.0, 76.0, 67.0, 79.0)),),
+            )
+            for s in (warm, cold)
+        ]
+        gains = {(eff.name, warm): (0.809, 10.0), (eff.name, cold): (0.806, 10.0)}
+        temps = {warm: 75.2, cold: 69.8}
+
+        # Without the unit's reading, the fallback picks the warm neighbour: no heat.
+        fallback = _regulating_sweep_options(eff, schedules, 12, gains=gains, current_temps=temps)
+        assert not any(o.mode == "heat" for o in fallback)
+
+        # With it (thermistor reads 70.5), heat survives and the pointless cool is pruned.
+        options = _regulating_sweep_options(
+            eff, schedules, 12, gains=gains, current_temps={**temps, eff.temp_col: 70.5},
+        )
+        assert any(o.mode == "heat" and o.target == 71.0 for o in options)
+        assert not any(o.mode == "cool" for o in options)
+
     def test_sweep_no_schedule_returns_off_only(self) -> None:
         """No matching schedule -> only off option."""
         options = _regulating_sweep_options(self._bedroom_eff(), [], 12)
@@ -1942,3 +1971,161 @@ class TestSuperposition:
                 f"Energy cost mismatch at flat {flat_idx}: "
                 f"precomputed={precomputed[flat_idx]:.4f} vs expected={expected:.4f}"
             )
+
+
+# ── Planned delays: the immediate command reflects what the plan does now ──
+
+
+class TestDelayedCommands:
+    """A delayed start is commanded as off: the receding horizon re-plans every cycle.
+
+    Regression: the plan said ``mini_split_living_room = cool @ 73.3 delay=60m
+    duration=120m`` and the command JSON sent ``miniSplitLivingRoomMode: cool``.
+    """
+
+    _DELAYED = EffectorDecision("mini_split_living_room", mode="cool", target=73.3, delay_steps=12, duration_steps=24)
+    _NOW = EffectorDecision("mini_split_bedroom", mode="heat", target=70.0, delay_steps=0, duration_steps=12)
+
+    def _decision(self, *effs: EffectorDecision) -> ControlDecision:
+        from weatherstat.control import _command_targets
+
+        targets, info = _command_targets(list(effs), {"thermostat_upstairs_temp": 70.0}, make_schedules(), 12)
+        return ControlDecision(timestamp="2026-11-19T20:00:00+00:00", effectors=effs, command_targets=targets, trajectory_info=info)
+
+    def test_command_mode(self) -> None:
+        assert self._DELAYED.command_mode == "off" and not self._DELAYED.active_now
+        assert self._NOW.command_mode == "heat" and self._NOW.active_now
+        assert EffectorDecision("blower_office", mode="low", delay_steps=24).command_mode == "off"
+        assert EffectorDecision("x").command_mode == "off"
+
+    def test_command_targets(self) -> None:
+        traj = EffectorDecision("thermostat_upstairs", mode="heating", delay_steps=12, duration_steps=12)
+        d = self._decision(self._DELAYED, self._NOW, traj)
+        assert "mini_split_living_room" not in d.command_targets  # commanded off: no target
+        assert d.command_targets["mini_split_bedroom"] == 70.0
+        # Trajectory: delayed → the off (safety-net) setpoint, and the plan is kept in trajectory_info.
+        assert d.command_targets["thermostat_upstairs"] < 70.0
+        assert d.trajectory_info["thermostat_upstairs"]["delay_steps"] == 12
+
+    def test_command_json_sends_off_for_delayed(self, tmp_path) -> None:
+        import json
+        from unittest.mock import patch
+
+        blower = EffectorDecision("blower_office", mode="high", delay_steps=12, duration_steps=12)
+        d = self._decision(self._DELAYED, self._NOW, blower)
+        with patch("weatherstat.control.PREDICTIONS_DIR", tmp_path):
+            cmd = json.loads(write_command_json(d).read_text())
+        assert cmd["miniSplitLivingRoomMode"] == "off"
+        assert "miniSplitLivingRoomTarget" not in cmd
+        assert cmd["miniSplitBedroomMode"] == "heat" and cmd["miniSplitBedroomTarget"] == 70.0
+        assert cmd["blowerOfficeMode"] == "off"
+
+    def test_control_state_records_commanded_modes(self, tmp_path) -> None:
+        """The mode hold reads prev_state.modes: it must hold what the unit was told, not the plan."""
+        import json
+        from unittest.mock import patch
+
+        from weatherstat.control import save_control_state
+
+        state_file = tmp_path / "control_state.json"
+        with patch("weatherstat.control.CONTROL_STATE_FILE", state_file):
+            save_control_state(self._decision(self._DELAYED, self._NOW))
+        modes = json.loads(state_file.read_text())["modes"]
+        assert modes == {"mini_split_living_room": "off", "mini_split_bedroom": "heat"}
+
+    def test_decision_log_records_plan_and_command(self, tmp_path) -> None:
+        import json
+        import sqlite3
+
+        from weatherstat.decision_log import log_decision
+
+        db = tmp_path / "decision_log.db"
+        log_decision(self._decision(self._DELAYED, self._NOW), {}, {}, [], 12, False, db_path=db)
+        con = sqlite3.connect(db)
+        effs, splits = con.execute("SELECT effector_decisions, mini_splits FROM decisions").fetchone()
+        con.close()
+        by_name = {e["name"]: e for e in json.loads(effs)}
+        lr = by_name["mini_split_living_room"]
+        assert lr["mode"] == "cool" and lr["delay_steps"] == 12 and lr["command_mode"] == "off"
+        legacy = {s["name"]: s for s in json.loads(splits)}
+        assert legacy["living_room"] == {"name": "living_room", "mode": "off", "target": None}
+        assert legacy["bedroom"]["mode"] == "heat"
+
+    def test_describe_plan(self) -> None:
+        from weatherstat.control import describe_plan
+
+        assert describe_plan(self._DELAYED, "°F") == "off now → cool @ 73.3°F in 60m for 120m"
+        assert describe_plan(self._NOW, "°F") == "heat @ 70.0°F for 60m"
+        assert describe_plan(EffectorDecision("x"), "°F") == "off"
+
+
+class TestDelaysAndModeHold:
+    """Inside quiet hours the held mode starts now; outside, no delayed start may land inside them."""
+
+    @staticmethod
+    def _state(mode: str) -> ControlState:
+        return ControlState(last_decision_time="2026-11-19T06:00:00+00:00", modes={"mini_split_bedroom": mode})
+
+    @staticmethod
+    def _schedule() -> list[ComfortSchedule]:
+        return [ComfortSchedule(
+            sensor="bedroom_temp", label="bedroom",
+            entries=(ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 70.0, 72.0, 68.0, 74.0, 65.0, 77.0)),),
+        )]
+
+    _GAINS = {("mini_split_bedroom", "bedroom_temp"): (0.732, 10.0)}
+
+    def _options(self, hour: int, prev: ControlState | None, release: set[str] | None = None) -> list[EffectorDecision]:
+        return _regulating_sweep_options(
+            EFFECTOR_MAP["mini_split_bedroom"], self._schedule(), hour, gains=self._GAINS, prev_state=prev,
+            current_temps={"bedroom_temp": 73.5}, hold_release_sensors=release,
+        )
+
+    def test_held_mode_options_start_now(self) -> None:
+        opts = self._options(23, self._state("cool"))  # bedroom hold window [22, 7]
+        assert opts and all(o.mode == "cool" and o.delay_steps == 0 for o in opts)
+        assert all(o.command_mode == "cool" for o in opts)  # whatever wins, the command keeps the held mode
+
+    def test_delayed_start_into_quiet_hours_not_offered(self) -> None:
+        opts = self._options(21, self._state("off"))  # 1h and 2h delays land at 22, 23: inside the hold
+        active = [o for o in opts if o.mode != "off"]
+        assert active and all(o.delay_steps == 0 for o in active)
+
+    def test_delays_offered_when_hold_cannot_block_them(self) -> None:
+        for hour, prev, release in [
+            (12, self._state("off"), None),  # quiet hours far away
+            (21, self._state("off"), {"bedroom_temp"}),  # a comfort request lifts the hold
+            (21, None, None),  # no previous state: no hold
+        ]:
+            opts = self._options(hour, prev, release)
+            assert any(o.delay_steps > 0 for o in opts), (hour, prev, release)
+
+
+class TestMissingSensorsNotScored:
+    """A sensor without a current reading (missing or frozen) is neither scored nor predicted."""
+
+    def test_sweep_skips_sensor_without_reading(self) -> None:
+        from weatherstat.control import sweep_scenarios_physics
+        from weatherstat.simulator import load_sim_params
+
+        temps = {
+            "thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0,
+            "bedroom_temp": 68.5, "office_temp": 70.0, "family_room_temp": 69.5,
+            "kitchen_temp": 70.0, "bathroom_temp": 69.0,
+            # piano_temp frozen → dropped by control before the sweep
+        }
+        decision, _scenario, _blocked, _plan = sweep_scenarios_physics(
+            temps, 45.0, [45.0] * 12, {}, load_sim_params(), 14.0, {}, make_schedules(), 14,
+            solar_fractions=[0.0] * 13, solar_elevations=[0.0] * 144,
+        )
+        assert "piano_temp" not in decision.predictions
+        assert "bedroom_temp" in decision.predictions
+
+    def test_cost_ignores_unscored_schedule(self) -> None:
+        """Before: a missing sensor was simulated from a 70° placeholder and scored."""
+        schedules = make_schedules()
+        piano = [s for s in schedules if s.sensor == "piano_temp"]
+        assert piano, "example config constrains piano_temp"
+        preds = {f"piano_temp_t+{h}": 60.0 for h in CONTROL_HORIZONS}
+        assert compute_comfort_cost(preds, piano, 14) > 0
+        assert compute_comfort_cost(preds, [s for s in schedules if s.sensor != "piano_temp"], 14) == 0

@@ -3,6 +3,7 @@
 Checks for conditions that prevent the control loop from working:
 - Thermostat turned off (hvac_mode=off) while control wants to heat
 - Device health thresholds (configured per-effector in weatherstat.yaml)
+- Frozen sensors (alerts built by sensor_health.py, dispatched here)
 
 Called from the control loop after each decision cycle. Safety alerts
 use push notifications (no quiet hours — these are urgent).
@@ -34,6 +35,7 @@ from weatherstat.config import HA_TOKEN, HA_URL
 _DEFAULT_COOLDOWNS: dict[str, int] = {
     "thermostat_off": 3600,   # 1 hour
     "device_fault": 1800,     # 30 min — more urgent
+    "sensor_frozen": 43200,   # 12 h — a dead battery doesn't need an hourly reminder
 }
 
 
@@ -54,6 +56,7 @@ class SafetyAlert:
     title: str
     message: str
     severity: str = "warning"  # "warning" or "critical"
+    category: str = ""  # cooldown key (e.g. "sensor_frozen"); "" = derived from key
 
 
 # ── Thermostat mode check ────────────────────────────────────────────────
@@ -361,7 +364,7 @@ def process_safety_alerts(
         cooldown_key = f"safety_{alert.key}"
         cooldowns = _get_cooldowns()
         cooldown_seconds = cooldowns.get(
-            alert.key.rsplit("_", 1)[0],  # "thermostat_off_upstairs" -> "thermostat_off"
+            alert.category or alert.key.rsplit("_", 1)[0],  # "thermostat_off_upstairs" -> "thermostat_off"
             cooldowns.get(alert.key, 3600),
         )
 

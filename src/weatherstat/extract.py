@@ -439,13 +439,19 @@ def _share_text_values(wide: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
+def load_collector_snapshots(db_path: Path | None = None, *, quarantine: bool = True) -> pd.DataFrame:
     """Load all collector snapshots from the SQLite database.
 
     Reads from the EAV ``readings`` table and pivots to wide format.
 
     Args:
         db_path: Path to snapshots.db. Defaults to SNAPSHOTS_DB.
+        quarantine: Mask frozen spans of monitored sensors to NaN
+            (sensor_health.quarantine_frozen) — a dead sensor's repeated last
+            value is missing data, not a flat line. Detection runs on every
+            load over the full history, after the snapshot cache, so the raw
+            readings (and the cache) are untouched. The spans and limits used
+            are in ``df.attrs``. False returns the raw readings.
 
     Returns:
         DataFrame with all snapshots in chronological order.
@@ -474,6 +480,10 @@ def load_collector_snapshots(db_path: Path | None = None) -> pd.DataFrame:
             # so downstream code can distinguish "closed" from "unknown".
             df[col] = df[col].astype("boolean")
 
+    if quarantine:
+        from weatherstat.sensor_health import quarantine_frozen
+
+        df = quarantine_frozen(df)
     return df
 
 

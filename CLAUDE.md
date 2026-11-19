@@ -61,6 +61,8 @@ Hysteresis-aware smart thermostat system for hydronic floor heat with massive th
 
 39. **Refit performance** (done) — Hourly refit about 2× faster cold and 8× warm, with `thermal_params.json` bit-identical (exact rewrites only: same math, same RNG draws). One snapshot load per refit, shared with the tracker; vectorized solar features; numpy tau segmentation; bootstrap, VIF and identification refits solved from Gram matrices (`gram.py`). Long-running processes reuse unchanged history: tau fits are memoized by segment, and `load_collector_snapshots` caches the pivoted frame and reads only new rows (guarded against deletes and VACUUM renumbering, with a periodic full re-read; `clear_snapshot_cache()` forces one). Bootstrap stability is a **day-block bootstrap** (resamples draw whole local days): rows within a day are autocorrelated, so the 5-minute-row bootstrap understated variance. CVs drive warnings and health grades only, never what is kept. Collector `readings` is keyed `(name, timestamp)`, re-keyed in place on collector start (skipped without enough free disk); readers use `extract.latest_timestamp` rather than bare `MAX(timestamp)`. Tests pin each rewrite against the code it replaced; `just synth-db` / `just bench-sysid` measure it.
 
+40. **Frozen sensors & honoured delays** (done) — A dying battery sensor often keeps reporting its last value instead of going unavailable: control scores a stale room and refits fit a flat line. `sensor_health.py` calls a sensor frozen when its reading has not changed for longer than `max(defaults.frozen_floor_hours, defaults.frozen_multiplier × the 99.9th-percentile flat run in its own history)`, counted in observed readings so collector outages don't count; when half the monitored sensors freeze at once (an HA stall), any other flat sensor past the floor is frozen too. History: frozen spans are masked to NaN at load, so sysid and the tracker skip them, while snapshots.db keeps the raw readings. Live: frozen sensors are not scored (nor is any sensor without a reading), show as FROZEN in the TUI, web, MQTT and cards, and raise a safety alert that clears when the sensor reads again. `just debug frozen`. Delays: every `EffectorDecision` is a plan, and `active_now`/`command_mode` give what is commanded this cycle, so a delayed start is commanded off and re-planned (receding horizon); the decision log keeps both. In the quiet-hours mode hold, the held mode gets only start-now options, and a delayed start that would land inside the window is not offered.
+
 See `docs/FUTURE.md` for the roadmap and `docs/plans/` for detailed plans.
 
 ## Commands
@@ -97,6 +99,7 @@ just debug why        # Explain why active effectors are on (snapshot DB temps)
 just debug decision-why  # Explain latest decision (live temps from decision log)
 just debug advisory   # Advisory states + compound tau effects
 just debug overlays   # Active comfort overlays, recent events, per-room habit summary
+just debug frozen     # Frozen-sensor limits, sensors frozen now, frozen spans in history (masked at load)
 just debug decisions  # Recent decision log
 just replay           # Replay an environment opportunity evaluation
 just bundle           # Create or replay a point-in-time debug bundle
@@ -119,6 +122,7 @@ just validate         # Quick sysid + prediction validation smoke test
 - Collector: `src/weatherstat/collector.py`
 - Executor: `src/weatherstat/executor.py`
 - Validation: `src/weatherstat/validate.py` (sysid diagnostics + prediction envelope)
+- Frozen sensors: `src/weatherstat/sensor_health.py` (detection, load-time quarantine, live check, alerts)
 
 ## Conventions
 

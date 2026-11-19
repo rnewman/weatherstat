@@ -152,6 +152,14 @@ health:
       entity: sensor.combi_heating_mode
       state: "Space Heating"
       for_minutes: 3
+  # Battery-powered room sensors: a dying battery often leaves HA repeating the
+  # last reading rather than going unavailable. Weatherstat detects that itself
+  # (frozen sensors, see defaults.frozen_*); a low-battery check warns earlier.
+  # bedroom_sensor_battery:
+  #   entity: sensor.climate_bedroom_battery_level
+  #   min_value: 15
+  #   severity: warning
+  #   message: "Bedroom sensor battery low — replace it before the reading freezes"
 
 # ── Environment ─────────────────────────────────────────────────────────
 # Observable factors that affect physics (tau, solar, gain) but aren't
@@ -336,3 +344,8 @@ defaults:
   # overlay_duration_hours: 3     # how long a bump lasts unless a duration is given
   # overlay_step: 1               # size of one +/- press (configured unit)
   # overlay_max_delta: 5          # cap on |delta| per sensor (configured unit)
+  # Frozen sensors: a constrained (or outdoor) sensor whose reading hasn't changed for longer than
+  # max(frozen_floor_hours, frozen_multiplier × the 99.9th-percentile flat run in its own history)
+  # is treated as missing — not scored, excluded from sysid, alerted. `just debug frozen` shows limits and spans.
+  # frozen_floor_hours: 3
+  # frozen_multiplier: 2

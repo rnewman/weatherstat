@@ -18,7 +18,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Input, Static, TabbedContent, TabPane
 
-from weatherstat.config import CONTROL_INTERVAL, SYSID_INTERVAL
+from weatherstat.config import CONTROL_INTERVAL, SYSID_INTERVAL, UNIT_SYMBOL
 from weatherstat.overlay import format_remaining
 from weatherstat.tui.controller import ActionResult, StatusSnapshot, TUIController
 from weatherstat.tui.widgets import (
@@ -423,6 +423,7 @@ class WeatherstatApp(App):
             snap.sensor_labels,
             mrt_offsets=snap.mrt_offsets or None,
             overlays=overlay_tuples or None,
+            frozen={col: fz.describe(UNIT_SYMBOL) for col, fz in snap.frozen.items()} or None,
         )
         self.query_one(EffectorPanel).set_current_temps(snap.temps)
 
@@ -443,6 +444,7 @@ class WeatherstatApp(App):
                 "target": e.target,
                 "delay_steps": e.delay_steps,
                 "duration_steps": e.duration_steps,
+                "command_mode": e.commanded,
             }
             for e in snap.effectors
         ]

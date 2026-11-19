@@ -165,6 +165,7 @@ class TemperaturePanel(Static):
         self._labels: dict[str, str] = {}  # sensor_col -> label
         self._mrt_offsets: dict[str, float] = {}  # sensor_col -> MRT offset
         self._overlays: dict[str, tuple[float, str]] = {}  # sensor_col -> (delta, remaining text)
+        self._frozen: dict[str, str] = {}  # sensor_col -> "69.8°F for 23h (limit 16h)"
 
     def set_data(
         self,
@@ -173,12 +174,14 @@ class TemperaturePanel(Static):
         labels: dict[str, str],
         mrt_offsets: dict[str, float] | None = None,
         overlays: dict[str, tuple[float, str]] | None = None,
+        frozen: dict[str, str] | None = None,
     ) -> None:
         self._temps = temps
         self._comfort = comfort
         self._labels = labels
         self._mrt_offsets = mrt_offsets or {}
         self._overlays = overlays or {}
+        self._frozen = frozen or {}
         self._refresh()
 
     def _refresh(self) -> None:
@@ -204,6 +207,9 @@ class TemperaturePanel(Static):
                 lines.append(text.markup if hasattr(text, "markup") else str(text))
             else:
                 lines.append(f"  {label:<22} {temp:>5.1f}{UNIT_SYMBOL}")
+        for sensor_col, desc in self._frozen.items():
+            label = self._labels.get(sensor_col, sensor_col.removesuffix("_temp"))
+            lines.append(f"  {label:<22} [bold red]FROZEN[/] [dim]{desc} — ignored[/]")
         self.update("\n".join(lines))
 
 
@@ -315,8 +321,19 @@ class EffectorPanel(Static):
             target = self._command_targets.get(name)
 
             override = self._overrides.get(name)
+            delay = d.get("delay_steps", 0)
+            dur = d.get("duration_steps")
             if mode == "off":
                 line = f"  {short_name:<18} [dim]OFF[/]"
+            elif d.get("command_mode", mode) == "off" and delay:
+                # Planned for later: commanded off this cycle (receding horizon re-plans).
+                plan = [mode.upper()]
+                if d.get("target") is not None:  # the plan's target (command_targets holds the off setpoint)
+                    plan.append(f"({d['target']:.0f}{UNIT_SYMBOL})")
+                plan.append(f"in {delay * 5}m")
+                if dur is not None:
+                    plan.append(f"for {dur * 5}m")
+                line = f"  {short_name:<18} [dim]OFF now → {' '.join(plan)}[/]"
             else:
                 # Distinguish active heating/cooling from mode-only (standby).
                 # A thermostat in "heat" mode with setpoint below room temp isn't
@@ -338,8 +355,6 @@ class EffectorPanel(Static):
                 parts = [display_mode]
                 if target is not None:
                     parts.append(f"({target:.0f}{UNIT_SYMBOL})")
-                delay = d.get("delay_steps", 0)
-                dur = d.get("duration_steps")
                 if delay:
                     parts.append(f"delay:{delay * 5}m")
                 if dur is not None:

@@ -484,3 +484,29 @@ class TestButtonStates:
         button_start = body.rfind("<button", 0, force_idx)
         button_tag = body[button_start:force_idx + len("Force execute")]
         assert "disabled" not in button_tag
+
+
+# ── Frozen sensors and planned delays ─────────────────────────────────────
+
+
+class TestFrozenAndDelayed:
+    def test_frozen_room_flagged_without_reading(self) -> None:
+        from weatherstat.sensor_health import FrozenSensor
+
+        snap = _make_snapshot(
+            temps={"thermostat_upstairs_temp": 68.5},
+            frozen={"kitchen_temp": FrozenSensor("kitchen_temp", 69.8, "2026-11-10T04:55:00.000Z", 23.0, 3.0)},
+        )
+        body = _html(snap)
+        assert "sensor frozen" in body and "69.8" in body
+        assert body.count("<div class='bar'") == 1  # no comfort bar for the frozen room
+        assert "name='sensor' value='kitchen_temp'" not in body  # nothing to bump against
+
+    def test_delayed_effector_shows_off_now(self) -> None:
+        snap = _make_snapshot(effectors=(
+            EffectorView(name="mini_split_bedroom", mode="cool", target=73.3, delay_steps=12, duration_steps=24,
+                         override=None, command_mode="off"),
+        ))
+        body = _html(snap)
+        assert "<span class='mode off'>OFF</span>" in body
+        assert "→ COOL 73.3° in 60m" in body

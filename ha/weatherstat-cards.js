@@ -27,6 +27,7 @@ const STATUS_COLOR = {
   ok: "var(--weatherstat-ok-color, var(--success-color, #3a9d4d))",
   warm: "var(--weatherstat-warm-color, #f0a020)",
   hot: "var(--weatherstat-hot-color, var(--error-color, #db4437))",
+  frozen: "var(--disabled-text-color, #9e9e9e)",
 };
 
 const MODE_COLOR = {
@@ -157,7 +158,9 @@ function roomModel(hass, cfg, pending) {
     preferred_hi: band("preferred_hi"),
     acceptable_hi: band("acceptable_hi"),
   };
-  const status = statusFor(feels, bands);
+  // Weatherstat flags a sensor whose reading stopped changing (dead battery): no comfort status.
+  const frozen = available && a.status === "frozen" ? a.frozen || {} : null;
+  const status = frozen ? "frozen" : statusFor(feels, bands);
 
   return {
     room,
@@ -165,6 +168,7 @@ function roomModel(hass, cfg, pending) {
     name: cfg.name || a.name || titleCase(room),
     unit: a.unit || st.attributes.unit_of_measurement || "°",
     available,
+    frozen,
     temp,
     feels,
     offset,
@@ -185,7 +189,7 @@ function roomModel(hass, cfg, pending) {
 
 function barHtml(m, horizon) {
   const b = m.bands;
-  if (b.acceptable_lo === null || m.feels === null) return `<div class="bar empty"></div>`;
+  if (b.acceptable_lo === null || m.feels === null || m.frozen) return `<div class="bar empty"></div>`;
   const pred = num(m.predictions[horizon]);
   const values = [b.acceptable_lo, b.acceptable_hi, m.feels, m.temp];
   if (pred !== null) values.push(pred);
@@ -239,6 +243,7 @@ function roomHtml(m, cfg, compact) {
   const pred = num(m.predictions[horizon]);
   const subParts = [];
   if (!m.available) subParts.push("Weatherstat offline");
+  else if (m.frozen) subParts.push(`sensor frozen${m.frozen.hours ? ` for ${fmtDuration(m.frozen.hours * 60)}` : ""} — ignored`);
   else {
     if (m.status) subParts.push(STATUS_WORD[m.status]);
     if (Math.abs(m.offset) >= 0.2) subParts.push(`feels ${fmt(m.feels)}°`);

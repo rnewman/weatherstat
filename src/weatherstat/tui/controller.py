@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from weatherstat.sensor_health import FrozenSensor
+
 # ── Snapshot data structures ────────────────────────────────────────────────
 
 
@@ -53,6 +55,14 @@ class EffectorView:
     delay_steps: int
     duration_steps: int | None
     override: str | None  # description if a manual override was detected, else None
+    command_mode: str | None = None  # what is commanded now (a delayed plan → "off"); None = derive
+
+    @property
+    def commanded(self) -> str:
+        """The mode the device is commanded to this cycle (the plan's, unless delayed)."""
+        if self.command_mode is not None:
+            return self.command_mode
+        return self.mode if self.mode != "off" and self.delay_steps == 0 else "off"
 
 
 @dataclass(frozen=True)
@@ -109,6 +119,7 @@ class StatusSnapshot:
     warnings: list[dict]
     ha_error: str | None  # None when HA is reachable; one-line error otherwise
     overlays: dict[str, OverlayView] = field(default_factory=dict)  # sensor_col → active overlay
+    frozen: dict[str, FrozenSensor] = field(default_factory=dict)  # sensor_col → frozen reading (not in temps)
 
 
 @dataclass(frozen=True)
@@ -185,6 +196,7 @@ class TUIController:
         self._solar_plane_gains: dict[str, dict[str, float]] = {}
         self._last_ha_error: str | None = None
         self._overlay_listeners: list[Callable[[], None]] = []
+        self._frozen_seen: set[str] = set()  # frozen sensors already logged
 
         # Cached snapshot, refreshed by build_snapshot()
         self._latest_snapshot: StatusSnapshot | None = None
@@ -311,7 +323,7 @@ class TUIController:
             PREDICTION_SENSORS,
             SENSOR_LABELS,
             TIMEZONE,
-            UNIT_SYMBOL,  # noqa: F401
+            UNIT_SYMBOL,
         )
         from weatherstat.control import (
             apply_comfort_profile,
@@ -431,6 +443,26 @@ class TUIController:
                 with contextlib.suppress(ValueError, TypeError):
                     temps[sensor_col] = float(val)
 
+        # Frozen sensors: a dead device's repeated last value is not a temperature.
+        # Shown as frozen, not as a reading (control ignores them the same way).
+        frozen: dict[str, FrozenSensor] = {}
+        try:
+            from weatherstat.sensor_health import frozen_sensors_now
+
+            frozen = frozen_sensors_now()
+        except Exception as e:
+            self._log(f"[sensors] [red]Frozen-sensor check failed: {e}[/]")
+        for col in frozen:
+            temps.pop(col, None)
+        with self._lock:
+            newly = sorted(set(frozen) - self._frozen_seen)
+            recovered = sorted(self._frozen_seen - set(frozen))
+            self._frozen_seen = set(frozen)
+        for col in newly:
+            self._log(f"[sensors] [bold red]{col} frozen[/] at {frozen[col].describe(UNIT_SYMBOL)} — ignored")
+        for col in recovered:
+            self._log(f"[sensors] [green]{col} reading again[/]")
+
         # Comfort bounds at the current house-local hour — the same clock control.py
         # and apply_overlays use. The host clock is wrong when it runs in UTC (a
         # container, a server): the display would read a different hour than the
@@ -498,6 +530,7 @@ class TUIController:
                             delay_steps=ed.delay_steps,
                             duration_steps=ed.duration_steps,
                             override=override_map.get(ed.name),
+                            command_mode=ed.command_mode,
                         )
                         for ed in decision.effectors
                     )
@@ -574,6 +607,7 @@ class TUIController:
             warnings=warnings,
             ha_error=ha_error,
             overlays=overlays_view,
+            frozen=frozen,
         )
         with self._lock:
             self._latest_snapshot = snap

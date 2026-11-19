@@ -275,13 +275,28 @@ class EffectorDecision:
     - trajectory: mode="heating"/"off", delay_steps, duration_steps
     - regulating: mode="heat"/"cool"/"off", target (comfort setpoint)
     - binary: mode="off"/"low"/"high"/etc.
+
+    Every type carries delay_steps/duration_steps: the decision is a *plan*
+    ("cool @ 73 in 60m for 2h"). What is commanded now is ``command_mode``:
+    the receding horizon re-plans every cycle, so a delayed start means "not
+    now" — the device is commanded off until a later cycle starts it.
     """
 
     name: str  # "thermostat_upstairs", "blower_office", "mini_split_bedroom"
     mode: str = "off"  # "off", "heating", "heat", "cool", "low", "high"
     target: float | None = None  # regulating effectors: comfort setpoint (°F)
-    delay_steps: int = 0  # trajectory effectors: 5-min steps before activation
-    duration_steps: int | None = None  # trajectory effectors: steps of activation (None = full horizon)
+    delay_steps: int = 0  # 5-min steps before activation
+    duration_steps: int | None = None  # steps of activation (None = full horizon)
+
+    @property
+    def active_now(self) -> bool:
+        """The plan has this effector on from now (not off, not delayed)."""
+        return self.mode != "off" and self.delay_steps == 0
+
+    @property
+    def command_mode(self) -> str:
+        """The mode to command this cycle: the plan's mode if active now, else "off"."""
+        return self.mode if self.active_now else "off"
 
 
 @dataclass(frozen=True)

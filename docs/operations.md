@@ -39,6 +39,21 @@ Exits 0 if the latest snapshot is <10 minutes old, 1 if stale.
 The durable collector runs this automatically and shows macOS notifications
 when data goes stale.
 
+### Frozen sensors
+
+```bash
+just debug frozen      # per-sensor limits, sensors frozen now, frozen spans in history
+```
+
+A dead battery device often keeps reporting its last value instead of going
+unavailable. A constrained (or outdoor) sensor whose reading has not changed for
+longer than `max(3h, 2 × the 99.9th-percentile flat run in its own history)` is
+treated as missing: control does not score it, the TUI/web/HA cards show it as
+frozen, a safety alert goes to HA (re-sent every 12h, dismissed when it reads
+again), and sysid excludes the span (masked at load; snapshots.db keeps the raw
+readings). Tune with `defaults.frozen_floor_hours` / `defaults.frozen_multiplier`.
+Battery-level `health:` checks warn before it gets that far.
+
 ### Inspecting the database
 
 ```bash
@@ -118,6 +133,8 @@ detection (respects manual changes for 30 minutes).
 - Setpoints clamped to [62, 78]°F (absolute bounds, configurable)
 - 3-minute minimum hold time between thermostat setpoint changes
 - Per-device mode hold window (e.g., 10pm–7am via `mode_hold_window`): no mini-split mode changes during quiet hours, only target temperature adjustments
+- Planned delays are honoured: a plan that starts an effector later ("cool in 60m") commands it off now; the next cycles re-plan. In quiet hours the held mode only gets start-now options, and a delayed start that would land in quiet hours is not offered
+- Frozen sensors (see above) are dropped from scoring rather than trusted
 - Refuses to execute if data is >15 minutes stale
 - Cold-sensor override: forces immediate trajectory-effector activation when any sensor is significantly below comfort minimum
 - Dry-run is always the default

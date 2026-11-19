@@ -152,20 +152,22 @@ def log_decision(
     wind_speed = _safe_float(latest, "wind_speed")
     weather_condition = str(latest.get("weather_condition", "")) if hasattr(latest, "get") else ""
 
-    # Backward compat: fill old columns from new data
-    up_heating = any(e.mode != "off" for e in decision.effectors if e.name == "thermostat_upstairs")
-    dn_heating = any(e.mode != "off" for e in decision.effectors if e.name == "thermostat_downstairs")
+    # Backward compat: fill old columns from new data. Legacy columns record what
+    # was commanded this cycle (a delayed start was commanded off); the plan,
+    # delays included, is in effector_decisions.
+    up_heating = any(e.active_now for e in decision.effectors if e.name == "thermostat_upstairs")
+    dn_heating = any(e.active_now for e in decision.effectors if e.name == "thermostat_downstairs")
     up_setpoint = decision.command_targets.get("thermostat_upstairs", 0.0)
     dn_setpoint = decision.command_targets.get("thermostat_downstairs", 0.0)
 
     # Backward compat: serialize blower/mini-split decisions from unified effectors
     blowers_json = json.dumps([
-        {"name": e.name.removeprefix("blower_"), "mode": e.mode}
+        {"name": e.name.removeprefix("blower_"), "mode": e.command_mode}
         for e in decision.effectors
         if EFFECTOR_MAP.get(e.name) and EFFECTOR_MAP[e.name].control_type == "binary"
     ])
     mini_splits_json = json.dumps([
-        {"name": e.name.removeprefix("mini_split_"), "mode": e.mode, "target": e.target}
+        {"name": e.name.removeprefix("mini_split_"), "mode": e.command_mode, "target": e.target if e.active_now else None}
         for e in decision.effectors
         if EFFECTOR_MAP.get(e.name) and EFFECTOR_MAP[e.name].control_type == "regulating"
     ])
@@ -175,6 +177,7 @@ def log_decision(
         {
             "name": e.name, "mode": e.mode, "target": e.target,
             "delay_steps": e.delay_steps, "duration_steps": e.duration_steps,
+            "command_mode": e.command_mode,  # what was sent this cycle (delayed → off)
         }
         for e in decision.effectors
     ])

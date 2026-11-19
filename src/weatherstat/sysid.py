@@ -1328,7 +1328,21 @@ def load_snapshots_timed() -> tuple[pd.DataFrame, float]:
     df = load_collector_snapshots()
     seconds = time.monotonic() - t0
     print(f"  {len(df)} snapshots loaded in {seconds:.1f}s")
+    _print_frozen_spans(df)
     return df, seconds
+
+
+def _print_frozen_spans(df: pd.DataFrame) -> None:
+    """Report the frozen-sensor spans the load masked (sensor_health.quarantine_frozen)."""
+    from weatherstat.sensor_health import ATTR_SPANS, summarize_spans
+
+    spans = df.attrs.get(ATTR_SPANS) or []
+    if not spans:
+        return
+    hours = sum(s.hours for s in spans)
+    print(f"  Excluding {len(spans)} frozen-sensor span(s), {hours:.0f} sensor-hours (raw readings kept):")
+    for line in summarize_spans(spans, UNIT_SYMBOL):
+        print(f"    {line}")
 
 
 def fit_sysid(

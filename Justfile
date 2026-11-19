@@ -76,7 +76,7 @@ comfort *ARGS:
 ha-cards *ARGS:
     uv run --with websockets python ./scripts/deploy_ha_cards.py {{ARGS}}
 
-# Debug inspector (subcommands: temps, gains, taus, decisions, opportunities, overlays, snapshots, comfort; --bundle <dir> for bundles)
+# Debug inspector (subcommands: temps, gains, taus, decisions, opportunities, overlays, snapshots, frozen, comfort; --bundle <dir> for bundles)
 debug *ARGS:
     uv run python ./scripts/debug_state.py {{ARGS}}
 
