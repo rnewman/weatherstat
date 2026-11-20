@@ -85,6 +85,7 @@ def bridge():
         source_entities={"bedroom_temp": "sensor.climate_bedroom_air_temperature"},
         load_overlays=lambda: dict(overlays),
         timer_factory=ManualTimer,
+        regulating=(),  # regulation inputs: tests/test_regulation_publisher.py
     )
     client = FakeClient()
     b.attach(client)

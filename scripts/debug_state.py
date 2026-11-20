@@ -16,6 +16,7 @@ Usage:
     python scripts/debug_state.py comfort [SENSOR]       # comfort schedules (optionally filtered)
     python scripts/debug_state.py why [EFFECTOR]          # explain why active effectors are on
     python scripts/debug_state.py advisory               # advisory states + compound tau effects
+    python scripts/debug_state.py regulation             # regulation inputs: weights, response, live V vs unit, history
 
     --bundle <dir>   Point at a debug bundle instead of the live data directory.
                      Example: python scripts/debug_state.py --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 temps
@@ -686,6 +687,148 @@ def cmd_frozen() -> None:
         print(f"  {line}")
 
 
+def cmd_regulation(n_history: int = 5) -> None:
+    """Virtual regulation sensors (PLAN-41): per regulating effector, weights (adopted vs fresh),
+    learned response curve, live V vs the unit's own reading, dropped members, adoption history."""
+    from weatherstat._data_dir import load_env_file
+
+    load_env_file(_data_dir / ".env")  # HA_URL / HA_TOKEN for the live readings (env vars win)
+    from weatherstat.config import EFFECTOR_MAP, UNIT_SYMBOL, delta_temp
+    from weatherstat.regulation import (
+        MIN_COVERAGE,
+        REGULATION_HISTORY_FILE,
+        WEIGHT_TOLERANCE,
+        compute_weights,
+        load_adopted,
+        regulating_effectors,
+        weights_differ,
+    )
+    from weatherstat.regulation_publisher import (
+        FOLLOW_TOLERANCE_F,
+        default_lock,
+        evaluate_unit,
+        fetch_ha_states,
+        member_values,
+        unit_reading,
+        weights_text,
+    )
+    from weatherstat.yaml_config import load_config
+
+    effectors = regulating_effectors()
+    if not effectors:
+        print("No regulating effectors configured.")
+        return
+    cfg = load_config()
+    p = _paths()
+    params = _load_json(p["thermal_params"]) or {}
+    responses = params.get("regulation_responses") or {}
+
+    try:
+        from weatherstat.simulator import load_sim_params
+
+        gains = load_sim_params().gains
+    except Exception as e:  # noqa: BLE001
+        print(f"(could not load sim params: {e})")
+        gains = {}
+    adopted = load_adopted()
+
+    # Live readings: one /api/states call, frozen detection as the publisher does it.
+    states: dict[str, dict] | None = None
+    try:
+        states = fetch_ha_states()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ No live HA readings: {e}\n")
+    values: dict[str, float] = {}
+    unavailable: dict[str, str] = {}
+    if states is not None:
+        cols = sorted(set(cfg.prediction_sensors) | {s for e in adopted.values() for s in e.get("weights", {})})
+        values, unavailable = member_values(states, cols)
+        try:
+            from weatherstat.sensor_health import frozen_sensors_now
+
+            for col, fz in frozen_sensors_now(live_values=values).items():
+                unavailable.setdefault(col, f"frozen ({fz.describe(UNIT_SYMBOL)})")
+                values.pop(col, None)
+        except Exception as e:  # noqa: BLE001
+            print(f"(frozen-sensor check failed: {e})")
+
+    lock = default_lock()
+    holder = lock.holder() if lock.path.exists() else None
+    live_set = set(cfg.regulation_live)
+    print(f"min coverage {MIN_COVERAGE:.0%} · weight tolerance {WEIGHT_TOLERANCE} · "
+          f"publisher lock: {f'pid {holder}' if holder else 'not held'}")
+
+    for name in effectors:
+        print(f"\n{name}  ({EFFECTOR_MAP[name].entity_id}){'  [live: follows-V check on]' if name in live_set else ''}")
+        entry = adopted.get(name)
+        fresh = compute_weights(gains, name)
+        if entry:
+            print(f"  adopted   ({_ago(entry.get('adopted_at'))}): {weights_text(entry['weights'])}")
+        else:
+            print("  adopted:  none (publisher falls back to fresh weights)")
+        if fresh:
+            if entry:
+                differs = weights_differ(entry["weights"], fresh)
+                verdict = "would be ADOPTED at next refit" if differs else f"within tolerance {WEIGHT_TOLERANCE}, kept"
+            else:
+                verdict = "would be adopted"
+            print(f"  fresh:    {weights_text(fresh)}  → {verdict}")
+        else:
+            print("  fresh:    no positive gains on constrained sensors")
+
+        r = responses.get(name)
+        if r:
+            modes = r.get("modes") or {}
+            curves = [*modes.items(), *([("pooled", r)] if len(modes) < 2 else [])]
+            for label, c in curves:
+                brier = c.get("brier")
+                half_on = c["offset"] - c["band"] / 2
+                where = f"{abs(half_on):.2f}° {'past' if half_on >= 0 else 'short of'} its setpoint"
+                print(f"  response ({label}): half-on {where}, ramp {c['band']:.2f}° wide"
+                      f"  ({c.get('n_rows', 0)} rows, brier {brier if brier is not None else '?'})")
+        else:
+            print(f"  response: not fitted (regulation_responses absent) — configured band "
+                  f"{EFFECTOR_MAP[name].proportional_band}")
+
+        if states is None:
+            continue
+        weights = dict(entry["weights"]) if entry else fresh
+        u = evaluate_unit(name, weights, entry.get("adopted_at") if entry else None, values, unavailable)
+        reading, mode = unit_reading(states, name)
+        attrs = states.get(EFFECTOR_MAP[name].entity_id, {}).get("attributes", {})
+        target, action = attrs.get("temperature"), attrs.get("hvac_action")
+        if u.value is None:
+            print(f"  V now:    UNAVAILABLE — {u.reason}")
+        else:
+            cov = "" if u.coverage >= 0.999 else f"  (coverage {u.coverage:.0%})"
+            print(f"  V now:    {u.value:.2f}{UNIT_SYMBOL}{cov}")
+            for s, w in sorted(u.used.items(), key=lambda kv: -kv[1]):
+                print(f"            {s:<30} {u.members.get(s, float('nan')):6.2f}  w {w:.3f}")
+        for s, why in u.dropped.items():
+            print(f"  dropped:  {s}: {why}")
+        if reading is not None:
+            diff = f"  (unit − V {reading - u.value:+.2f}; unit rounds to 0.5°C)" if u.value is not None else ""
+            print(f"  unit:     reads {reading:.1f}{UNIT_SYMBOL}{diff}  mode {mode}  target {target}  action {action}")
+            if u.value is not None and name in live_set:
+                tol = delta_temp(FOLLOW_TOLERANCE_F)
+                ok = abs(reading - u.value) <= tol
+                print(f"  follows:  {'yes' if ok else 'NO'} (tolerance {tol:.1f}{UNIT_SYMBOL}; alert after 10 min)")
+        else:
+            print("  unit:     no current_temperature")
+
+    if REGULATION_HISTORY_FILE.exists():
+        lines = REGULATION_HISTORY_FILE.read_text().splitlines()[-n_history:]
+        print(f"\nAdoption history (last {len(lines)} of regulation_history.jsonl):")
+        for line in lines:
+            try:
+                h = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            print(f"  {h.get('ts', '?')[:16]}  {h.get('effector')}: {weights_text(h.get('weights', {}))}")
+    else:
+        print("\nNo adoption history yet (regulation_history.jsonl).")
+
+
 def cmd_why(effector_filter: str | None = None) -> None:
     """Explain why each active effector is on: gains, affected sensors, current temps, predictions."""
     p = _paths()
@@ -1205,6 +1348,7 @@ COMMANDS = {
     "comfort": lambda args: cmd_comfort(args[0] if args else None),
     "why": lambda args: cmd_why(args[0] if args else None),
     "advisory": lambda args: cmd_advisory(),
+    "regulation": lambda args: cmd_regulation(int(args[0]) if args else 5),
 }
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -565,17 +565,19 @@ def compute_comfort_cost_by_sensor(
 def compute_energy_cost(
     scenario: Scenario,
     current_temps: dict[str, float] | None = None,
+    regulating_activity: dict[str, float] | None = None,
 ) -> float:
     """Per-effector energy penalty from config.
 
     Used as tiebreaker when comfort cost is equal — prefer less energy usage.
     Trajectory cost is proportional to heating duration within the horizon.
-    Regulating cost is proportional to expected activity (target vs room temp).
+    Regulating cost is proportional to the unit's simulated mean |activity|
+    (``regulating_activity``, from ``predict(activity_out=...)``); without it, a
+    flat half-activity estimate over the active window.
     Binary cost is a per-mode lookup.
     """
     cost = 0.0
     max_h = max(CONTROL_HORIZONS)
-    temps = current_temps or {}
 
     for ed in scenario.effectors.values():
         eff_cfg = EFFECTOR_MAP.get(ed.name)
@@ -589,17 +591,12 @@ def compute_energy_cost(
             cost += ec * dur / max_h
 
         elif eff_cfg.control_type == "regulating":
-            p_band = eff_cfg.proportional_band
-            room_temp = temps.get(eff_cfg.temp_col) if eff_cfg.temp_col else None
-            if room_temp is not None and ed.target is not None:
-                delta = max(0.0, ed.target - room_temp) if ed.mode == "heat" else max(0.0, room_temp - ed.target)
-                avg_activity = min(1.0, delta / p_band)
-            else:
-                avg_activity = 0.5
-            dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
-            active_fraction = dur / max_h
             assert isinstance(ec, int | float)
-            cost += ec * avg_activity * active_fraction
+            if regulating_activity is not None:
+                cost += ec * regulating_activity.get(ed.name, 0.0)
+            else:
+                dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
+                cost += ec * 0.5 * dur / max_h
 
         elif eff_cfg.control_type == "binary":
             dur = ed.duration_steps if ed.duration_steps is not None else (max_h - ed.delay_steps)
@@ -727,8 +724,13 @@ def _batch_comfort_cost(
 def _batch_energy_cost(
     scenarios: list[Scenario],
     current_temps: dict[str, float],
+    activity: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Vectorized energy cost for all scenarios. Returns (n_scenarios,) array."""
+    """Vectorized energy cost for all scenarios. Returns (n_scenarios,) array.
+
+    ``activity``: regulating effector -> (n_scenarios, horizon) simulated activity
+    from ``predict(activity_out=...)``; regulating energy is ec × mean |activity|.
+    """
     n = len(scenarios)
     max_h = max(CONTROL_HORIZONS)
     costs = np.zeros(n)
@@ -773,18 +775,11 @@ def _batch_energy_cost(
 
         elif eff_cfg.control_type == "regulating":
             assert isinstance(ec, (int, float))
-            p_band = eff_cfg.proportional_band
-            room_temp = current_temps.get(eff_cfg.temp_col) if eff_cfg.temp_col else None
-            if room_temp is not None:
-                targets = np.array([d.target if d.target is not None else room_temp for d in decisions])
-                heat_modes = np.array([d.mode == "heat" for d in decisions])
-                delta = np.where(heat_modes,
-                                 np.maximum(0.0, targets - room_temp),
-                                 np.maximum(0.0, room_temp - targets))
-                activity = np.minimum(1.0, delta / p_band)
+            act = (activity or {}).get(eff_cfg.name)
+            if act is not None:
+                costs += _regulating_energy(eff_cfg.name, act)
             else:
-                activity = np.full(n, 0.5)
-            costs += np.where(active, ec * activity * active_frac, 0.0)
+                costs += np.where(active, ec * 0.5 * active_frac, 0.0)
 
         elif eff_cfg.control_type == "binary":
             assert isinstance(ec, dict)
@@ -865,13 +860,23 @@ def _cautious_setpoint(current_temp: float, heating: bool, comfort_min: float = 
 # ── Scenario generation & sweep ──────────────────────────────────────────
 
 
-def _dedup_targets(targets: list[float], tol: float = 0.5) -> list[float]:
-    """Deduplicate sorted targets within tolerance, keeping one per cluster."""
-    result: list[float] = []
-    for t in sorted(set(targets)):
-        if not result or abs(t - result[-1]) > tol:
-            result.append(t)
-    return result
+# Where a delegated unit may be told to hold its input V: the bottom, middle and top of
+# the gain-weighted preferred band. Its own thermostat does the rest, whichever way the
+# house is drifting, and the planner never asks for more than the top of what is
+# preferred. Levels relative to the reading ("V + 0.5") are not offered: re-planned
+# every cycle they move with V, so the unit never reaches its setpoint and never stops
+# itself. A level the unit would not act on within the horizon simulates as off and is
+# folded into it after the marginal simulation (exact, no heuristic pruning here). Each
+# extra level adds ~6 options (delay × duration) per mode and unit.
+_REGULATING_BAND_POINTS = (0.0, 0.5, 1.0)
+_REGULATING_STEP = 0.5  # unit setpoint resolution (HA target_temp_step)
+# Durations for delegated units: no 1-hour cap — the unit already backs off as its
+# input nears the target, so a short cap mostly duplicates a lower setpoint.
+_REGULATING_DURATIONS = tuple(d for d in TRAJECTORY_DURATIONS if d > 12)
+
+
+def _round_setpoint(x: float) -> float:
+    return round(round(x / _REGULATING_STEP) * _REGULATING_STEP, 1)
 
 
 def _regulating_sweep_options(
@@ -881,101 +886,53 @@ def _regulating_sweep_options(
     gains: dict[tuple[str, str], tuple[float, float]] | None = None,
     prev_state: ControlState | None = None,
     current_temps: dict[str, float] | None = None,
-    current_mrt_offsets: dict[str, float] | None = None,
     hold_release_sensors: set[str] | None = None,
+    regulation: object | None = None,
 ) -> list[EffectorDecision]:
-    """Generate sweep options for a regulating effector from all affected sensors.
+    """Sweep options for a delegated (regulating) effector, on the scale of what it reads.
 
-    Instead of deriving mode/target from one sensor, we:
-    1. Find all constrained sensors this effector has meaningful sysid gain on.
-    2. Collect their preferred temps (pref_lo for heat targets, pref_hi for cool).
-    3. **Adjust targets for MRT**: the user's comfort preference is an operative
-       (perceived) temperature, but the effector target is an air temperature.
-       When cold walls lower perceived temp, the effector must target a higher
-       air temp to achieve the desired perceived comfort:
-       ``target_air = preferred_operative + mrt_offset``.
-       Uses current-moment MRT offset (not per-horizon) because the target is
-       set immediately and held for the sweep duration.
-    4. Generate off + heat@each_pref_lo + cool@each_pref_hi.
-    5. Idle suppression prunes options where the effector would be inactive
-       (room already past target by more than the proportional band).
-    6. Mode hold window locks to previous mode during quiet hours. The held
-       mode's targets are exempt from idle suppression, so the target still
-       follows comfort (heat @ a low target idles the unit without a mode
-       change). Held options all start now (delay 0): a delayed start is
-       commanded as off until it begins, which is a mode change; for the same
-       reason, outside the window a delayed start that would land inside it
-       is not offered (it would never begin). An active
-       comfort overlay on any sensor this effector affects lifts the hold:
-       someone is awake and asking, which is what the quiet hours exist to
-       protect.
+    The unit regulates on its virtual input V = Σ wₛ·Tₛ (regulation.py), so a
+    target is a point on V's scale, not any one room's temperature:
+
+    1. V now, from the adopted weights (``regulation``) or, without a model,
+       weights computed from ``gains`` over the scheduled sensors.
+    2. Hold levels: the bottom, middle and top of the gain-weighted preferred
+       band [Σ wₛ·pref_loₛ, Σ wₛ·pref_hiₛ]. They are absolute, anchored in
+       comfort and not in where V happens to be: a level below V in heat mode
+       is a floor (idle now, catches the fall), one above V heats up to it and
+       stops there. Each level becomes the setpoint that makes this unit hold
+       it (``ResponseCurve.setpoint_for``, from the fit for that mode: a unit
+       that runs on past its setpoint is told less), rounded to the unit's
+       0.5° step. No MRT adjustment: the
+       scorer applies MRT to predictions.
+    3. off + mode × setpoint × delay × duration. No idle pruning: after the
+       marginal simulation, options whose activity traces match collapse into
+       one, and an all-idle option into off (``_dedupe_regulating``).
+    4. Mode hold window locks to previous mode during quiet hours. Held
+       options all start now (delay 0): a delayed start is commanded as off
+       until it begins, which is a mode change; for the same reason, outside
+       the window a delayed start that would land inside it is not offered (it
+       would never begin). An active comfort overlay on any sensor this
+       effector affects lifts the hold: someone is awake and asking, which is
+       what the quiet hours exist to protect.
 
     The trajectory sweep scores every surviving option across ALL sensors,
     so the optimizer picks whichever mode/target minimizes total comfort cost.
-
-    Args:
-        eff: EffectorConfig for the regulating effector.
-        schedules: Comfort schedules (uncorrected user-configured values).
-        base_hour: Current hour of day (0-23).
-        gains: Sysid gains keyed by (effector, sensor).
-        prev_state: Previous control state for mode hold.
-        current_temps: Current sensor temperatures.
-        current_mrt_offsets: Per-sensor MRT offsets at current moment from
-            ``compute_current_mrt_offsets``.  Positive when cold (need higher
-            air temp for same perceived comfort).
-        hold_release_sensors: Sensor columns with an active comfort overlay.
-            If this effector affects any of them, the mode hold is lifted.
     """
     from weatherstat.config import EffectorConfig
+    from weatherstat.regulation import RegulationModel, compute_weights, virtual_reading
 
     assert isinstance(eff, EffectorConfig)
     options: list[EffectorDecision] = [EffectorDecision(eff.name)]
     temps = current_temps or {}
 
-    # ── Find constrained sensors this effector affects ──
-    schedule_sensors = {s.sensor for s in schedules}
-    affected_sensors: list[str] = []
-    if gains:
-        for (eff_name, sensor_name), (gain, _lag) in gains.items():
-            if eff_name == eff.name and gain != 0 and sensor_name in schedule_sensors:
-                affected_sensors.append(sensor_name)
-
-    # ── Collect preferred temps from all affected sensors ──
-    # Targets are air temperatures that produce the desired operative (perceived)
-    # comfort.  MRT offset bridges the gap: target_air = preferred + mrt_offset.
-    heat_targets: list[float] = []  # pref_lo + mrt_offset values
-    cool_targets: list[float] = []  # pref_hi + mrt_offset values
-    for sensor_col in affected_sensors:
-        mrt_adj = (current_mrt_offsets or {}).get(sensor_col, 0.0)
-        for sched in schedules:
-            if sched.sensor == sensor_col:
-                comfort = sched.comfort_at(base_hour)
-                if comfort is not None:
-                    heat_targets.append(comfort.preferred_lo + mrt_adj)
-                    cool_targets.append(comfort.preferred_hi + mrt_adj)
-                break
-
-    if not heat_targets and not cool_targets:
-        return options
-
-    heat_targets = _dedup_targets(heat_targets)
-    cool_targets = _dedup_targets(cool_targets)
-
-    # ── Reference temp for idle suppression: the reading the unit regulates on ──
-    # The unit compares its target to its own thermistor (temp_col), not to any
-    # room sensor. Fall back to the highest-gain sensor only when that reading is
-    # missing (bundles, tests): picking a room by gain is fragile — two rooms can
-    # tie (living room split: piano 0.809 vs living room 0.806) and a warm
-    # neighbour then prunes every heat option for a cold room.
-    ref_temp: float | None = temps.get(eff.temp_col) if eff.temp_col else None
-    if ref_temp is None and gains:
-        best_gain = 0.0
-        for (eff_name, sensor_name), (gain, _lag) in gains.items():
-            if eff_name == eff.name and abs(gain) > best_gain and sensor_name in temps:
-                best_gain = abs(gain)
-                ref_temp = temps[sensor_name]
-
-    p_band = eff.proportional_band
+    schedule_sensors = [s.sensor for s in schedules]
+    if isinstance(regulation, RegulationModel):
+        weights = {s: w for s, w in regulation.weights.items() if s in schedule_sensors}
+    else:
+        weights = compute_weights(gains or {}, eff.name, schedule_sensors)
+    reading = virtual_reading(weights, temps)
+    affected_sensors = sorted(weights)
 
     # ── Mode hold (quiet hours): keep the current mode, unless a comfort request lifts it ──
     held_mode: str | None = None
@@ -987,6 +944,35 @@ def _regulating_sweep_options(
         else:
             held_mode = prev_state.modes.get(eff.name, "off")
 
+    if reading.value is None:
+        # Nothing to regulate on (no members with readings): off, or the held setpoint.
+        if held_mode not in (None, "off") and prev_state is not None:
+            return [EffectorDecision(eff.name, mode=held_mode, target=prev_state.setpoints.get(eff.name, 0.0))]
+        return options
+    # ── Hold levels on V's scale, and the setpoints that hold them ──
+    pref_lo = pref_hi = None
+    num_lo = num_hi = den = 0.0
+    for sched in schedules:
+        w = reading.used.get(sched.sensor)
+        comfort = sched.comfort_at(base_hour) if w else None
+        if comfort is None:
+            continue
+        num_lo += w * comfort.preferred_lo
+        num_hi += w * comfort.preferred_hi
+        den += w
+    if den > 0:
+        pref_lo, pref_hi = num_lo / den, num_hi / den
+    lo_limit, hi_limit = abs_temp(60.0), abs_temp(85.0)
+    response = regulation.response if isinstance(regulation, RegulationModel) else None
+    heat_targets: set[float] = set()
+    cool_targets: set[float] = set()
+    if pref_lo is not None and pref_hi is not None:
+        for frac in _REGULATING_BAND_POINTS:
+            hold = pref_lo + frac * (pref_hi - pref_lo)
+            for sign, mode, targets in ((1.0, "heat", heat_targets), (-1.0, "cool", cool_targets)):
+                setpoint = response.for_mode(mode).setpoint_for(hold, sign) if response is not None else hold
+                targets.add(min(max(_round_setpoint(setpoint), lo_limit), hi_limit))
+
     def _starts_in_hold(delay: int) -> bool:
         """A delayed start that lands in quiet hours would never happen: the unit is
         commanded off until then, and the hold keeps it off."""
@@ -997,22 +983,15 @@ def _regulating_sweep_options(
     # ── Generate options per supported mode with delay × duration ──
     max_horizon = max(CONTROL_HORIZONS)
     for mode in eff.supported_modes:
-        targets = heat_targets if mode == "heat" else cool_targets if mode == "cool" else []
+        targets = sorted(heat_targets) if mode == "heat" else sorted(cool_targets) if mode == "cool" else []
         for target in targets:
-            # Idle suppression: skip if effector would be idle. Not for the held mode:
-            # there an "idle" target is exactly how the unit backs off without a mode change.
-            if ref_temp is not None and mode != held_mode:
-                if mode == "heat" and ref_temp > target + p_band:
-                    continue
-                if mode == "cool" and ref_temp < target - p_band:
-                    continue
             for delay in TRAJECTORY_DELAYS:
                 if delay >= max_horizon or (mode != held_mode and _starts_in_hold(delay)):
                     continue
-                for duration in TRAJECTORY_DURATIONS:
+                for duration in _REGULATING_DURATIONS:
                     effective_duration = min(duration, max_horizon - delay)
                     options.append(EffectorDecision(
-                        eff.name, mode=mode, target=round(target, 1),
+                        eff.name, mode=mode, target=target,
                         delay_steps=delay, duration_steps=effective_duration,
                     ))
     # Deduplicate (capping creates duplicates)
@@ -1021,12 +1000,12 @@ def _regulating_sweep_options(
     # Mode hold: lock to current mode during quiet-hours window (no compressor starts/stops).
     # Only options that start now: a delayed start is commanded as "off" until it
     # begins (EffectorDecision.command_mode) — a mode change the hold forbids. The
-    # held mode backs off through its target instead (exempt from idle suppression).
+    # held mode backs off through its target instead.
     if held_mode is not None and prev_state is not None:
         options = [o for o in options if o.mode == held_mode and o.delay_steps == 0]
         if not options:
-            # Held mode has no comfort-derived targets (e.g. heat held but the schedule only yields
-            # cool targets). Keep the previous setpoint rather than inventing one.
+            # Held mode isn't sweepable (e.g. held "off" is filtered above as option 0
+            # only when off is the held mode). Keep the previous setpoint.
             prev_target = prev_state.setpoints.get(eff.name, 0.0)
             options = [EffectorDecision(eff.name, mode=held_mode, target=prev_target)]
 
@@ -1222,8 +1201,8 @@ def _enumerate_options(
     current_temps: dict[str, float] | None,
     ineligible_effectors: set[str] | None,
     gains: dict[tuple[str, str], tuple[float, float]] | None,
-    current_mrt_offsets: dict[str, float] | None = None,
     hold_release_sensors: set[str] | None = None,
+    regulation: dict[str, object] | None = None,
 ) -> tuple[dict[str, list[EffectorDecision]], list]:
     """Enumerate per-effector sweep options (shared by scenario generation and option groups).
 
@@ -1264,8 +1243,8 @@ def _enumerate_options(
             if schedules is not None:
                 per_effector_options[eff.name] = _regulating_sweep_options(
                     eff, schedules, base_hour, gains, prev_state, current_temps,
-                    current_mrt_offsets=current_mrt_offsets,
                     hold_release_sensors=hold_release_sensors,
+                    regulation=(regulation or {}).get(eff.name),
                 )
             else:
                 per_effector_options[eff.name] = [
@@ -1326,6 +1305,8 @@ class MarginalResult:
     deltas: list[np.ndarray]  # per group: (n_options, n_targets)
     target_names: list[str]
     target_name_index: dict[str, int]
+    activity: list[dict[str, np.ndarray]] = field(default_factory=list)
+    # per group: regulating effector -> (n_options, horizon) signed activity in that option's marginal
 
 
 # Top-K for exact refinement after approximate marginal scoring
@@ -1350,14 +1331,7 @@ def _option_energy_cost(
             assert isinstance(ec, (int, float))
             cost += ec * active_frac
         elif eff_cfg.control_type == "regulating":
-            room_temp = current_temps.get(eff_cfg.temp_col) if eff_cfg.temp_col else None
-            if room_temp is not None and ed.target is not None:
-                delta = max(0.0, ed.target - room_temp) if ed.mode == "heat" else max(0.0, room_temp - ed.target)
-                activity = min(1.0, delta / eff_cfg.proportional_band)
-            else:
-                activity = 0.5
-            assert isinstance(ec, (int, float))
-            cost += ec * activity * active_frac
+            pass  # priced from its simulated activity after the marginals (_dedupe_regulating)
         elif eff_cfg.control_type == "binary":
             assert isinstance(ec, dict)
             cost += ec.get(ed.mode, 0.0) * active_frac
@@ -1481,19 +1455,89 @@ def _compute_marginals(
             scenarios.append(Scenario(effectors=opt))
         group_slices.append((start, len(scenarios)))
 
-    target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, horizons)
+    activity: dict[str, np.ndarray] = {}
+    target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, horizons, activity_out=activity)
     t_base = pred_matrix[0]
 
     deltas: list[np.ndarray] = []
-    for start, end in group_slices:
+    group_activity: list[dict[str, np.ndarray]] = []
+    for group, (start, end) in zip(groups, group_slices, strict=True):
         deltas.append(pred_matrix[start:end] - t_base[None, :])
+        group_activity.append({n: activity[n][start:end] for n in group.names if n in activity})
 
     return MarginalResult(
         t_base=t_base,
         deltas=deltas,
         target_names=list(target_names),
         target_name_index={t: j for j, t in enumerate(target_names)},
+        activity=group_activity,
     )
+
+
+def _regulating_energy(eff_name: str, activity: np.ndarray) -> np.ndarray:
+    """Energy cost of a regulating effector from its simulated activity: ec × mean |activity|."""
+    ec = EFFECTOR_MAP[eff_name].energy_cost
+    assert isinstance(ec, (int, float))
+    return ec * np.abs(activity).mean(axis=-1)
+
+
+def _dedupe_regulating(
+    groups: list[EffectorOptionGroup],
+    marginals: MarginalResult,
+    tol: float = 1e-3,
+) -> tuple[list[EffectorOptionGroup], MarginalResult, int]:
+    """Collapse regulating options that simulate identically; price them by their activity.
+
+    A delegated unit's options are (mode, setpoint, delay, duration), but what the
+    house sees is only its activity trace. Options whose marginal traces match
+    (within ``tol``) are the same plan; one whose trace is all zero is off. Keeps
+    the first of each (option 0, the group's off/held baseline, always survives),
+    so this is exact for the marginal. Regulating energy is set from the trace
+    here (the option list is built before anything is simulated).
+
+    Returns (groups, marginals, n_removed).
+    """
+    new_groups: list[EffectorOptionGroup] = []
+    new_deltas: list[np.ndarray] = []
+    new_activity: list[dict[str, np.ndarray]] = []
+    removed = 0
+    for group, delta, acts in zip(groups, marginals.deltas, marginals.activity, strict=True):
+        reg = [n for n in group.names if n in acts]
+        if not reg:
+            new_groups.append(group)
+            new_deltas.append(delta)
+            new_activity.append(acts)
+            continue
+        traces = np.concatenate([acts[n] for n in reg], axis=1)
+        keys = np.round(traces / tol).astype(np.int64)
+        keep: list[int] = []
+        seen: set[bytes] = set()
+        zero = np.zeros(keys.shape[1], dtype=np.int64).tobytes()
+        for i in range(len(group.options)):
+            k = keys[i].tobytes()
+            if i == 0:
+                seen.add(k)
+                keep.append(i)
+                continue
+            if k in seen or (k == zero and _is_off_option(group.options[0])):
+                continue
+            seen.add(k)
+            keep.append(i)
+        removed += len(group.options) - len(keep)
+        idx = np.array(keep)
+        energy = group.energy_costs[idx].copy()
+        for n in reg:
+            energy = energy + _regulating_energy(n, acts[n][idx])
+        new_groups.append(EffectorOptionGroup(
+            names=group.names, options=tuple(group.options[i] for i in keep), energy_costs=energy,
+        ))
+        new_deltas.append(delta[idx])
+        new_activity.append({n: a[idx] for n, a in acts.items()})
+    return new_groups, replace(marginals, deltas=new_deltas, activity=new_activity), removed
+
+
+def _is_off_option(option: dict[str, EffectorDecision]) -> bool:
+    return all(ed.mode == "off" for ed in option.values())
 
 
 def _score_combinations(
@@ -1825,8 +1869,8 @@ def sweep_scenarios_physics(
     # ── Option enumeration ──
     per_effector_options, dependent_effectors = _enumerate_options(
         schedules, base_hour, prev_state, current_temps, _ineligible, gains=sim_params.gains,
-        current_mrt_offsets=current_mrt_offsets,
         hold_release_sensors=hold_release_sensors,
+        regulation=sim_params.regulation,
     )
 
     # ── Physical constraints: block trajectory effectors at/above comfort max ──
@@ -1882,14 +1926,14 @@ def sweep_scenarios_physics(
     )
 
     def _score_all(
-        scens: list[Scenario], pred: np.ndarray, tnames: list[str],
+        scens: list[Scenario], pred: np.ndarray, tnames: list[str], activity: dict[str, np.ndarray],
     ) -> tuple[np.ndarray, int, float]:
         """Score scenarios (vectorized). Returns (costs, best_idx, best_cost)."""
         tidx = {t: j for j, t in enumerate(tnames)}
         comfort = _batch_comfort_cost(pred, _ComfortSpec.build(
             schedules, base_hour, tidx, mrt_offsets=horizon_mrt_offsets,
         ))
-        energy = _batch_energy_cost(scens, current_temps)
+        energy = _batch_energy_cost(scens, current_temps, activity)
         total = comfort + energy
         best_idx = int(np.argmin(total))
         return total, best_idx, float(total[best_idx])
@@ -1899,6 +1943,10 @@ def sweep_scenarios_physics(
     print(f"\n[control] Superposition sweep: {n_combos_total:,} combos from {n_marginal} marginals...")
 
     marginals = _compute_marginals(sweep_state, groups, sim_params, CONTROL_HORIZONS)
+    groups, marginals, n_same = _dedupe_regulating(groups, marginals)
+    if n_same:
+        n_combos_total = int(np.prod([len(g.options) for g in groups]))
+        print(f"  Regulating options that simulate identically folded: -{n_same} → {n_combos_total:,} combos")
 
     # Build comfort spec with target name index from marginals
     comfort_spec_indexed = _ComfortSpec.build(
@@ -2007,15 +2055,21 @@ def sweep_scenarios_physics(
         scenarios = _cross_with_advisory(top_k_hvac, effective_options, _ADVISORY_MAX_SCENARIOS)
         print(f"  [advisory] {len(top_k_hvac)} HVAC × {n_adv_combos} advisory = {len(scenarios):,} scenarios")
 
-        target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-        all_costs, best_idx, best_cost = _score_all(scenarios, pred_matrix, target_names)
+        exact_activity: dict[str, np.ndarray] = {}
+        target_names, pred_matrix = predict(
+            sweep_state, scenarios, sim_params, CONTROL_HORIZONS, activity_out=exact_activity,
+        )
+        all_costs, best_idx, best_cost = _score_all(scenarios, pred_matrix, target_names, exact_activity)
     else:
         # No advisory: exact refinement of top-K
         scenarios = top_k_hvac
         print(f"  Exact refinement: {len(scenarios)} scenarios")
 
-        target_names, pred_matrix = predict(sweep_state, scenarios, sim_params, CONTROL_HORIZONS)
-        all_costs, best_idx, best_cost = _score_all(scenarios, pred_matrix, target_names)
+        exact_activity = {}
+        target_names, pred_matrix = predict(
+            sweep_state, scenarios, sim_params, CONTROL_HORIZONS, activity_out=exact_activity,
+        )
+        all_costs, best_idx, best_cost = _score_all(scenarios, pred_matrix, target_names, exact_activity)
 
     if best_idx < 0:
         raise RuntimeError("No HVAC scenarios evaluated")
@@ -2075,7 +2129,10 @@ def sweep_scenarios_physics(
     predictions = _pred_dict(pred_matrix, best_idx, target_idx)
     # Recompute comfort/energy split for the winner (cheap: single scenario)
     comfort = compute_comfort_cost(predictions, schedules, base_hour, mrt_offsets=horizon_mrt_offsets)
-    energy = compute_energy_cost(scenario, current_temps)
+    energy = compute_energy_cost(
+        scenario, current_temps,
+        regulating_activity={n: float(np.abs(a[best_idx]).mean()) for n, a in exact_activity.items()},
+    )
     total = comfort + energy
 
     # Build effector decisions and command targets
@@ -2436,6 +2493,28 @@ def _detect_frozen_sensors(current_temps: dict[str, float]) -> dict[str, FrozenS
     except Exception as e:  # noqa: BLE001 — a snapshot DB problem must not stop control
         print(f"  WARNING: frozen-sensor check failed: {e}", file=sys.stderr)
         return {}
+
+
+def _regulation_log(sim_params: object, current_temps: dict[str, float]) -> dict[str, dict] | None:
+    """Each regulating unit's virtual input at decision time, for the decision log.
+
+    ``current_temps`` already excludes frozen sensors, so V here matches what the
+    sweep used (the published value may differ slightly: it is recomputed every
+    minute from live readings).
+    """
+    from weatherstat.regulation import virtual_reading
+    from weatherstat.simulator import SimParams
+
+    assert isinstance(sim_params, SimParams)
+    out: dict[str, dict] = {}
+    for name, model in sim_params.regulation.items():
+        r = virtual_reading(model.weights, current_temps)
+        out[name] = {
+            "v": r.value, "coverage": r.coverage, "adopted_at": model.adopted_at,
+            "offset": model.response.offset, "band": model.response.band,
+            "modes": {m: {"offset": c.offset, "band": c.band} for m, c in model.response.modes.items()},
+        }
+    return out or None
 
 
 def run_control_cycle(live: bool = False) -> ControlDecision | None:
@@ -2962,6 +3041,23 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
                 rationale_map[ed.name] = _state_rationale(ed)
             else:
                 print(f"  {ed.name:<20} {describe_plan(ed)}")
+                model = sim_params.regulation.get(ed.name)
+                if model is not None and ed.target is not None:
+                    from weatherstat.regulation import virtual_reading
+
+                    v = virtual_reading(model.weights, current_temps).value
+                    if v is not None:
+                        sign = 1.0 if ed.mode == "heat" else -1.0
+                        curve = model.response.for_mode(ed.mode)
+                        level = float(curve.level(sign * (ed.target - v)))
+                        hold = curve.holds_at(ed.target, sign)
+                        doing = "idle" if level < 0.005 else f"running at ~{level:.0%}"
+                        if not ed.active_now:
+                            doing = f"would be {doing}"
+                        print(
+                            f"     input V={v:.1f}{UNIT_SYMBOL}; setpoint {ed.target:.1f} holds it near "
+                            f"{hold:.1f} → {doing} now"
+                        )
                 r = _counterfactual_rationale(ed.name)
                 print(r)
                 r_text = r.strip().removeprefix("-> ")
@@ -3131,6 +3227,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         blocked_effectors=blocked_dict,
         cycle_seconds=_cycle_seconds,
         overlays=active_overlay_labels(active_overlays, _now_utc) or None,
+        regulation=_regulation_log(sim_params, current_temps),
     )
     print("  Decision logged")
 

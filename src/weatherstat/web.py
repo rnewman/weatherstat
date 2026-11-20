@@ -307,6 +307,8 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
     else:
         effectors_html = "<section><h2>Effectors</h2><p>(no decision yet)</p></section>"
 
+    regulation_html = _regulation_html(snap)
+
     # ── Forecast ──
     forecast_html = ""
     if snap.forecast:
@@ -388,6 +390,7 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
 {actions}
 {temps_html}
 {effectors_html}
+{regulation_html}
 {forecast_html}
 {env_html}
 {opps_html}
@@ -395,6 +398,50 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
 </body>
 </html>
 """
+
+
+def _regulation_html(snap: StatusSnapshot) -> str:
+    """Per regulating effector: published input V, coverage, members/weights, follows-V status."""
+    from weatherstat.config import UNIT_SYMBOL
+    from weatherstat.regulation_publisher import effector_title, follows_text, member_label, weights_text
+
+    status = snap.regulation
+    if status is None:
+        return ""
+    rows: list[str] = []
+    for name, u in status.units.items():
+        if u.value is None:
+            state = f"<span class='frozen'>unavailable</span> <span class='dim'>{escape(u.reason or '')}</span>"
+        else:
+            cov = "" if u.coverage >= 0.999 else f" <span class='dim'>· {u.coverage:.0%} coverage</span>"
+            state = f"<b>{u.value:.1f}{UNIT_SYMBOL}</b>{cov}"
+        meta: list[str] = []
+        if u.unit_reading is not None:
+            diff = f" ({u.unit_reading - u.value:+.1f})" if u.value is not None else ""
+            meta.append(f"unit reads {u.unit_reading:.1f}{diff}")
+        ft = follows_text(u.follows)
+        if ft is not None:
+            cls = "frozen" if u.follows is not None and u.follows.state == "alert" else "dim"
+            meta.append(f"<span class='{cls}'>{escape(ft)}</span>")
+        dropped = "".join(
+            f"<div class='frozen'>✗ {escape(member_label(s))}: {escape(why)}</div>" for s, why in u.dropped.items()
+        )
+        rows.append(
+            "<div class='eff'>"
+            f"<div class='eff-name'>{escape(effector_title(name))}</div>"
+            f"<div class='eff-state'>V {state}</div>"
+            + (f"<div class='eff-meta'>{' · '.join(meta)}</div>" if meta else "")
+            + (f"<div class='rationale'>{escape(weights_text(u.used))}</div>" if u.used else "")
+            + dropped
+            + "</div>"
+        )
+    note = ""
+    if status.role == "standby":
+        note = f"<p class='dim'>Published by another process (pid {escape(status.holder or '?')})</p>"
+    if status.error:
+        note += f"<p class='frozen'>{escape(status.error)}</p>"
+    body = "<div class='effs'>" + "".join(rows) + "</div>" if rows else "<p class='dim'>(no readings yet)</p>"
+    return f"<section><h2>Regulation inputs</h2>{body}{note}</section>"
 
 
 def _room_html(snap: StatusSnapshot, sensor_col: str, value: float) -> str:
@@ -639,7 +686,14 @@ def _snapshot_to_dict(snap: StatusSnapshot) -> dict:
         "opportunities": snap.opportunities,
         "warnings": snap.warnings,
         "ha_error": snap.ha_error,
+        "regulation": _regulation_json(snap),
     }
+
+
+def _regulation_json(snap: StatusSnapshot) -> dict | None:
+    from weatherstat.mqtt_bridge import regulation_summary
+
+    return regulation_summary(snap.regulation)
 
 
 def _json_default(obj):

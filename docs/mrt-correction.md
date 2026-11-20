@@ -146,29 +146,17 @@ to uncorrected bounds.
 
 ### Regulating Effector Targets
 
-Regulating effectors (mini splits) sweep target temperatures from
-comfort schedule bounds. These targets are **air temperatures** — the
-physical setpoint the device aims for. But the user's comfort preference
-is about **operative (perceived) temperature**.
-
-If the user wants to feel 72°F and MRT says cold walls make 72°F air
-feel like 70.5°F, the device must target 73.5°F air to achieve 72°F
-perceived:
-
-```
-target_air = preferred_operative + mrt_offset
-```
-
-Without this adjustment, the sweep can only offer "off" and "heat@72"
-as candidates. Scoring penalizes 72°F air (which feels like 70.5°F)
-for being below preferred, but no better option exists — the optimizer
-can't discover 73.5°F if it's not in the candidate set. The result:
-the mini split heats to 72°F, the room feels cold, and the optimizer
-reports comfort cost it can't reduce.
-
-Regulating targets use the **current-moment** MRT offset (not
-per-horizon), because the target temperature is set immediately and
-held for the sweep duration.
+Until PLAN-41, regulating targets were derived from each
+room's preferred temperature plus the current MRT offset
+(`target_air = preferred_operative + mrt_offset`), because the target
+candidates were the only way the sweep could reach a warmer air
+temperature. That adjustment is gone. A regulating effector's target is
+now a point on the scale of its virtual input V (a gain-weighted mean of
+the sensors it affects; see `regulation.py`). The sweep offers setpoints
+that hold the bottom, middle and top of the gain-weighted preferred band,
+and the scorer applies MRT to the predicted temperatures like any other
+effector's. A warmer feels-like result is reached by choosing a higher
+level, not by shifting the candidates.
 
 ### Parameters
 

@@ -25,9 +25,12 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from weatherstat.sensor_health import FrozenSensor
+
+if TYPE_CHECKING:
+    from weatherstat.regulation_publisher import RegulationStatus
 
 # ── Snapshot data structures ────────────────────────────────────────────────
 
@@ -120,6 +123,7 @@ class StatusSnapshot:
     ha_error: str | None  # None when HA is reachable; one-line error otherwise
     overlays: dict[str, OverlayView] = field(default_factory=dict)  # sensor_col → active overlay
     frozen: dict[str, FrozenSensor] = field(default_factory=dict)  # sensor_col → frozen reading (not in temps)
+    regulation: RegulationStatus | None = None  # virtual regulation inputs (regulation_publisher); None = not running
 
 
 @dataclass(frozen=True)
@@ -197,6 +201,8 @@ class TUIController:
         self._last_ha_error: str | None = None
         self._overlay_listeners: list[Callable[[], None]] = []
         self._frozen_seen: set[str] = set()  # frozen sensors already logged
+        self._regulation_source: Callable[[], RegulationStatus | None] | None = None
+        self._cycle_requested = False  # request_cycle() arrived while a cycle was running
 
         # Cached snapshot, refreshed by build_snapshot()
         self._latest_snapshot: StatusSnapshot | None = None
@@ -233,6 +239,22 @@ class TUIController:
     def set_next_cycle_at(self, when: datetime | None) -> None:
         with self._lock:
             self._next_cycle_at = when
+
+    def set_regulation_source(self, fn: Callable[[], RegulationStatus | None] | None) -> None:
+        """Where snapshots read the regulation inputs from (the running ``RegulationPublisher.status``)."""
+        with self._lock:
+            self._regulation_source = fn
+
+    def _read_regulation(self) -> RegulationStatus | None:
+        with self._lock:
+            fn = self._regulation_source
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception as e:
+            self._log(f"[regulation] [red]Failed to read regulation status: {e}[/]")
+            return None
 
     # ── Snapshot building ───────────────────────────────────────────────────
 
@@ -608,6 +630,7 @@ class TUIController:
             ha_error=ha_error,
             overlays=overlays_view,
             frozen=frozen,
+            regulation=self._read_regulation(),
         )
         with self._lock:
             self._latest_snapshot = snap
@@ -691,7 +714,24 @@ class TUIController:
             self._next_cycle_at = datetime.now(UTC) + timedelta(
                 seconds=_control_interval()
             )
+            rerun, self._cycle_requested = self._cycle_requested, False
         self.publish_snapshot()
+        if rerun:
+            self.run_cycle()
+
+    def request_cycle(self, reason: str) -> ActionResult:
+        """Run a control cycle now because something changed (e.g. a regulation input's membership)."""
+        with self._lock:
+            if self._cycle_running:
+                self._cycle_requested = True  # the running cycle may have read the old inputs: run again after it
+                queued = True
+            else:
+                queued = False
+        if queued:
+            self._log(f"[control] {reason}; another cycle will follow the running one")
+            return ActionResult("already_running", "Control cycle queued after the running one")
+        self._log(f"[control] {reason}; running a cycle now")
+        return self.run_cycle()
 
     def run_sysid(self) -> ActionResult:
         with self._lock:

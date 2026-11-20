@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from weatherstat.config import DATA_DIR, EFFECTOR_MAP, PREDICTION_SENSORS, UNIT_SYMBOL, abs_temp, delta_temp
+from weatherstat.regulation import RegulationModel, build_models, responses_from_json
 from weatherstat.types import EffectorDecision, Scenario
 
 # Minimum |t-statistic| for an effector→sensor gain to be used in simulation.
@@ -94,6 +95,9 @@ class SimParams:
     # by transition-weighted identification. Used for observed-state prediction
     # but excluded from counterfactual advisory toggles (see PLAN-36).
     environment_solar_betas: dict[str, dict[str, float]] = field(default_factory=dict)  # device -> {sensor -> beta}
+    regulation: dict[str, RegulationModel] = field(default_factory=dict)
+    # regulating effector -> what it regulates on (virtual input weights) and how it
+    # responds (learned curve). See regulation.py / PLAN-41.
 
 
 @dataclass(frozen=True)
@@ -327,6 +331,10 @@ def load_sim_params(path: Path | None = None) -> SimParams:
     for dev, sensor_betas in raw_solar_betas.items():
         environment_solar_betas[dev] = {str(k): float(v) for k, v in sensor_betas.items()}
 
+    # Regulating effectors: what each regulates on (adopted virtual-input weights,
+    # else computed from these filtered gains) and its learned response curve.
+    regulation = build_models(gains, responses_from_json(data.get("regulation_responses", {})), sensors)
+
     return SimParams(
         taus=taus,
         gains=gains,
@@ -339,6 +347,7 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         solar_plane_gains=solar_plane_gains,
         environment_solar_betas=environment_solar_betas,
         correlational_couplings=correlational_couplings,
+        regulation=regulation,
     )
 
 
@@ -708,11 +717,35 @@ def _build_environment_timelines(
     return timelines
 
 
+# Scenarios per simulation chunk: per-sensor arrays are (n, horizon); chunking keeps
+# the regulating joint pass (all member sensors held at once) bounded in memory.
+_PREDICT_CHUNK = 8192
+
+
+@dataclass
+class _SensorPrep:
+    """Per-sensor inputs for the Euler loop, vectorized over scenarios."""
+
+    cur_temp: float
+    tau_scalar: float
+    tau_matrix: np.ndarray | None  # (n, H) when advisory timelines modulate tau
+    solar_vec: np.ndarray  # (H,)
+    solar_arr: np.ndarray | None  # (n, H) when advisory devices modulate solar
+    total_eff: np.ndarray  # (n, H + 1): non-regulating effector forcing (+ regulating history)
+    reg_gains: list[tuple[str, float, int]]  # (regulating effector, positive gain, lag steps)
+
+    def base_dTdt(self, T: np.ndarray, step_idx: int, outdoor: float) -> np.ndarray:
+        tau = self.tau_matrix[:, step_idx] if self.tau_matrix is not None else self.tau_scalar
+        solar = self.solar_arr[:, step_idx] if self.solar_arr is not None else self.solar_vec[step_idx]
+        return (outdoor - T) / tau + self.total_eff[:, step_idx + 1] + solar
+
+
 def predict(
     state: HouseState,
     scenarios: list[Scenario],
     params: SimParams,
     horizons: list[int],
+    activity_out: dict[str, np.ndarray] | None = None,
 ) -> tuple[list[str], np.ndarray]:
     """Predict room temperatures for multiple HVAC scenarios.
 
@@ -721,16 +754,47 @@ def predict(
     once using numpy broadcasting, and effector forcing is pre-computed
     per sensor as a single slice operation per effector.
 
+    Regulating effectors (mini splits) are delegated: each runs its own
+    thermostat on its virtual input V = Σ wₛ·Tₛ (regulation.py), so its activity
+    is one trace per scenario — computed in a joint pass over V's member
+    sensors — that then reaches every sensor through its learned gain.
+
     Args:
         state: Current house state (temps, weather, windows, effector history).
         scenarios: HVAC trajectory scenarios to evaluate.
         params: Thermal model parameters from sysid.
         horizons: Prediction horizons in 5-min steps (e.g., [12, 24, 48, 72]).
+        activity_out: If given, filled with regulating effector name ->
+            (n_scenarios, max_horizon) signed activity (+heat, −cool).
 
     Returns:
         (target_names, predictions) where predictions shape is (n_scenarios, n_targets).
         target_names like "bedroom_temp_t+12".
     """
+    if len(scenarios) <= _PREDICT_CHUNK:
+        return _predict_chunk(state, scenarios, params, horizons, activity_out)
+    names: list[str] = []
+    parts: list[np.ndarray] = []
+    act_parts: dict[str, list[np.ndarray]] = defaultdict(list)
+    for start in range(0, len(scenarios), _PREDICT_CHUNK):
+        chunk_act: dict[str, np.ndarray] | None = {} if activity_out is not None else None
+        names, part = _predict_chunk(state, scenarios[start:start + _PREDICT_CHUNK], params, horizons, chunk_act)
+        parts.append(part)
+        for k, v in (chunk_act or {}).items():
+            act_parts[k].append(v)
+    if activity_out is not None:
+        for k, v in act_parts.items():
+            activity_out[k] = np.concatenate(v, axis=0)
+    return names, np.concatenate(parts, axis=0)
+
+
+def _predict_chunk(
+    state: HouseState,
+    scenarios: list[Scenario],
+    params: SimParams,
+    horizons: list[int],
+    activity_out: dict[str, np.ndarray] | None,
+) -> tuple[list[str], np.ndarray]:
     max_horizon = max(horizons)
     n_scenarios = len(scenarios)
     n_future = max_horizon + 1
@@ -754,6 +818,7 @@ def predict(
     activity_matrices, regulating_effectors = _build_activity_matrices(
         scenarios, params, state.recent_history, n_future,
     )
+    regulating_names = {reg.effector_name for reg in regulating_effectors}
 
     # Build advisory timelines and merge into activity matrices for gain lookup.
     # Advisory timelines encode per-step advisory effector state (0/1) for each
@@ -781,8 +846,7 @@ def predict(
         for step in range(1, max_horizon + 1)
     ])
 
-    # Simulate each sensor (vectorized across all scenarios)
-    for sensor_col, col_targets in sensor_targets.items():
+    def _prep(sensor_col: str) -> _SensorPrep:
         tau_model = params.taus.get(sensor_col, TauModel(tau_base=40.0))
 
         # Per-step tau when advisory timelines modulate this sensor's envelope.
@@ -866,7 +930,6 @@ def predict(
         # Advisory solar modulation: advisory effectors can amplify/attenuate
         # solar gain (e.g., blinds reduce solar, open window changes airflow).
         # Multiplicative: solar_vec *= (1 + Σ(beta × timeline)).
-        per_step_solar = False
         solar_arr: np.ndarray | None = None
         if advisory_future and params.environment_solar_betas:
             solar_mod = np.zeros((n_scenarios, max_horizon))
@@ -886,15 +949,24 @@ def predict(
                     has_solar_mod = True
             if has_solar_mod:
                 solar_arr = solar_vec[None, :] * (1.0 + solar_mod)
-                per_step_solar = True
 
         cur_temp = state.current_temps.get(sensor_col, abs_temp(70.0))
 
         # Pre-compute total effector forcing: (n_scenarios, max_horizon + 1)
-        # Vectorized over both scenarios AND timesteps — one slice op per effector
+        # Vectorized over both scenarios AND timesteps — one slice op per effector.
+        # A regulating effector's matrix holds only its recorded history (its future
+        # comes from the joint pass below), and only its warming side counts:
+        # heating can't cool a sensor and cooling can't warm one, so a negative
+        # cross gain contributes nothing (it is confounding, not physics).
         total_eff = np.zeros((n_scenarios, max_horizon + 1))
+        reg_gains: list[tuple[str, float, int]] = []
         for eff_name, (gain, lag_min) in sensor_gains.items():
             lag_s = int(round(lag_min / 5.0))
+            if eff_name in regulating_names:
+                gain = max(gain, 0.0)
+                if gain == 0.0:
+                    continue
+                reg_gains.append((eff_name, gain, lag_s))
             mat = activity_matrices[eff_name]
             # Source: activity matrix columns for steps 1..max_horizon, shifted by lag
             src_start = _HISTORY_STEPS + 1 - lag_s
@@ -912,71 +984,99 @@ def predict(
             if dst_start < dst_end:
                 total_eff[:, dst_start:dst_end] += gain * mat[:, src_start:src_end]
 
-        # Collect regulating effector info for this sensor
-        sensor_reg: list[tuple[float, int, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        return _SensorPrep(
+            cur_temp=cur_temp, tau_scalar=tau_scalar, tau_matrix=tau_matrix,
+            solar_vec=solar_vec, solar_arr=solar_arr, total_eff=total_eff, reg_gains=reg_gains,
+        )
+
+    preps = {sensor_col: _prep(sensor_col) for sensor_col in sensor_targets}
+
+    # ── Regulating effectors: one activity trace per unit (joint pass) ──
+    activity = _regulating_activity(
+        regulating_effectors, params, preps, state, outdoor_vec, n_scenarios, max_horizon,
+    )
+    if activity_out is not None:
         for reg in regulating_effectors:
-            gain_info = sensor_gains.get(reg.effector_name)
-            if gain_info is None:
+            act = activity.get(reg.effector_name)
+            activity_out[reg.effector_name] = act[:, 1:] if act is not None else np.zeros((n_scenarios, max_horizon))
+    for prep in preps.values():
+        for eff_name, gain, lag_s in prep.reg_gains:
+            act = activity.get(eff_name)
+            if act is None or lag_s >= max_horizon:
                 continue
-            gain, lag_min = gain_info
-            lag_steps = int(round(lag_min / 5.0))
-            sensor_reg.append((abs(gain), lag_steps, reg.proportional_band, reg.targets, reg.modes,
-                               reg.delay_steps, reg.duration_steps))
+            # Step k feels the unit's activity at step k − lag (none before step 1).
+            prep.total_eff[:, 1 + lag_s:] += gain * act[:, 1:max_horizon + 1 - lag_s]
 
-        # Euler integration: loop over timesteps, vectorized over scenarios
-        T = np.full(n_scenarios, cur_temp)
+    # ── Euler integration per sensor, vectorized over scenarios ──
+    for sensor_col, col_targets in sensor_targets.items():
+        prep = preps[sensor_col]
+        T = np.full(n_scenarios, prep.cur_temp)
         horizon_results: dict[int, np.ndarray] = {}
-
         for step_idx in range(max_horizon):
+            T = T + _DT_HOURS * prep.base_dTdt(T, step_idx, outdoor_vec[step_idx])
             step = step_idx + 1
-            tau_val = tau_matrix[:, step_idx] if per_step_tau else tau_scalar
-            solar_val = solar_arr[:, step_idx] if per_step_solar else solar_vec[step_idx]
-            dTdt = (outdoor_vec[step_idx] - T) / tau_val + total_eff[:, step] + solar_val
-
-            # Regulating effector contributions (proportional to target - current temp)
-            for abs_gain, lag_s, p_band, targets, modes, delays, durations in sensor_reg:
-                if step - lag_s < 1:
-                    continue
-                # Active mask: effector is on during [delay, delay+duration)
-                active = (step >= delays) & (step < delays + durations)
-                effective_modes = np.where(active, modes, 0.0)
-                # Heating: activity = clip((target - T) / band, 0, 1)
-                # Cooling: activity = clip((T - target) / band, 0, 1)
-                heat_mask = effective_modes > 0  # (n_scenarios,)
-                cool_mask = effective_modes < 0
-                activity = np.zeros(n_scenarios)
-                if heat_mask.any():
-                    activity = np.where(
-                        heat_mask,
-                        np.clip((targets - T) / p_band, 0.0, 1.0),
-                        activity,
-                    )
-                if cool_mask.any():
-                    activity = np.where(
-                        cool_mask,
-                        np.clip((T - targets) / p_band, 0.0, 1.0),
-                        activity,
-                    )
-                # Sign: heating adds heat (+gain), cooling removes heat (-gain)
-                signed_activity = np.where(heat_mask, activity, np.where(cool_mask, -activity, 0.0))
-                contribution = abs_gain * signed_activity
-                # Mode-direction clamp: heating can't cool, cooling can't warm.
-                # Gains fitted from heating data may be confounded; inverting
-                # them for cooling can produce nonsense cross-coupling effects.
-                contribution = np.where(heat_mask, np.maximum(contribution, 0.0), contribution)
-                contribution = np.where(cool_mask, np.minimum(contribution, 0.0), contribution)
-                dTdt += contribution
-
-            T = T + _DT_HOURS * dTdt
             if step in horizon_set:
                 horizon_results[step] = T.copy()
-
-        # Fill result columns for this sensor
         for j, h in col_targets:
             result[:, j] = horizon_results.get(h, np.nan)
 
     return target_names, result
 
+
+def _regulating_activity(
+    regulating_effectors: list[_RegulatingEffector],
+    params: SimParams,
+    preps: dict[str, _SensorPrep],
+    state: HouseState,
+    outdoor_vec: np.ndarray,
+    n_scenarios: int,
+    max_horizon: int,
+) -> dict[str, np.ndarray]:
+    """Signed activity (n, max_horizon + 1; column 0 unused) per regulating effector.
+
+    Each unit runs on its virtual input V = Σ wₛ·Tₛ over member sensors that
+    have a reading (renormalized, as the published value is). V's members
+    are integrated jointly, because a unit's activity depends on V and V on
+    every active unit's activity. Activity at step k is decided from the
+    temperatures at the start of step k: level = response(sign·(target − V)),
+    gated by the plan's [delay, delay + duration) window.
+    """
+    from weatherstat.regulation import MIN_COVERAGE
+
+    units: list[tuple[_RegulatingEffector, list[str], np.ndarray, RegulationModel]] = []
+    for reg in regulating_effectors:
+        model = params.regulation.get(reg.effector_name)
+        if model is None or not np.any(reg.modes != 0):
+            continue
+        members = [s for s in model.weights if s in preps and s in state.current_temps]
+        total = sum(model.weights.values())
+        present = sum(model.weights[s] for s in members)
+        if not members or total <= 0 or present / total < MIN_COVERAGE:
+            continue  # no usable input: the real unit falls back to its own thermistor
+        w = np.array([model.weights[s] for s in members]) / present
+        units.append((reg, members, w, model))
+    if not units:
+        return {}
+
+    member_set = sorted({s for _, members, _, _ in units for s in members})
+    T = {s: np.full(n_scenarios, preps[s].cur_temp) for s in member_set}
+    activity = {reg.effector_name: np.zeros((n_scenarios, max_horizon + 1)) for reg, *_ in units}
+    for step in range(1, max_horizon + 1):
+        for reg, members, w, model in units:
+            V = sum(wi * T[s] for wi, s in zip(w, members, strict=True))
+            active = (step >= reg.delay_steps) & (step < reg.delay_steps + reg.duration_steps)
+            sign = np.where(active, reg.modes, 0.0)
+            level = model.response.level_for(sign * (reg.targets - V), sign)
+            activity[reg.effector_name][:, step] = sign * level
+        for s in member_set:
+            prep = preps[s]
+            dTdt = prep.base_dTdt(T[s], step - 1, outdoor_vec[step - 1])
+            for eff_name, gain, lag_s in prep.reg_gains:
+                act = activity.get(eff_name)
+                if act is not None and step - lag_s >= 1:
+                    dTdt = dTdt + gain * act[:, step - lag_s]
+            T[s] = T[s] + _DT_HOURS * dTdt
+    return activity
 
 
 # ── Recent history extraction from snapshot data ─────────────────────────

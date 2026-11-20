@@ -66,11 +66,32 @@ def sysid_refit() -> SysidOutcome:
     except Exception as e:  # noqa: BLE001 — isolate tracker faults from the refit
         tracker_msg = f"tracker: error — {e}"
 
+    regulation_msg = adopt_regulation_weights()
+
     return SysidOutcome(
         True,
-        f"Complete. {result.n_snapshots} snapshots, {n_taus} sensors, {n_gains} gains. {tracker_msg}",
+        f"Complete. {result.n_snapshots} snapshots, {n_taus} sensors, {n_gains} gains. {tracker_msg}"
+        + (f" {regulation_msg}" if regulation_msg else ""),
         time.monotonic() - t0,
     )
+
+
+def adopt_regulation_weights(log: Callable[[str], None] = print) -> str:
+    """Re-derive each regulating effector's input weights from the fresh (filtered) gains.
+
+    ``regulation.adopt_weights`` replaces a published weight set only when a
+    weight moves by more than the tolerance, and records every adoption in
+    regulation_history.jsonl. Failure never fails the refit. Returns a short
+    summary for the refit message ("" when nothing changed).
+    """
+    try:
+        from weatherstat.regulation import adopt_weights
+        from weatherstat.simulator import load_sim_params
+
+        changed = adopt_weights(load_sim_params().gains, log=log)
+    except Exception as e:  # noqa: BLE001 — the batch params are already saved
+        return f"regulation: error — {e}"
+    return f"regulation: adopted new weights for {', '.join(changed)}." if changed else ""
 
 
 def run_retention_if_due(
@@ -121,8 +142,15 @@ def run_headless_loop(live: bool = False) -> None:
 
     last_sysid_at = time.monotonic()  # fresh start: params on disk are current enough
 
-    # Home Assistant comfort controls (MQTT). A change from HA wakes the loop for an immediate cycle.
+    # Home Assistant comfort controls (MQTT). A change from HA wakes the loop for an immediate cycle;
+    # so does a change in what a regulation input is made of (a member frozen or back).
     wake = threading.Event()
+    wake_reason = ["Comfort changed from Home Assistant"]
+
+    def _wake(reason: str) -> None:
+        wake_reason[0] = reason
+        wake.set()
+
     bridge = None
     try:
         from weatherstat.mqtt_bridge import start_mqtt_bridge
@@ -131,43 +159,62 @@ def run_headless_loop(live: bool = False) -> None:
         def _apply_from_ha(cmd: OverlayCommand) -> None:
             result = apply_overlay_command(cmd, source="ha")
             print(f"[overlay] {cmd.sensor}: {result.describe() if result else 'cleared'} [ha]")
-            wake.set()
+            _wake("Comfort changed from Home Assistant")
 
         bridge = start_mqtt_bridge(apply=_apply_from_ha, log=print)
     except Exception as e:
         print(f"[runtime] Home Assistant bridge failed to start: {e}", file=sys.stderr)
         traceback.print_exc()
 
-    while True:
-        try:
-            decision = run_control_cycle(live=live)
-            if live and decision:
-                from weatherstat.executor import execute
+    # Virtual regulation inputs (PLAN-41): published every 60 s on their own thread.
+    publisher = None
+    try:
+        from weatherstat.regulation_publisher import start_regulation_publisher
 
-                execute()
-        except Exception as e:
-            print(f"[runtime] Error in control cycle: {e}", file=sys.stderr)
-            traceback.print_exc()
+        publisher = start_regulation_publisher(
+            log=print,
+            live=lambda: live,
+            publish=bridge.publish_regulation if bridge is not None else None,
+            request_cycle=_wake,
+        )
+    except Exception as e:
+        print(f"[runtime] Regulation publisher failed to start: {e}", file=sys.stderr)
+        traceback.print_exc()
 
-        if SYSID_INTERVAL > 0 and (time.monotonic() - last_sysid_at) >= SYSID_INTERVAL:
-            print(f"\n[runtime] Sysid refit due ({datetime.now(UTC):%H:%M UTC})")
+    try:
+        while True:
             try:
-                outcome = sysid_refit()
-                print(f"[sysid] {outcome.message} ({outcome.duration_seconds:.1f}s)")
+                decision = run_control_cycle(live=live)
+                if live and decision:
+                    from weatherstat.executor import execute
+
+                    execute()
             except Exception as e:
-                print(f"[runtime] Error in sysid refit: {e}", file=sys.stderr)
+                print(f"[runtime] Error in control cycle: {e}", file=sys.stderr)
                 traceback.print_exc()
-            last_sysid_at = time.monotonic()
 
-        try:
-            run_retention_if_due()
-        except Exception as e:
-            print(f"[runtime] Error in retention: {e}", file=sys.stderr)
-            traceback.print_exc()
+            if SYSID_INTERVAL > 0 and (time.monotonic() - last_sysid_at) >= SYSID_INTERVAL:
+                print(f"\n[runtime] Sysid refit due ({datetime.now(UTC):%H:%M UTC})")
+                try:
+                    outcome = sysid_refit()
+                    print(f"[sysid] {outcome.message} ({outcome.duration_seconds:.1f}s)")
+                except Exception as e:
+                    print(f"[runtime] Error in sysid refit: {e}", file=sys.stderr)
+                    traceback.print_exc()
+                last_sysid_at = time.monotonic()
 
-        if bridge is not None:
-            bridge.publish_overlays()  # expiries pruned by the cycle reach HA now
-        print(f"\n[runtime] Next cycle in {CONTROL_INTERVAL // 60} minutes...\n")
-        if wake.wait(CONTROL_INTERVAL):
-            print("[runtime] Comfort changed from Home Assistant; running a cycle now")
-        wake.clear()
+            try:
+                run_retention_if_due()
+            except Exception as e:
+                print(f"[runtime] Error in retention: {e}", file=sys.stderr)
+                traceback.print_exc()
+
+            if bridge is not None:
+                bridge.publish_overlays()  # expiries pruned by the cycle reach HA now
+            print(f"\n[runtime] Next cycle in {CONTROL_INTERVAL // 60} minutes...\n")
+            if wake.wait(CONTROL_INTERVAL):
+                print(f"[runtime] {wake_reason[0]}; running a cycle now")
+            wake.clear()
+    finally:
+        if publisher is not None:
+            publisher.stop()  # release the single-publisher lock for the next process

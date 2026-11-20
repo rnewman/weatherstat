@@ -33,6 +33,7 @@ For every constrained sensor (`<room>` is its label from `weatherstat.yaml`):
 | `number.weatherstat_<room>_comfort` | The room's comfort overlay, −max…+max. Setting it applies an absolute overlay for `overlay_duration_hours`; 0 clears it. −/+ presses are debounced (2 s) into one recorded request. |
 | `sensor.weatherstat_<room>_comfort_until` | When that overlay expires (timestamp; unknown when none). |
 | `sensor.weatherstat_<room>` | Feels-like temperature (air minus MRT offset). Attributes: comfort band (preferred/acceptable, overlay included), overlay, predictions by horizon, comfort cost vs all-off, status (cold/cool/ok/warm/hot), and the HA sensor it reads. |
+| `sensor.weatherstat_<effector>_input` | Per regulating effector (mini split): the temperature it should regulate on, a weighted mean of the rooms it affects (weights from its learned gains). Published every minute; unavailable when Weatherstat stops, when no update arrives for 3 minutes, or when too few of those rooms report. Attributes: weights, member readings, dropped members, coverage. See [Mini split inputs](#mini-split-inputs). |
 | `sensor.weatherstat_status` | `live` / `dry run`. Attributes: profile, next cycle, effector plan with per-device rationale, costs, comfort requests, advisories, warnings, data and model age. |
 
 The room and status sensors come from the TUI's status snapshot, so the TUI
@@ -41,6 +42,62 @@ entities go unavailable when Weatherstat stops (MQTT last will).
 
 The number entities work anywhere HA does: voice ("set bedroom comfort to
 2"), automations, or a plain tile card with the `numeric-input` feature.
+
+## Mini split inputs
+
+A mini split runs its own thermostat on whatever temperature it reads, so
+Weatherstat publishes `sensor.weatherstat_<effector>_input` for each regulating
+effector (enabled with the `mqtt:` block). Pointing the unit at it makes the unit
+regulate on the rooms it actually heats and cools, weighted by its learned
+effect on each. Weatherstat plans its setpoints on that input's scale.
+
+1. **Check the input.** `just debug regulation` shows each unit's weights, the
+   live input, and the unit's own reading.
+2. **Point the unit at it.** For a Mitsubishi unit on an ESPHome
+   [CN105](https://github.com/echavet/MitsubishiCN105ESPHome) board:
+
+   ```yaml
+   sensor:
+     - platform: homeassistant
+       id: remote_temp
+       name: "Remote Temperature Sensor"
+       entity_id: sensor.weatherstat_mini_split_bedroom_input
+       unit_of_measurement: "°C"
+       filters:
+         - lambda: return (x - 32) * (5.0/9.0);   # only if HA reports °F
+       on_value:
+         then:
+           - lambda: |-
+               if (std::isfinite(x) && x >= 1 && x <= 40) id(hp).set_remote_temperature(x);
+               else id(hp).set_remote_temperature(0);  // unavailable: the unit's own thermistor
+
+   interval:
+     - interval: 60s
+       then:
+         - if:
+             condition:
+               api.connected:
+             then:
+               - lambda: |-
+                   const float t = id(remote_temp).state;
+                   if (std::isfinite(t) && t >= 1 && t <= 40) id(hp).set_remote_temperature(t);
+   ```
+
+   - **The interval is required.** HA sends a subscribed entity to the board
+     only when its state changes (`force_update` does not change that), and
+     the CN105 watchdog (`remote_temperature_timeout`) resets only when
+     `set_remote_temperature()` is called. Without the interval, a steady
+     input drops the unit to its thermistor after the timeout.
+   - **Don't use `clamp` or `throttle` on this sensor.** `clamp` with
+     `ignore_out_of_range` discards the NaN an unavailable entity arrives
+     as, so the unit would keep a stale value until the timeout; `throttle`
+     can swallow the update that says the input went away. The `on_value`
+     lambda above falls back to the thermistor at once instead.
+3. **Turn on the follow check.** Add the effector to `defaults.regulation_live`
+   in `weatherstat.yaml` and restart. Weatherstat then alerts when the unit's
+   reported temperature stays more than 1.5°F from the input for 10 minutes
+   (the remote reading timed out, the board reads another entity, or the unit
+   fell back to its thermistor).
 
 ## Cards
 

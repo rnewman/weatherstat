@@ -111,6 +111,10 @@ def init_db(db_path: Path | None = None) -> Path:
     # Schema migration: active comfort overlays at decision time ({label: delta})
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE decisions ADD COLUMN overlays TEXT")
+    # Schema migration: regulating units' virtual input at decision time
+    # ({effector: {v, coverage, adopted_at, offset, band}}, PLAN-41)
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE decisions ADD COLUMN regulation TEXT")
     conn.commit()
     conn.close()
     return path
@@ -132,6 +136,7 @@ def log_decision(
     blocked_effectors: dict[str, str] | None = None,
     cycle_seconds: float | None = None,
     overlays: dict[str, float] | None = None,
+    regulation: dict[str, dict] | None = None,
     db_path: Path | None = None,
 ) -> None:
     """Record a control decision to the decision log.
@@ -234,6 +239,7 @@ def log_decision(
 
     # Active comfort overlays ({label: delta}), None when there are none
     overlays_json = json.dumps(overlays) if overlays else None
+    regulation_json = json.dumps(regulation) if regulation else None
 
     conn = _connect(path)
     conn.execute(
@@ -243,8 +249,8 @@ def log_decision(
             current_temps, upstairs_heating, downstairs_heating, upstairs_setpoint, downstairs_setpoint,
             blowers, mini_splits, predictions, comfort_cost, energy_cost, total_cost,
             comfort_bounds, trajectory, outcome_backfilled, effector_decisions, command_targets,
-            active_profile, mrt_offsets, blocked, cycle_seconds, overlays
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+            active_profile, mrt_offsets, blocked, cycle_seconds, overlays, regulation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             decision.timestamp,
@@ -273,6 +279,7 @@ def log_decision(
             blocked_json,
             cycle_seconds,
             overlays_json,
+            regulation_json,
         ),
     )
     conn.commit()

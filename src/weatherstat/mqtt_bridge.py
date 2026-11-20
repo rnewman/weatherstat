@@ -14,8 +14,18 @@ device with, for every constrained sensor:
   the room as attributes: comfort band, overlay, predictions, comfort cost,
   status (cold / cool / ok / warm / hot), and the HA sensor it reads.
 
+Per regulating effector (mini split), ``sensor.weatherstat_<effector>_input``:
+the virtual regulation sensor V the unit regulates on (PLAN-41), published
+every minute by ``regulation_publisher`` with ``force_update`` (every publish is
+recorded; HA's ESPHome integration still forwards only changed states, so the
+boards re-assert the last value themselves to keep the CN105 watchdog fed) and
+``expire_after`` (a hung process goes unavailable, not just a disconnected
+one). It is unavailable when the bridge is offline or when too few members
+are readable (its own availability topic).
+
 Plus ``sensor.weatherstat_status`` (live / dry run) carrying the effector plan
-with per-device rationale, costs, advisories, warnings and data health. The
+with per-device rationale, costs, advisories, warnings, data health and the
+regulation inputs. The
 room and status sensors come from the TUI's status snapshot, so they are
 published by the TUI only; the headless loop publishes the comfort controls.
 
@@ -51,6 +61,7 @@ from weatherstat.overlay import ComfortOverlay, OverlayCommand, OverlayStore, fo
 from weatherstat.yaml_config import MqttConfig
 
 STATE_INTERVAL = 30.0  # seconds between overlay state republishes (catches CLI changes and expiry)
+REGULATION_EXPIRE_AFTER = 180  # seconds without a publish before HA marks a regulation input unavailable
 
 LogFn = Callable[[str], None]
 ApplyFn = Callable[[OverlayCommand], Any]
@@ -98,6 +109,15 @@ class BridgeTopics:
     def status_config(self) -> str:
         return f"{self.discovery_prefix}/sensor/weatherstat/status/config"
 
+    def regulation_state(self, effector: str) -> str:
+        return f"{self.prefix}/regulation/{effector}"
+
+    def regulation_availability(self, effector: str) -> str:
+        return f"{self.prefix}/regulation/{effector}/availability"
+
+    def regulation_config(self, effector: str) -> str:
+        return f"{self.discovery_prefix}/sensor/weatherstat/{effector}_input/config"
+
     def label_from_set_topic(self, topic: str) -> str | None:
         head = f"{self.prefix}/overlay/"
         if not (topic.startswith(head) and topic.endswith("/set")):
@@ -135,8 +155,10 @@ def discovery_messages(
     step: float,
     max_delta: float,
     unit: str,
+    regulating: list[str] | tuple[str, ...] = (),
 ) -> list[tuple[str, dict]]:
-    """Discovery config messages for every constrained sensor (``labels``: column → label)."""
+    """Discovery config messages for every constrained sensor (``labels``: column → label)
+    and every regulating effector's input (``regulating``)."""
     device = device_info()
     origin = {"name": "Weatherstat", "sw_version": device["sw_version"]}
     messages: list[tuple[str, dict]] = []
@@ -204,6 +226,8 @@ def discovery_messages(
                 },
             )
         )
+    for effector in regulating:
+        messages.append((topics.regulation_config(effector), regulation_discovery(topics, effector, unit=unit)))
     messages.append(
         (
             topics.status_config,
@@ -402,7 +426,82 @@ def status_payload(snap: Any) -> dict:
             }
             for col, fz in getattr(snap, "frozen", {}).items()
         ],
+        "regulation": regulation_summary(getattr(snap, "regulation", None)),
         "updated": snap.timestamp.isoformat(),
+    }
+
+
+def regulation_discovery(topics: BridgeTopics, effector: str, *, unit: str) -> dict:
+    """Discovery config for one regulating effector's input (``sensor.weatherstat_<effector>_input``).
+
+    Available only while both the bridge (last will) and the entity's own
+    availability topic say "online": below min coverage the publisher marks it
+    offline, so the unit falls back to its thermistor rather than read a wrong number.
+    """
+    device = device_info()
+    state_topic = topics.regulation_state(effector)
+    return {
+        "name": f"{display_name(effector)} input",
+        "unique_id": f"weatherstat_{effector}_input",
+        "default_entity_id": f"sensor.weatherstat_{effector}_input",
+        "state_topic": state_topic,
+        "json_attributes_topic": state_topic,
+        "value_template": "{{ value_json.value }}",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "unit_of_measurement": unit,
+        "suggested_display_precision": 1,
+        "force_update": True,
+        "expire_after": REGULATION_EXPIRE_AFTER,
+        "availability": [
+            {"topic": topics.availability},
+            {"topic": topics.regulation_availability(effector)},
+        ],
+        "availability_mode": "all",
+        "icon": "mdi:home-thermometer-outline",
+        "device": device,
+        "origin": {"name": "Weatherstat", "sw_version": device["sw_version"]},
+    }
+
+
+def regulation_payload(u: Any, now: datetime) -> dict | None:
+    """State + attributes for one regulating effector's input; None when there is no value."""
+    if u.value is None:
+        return None
+    return {
+        "value": round(float(u.value), 2),
+        "weights": {s: round(w, 3) for s, w in u.used.items()},
+        "members": {s: _r(v) for s, v in u.members.items()},
+        "dropped": dict(u.dropped),
+        "coverage": _r(u.coverage, 3),
+        "weight_set": {s: round(w, 3) for s, w in u.weights.items()},
+        "adopted_at": u.adopted_at,
+        "updated": now.isoformat(),
+    }
+
+
+def regulation_summary(status: Any) -> dict | None:
+    """Compact per-unit view of the regulation inputs (MQTT status attribute, web JSON)."""
+    if status is None:
+        return None
+    units = {}
+    for name, u in status.units.items():
+        f = u.follows
+        units[name] = {
+            "value": _r(u.value, 1),
+            "coverage": _r(u.coverage, 2),
+            "weights": {s: round(w, 2) for s, w in u.used.items()},
+            "dropped": dict(u.dropped),
+            "reason": u.reason,
+            "unit_reading": _r(u.unit_reading),
+            "follows": None if f is None else {"state": f.state, "diff": _r(f.diff), "since": f.since.isoformat() if f.since else None},
+            "adopted_at": u.adopted_at,
+        }
+    return {
+        "role": status.role,
+        "holder": status.holder,
+        "error": status.error,
+        "units": units,
     }
 
 
@@ -482,6 +581,7 @@ class MqttBridge:
         source_entities: dict[str, str] | None = None,
         load_overlays: Callable[[], dict[str, ComfortOverlay]] | None = None,
         timer_factory: TimerFactory | None = None,
+        regulating: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         from weatherstat.config import OVERLAY_MAX_DELTA, OVERLAY_STEP, SENSOR_LABELS, UNIT_SYMBOL
 
@@ -497,6 +597,11 @@ class MqttBridge:
         self.source_entities = dict(source_entities if source_entities is not None else _temp_entities())
         self._load_overlays = load_overlays or (lambda: {o.sensor: o for o in OverlayStore.load().all()})
         self._timer_factory: TimerFactory = timer_factory or (lambda secs, fn: threading.Timer(secs, fn))
+        if regulating is None:
+            from weatherstat.regulation import regulating_effectors
+
+            regulating = regulating_effectors()
+        self.regulating = tuple(regulating)
 
         self._lock = threading.RLock()
         self._client: MqttClient | None = None
@@ -506,6 +611,7 @@ class MqttBridge:
         self._stop = threading.Event()
         self._publisher: threading.Thread | None = None
         self._last_snapshot: Any = None  # re-sent on (re)connect
+        self._regulation_available: dict[str, str] = {}  # effector → last availability sent ("online"/"offline")
 
     # ── Lifecycle ──
 
@@ -585,6 +691,7 @@ class MqttBridge:
             step=self.step,
             max_delta=self.max_delta,
             unit=self.unit,
+            regulating=self.regulating,
         ):
             client.publish(topic, json.dumps(payload), qos=1, retain=True)
         client.publish(self.topics.availability, "online", qos=1, retain=True)
@@ -595,9 +702,11 @@ class MqttBridge:
                 self._published.pop(topic, None)
             self._published.pop(self.topics.status_state, None)
             snap = self._last_snapshot
+            self._regulation_available.clear()  # re-send per-input availability with the next publish
         if snap is not None:
             self.publish_snapshot(snap)
-        self._log(f"[mqtt] Connected; publishing {len(self.labels)} room comfort control(s) to Home Assistant")
+        reg = f" and {len(self.regulating)} regulation input(s)" if self.regulating else ""
+        self._log(f"[mqtt] Connected; publishing {len(self.labels)} room comfort control(s){reg} to Home Assistant")
 
     # ── State ──
 
@@ -653,6 +762,36 @@ class MqttBridge:
                 client.publish(topic, json.dumps(payload), qos=1, retain=True)
                 self._published[topic] = key
                 sent += 1
+        return sent
+
+    def publish_regulation(self, units: dict[str, Any], now: datetime | None = None) -> int:
+        """Publish each regulating effector's input V (``regulation_publisher`` calls this every minute).
+
+        The value is sent every time, unretained: ``force_update`` records each
+        one, and a missed minute is what ``expire_after`` is for. Availability
+        is retained and sent on change: "offline" when there is no value (coverage too low), so HA shows the
+        input unavailable rather than a stale or wrong number.
+        """
+        now = now or datetime.now(UTC)
+        sent = 0
+        with self._lock:
+            client = self._client
+            if client is None or not self._connected:
+                return 0
+            # Re-assert the device's availability: if a second Weatherstat process (TUI + headless)
+            # stopped, its retained "offline" would otherwise hold the publisher's inputs unavailable.
+            client.publish(self.topics.availability, "online", qos=1, retain=True)
+            for name, u in units.items():
+                if name not in self.regulating:
+                    continue
+                payload = regulation_payload(u, now)
+                availability = "offline" if payload is None else "online"
+                if self._regulation_available.get(name) != availability:
+                    client.publish(self.topics.regulation_availability(name), availability, qos=1, retain=True)
+                    self._regulation_available[name] = availability
+                if payload is not None:
+                    client.publish(self.topics.regulation_state(name), json.dumps(payload), qos=1, retain=False)
+                    sent += 1
         return sent
 
     def _publish_loop(self) -> None:

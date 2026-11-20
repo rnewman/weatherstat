@@ -8,6 +8,7 @@ trajectory generation, window schedule adjustment, and quiet hours.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from weatherstat.config import EFFECTOR_MAP, EFFECTORS
 from weatherstat.control import (
@@ -674,44 +675,108 @@ class TestRegulatingSweepOptions:
         )
         assert any(o.mode == "cool" for o in options)
 
-    def test_sweep_idle_suppression_prunes_heat_when_hot(self) -> None:
-        """Heat option should be pruned when room is well above target."""
+    def test_no_idle_pruning_up_front(self) -> None:
+        """Heat is offered even with the room warm: idle options fold into off after
+        the marginal simulation (exact), not by a heuristic here."""
         eff = self._bedroom_eff()
         options = _regulating_sweep_options(
             eff, self._bedroom_schedule(), 12,
             gains=self._bedroom_gains(), current_temps={"bedroom_temp": 72.0},
         )
-        # Room is 2°F above pref_lo=70 and p_band=1.0, so heat@70 is idle-suppressed
-        assert not any(o.mode == "heat" for o in options)
+        assert any(o.mode == "heat" for o in options)
+        assert any(o.mode == "cool" for o in options)
 
-    def test_sweep_idle_suppression_uses_unit_thermistor(self) -> None:
-        """Idle suppression follows the unit's own reading, not the highest-gain room.
+    @staticmethod
+    def _two_room_schedules(bands: dict[str, tuple[float, float]]) -> list[ComfortSchedule]:
+        return [
+            ComfortSchedule(
+                sensor=s, label=s.removesuffix("_temp"),
+                entries=(ComfortScheduleEntry(0, 24, RoomComfort(s, lo, hi, lo - 1.0, hi + 2.0, lo - 4.0, hi + 5.0)),),
+            )
+            for s, (lo, hi) in bands.items()
+        ]
 
-        Regression: the living room split's highest gain was on a warm neighbour
-        (piano, by 0.003), which pruned every heat option while the living room was cold.
+    def test_setpoints_span_weighted_preferred_band(self) -> None:
+        """Setpoints are the bottom, middle and top of the gain-weighted preferred band
+        on V = Σ wₛ·Tₛ: anchored in comfort, not in any one room or in where V is now.
+
+        Regression: with a warm neighbour and a cold room at near-equal gain, idle
+        suppression pruned every heat option and left the split on cool. Both modes
+        are offered the same three levels.
         """
         eff = self._bedroom_eff()
         warm, cold = "piano_temp", "bedroom_temp"
-        schedules = [
-            ComfortSchedule(
-                sensor=s, label=s.removesuffix("_temp"),
-                entries=(ComfortScheduleEntry(0, 24, RoomComfort(s, 71.0, 74.0, 70.0, 76.0, 67.0, 79.0)),),
-            )
-            for s in (warm, cold)
-        ]
+        schedules = self._two_room_schedules({warm: (71.0, 74.0), cold: (71.0, 74.0)})
         gains = {(eff.name, warm): (0.809, 10.0), (eff.name, cold): (0.806, 10.0)}
-        temps = {warm: 75.2, cold: 69.8}
+        options = _regulating_sweep_options(eff, schedules, 12, gains=gains, current_temps={warm: 75.2, cold: 69.8})
+        assert {o.target for o in options if o.mode == "heat"} == {71.0, 72.5, 74.0}
+        assert {o.target for o in options if o.mode == "cool"} == {71.0, 72.5, 74.0}
 
-        # Without the unit's reading, the fallback picks the warm neighbour: no heat.
-        fallback = _regulating_sweep_options(eff, schedules, 12, gains=gains, current_temps=temps)
-        assert not any(o.mode == "heat" for o in fallback)
-
-        # With it (thermistor reads 70.5), heat survives and the pointless cool is pruned.
+    def test_setpoints_weighted_across_rooms(self) -> None:
+        """The band is weighted like V: a room with twice the gain counts twice."""
+        eff = self._bedroom_eff()
+        schedules = self._two_room_schedules({"bedroom_temp": (67.0, 69.0), "piano_temp": (70.0, 73.0)})
+        gains = {(eff.name, "bedroom_temp"): (0.8, 10.0), (eff.name, "piano_temp"): (0.4, 10.0)}
         options = _regulating_sweep_options(
-            eff, schedules, 12, gains=gains, current_temps={**temps, eff.temp_col: 70.5},
+            eff, schedules, 12, gains=gains, current_temps={"bedroom_temp": 70.3, "piano_temp": 73.0},
         )
-        assert any(o.mode == "heat" and o.target == 71.0 for o in options)
-        assert not any(o.mode == "cool" for o in options)
+        # Band on V: [(2·67 + 70) / 3, (2·69 + 73) / 3] = [68.0, 70.33]; middle 69.17
+        assert {o.target for o in options if o.mode == "heat"} == {68.0, 69.0, 70.5}
+
+    def test_setpoints_do_not_follow_the_reading(self) -> None:
+        """However cold or warm the rooms are, the setpoints stay within the preferred
+        band: no "a bit more than it reads now", which never lets the unit stop itself.
+
+        Regression: every heat option was V + {0.5, 1, 2}, so a unit asked to cool
+        a room was told to heat a little above its reading, and one room below its
+        floor drove another room's setpoint past its band.
+        """
+        eff = self._bedroom_eff()
+        schedules = self._two_room_schedules({"bedroom_temp": (67.0, 69.0)})
+        gains = {(eff.name, "bedroom_temp"): (0.8, 10.0)}
+        seen = set()
+        for temp in (60.0, 68.0, 70.3, 78.0):
+            options = _regulating_sweep_options(eff, schedules, 12, gains=gains, current_temps={"bedroom_temp": temp})
+            targets = {o.target for o in options if o.mode != "off"}
+            assert targets == {67.0, 68.0, 69.0}
+            seen |= targets
+        assert max(seen) <= 69.0
+
+    def test_setpoints_account_for_learned_response(self) -> None:
+        """A unit that keeps heating until it reads 1.25° over its setpoint is told
+        less, so that it holds the level asked for (and more, when cooling)."""
+        from weatherstat.regulation import RegulationModel, ResponseCurve
+
+        eff = self._bedroom_eff()
+        schedules = self._two_room_schedules({"bedroom_temp": (67.0, 69.0)})
+        response = ResponseCurve(offset=1.25, band=0.25)
+        model = RegulationModel(eff.name, {"bedroom_temp": 1.0}, response)
+        options = _regulating_sweep_options(
+            eff, schedules, 12, current_temps={"bedroom_temp": 70.3}, regulation=model,
+        )
+        heat = sorted({o.target for o in options if o.mode == "heat"})
+        cool = sorted({o.target for o in options if o.mode == "cool"})
+        assert heat == [66.0, 67.0, 68.0]  # 67/68/69 − 1.125, to the unit's 0.5° step
+        assert cool == [68.0, 69.0, 70.0]  # + 1.125
+        for setpoint, sign in [(heat[1], 1.0), (cool[1], -1.0)]:
+            assert response.holds_at(setpoint, sign) == pytest.approx(68.0, abs=0.25)
+
+    def test_setpoints_use_the_fit_for_each_mode(self) -> None:
+        """Heat and cool have their own fits: a unit that holds 2.25° past its heat
+        setpoint and 1.5° past its cool setpoint gets different setpoints for the same level."""
+        from weatherstat.regulation import RegulationModel, ResponseCurve
+
+        eff = self._bedroom_eff()
+        schedules = self._two_room_schedules({"bedroom_temp": (67.0, 69.0)})
+        response = ResponseCurve(1.25, 0.25, modes={
+            "heat": ResponseCurve(offset=3.25, band=2.0), "cool": ResponseCurve(offset=2.5, band=2.0),
+        })
+        model = RegulationModel(eff.name, {"bedroom_temp": 1.0}, response)
+        options = _regulating_sweep_options(
+            eff, schedules, 12, current_temps={"bedroom_temp": 70.3}, regulation=model,
+        )
+        assert sorted({o.target for o in options if o.mode == "heat"}) == [65.0, 66.0, 67.0]  # 67/68/69 − 2.25
+        assert sorted({o.target for o in options if o.mode == "cool"}) == [68.5, 69.5, 70.5]  # + 1.5
 
     def test_sweep_no_schedule_returns_off_only(self) -> None:
         """No matching schedule -> only off option."""
@@ -826,8 +891,9 @@ class TestModeHoldWindow:
         )
         assert options, "hold must still yield options"
         assert all(o.mode == "heat" for o in options)  # no mode change during quiet hours
-        assert {o.target for o in options} == {67.0}
-        assert not any(o.target == 71.2 for o in options)
+        targets = {o.target for o in options}
+        assert 67.0 in targets  # the (lowered) preferred edge: the unit can back off
+        assert 71.2 not in targets
 
     def test_comfort_request_lifts_hold(self) -> None:
         """An active overlay on a sensor this split affects releases the hold: off and cool return."""
@@ -840,8 +906,6 @@ class TestModeHoldWindow:
         )
         modes = {o.mode for o in options}
         assert "off" in modes and "cool" in modes
-        # Released, ordinary idle suppression applies again: heat @67 with the room at 72.5 is pruned
-        assert "heat" not in modes
 
     def test_request_on_unaffected_sensor_keeps_hold(self) -> None:
         """An overlay on a room this split doesn't affect leaves the hold in place."""
@@ -896,21 +960,16 @@ class TestModeHoldWindow:
 class TestProportionalEnergyCost:
     """Test proportional energy cost for mini splits."""
 
-    def test_higher_target_more_energy_when_heating(self) -> None:
-        """Higher target vs room temp -> more expected activity -> higher cost.
-
-        With proportional_band=1.0 and room at 68F:
-        target 68.5 -> delta=0.5 -> activity=0.5,
-        target 69.0 -> delta=1.0 -> activity=1.0.
-        """
-        low_target = Scenario(effectors={
-            "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=68.5),
-        })
-        high_target = Scenario(effectors={
+    def test_energy_follows_simulated_activity(self) -> None:
+        """Regulating energy is energy_cost × the unit's simulated mean |activity|."""
+        heat = Scenario(effectors={
             "mini_split_bedroom": EffectorDecision("mini_split_bedroom", mode="heat", target=69.0),
         })
-        temps = {"mini_split_bedroom_temp": 68.0}
-        assert compute_energy_cost(low_target, temps) < compute_energy_cost(high_target, temps)
+        ec = EFFECTOR_MAP["mini_split_bedroom"].energy_cost
+        low = compute_energy_cost(heat, regulating_activity={"mini_split_bedroom": 0.2})
+        high = compute_energy_cost(heat, regulating_activity={"mini_split_bedroom": 0.8})
+        assert low == pytest.approx(ec * 0.2)
+        assert high == pytest.approx(ec * 0.8)
 
     def test_off_mini_split_no_energy_cost(self) -> None:
         """Off mini split should have zero energy cost."""
@@ -1846,10 +1905,14 @@ class TestSuperposition:
         )
 
     def test_superposition_ranking_with_regulating(self) -> None:
-        """Top-K from approximate scoring contains the true winner from full simulation.
+        """Exact refinement of the approximate top-K finds a near-optimal plan.
 
-        Regulating effectors break linearity slightly, but the true winner should
-        still be within the top-K approximate candidates.
+        Regulating effectors break linearity: a unit's activity depends on its
+        input V, which the other effectors also move (floor heat warming V's
+        members makes the split idle sooner). With near-tied costs the exact
+        winner may rank just outside the top-K, so the requirement is on what the
+        sweep would choose — the best exact cost among the top-K — not on
+        membership: within max(0.05, 0.01%) of the global optimum.
         """
         from weatherstat.control import (
             _SUPERPOSITION_TOP_K,
@@ -1870,6 +1933,9 @@ class TestSuperposition:
         per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
         groups = _build_option_groups(per_eff, deps, temps)
         marginals = _compute_marginals(state, groups, sim_params, CONTROL_HORIZONS)
+        from weatherstat.control import _dedupe_regulating
+
+        groups, marginals, _ = _dedupe_regulating(groups, marginals)
 
         from weatherstat.control import _ComfortSpec
 
@@ -1887,17 +1953,21 @@ class TestSuperposition:
         all_scenarios = _materialize_scenarios(groups, combo_indices, list(range(n_combos)))
         from weatherstat.control import _batch_comfort_cost, _batch_energy_cost
 
-        exact_names, exact_pred = predict(state, all_scenarios, sim_params, CONTROL_HORIZONS)
+        exact_activity: dict[str, np.ndarray] = {}
+        exact_names, exact_pred = predict(
+            state, all_scenarios, sim_params, CONTROL_HORIZONS, activity_out=exact_activity,
+        )
         tidx = {t: j for j, t in enumerate(exact_names)}
         exact_comfort = _batch_comfort_cost(exact_pred, _ComfortSpec.build(schedules, 12, tidx))
-        exact_energy = _batch_energy_cost(all_scenarios, temps)
+        exact_energy = _batch_energy_cost(all_scenarios, temps, exact_activity)
         exact_costs = exact_comfort + exact_energy
 
-        # The true winner must be in the top-K
-        true_best = int(np.argmin(exact_costs))
-        assert true_best in top_flat, (
-            f"True winner at flat index {true_best} (cost {exact_costs[true_best]:.4f}) "
-            f"not in top-{K} (worst in top-K: {approx_costs[ranked[K-1]]:.4f})"
+        true_best = float(exact_costs.min())
+        chosen = float(exact_costs[top_flat].min())
+        tolerance = max(0.05, 1e-4 * abs(true_best))
+        assert chosen <= true_best + tolerance, (
+            f"Best exact cost in top-{K} is {chosen:.4f}, global optimum {true_best:.4f} "
+            f"(loss {chosen - true_best:.4f} > {tolerance:.4f})"
         )
 
     def test_materialize_scenarios_correct(self) -> None:
@@ -1934,9 +2004,16 @@ class TestSuperposition:
                 )
 
     def test_energy_costs_precomputed(self) -> None:
-        """Pre-computed energy costs match compute_energy_cost for materialized scenarios."""
+        """Pre-computed energy costs match compute_energy_cost for materialized scenarios.
+
+        Regulating options are priced from their marginal activity trace, so the
+        reference is compute_energy_cost given that same activity.
+        """
         from weatherstat.control import (
+            CONTROL_HORIZONS,
             _build_option_groups,
+            _compute_marginals,
+            _dedupe_regulating,
             _enumerate_options,
             _materialize_scenarios,
         )
@@ -1948,6 +2025,8 @@ class TestSuperposition:
 
         per_eff, deps = _enumerate_options(schedules, 12, None, temps, set(), sim_params.gains)
         groups = _build_option_groups(per_eff, deps, temps)
+        marginals = _compute_marginals(self._make_state(), groups, sim_params, CONTROL_HORIZONS)
+        groups, marginals, _ = _dedupe_regulating(groups, marginals)
 
         # Build combo indices
         option_counts = [len(g.options) for g in groups]
@@ -1966,7 +2045,12 @@ class TestSuperposition:
         scenarios = _materialize_scenarios(groups, combo_indices, sample_indices)
 
         for s_idx, flat_idx in enumerate(sample_indices):
-            expected = compute_energy_cost(scenarios[s_idx], temps)
+            reg_activity = {
+                name: float(np.abs(acts[name][combo_indices[g][flat_idx]]).mean())
+                for g, acts in enumerate(marginals.activity)
+                for name in acts
+            }
+            expected = compute_energy_cost(scenarios[s_idx], temps, regulating_activity=reg_activity)
             assert abs(precomputed[flat_idx] - expected) < 0.001, (
                 f"Energy cost mismatch at flat {flat_idx}: "
                 f"precomputed={precomputed[flat_idx]:.4f} vs expected={expected:.4f}"
@@ -2099,6 +2183,60 @@ class TestDelaysAndModeHold:
         ]:
             opts = self._options(hour, prev, release)
             assert any(o.delay_steps > 0 for o in opts), (hour, prev, release)
+
+
+class TestCoolerRequestIsNotFoughtWithHeat:
+    """Regression: a room at 70.3°, asked 4° cooler for 3 h on a cold night.
+
+    Past the request's expiry the schedule wants 71° again and the room is predicted
+    well below it, which outweighed the hours inside the request: the split was
+    commanded "heat @ 72" (the reading + 0.5, which a unit that overshoots runs flat
+    out for) all night. Setpoints are now levels within the *current* preferred band,
+    so while the request stands the unit can at most hold the top of it.
+    """
+
+    def _sweep(self) -> tuple[object, EffectorDecision | None, list[ComfortSchedule], object]:
+        from datetime import UTC, datetime, timedelta
+
+        from weatherstat.control import sweep_scenarios_physics
+        from weatherstat.overlay import ComfortOverlay, apply_overlays
+        from weatherstat.simulator import load_sim_params
+
+        night = RoomComfort("bedroom", 71.0, 73.0, 69.0, 74.0, 66.0, 77.0, cold_penalty=2.0, hot_penalty=0.8)
+        now = datetime(2026, 11, 20, 2, 5, tzinfo=UTC)
+        overlay = ComfortOverlay("bedroom_temp", -4.0, now, now + timedelta(hours=3))
+        schedules = apply_overlays(
+            make_schedules(bedroom=[ComfortScheduleEntry(0, 24, night)]), [overlay], now, UTC,
+        )
+        temps = {
+            "thermostat_upstairs_temp": 72.0, "thermostat_downstairs_temp": 71.0,
+            "bedroom_temp": 70.3, "office_temp": 71.0, "family_room_temp": 71.0,
+            "kitchen_temp": 71.0, "bathroom_temp": 71.0, "piano_temp": 71.0,
+        }
+        params = load_sim_params()
+        decision, scenario, _blocked, _plan = sweep_scenarios_physics(
+            temps, 40.0, [40.0] * 12, {}, params, 2.0, {}, schedules, 2,
+            solar_fractions=[0.0] * 13, solar_elevations=[0.0] * 144, hold_release_sensors={"bedroom_temp"},
+        )
+        return decision, scenario.effectors.get("mini_split_bedroom"), schedules, params
+
+    def test_request_reverts_mid_horizon(self) -> None:
+        """The setup: bounds are 4° lower for hours 2–4, back by hour 6."""
+        _decision, _ed, schedules, _params = self._sweep()
+        bedroom = next(s for s in schedules if s.sensor == "bedroom_temp")
+        assert bedroom.comfort_at(3).preferred_hi == 69.0  # type: ignore[union-attr]
+        assert bedroom.comfort_at(6).preferred_lo == 71.0  # type: ignore[union-attr]
+
+    def test_split_holds_no_higher_than_the_requested_band(self) -> None:
+        decision, ed, _schedules, params = self._sweep()
+        if ed is not None and ed.mode == "heat":
+            assert ed.target is not None
+            hold = params.regulation["mini_split_bedroom"].response.holds_at(ed.target, 1.0)  # type: ignore[attr-defined]
+            assert hold <= 69.0 + 0.25  # top of the requested band, to the unit's 0.5° step
+        # The room is allowed to fall toward the request instead of being held or warmed.
+        bedroom = decision.predictions["bedroom_temp"]  # type: ignore[attr-defined]
+        assert bedroom["1h"] < 70.3
+        assert bedroom["2h"] <= 69.5
 
 
 class TestMissingSensorsNotScored:

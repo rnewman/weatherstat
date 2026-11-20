@@ -267,6 +267,12 @@ class WeatherstatConfig:
     # max(frozen_floor_hours, frozen_multiplier × p99.9 of its own flat runs) is treated as missing
     frozen_floor_hours: float = 3.0
     frozen_multiplier: float = 2.0
+    # Virtual regulation sensors (regulation.py, PLAN-41): the input each regulating effector
+    # regulates on, a gain-weighted mean of the sensors it affects
+    regulation_min_coverage: float = 0.6  # publish unavailable below this share of weight available
+    regulation_weight_tolerance: float = 0.05  # adopt refit weights only when one moves more than this
+    # Effectors switched over to read their published V: alert when the unit's reading stops following it
+    regulation_live: tuple[str, ...] = ()
     comfort_entity: str | None = None  # HA input_select controlling active comfort profile
     comfort_profiles: dict[str, ComfortProfile] = field(default_factory=dict)
     mrt_correction: MrtCorrectionConfig | None = None
@@ -836,6 +842,9 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         overlay_max_delta=_opt_float("overlay_max_delta"),
         frozen_floor_hours=float(defaults.get("frozen_floor_hours", 3.0)),
         frozen_multiplier=float(defaults.get("frozen_multiplier", 2.0)),
+        regulation_min_coverage=float(defaults.get("regulation_min_coverage", 0.6)),
+        regulation_weight_tolerance=float(defaults.get("regulation_weight_tolerance", 0.05)),
+        regulation_live=tuple(str(x) for x in (defaults.get("regulation_live") or ())),
         comfort_entity=comfort_entity,
         comfort_profiles=comfort_profiles,
         mrt_correction=mrt_correction,

@@ -31,6 +31,7 @@ from weatherstat.tui.widgets import (
     LogView,
     OpportunityPanel,
     PredictionPanel,
+    RegulationPanel,
     StatusHeader,
     TemperaturePanel,
 )
@@ -144,6 +145,7 @@ class WeatherstatApp(App):
         self._web_port = web_port
         self._web_server: object | None = None
         self._mqtt: object | None = None  # MqttBridge when `mqtt:` is configured
+        self._regulation: object | None = None  # RegulationPublisher when regulating effectors exist
 
         self.controller = TUIController(
             live=live,
@@ -164,6 +166,7 @@ class WeatherstatApp(App):
                         yield ForecastPanel()
                     with Vertical(id="right-col"):
                         yield EffectorPanel()
+                        yield RegulationPanel()
                         yield OpportunityPanel()
                         yield HealthPanel()
             with TabPane("Predictions", id="predictions"):
@@ -198,6 +201,8 @@ class WeatherstatApp(App):
 
         # Optional Home Assistant bridge (MQTT discovery), enabled by an `mqtt:` block in weatherstat.yaml
         self._start_mqtt_bridge()
+        # Virtual regulation inputs (PLAN-41): every 60 s, published when the bridge is up
+        self._start_regulation_publisher()
 
     # ── Tab switching ───────────────────────────────────────────────────────
 
@@ -286,6 +291,9 @@ class WeatherstatApp(App):
             self.notify(f"Config reload failed: {e}", severity="error")
 
     def on_unmount(self) -> None:
+        publisher = self._regulation
+        if publisher is not None:
+            publisher.stop()  # type: ignore[attr-defined]  # releases the single-publisher lock
         bridge = self._mqtt
         if bridge is not None:
             bridge.stop()  # type: ignore[attr-defined]  # retained "offline" → HA marks entities unavailable
@@ -376,6 +384,7 @@ class WeatherstatApp(App):
             self._update_forecast(snap)
             self._update_effectors(snap)
             self._update_opportunities(snap)
+            self._update_regulation(snap)
             self._update_predictions(snap)
         except Exception as e:
             self._log(f"[snapshot] [red]Apply failed: {e}[/]")
@@ -472,6 +481,9 @@ class WeatherstatApp(App):
             opportunities=snap.opportunities or None,
             warnings=snap.warnings or None,
         )
+
+    def _update_regulation(self, snap: StatusSnapshot) -> None:
+        self.query_one(RegulationPanel).set_data(snap.regulation)
 
     def _update_predictions(self, snap: StatusSnapshot) -> None:
         if snap.predictions:
@@ -571,6 +583,28 @@ class WeatherstatApp(App):
                 bridge.publish_snapshot(snap)
         except Exception as e:
             self._log(f"[mqtt] [red]Failed to start Home Assistant bridge: {e}[/]")
+            self._log(traceback.format_exc())
+
+    # ── Regulation inputs ───────────────────────────────────────────────────
+
+    def _start_regulation_publisher(self) -> None:
+        try:
+            from weatherstat.regulation_publisher import start_regulation_publisher
+
+            bridge = self._mqtt
+            controller = self.controller
+            publisher = start_regulation_publisher(
+                log=self._log,
+                live=lambda: controller.live_mode,
+                publish=bridge.publish_regulation if bridge is not None else None,  # type: ignore[attr-defined]
+                request_cycle=controller.request_cycle,
+            )
+            if publisher is None:
+                return
+            self._regulation = publisher
+            controller.set_regulation_source(publisher.status)
+        except Exception as e:
+            self._log(f"[regulation] [red]Failed to start regulation publisher: {e}[/]")
             self._log(traceback.format_exc())
 
     # ── Logging ─────────────────────────────────────────────────────────────

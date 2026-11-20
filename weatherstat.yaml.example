@@ -50,11 +50,23 @@ sensors:
     combi_heating:
       entity_id: sensor.combi_heating_mode
       encoding: { "Space Heating": 1, "Idle": 0, "Domestic Hot Water": 0, "DHW Recirculating": 0 }
+    # Mini split delivery (e.g. Mitsubishi CN105 via ESPHome): hvac_action alone is not
+    # delivery. Sub mode says whether the compressor is running normally.
+    # mini_split_bedroom_sub_mode:
+    #   entity_id: sensor.bedroom_split_sub_mode
+    #   encoding: { NORMAL: 1, PREHEAT: 0, DEFROST: 0, STANDBY: 0, "OFF": 0 }
+    # mini_split_bedroom_stage:
+    #   entity_id: sensor.bedroom_split_stage_or_fan_state
+    #   encoding: { IDLE: 0, LOW: 1, GENTLE: 1, MEDIUM: 1, MODERATE: 1, HIGH: 1, DIFFUSE: 1 }
 
   # Power sensors: numeric energy/power measurements
   power:
     combi_gas_usage:
       entity_id: sensor.combi_current_gas_usage
+    # mini_split_bedroom_input_power:
+    #   entity_id: sensor.bedroom_split_input_power
+    # mini_split_bedroom_energy:       # kWh counter; a delivery signal for units without power
+    #   entity_id: sensor.bedroom_split_energy_usage
 
 # ── Effectors ───────────────────────────────────────────────────────────
 
@@ -349,3 +361,9 @@ defaults:
   # is treated as missing — not scored, excluded from sysid, alerted. `just debug frozen` shows limits and spans.
   # frozen_floor_hours: 3
   # frozen_multiplier: 2
+  # Virtual regulation sensors (PLAN-41): each mini split's input V = gain-weighted mean of the rooms it
+  # affects, published every minute as sensor.weatherstat_<effector>_input (needs the mqtt: block).
+  # `just debug regulation` shows weights, the learned response, and V vs the unit's reading.
+  # regulation_min_coverage: 0.6      # publish unavailable when less than this share of the weight is readable
+  # regulation_weight_tolerance: 0.05 # adopt refit weights only when one moves by more than this
+  # regulation_live: []               # effectors whose unit reads V (see ha/README.md § Mini split inputs): alert if it stops following

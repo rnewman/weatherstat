@@ -235,6 +235,9 @@ def main() -> None:
                         help="Show what would be written without writing")
     parser.add_argument("--db", type=Path, default=None,
                         help=f"Database path (default: {SNAPSHOTS_DB})")
+    parser.add_argument("--names", nargs="+", default=None,
+                        help="Only write these columns (e.g. sensors just added to the config); "
+                             "with --hours, backfills their recent history without densifying other columns")
     args = parser.parse_args()
 
     _check_config()
@@ -279,6 +282,16 @@ def main() -> None:
 
     # Fetch and build DataFrame
     df = _fetch_and_build_df(start, end)
+    if args.names:
+        missing = sorted(set(args.names) - set(df.columns))
+        if missing:
+            print(f"Not produced by the history fetch (check the config): {', '.join(missing)}", file=sys.stderr)
+            sys.exit(1)
+        df = df[["timestamp", *args.names]]
+        # Never write ahead of the collector: its next snapshot owns that timestamp.
+        newest = conn.execute("SELECT MAX(timestamp) FROM readings").fetchone()[0]
+        if newest:
+            df = df[df["timestamp"] <= newest]
     print(f"Built {len(df)} rows × {len(df.columns) - 1} columns")
 
     # Convert to EAV

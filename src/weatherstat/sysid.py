@@ -138,6 +138,8 @@ class SysIdResult:
     solar_plane_gains: dict[str, dict[str, float]] = field(default_factory=dict)  # sensor -> {plane -> gain}
     regression_models: dict[str, dict] = field(default_factory=dict)  # sensor -> {tau_base, feature_names, coefficients}
     coupling_identification: dict[str, dict[str, dict[str, dict]]] = field(default_factory=dict)  # family -> device -> sensor -> record
+    # effector -> {offset, band, n_rows, brier, modes: {heat|cool: {...}}}
+    regulation_responses: dict[str, dict] = field(default_factory=dict)
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
@@ -1146,6 +1148,14 @@ def run_sysid(output_path: Path | None = None, verbose: bool = False) -> tuple[S
     """
     result, diagnostics = fit_sysid(verbose=verbose)
     save_sysid_result(result, output_path, sensor_diagnostics=diagnostics)
+    if output_path is None:
+        # The live params changed: re-derive the regulating units' published input
+        # weights, as the periodic refit does (runtime.sysid_refit).
+        from weatherstat.runtime import adopt_regulation_weights
+
+        msg = adopt_regulation_weights()
+        if msg:
+            print(f"  {msg}")
     return result, diagnostics
 
 
@@ -1487,6 +1497,16 @@ def fit_sysid(
     # now uses solar_elevation_gains dynamically (per current sun state).
     # Static mrt_weights are only set via manual YAML config, not sysid.
 
+    # Regulating effectors' learned response (PLAN-41): P(running) vs the unit's own
+    # error, so the simulator can predict a delegated unit's activity for a target.
+    from weatherstat.regulation import fit_responses, responses_to_json
+
+    responses = fit_responses(df)
+    for name, pooled in responses.items():
+        for label, curve in [*pooled.modes.items(), *([("pooled", pooled)] if len(pooled.modes) < 2 else [])]:
+            print(f"  Response {name} {label}: half-on {curve.half_on:+.2f} past setpoint, ramp {curve.band:.2f} wide "
+                  f"[{curve.n_rows} rows, brier {curve.brier}]")
+
     sysid_result = SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
         data_start=data_start,
@@ -1503,6 +1523,7 @@ def fit_sysid(
         solar_plane_gains=solar_plane_gains,
         regression_models=regression_models,
         coupling_identification=coupling_identification,
+        regulation_responses=responses_to_json(responses),
     )
     return sysid_result, sensor_diagnostics
 

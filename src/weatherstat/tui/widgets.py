@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from rich.text import Text
 from textual.widgets import DataTable, RichLog, Static
 
 from weatherstat.config import UNIT_SYMBOL
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from weatherstat.regulation_publisher import RegulationStatus
 
 
 class StatusHeader(Static):
@@ -541,3 +548,50 @@ class LogView(RichLog):
 
     def __init__(self) -> None:
         super().__init__(id="log-view", wrap=True, highlight=True, markup=True)
+
+
+def regulation_lines(status: RegulationStatus | None, now: datetime | None = None) -> list[str]:
+    """Rich-markup lines for the regulation inputs panel (pure; tested without Textual)."""
+    from weatherstat.regulation_publisher import effector_title, follows_text, member_label, weights_text
+
+    head = "[bold]Regulation inputs[/]"
+    if status is None:
+        return [head, "  [dim]not running[/]"]
+    if status.role == "standby":
+        head += f"  [dim](published by pid {status.holder or '?'})[/]"
+    lines = [head]
+    if status.error:
+        lines.append(f"  [red]{status.error}[/]")
+    if not status.units:
+        lines.append("  [dim](no readings yet)[/]")
+    for name, u in status.units.items():
+        title = effector_title(name)
+        if u.value is None:
+            line = f"  {title}  [red]unavailable[/] [dim]{u.reason or ''}[/]"
+        else:
+            cov = "" if u.coverage >= 0.999 else f"  [yellow]{u.coverage:.0%}[/]"
+            line = f"  {title}  V [bold]{u.value:.1f}{UNIT_SYMBOL}[/]{cov}"
+        if u.unit_reading is not None:
+            diff = f" ({u.unit_reading - u.value:+.1f})" if u.value is not None else ""
+            line += f"  [dim]unit {u.unit_reading:.1f}{diff}[/]"
+        ft = follows_text(u.follows, now)
+        if ft is not None:
+            style = {"ok": "green", "mismatch": "yellow", "alert": "bold red"}.get(u.follows.state if u.follows else "", "dim")
+            line += f"  [{style}]{ft}[/]"
+        lines.append(line)
+        if u.used:
+            lines.append(f"    [dim]{weights_text(u.used)}[/]")
+        for s, why in u.dropped.items():
+            lines.append(f"    [red]✗ {member_label(s)}: {why}[/]")
+    return lines
+
+
+class RegulationPanel(Static):
+    """Per regulating effector: the published input V, coverage, members/weights, follows-V."""
+
+    def __init__(self) -> None:
+        super().__init__("", classes="panel")
+
+    def set_data(self, status: RegulationStatus | None) -> None:
+        self.display = status is not None  # hidden when no regulating effector (publisher not running)
+        self.update("\n".join(regulation_lines(status)))
