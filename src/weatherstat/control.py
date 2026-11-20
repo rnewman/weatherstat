@@ -1254,11 +1254,13 @@ def _enumerate_options(
 
         elif eff.control_type == "binary":
             binary_options: list[EffectorDecision] = [EffectorDecision(eff.name)]
-            for m in eff.supported_modes:
-                if m == "off":
+            for delay in TRAJECTORY_DELAYS:
+                if delay >= max_horizon:
                     continue
-                for delay in TRAJECTORY_DELAYS:
-                    if delay >= max_horizon:
+                # mode_schedule: a mode is offered only for a start inside its hours. A
+                # plan that runs past the band's edge is cut there by the next cycle.
+                for m in eff.modes_at((base_hour + delay * 5 // 60) % 24):
+                    if m == "off":
                         continue
                     for duration in TRAJECTORY_DURATIONS:
                         effective_duration = min(duration, max_horizon - delay)
@@ -1342,12 +1344,15 @@ def _build_option_groups(
     per_effector_options: dict[str, list[EffectorDecision]],
     dependent_effectors: list,
     current_temps: dict[str, float],
+    base_hour: int | None = None,
 ) -> list[EffectorOptionGroup]:
     """Build independent option groups from per-effector option lists.
 
     Independent effectors without dependents become singleton groups.
     Effectors with dependents form compound groups where parent+dependent
     options are enumerated together (dependency gate is not separable).
+    Dependents start now, so ``base_hour`` selects the modes their
+    ``mode_schedule`` allows (None: every supported mode).
     """
     from collections import defaultdict
     from itertools import product as iproduct
@@ -1413,7 +1418,8 @@ def _build_option_groups(
                         for pn in dep.depends_on
                     )
                     if all_parents_active:
-                        dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep.supported_modes])
+                        dep_modes = dep.supported_modes if base_hour is None else dep.modes_at(base_hour)
+                        dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep_modes])
                     else:
                         dep_option_lists.append([EffectorDecision(dep.name)])
                 for dep_combo in iproduct(*dep_option_lists):
@@ -1630,7 +1636,7 @@ def generate_trajectory_scenarios(
                 for pname in dep.depends_on
             )
             if all_parents_active:
-                dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep.supported_modes])
+                dep_option_lists.append([EffectorDecision(dep.name, mode=m) for m in dep.modes_at(base_hour)])
             else:
                 dep_option_lists.append([EffectorDecision(dep.name)])
             dep_names.append(dep.name)
@@ -1903,9 +1909,16 @@ def sweep_scenarios_physics(
 
     if blocked_reasons:
         print(f"  Heating blocked: {'; '.join(blocked_reasons)}")
+    limited: dict[tuple[str, ...], list[str]] = {}
+    for eff in EFFECTORS:
+        allowed = eff.modes_at(base_hour)
+        if allowed != eff.supported_modes:
+            limited.setdefault(allowed, []).append(eff.name)
+    for allowed, names in limited.items():
+        print(f"  Mode schedule: {', '.join(names)} limited to {'/'.join(allowed)} this hour")
 
     # ── Build option groups + marginals (superposition) ──
-    groups = _build_option_groups(per_effector_options, dependent_effectors, current_temps)
+    groups = _build_option_groups(per_effector_options, dependent_effectors, current_temps, base_hour)
     n_combos_total = 1
     for g in groups:
         n_combos_total *= len(g.options)

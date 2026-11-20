@@ -466,6 +466,7 @@ def generate_yaml(c: Classified) -> str:
             w("    mode_control: automatic")
             w(f"    supported_modes: [{', '.join(fan_modes)}]")
             w("    # depends_on: ???                # parent effector name (e.g., a thermostat)")
+            w('    # mode_schedule: [{ hours: [21, 9], modes: ["off", low] }]  # e.g. never high overnight')
             w(f"    state_encoding: {{ {', '.join(enc_parts)} }}")
             w("    max_lag_minutes: 5")
             energy_parts = ['"off": 0.0']

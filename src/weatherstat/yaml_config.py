@@ -63,6 +63,8 @@ class EffectorYamlConfig:
     depends_on: tuple[str, ...] = ()  # effector names this depends on (ALL must be active)
     proportional_band: float = 1.0  # regulating: activity ramp width (°F)
     mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
+    # binary: hour bands (start, end, modes) during which only those modes may be used
+    mode_schedule: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
 
     @property
     def domain(self) -> str:
@@ -585,6 +587,38 @@ def _parse_depends_on(raw: str | list | None) -> tuple[str, ...]:
     return tuple(str(x) for x in raw)
 
 
+def _parse_mode_schedule(
+    name: str, raw: list | None, control_type: str, supported: tuple[str, ...],
+) -> tuple[tuple[int, int, tuple[str, ...]], ...]:
+    """Parse ``mode_schedule``: [{hours: [start, end], modes: [...]}, ...].
+
+    Each band limits the effector to ``modes`` (plus off) for local hours
+    [start, end), wrapping midnight when start > end. Hours no band covers
+    allow every supported mode. Mistakes fail at load: a band that silently
+    did nothing would leave a fan on high at night.
+    """
+    if not raw:
+        return ()
+    if control_type != "binary":
+        raise ValueError(f"effectors.{name}.mode_schedule: only binary effectors have a mode schedule")
+    bands: list[tuple[int, int, tuple[str, ...]]] = []
+    for entry in raw:
+        hours, modes = entry.get("hours"), entry.get("modes")
+        if not isinstance(hours, list) or len(hours) != 2 or modes is None:
+            raise ValueError(f"effectors.{name}.mode_schedule: each band needs hours: [start, end] and modes: [...]")
+        start, end = int(hours[0]), int(hours[1])
+        if not (0 <= start <= 24 and 0 <= end <= 24):
+            raise ValueError(f"effectors.{name}.mode_schedule: hours must be 0–24, got {hours}")
+        allowed = tuple(str(m) for m in modes)
+        unknown = [m for m in allowed if m not in supported]
+        if unknown:
+            raise ValueError(
+                f"effectors.{name}.mode_schedule: {unknown} not in supported_modes {list(supported)}"
+            )
+        bands.append((start, end, allowed))
+    return tuple(bands)
+
+
 def _parse_config(data: dict) -> WeatherstatConfig:
     """Parse raw YAML dict into a WeatherstatConfig."""
     loc = data["location"]
@@ -624,12 +658,14 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         mode_hold_window = (int(mhw_raw[0]), int(mhw_raw[1])) if mhw_raw else None
         ec_raw = dev.get("energy_cost", 0.0)
         energy_cost = {str(k): float(v) for k, v in ec_raw.items()} if isinstance(ec_raw, dict) else float(ec_raw)
+        control_type = str(dev.get("control_type", "trajectory"))
+        supported_modes = tuple(str(m) for m in dev.get("supported_modes", ()))
         effectors[name] = EffectorYamlConfig(
             name=name,
             entity_id=dev["entity_id"],
-            control_type=str(dev.get("control_type", "trajectory")),
+            control_type=control_type,
             mode_control=str(dev.get("mode_control", "manual")),
-            supported_modes=tuple(str(m) for m in dev.get("supported_modes", ())),
+            supported_modes=supported_modes,
             state_encoding=state_enc,
             max_lag_minutes=int(dev.get("max_lag_minutes", 90)),
             energy_cost=energy_cost,
@@ -638,6 +674,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             depends_on=_parse_depends_on(dev.get("depends_on")),
             proportional_band=float(dev.get("proportional_band", 1.0)),
             mode_hold_window=mode_hold_window,
+            mode_schedule=_parse_mode_schedule(name, dev.get("mode_schedule"), control_type, supported_modes),
         )
 
     # ── State sensors (categorical with encoding) ─────────────────────

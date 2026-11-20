@@ -125,6 +125,11 @@ effectors:
     state_encoding: { "off": 0, low: 1, high: 2 }
     max_lag_minutes: 5
     energy_cost: { "off": 0.0, low: 0.001, high: 0.002 }
+    # Optional, binary effectors: hour bands that limit which modes the planner may use.
+    # Local hours [start, end), wrapping midnight; "off" is always allowed; hours no band
+    # covers allow every supported mode. Here: never high between 9pm and 9am.
+    # mode_schedule:
+    #   - { hours: [21, 9], modes: ["off", low] }
   blower_office:
     entity_id: fan.blower_office
     control_type: binary

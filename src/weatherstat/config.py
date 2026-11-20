@@ -68,6 +68,21 @@ class EffectorConfig:
     mode_encoding: dict[str, float] = field(default_factory=dict)  # for energy cost / sysid
     temp_col: str = ""  # sensor column for current temp (climate entities)
     energy_cost: float | dict[str, float] = 0.0  # per-effector energy cost (scalar or per-mode dict)
+    # binary: hour bands (start, end, modes) during which only those modes may be used
+    mode_schedule: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
+
+    def modes_at(self, hour: int) -> tuple[str, ...]:
+        """The supported modes the planner may use at this local hour.
+
+        The first ``mode_schedule`` band covering the hour ([start, end), wrapping
+        midnight when start > end) limits them to its modes; off is always allowed.
+        Hours no band covers allow every supported mode.
+        """
+        for start, end, modes in self.mode_schedule:
+            inside = start <= hour < end if start <= end else (hour >= start or hour < end)
+            if inside:
+                return tuple(m for m in self.supported_modes if m == "off" or m in modes)
+        return self.supported_modes
 
 
 def _snake_to_camel(s: str) -> str:
@@ -105,6 +120,7 @@ for name, cfg in _CFG.effectors.items():
         state_device=cfg.state_device,
         proportional_band=cfg.proportional_band,
         mode_hold_window=cfg.mode_hold_window,
+        mode_schedule=cfg.mode_schedule,
         mode_encoding=cfg.command_encoding or cfg.state_encoding,
         temp_col=temp_col,
         energy_cost=cfg.energy_cost,

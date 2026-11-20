@@ -463,3 +463,143 @@ class TestTemperatureUnits:
         cfg = load_config()
         assert cfg.location.unit == "F"
         assert cfg.unit_symbol == "°F"
+
+
+# ── Mode schedule: hour bands limiting a binary effector's modes ─────────
+
+
+class TestModeSchedule:
+    """``mode_schedule`` keeps a binary effector out of some modes at some hours
+    (a blower that may not run on high overnight)."""
+
+    QUIET = ((21, 9, ("off", "low")),)
+
+    @staticmethod
+    def _example() -> dict:
+        from pathlib import Path
+
+        import yaml
+
+        return yaml.safe_load((Path(__file__).parent.parent / "weatherstat.yaml.example").read_text())
+
+    def _quiet_blowers(self) -> tuple[tuple, dict]:
+        from dataclasses import replace
+
+        effs = tuple(replace(e, mode_schedule=self.QUIET) if e.name.startswith("blower_") else e for e in EFFECTORS)
+        return effs, {e.name: e for e in effs}
+
+    def test_parsed_from_yaml(self) -> None:
+        from weatherstat.yaml_config import _parse_config
+
+        data = self._example()
+        data["effectors"]["blower_office"]["mode_schedule"] = [{"hours": [21, 9], "modes": ["off", "low"]}]
+        cfg = _parse_config(data)
+        assert cfg.effectors["blower_office"].mode_schedule == self.QUIET
+        assert cfg.effectors["blower_gym"].mode_schedule == ()
+
+    @pytest.mark.parametrize(("effector", "band", "message"), [
+        ("blower_office", {"hours": [21, 9], "modes": ["off", "hi"]}, "not in supported_modes"),
+        ("blower_office", {"hours": [21], "modes": ["low"]}, "hours: \\[start, end\\]"),
+        ("blower_office", {"hours": [21, 30], "modes": ["low"]}, "0–24"),
+        ("blower_office", {"hours": [21, 9]}, "modes"),
+        ("thermostat_upstairs", {"hours": [21, 9], "modes": ["heat"]}, "only binary effectors"),
+    ])
+    def test_mistakes_fail_at_load(self, effector: str, band: dict, message: str) -> None:
+        """A band that silently did nothing would leave a fan on high at night."""
+        from weatherstat.yaml_config import _parse_config
+
+        data = self._example()
+        data["effectors"][effector]["mode_schedule"] = [band]
+        with pytest.raises(ValueError, match=message):
+            _parse_config(data)
+
+    def test_modes_at_wraps_midnight_and_keeps_off(self) -> None:
+        from dataclasses import replace
+
+        from weatherstat.config import EFFECTOR_MAP
+
+        blower = replace(EFFECTOR_MAP["blower_office"], mode_schedule=((21, 9, ("low",)),))
+        for hour in (21, 23, 0, 8):
+            assert blower.modes_at(hour) == ("off", "low"), hour  # off is always allowed
+        for hour in (9, 12, 20):
+            assert blower.modes_at(hour) == ("off", "low", "high"), hour
+        assert EFFECTOR_MAP["blower_office"].modes_at(23) == ("off", "low", "high")  # no schedule
+
+    def test_dependent_blowers_not_offered_high_in_quiet_hours(self) -> None:
+        effs, eff_map = self._quiet_blowers()
+        with patch("weatherstat.control.EFFECTORS", effs), patch("weatherstat.control.EFFECTOR_MAP", eff_map):
+            night = generate_trajectory_scenarios(base_hour=23)
+            day = generate_trajectory_scenarios(base_hour=12)
+
+        def modes(scenarios: list) -> set[str]:
+            return {ed.mode for s in scenarios for n, ed in s.effectors.items() if n.startswith("blower_")}
+
+        assert modes(night) == {"off", "low"}
+        assert modes(day) == {"off", "low", "high"}
+
+    def test_option_groups_follow_the_hour(self) -> None:
+        from weatherstat.control import _build_option_groups, _enumerate_options
+
+        effs, eff_map = self._quiet_blowers()
+        temps = {"thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 69.0}
+        with patch("weatherstat.control.EFFECTORS", effs), patch("weatherstat.control.EFFECTOR_MAP", eff_map):
+            per_eff, deps = _enumerate_options(None, 23, None, temps, set(), None)
+
+            def modes(hour: int | None) -> set[str]:
+                groups = _build_option_groups(per_eff, deps, temps, hour)
+                return {ed.mode for g in groups for o in g.options for n, ed in o.items() if n.startswith("blower_")}
+
+            assert modes(23) == {"off", "low"}
+            assert modes(8) == {"off", "low"}
+            assert modes(9) == {"off", "low", "high"}
+
+    def test_independent_binary_start_must_fall_in_allowed_hours(self) -> None:
+        """A delayed start is judged at the hour it would begin: at 20:xx, high may start
+        now but not in one or two hours (21:xx, 22:xx); low may start any time."""
+        from weatherstat.config import EffectorConfig
+        from weatherstat.control import _enumerate_options
+
+        fan = EffectorConfig(
+            name="fan_attic", entity_id="fan.attic", control_type="binary", mode_control="automatic",
+            supported_modes=("off", "low", "high"), command_keys={"mode": "fanAtticMode"},
+            mode_encoding={"off": 0, "low": 1, "high": 2}, mode_schedule=self.QUIET,
+        )
+        effs = EFFECTORS + (fan,)
+        with (
+            patch("weatherstat.control.EFFECTORS", effs),
+            patch("weatherstat.control.EFFECTOR_MAP", {e.name: e for e in effs}),
+        ):
+            per_eff, _deps = _enumerate_options(None, 20, None, {}, set(), None)
+        options = per_eff["fan_attic"]
+        assert {o.delay_steps for o in options if o.mode == "high"} == {0}
+        assert {o.delay_steps for o in options if o.mode == "low"} == {0, 12, 24}
+
+    def test_sweep_never_plans_high_in_quiet_hours(self) -> None:
+        from dataclasses import replace
+
+        from weatherstat.control import default_comfort_schedules, sweep_scenarios_physics
+
+        effs, eff_map = self._quiet_blowers()
+        base = load_sim_params()
+        params = replace(base, gains={
+            **base.gains,
+            ("blower_office", "office_temp"): (0.6, 10.0),
+            ("blower_family_room", "family_room_temp"): (0.6, 10.0),
+        })
+        # Cold downstairs: the floor heat runs and the blowers are worth using.
+        temps = {
+            "thermostat_upstairs_temp": 70.0, "thermostat_downstairs_temp": 64.0, "bedroom_temp": 69.0,
+            "office_temp": 63.0, "family_room_temp": 63.0, "kitchen_temp": 70.0, "bathroom_temp": 69.0,
+            "piano_temp": 70.0,
+        }
+
+        def blower_modes(hour: int) -> set[str]:
+            with patch("weatherstat.control.EFFECTORS", effs), patch("weatherstat.control.EFFECTOR_MAP", eff_map):
+                _decision, scenario, _blocked, _plan = sweep_scenarios_physics(
+                    temps, 30.0, [30.0] * 12, {}, params, float(hour), {}, default_comfort_schedules(),
+                    hour, solar_fractions=[0.0] * 13, solar_elevations=[0.0] * 144,
+                )
+            return {ed.mode for n, ed in scenario.effectors.items() if n.startswith("blower_")}
+
+        assert "high" in blower_modes(12)  # the scenario does call for high when it is allowed
+        assert "high" not in blower_modes(23)
