@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import requests
@@ -46,6 +47,8 @@ class AdvisoryState:
     cooldowns: dict[str, float] = field(default_factory=dict)
     opportunities: list[dict] = field(default_factory=list)
     warnings: list[dict] = field(default_factory=list)
+    # Devices listed in the suggestion notification currently on the phone.
+    notified: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> AdvisoryState:
@@ -56,10 +59,14 @@ class AdvisoryState:
             data = json.loads(ADVISORY_STATE_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             return cls()
+        opportunities = data.get("opportunities", [])
         return cls(
             cooldowns=data.get("cooldowns", {}),
-            opportunities=data.get("opportunities", []),
+            opportunities=opportunities,
             warnings=data.get("warnings", []),
+            # Files written before ``notified`` existed: any tracked opportunity
+            # may be on the phone.
+            notified=data.get("notified", [str(o.get("device")) for o in opportunities]),
         )
 
     def save(self) -> None:
@@ -70,6 +77,7 @@ class AdvisoryState:
                 "cooldowns": self.cooldowns,
                 "opportunities": self.opportunities,
                 "warnings": self.warnings,
+                "notified": self.notified,
             },
             indent=2,
         ))
@@ -91,6 +99,29 @@ def save_advisory_state(cooldowns: dict[str, float]) -> None:
 
 
 # ── Opportunity serialization ─────────────────────────────────────────────
+
+
+def opportunity_text(opp: dict) -> str:
+    """'Open office window in 20m for 1h' — one serialized opportunity as a sentence.
+
+    Shared by the phone notification and the MQTT status sensor. The TUI builds
+    the same line with markup.
+    """
+    from weatherstat.overlay import format_remaining
+
+    try:
+        from weatherstat.yaml_config import environment_display, load_config
+
+        dev = str(opp.get("device", "?"))
+        label, kind = environment_display(dev, load_config().environment.get(dev))
+    except Exception:  # noqa: BLE001 — display only
+        label, kind = str(opp.get("device", "?")), ""
+    mins = opp.get("in_minutes") or 0
+    dur = opp.get("duration_minutes")
+    timing = "now" if mins == 0 else f"in {format_remaining(timedelta(minutes=mins))}"
+    dur_str = f" for {format_remaining(timedelta(minutes=dur))}" if dur else ""
+    action = str(opp.get("action", "?")).replace("_", " ").capitalize()
+    return " ".join(part for part in (action, label, kind) if part) + f" {timing}{dur_str}"
 
 
 def _serialize_opportunity(opp: DeviceOpportunity) -> dict[str, object]:
@@ -201,16 +232,21 @@ def process_advisory_plan(
 
     Filters per-device opportunities to beneficial ones (``cost_delta < 0``),
     sorts them by magnitude, persists them to ``ADVISORY_STATE_FILE`` alongside
-    backup-breach warnings, and pushes a single rolled-up Home Assistant
-    notification for opportunities whose ``|cost_delta|`` exceeds
-    ``ADVISORY_NOTIFICATION_THRESHOLD`` — subject to cooldown and quiet-hour
-    gates. The rollup is dismissed when the previously-active set drains.
-    """
-    from weatherstat.yaml_config import environment_display, load_config
+    backup-breach warnings, and keeps one rolled-up Home Assistant notification
+    for opportunities whose ``|cost_delta|`` reaches
+    ``ADVISORY_NOTIFICATION_THRESHOLD``.
 
+    A suggestion past its cooldown (and outside quiet hours) sends the rollup.
+    The rollup lists every suggestion currently worth notifying, not only the
+    new one: it replaces the previous notification (same tag), which would
+    otherwise drop suggestions that still apply. Each listed suggestion's
+    cooldown restarts. The notification is dismissed once none of the
+    suggestions it lists is still worth notifying.
+
+    Suggestions can warm or cool (close a window on a cold day, open one on a
+    warm evening), so the title says neither.
+    """
     state = AdvisoryState.load()
-    _env = load_config().environment
-    had_opportunities = bool(state.opportunities)
 
     if advisory_plan is None:
         beneficial: list[DeviceOpportunity] = []
@@ -235,53 +271,46 @@ def process_advisory_plan(
             else current_hour >= start or current_hour < end
         )
 
+    # The opportunity cooldown key predates suggestions that close or warm.
     cooldown_secs = ADVISORY_COOLDOWNS.get("free_cooling", 14400)
     now_ts = time.time()
-    newly_notify: list[DeviceOpportunity] = []
+    worth = [o for o in beneficial if -o.cost_delta >= ADVISORY_NOTIFICATION_THRESHOLD]
+    due: list[DeviceOpportunity] = []
     if not quiet:
-        for opp in beneficial:
-            magnitude = -opp.cost_delta
-            if magnitude < ADVISORY_NOTIFICATION_THRESHOLD:
-                continue
-            cooldown_key = f"opportunity_{opp.device}"
-            last = state.cooldowns.get(cooldown_key)
-            if last is not None and (now_ts - last) < cooldown_secs:
-                continue
-            newly_notify.append(opp)
-            state.cooldowns[cooldown_key] = now_ts
+        for opp in worth:
+            last = state.cooldowns.get(f"opportunity_{opp.device}")
+            if last is None or (now_ts - last) >= cooldown_secs:
+                due.append(opp)
+    texts = {id(o): opportunity_text(_serialize_opportunity(o)) for o in beneficial}
 
     # ── Console output ──
     print("\n[advisory] Evaluating environment opportunities...")
     if not beneficial:
         print("  No beneficial opportunities")
     else:
-        notify_set = {id(o) for o in newly_notify}
+        due_set = {id(o) for o in due}
         for opp in beneficial:
-            label, kind = environment_display(opp.device, _env.get(opp.device))
-            tag = " (notify)" if id(opp) in notify_set else ""
-            timing = "now" if opp.advisory.transition_step == 0 else f"in {opp.advisory.transition_step * 5}m"
-            print(
-                f"  {opp.advisory.action.title()} {label} {kind}: "
-                f"cost_delta={opp.cost_delta:+.2f} {timing}{tag}"
-            )
+            tag = " (notify)" if id(opp) in due_set else ""
+            print(f"  {texts[id(opp)]}: cost_delta={opp.cost_delta:+.2f}{tag}")
 
     # ── Persistence + notification dispatch ──
     if not live:
         return
 
-    state.save()
+    if due:
+        lines = [f"{texts[id(o)]} (benefit {-o.cost_delta:.2f})" for o in worth]
+        title = "Weatherstat suggestion" if len(worth) == 1 else "Weatherstat suggestions"
+        if send_ha_notification(title, "\n".join(lines), _ROLLUP_TAG, notification_target):
+            for opp in worth:
+                state.cooldowns[f"opportunity_{opp.device}"] = now_ts
+            state.notified = [o.device for o in worth]
+            print(f"  → Notified ({len(worth)} suggestion{'s' if len(worth) != 1 else ''})")
+    elif state.notified and not {o.device for o in worth} & set(state.notified):
+        # Nothing the notification lists is still worth doing — clear it.
+        if dismiss_ha_notification(_ROLLUP_TAG, notification_target):
+            state.notified = []
 
-    if newly_notify:
-        lines: list[str] = []
-        for opp in newly_notify:
-            label, kind = environment_display(opp.device, _env.get(opp.device))
-            magnitude = -opp.cost_delta
-            lines.append(f"{opp.advisory.action.title()} {label} {kind} (benefit {magnitude:.2f})")
-        send_ha_notification("Free cooling", "\n".join(lines), _ROLLUP_TAG, notification_target)
-        print(f"  → Notified ({len(newly_notify)} opportunities)")
-    elif had_opportunities and not beneficial:
-        # The previously-active rollup no longer applies — clear it.
-        dismiss_ha_notification(_ROLLUP_TAG, notification_target)
+    state.save()
 
 
 # ── Comfort breach notifications ──────────────────────────────────────────

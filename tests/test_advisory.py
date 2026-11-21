@@ -399,6 +399,110 @@ class TestProcessAdvisoryPlan:
         assert len(data["opportunities"]) == 1
         assert sent == []
 
+    @staticmethod
+    def _capture(monkeypatch) -> tuple[list[tuple], list[tuple]]:
+        sent: list[tuple] = []
+        dismissed: list[tuple] = []
+        monkeypatch.setattr(
+            "weatherstat.advisory.send_ha_notification",
+            lambda *a, **kw: sent.append(a) or True,
+        )
+        monkeypatch.setattr(
+            "weatherstat.advisory.dismiss_ha_notification",
+            lambda *a, **kw: dismissed.append(a) or True,
+        )
+        return sent, dismissed
+
+    def test_close_suggestion_is_not_called_free_cooling(self, tmp_path, monkeypatch) -> None:
+        """Closing a window on a cold day keeps heat in; the notification says what to do, not why."""
+        from weatherstat.advisory import process_advisory_plan
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        sent, _ = self._capture(monkeypatch)
+
+        process_advisory_plan(self._plan(self._opp("bedroom", -2.0, action="close")), live=True, current_hour=12)
+
+        (title, body, _tag, _target), = sent
+        assert "cooling" not in title.lower()
+        assert body == "Close bedroom window now (benefit 2.00)"
+
+    def test_notification_gives_timing_and_duration(self, tmp_path, monkeypatch) -> None:
+        from weatherstat.advisory import process_advisory_plan
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        sent, _ = self._capture(monkeypatch)
+        opp = self._opp("living_room", -2.5, action="open", transition_step=6, return_step=18)
+
+        process_advisory_plan(self._plan(opp), live=True, current_hour=12)
+
+        assert sent[0][1] == "Open living room window in 30m for 1h (benefit 2.50)"
+
+    def test_new_suggestion_resends_ones_still_on_cooldown(self, tmp_path, monkeypatch) -> None:
+        """The rollup replaces the previous notification, so it lists every suggestion that still applies.
+
+        Listing only the newly due suggestion made the earlier one vanish from the
+        phone although it was still recommended.
+        """
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent, _ = self._capture(monkeypatch)
+        living = self._opp("living_room", -2.8)
+
+        process_advisory_plan(self._plan(living), live=True, current_hour=7)
+        process_advisory_plan(self._plan(living, self._opp("bedroom", -1.6, action="close")), live=True, current_hour=7)
+
+        assert len(sent) == 2
+        assert sent[1][1].splitlines() == [
+            "Open living room window now (benefit 2.80)",
+            "Close bedroom window now (benefit 1.60)",
+        ]
+        assert json.loads(state_file.read_text())["notified"] == ["living_room", "bedroom"]
+
+    def test_unchanged_suggestions_are_not_resent(self, tmp_path, monkeypatch) -> None:
+        from weatherstat.advisory import process_advisory_plan
+
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", tmp_path / "state.json")
+        sent, dismissed = self._capture(monkeypatch)
+        plan = self._plan(self._opp("living_room", -2.8))
+
+        process_advisory_plan(plan, live=True, current_hour=12)
+        process_advisory_plan(plan, live=True, current_hour=12)
+
+        assert len(sent) == 1
+        assert dismissed == []
+
+    def test_dismissed_when_listed_suggestions_fade(self, tmp_path, monkeypatch) -> None:
+        """A suggestion that dropped below the threshold leaves the phone, even if it is still slightly beneficial."""
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        sent, dismissed = self._capture(monkeypatch)
+
+        process_advisory_plan(self._plan(self._opp("bedroom", -1.6, action="close")), live=True, current_hour=12)
+        process_advisory_plan(self._plan(self._opp("bedroom", -0.04, action="close")), live=True, current_hour=12)
+
+        assert len(sent) == 1
+        assert len(dismissed) == 1
+        data = json.loads(state_file.read_text())
+        assert data["notified"] == []
+        assert len(data["opportunities"]) == 1  # still tracked for the TUI
+
+    def test_failed_send_retries_next_cycle(self, tmp_path, monkeypatch) -> None:
+        from weatherstat.advisory import process_advisory_plan
+
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr("weatherstat.advisory.ADVISORY_STATE_FILE", state_file)
+        monkeypatch.setattr("weatherstat.advisory.send_ha_notification", lambda *a, **kw: False)
+
+        process_advisory_plan(self._plan(self._opp("bedroom", -2.0)), live=True, current_hour=12)
+
+        data = json.loads(state_file.read_text())
+        assert "opportunity_bedroom" not in data["cooldowns"]
+        assert data["notified"] == []
+
     def test_warnings_persisted(self, tmp_path, monkeypatch) -> None:
         """Backup-breach warnings are persisted alongside opportunities."""
         from weatherstat.advisory import process_advisory_plan

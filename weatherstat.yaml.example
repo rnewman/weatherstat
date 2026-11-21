@@ -334,8 +334,7 @@ advisory:
   notification_threshold: 1.5   # min |cost_delta| (raw sweep cost) to push a phone notification
   quiet_hours: [22, 7]          # suppress notifications during these hours
   cooldowns:
-    free_cooling: 14400         # seconds between re-notifying about open opportunities
-    close_windows: 3600
+    free_cooling: 14400         # seconds before re-notifying about the same window/shade suggestion (open or close)
 
 safety:
   cooldowns:

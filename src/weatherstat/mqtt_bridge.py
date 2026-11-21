@@ -351,21 +351,10 @@ def room_payload(snap: Any, col: str, label: str, *, source_entity: str | None, 
     return payload
 
 
-def opportunity_text(opp: dict) -> str:
-    """'Open office window in 20m for 60m' — the TUI's opportunity line, without markup."""
-    try:
-        from weatherstat.yaml_config import environment_display, load_config
+def _opportunity_text(opp: dict) -> str:
+    from weatherstat.advisory import opportunity_text
 
-        dev = str(opp.get("device", "?"))
-        label, kind = environment_display(dev, load_config().environment.get(dev))
-    except Exception:  # noqa: BLE001 — display only
-        label, kind = str(opp.get("device", "?")), ""
-    mins = opp.get("in_minutes") or 0
-    dur = opp.get("duration_minutes")
-    timing = "now" if mins == 0 else f"in {format_remaining(timedelta(minutes=mins))}"
-    dur_str = f" for {format_remaining(timedelta(minutes=dur))}" if dur else ""
-    action = str(opp.get("action", "?")).capitalize()
-    return " ".join(part for part in (action, label, kind) if part) + f" {timing}{dur_str}"
+    return opportunity_text(opp)
 
 
 _MAX_LIST = 10  # cap advisory lists so attributes stay small enough for the recorder
@@ -412,7 +401,7 @@ def status_payload(snap: Any) -> dict:
             else None
         ),
         "environment": [{"label": e.label, "kind": e.kind, "active": e.is_active} for e in snap.environment],
-        "opportunities": [{**o, "text": opportunity_text(o)} for o in list(snap.opportunities)[:_MAX_LIST]],
+        "opportunities": [{**o, "text": _opportunity_text(o)} for o in list(snap.opportunities)[:_MAX_LIST]],
         "warnings": list(snap.warnings)[:_MAX_LIST],
         "overlays": {snap.sensor_labels.get(col, col): {"delta": _r(o.delta), "expires_at": o.expires_at.isoformat()} for col, o in snap.overlays.items()},
         "ha_error": snap.ha_error,

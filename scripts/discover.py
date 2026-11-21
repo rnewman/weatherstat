@@ -606,12 +606,10 @@ def generate_yaml(c: Classified) -> str:
 
     # ── Advisory ──
     w("# advisory:")
-    w("#   opportunity_threshold: 0.3   # minimum benefit to track window opportunity")
     w("#   notification_threshold: 1.5  # minimum benefit to push notification")
     w("#   quiet_hours: [22, 7]")
     w("#   cooldowns:")
-    w("#     free_cooling: 14400        # seconds between open-window notifications")
-    w("#     close_windows: 3600        # seconds between close-window notifications")
+    w("#     free_cooling: 14400        # seconds before re-notifying about the same window/shade suggestion")
     w()
 
     # ── Safety ──

@@ -524,26 +524,26 @@ def cmd_opportunities() -> None:
         print("No advisory_state.json found.")
         return
 
-    active = state.get("active", {})
+    from weatherstat.advisory import opportunity_text
+
+    opportunities = state.get("opportunities", [])
     cooldowns = state.get("cooldowns", {})
     now = datetime.now(UTC).timestamp()
 
-    print("Active opportunities:")
-    if active:
-        for k, v in sorted(active.items()):
-            print(f"  {k}: {json.dumps(v, indent=4)}")
-    else:
+    print("Opportunities (beneficial, from the last live cycle):")
+    for opp in opportunities:
+        print(f"  {opportunity_text(opp):<45} cost_delta={opp.get('cost_delta', 0):+.2f}")
+    if not opportunities:
         print("  (none)")
+    print(f"On the phone: {', '.join(state.get('notified', [])) or '(nothing)'}")
+    for w in state.get("warnings", []):
+        print(f"Warning: {w.get('message', '?')}")
 
     print()
-    print("Cooldowns:")
-    for k, expire in sorted(cooldowns.items()):
-        remaining = expire - now
-        if remaining > 0:
-            mins = int(remaining / 60)
-            print(f"  {k:<40} {mins}m remaining")
-        else:
-            print(f"  {k:<40} expired")
+    print("Last sent (cooldowns: advisory.cooldowns / safety.cooldowns in weatherstat.yaml):")
+    for k, sent in sorted(cooldowns.items(), key=lambda kv: -kv[1]):
+        ago = (now - sent) / 3600
+        print(f"  {k:<40} {ago:6.1f}h ago")
 
 
 def cmd_overlays(n: int = 20) -> None:
