@@ -83,6 +83,65 @@ def _fetch_states(entity_ids: list[str]) -> dict[str, dict]:
     return result
 
 
+def active_fraction(records: list[dict], active_state: str, start: datetime, end: datetime) -> float | None:
+    """Share of ``[start, end]`` an entity spent in ``active_state``, from its HA state
+    history (oldest first; the first record is its state at ``start``). None without
+    records. Unavailable or unknown counts as not active, as the snapshot state does."""
+    span = (end - start).total_seconds()
+    if not records or span <= 0:
+        return None
+    active = 0.0
+    for i, rec in enumerate(records):
+        t0 = max(start, datetime.fromisoformat(str(rec["last_changed"])))
+        t1 = datetime.fromisoformat(str(records[i + 1]["last_changed"])) if i + 1 < len(records) else end
+        if rec.get("state") == active_state and min(t1, end) > t0:
+            active += (min(t1, end) - t0).total_seconds()
+    return min(1.0, active / span)
+
+
+def _active_fractions(states: dict[str, dict], end: datetime, log: Callable[[str], None] = print) -> dict[str, str]:
+    """Active-fraction readings for binary environment entries over the last
+    collection interval, from HA's state history.
+
+    The snapshot state alone records a door opened for 30 seconds as open for the
+    whole interval, and misses one opened and closed between snapshots; sysid then
+    learns the effect of a brief opening as if it were a sustained one. Without
+    history the snapshot state stands for the interval.
+    """
+    entries = [cfg for cfg in _CFG.environment.values() if cfg.fraction_column]
+    if not entries:
+        return {}
+    start = end - timedelta(seconds=SNAPSHOT_INTERVAL_SECONDS)
+    history: dict[str, list[dict]] = {}
+    try:
+        resp = requests.get(
+            f"{_ha_url()}/api/history/period/{start.isoformat()}",
+            headers=_ha_headers(),
+            params={
+                "end_time": end.isoformat(),
+                "filter_entity_id": ",".join(cfg.entity_id for cfg in entries),
+                "minimal_response": "",
+                "no_attributes": "",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        history = {str(recs[0].get("entity_id", "")): recs for recs in resp.json() if recs}
+    except (requests.RequestException, ValueError) as e:
+        log(f"[collector] State history unavailable, active fractions from snapshot states: {e}")
+    out: dict[str, str] = {}
+    for cfg in entries:
+        try:
+            frac = active_fraction(history.get(cfg.entity_id, []), cfg.active_state, start, end)
+        except (KeyError, ValueError, TypeError):
+            frac = None
+        if frac is None:
+            entity = states.get(cfg.entity_id)
+            frac = 1.0 if entity is not None and entity.get("state") == cfg.active_state else 0.0
+        out[str(cfg.fraction_column)] = str(round(frac, 2))
+    return out
+
+
 def _fetch_forecast(weather_entity: str) -> list[dict]:
     """Fetch hourly weather forecast via HA service call.
 
@@ -415,7 +474,11 @@ def _write_readings(timestamp: str, values: dict[str, str]) -> None:
 
     # Sparse storage: skip unchanged values.  Find each column's most recent
     # value independently — sparse columns won't exist at every timestamp.
-    sparse_cols = {cfg.column for cfg in _CFG.environment.values() if cfg.storage == "sparse"}
+    sparse_cols = {
+        col
+        for cfg in _CFG.environment.values() if cfg.storage == "sparse"
+        for col in (cfg.column, cfg.fraction_column) if col
+    }
     if sparse_cols:
         for col in sparse_cols:
             if col not in values:
@@ -448,6 +511,7 @@ def collect_once(*, log: print = print) -> None:
 
     # Extract column values
     values = _extract_snapshot(states)
+    values.update(_active_fractions(states, datetime.now(UTC), log=log))
 
     # Fetch and inject forecast
     forecast = _fetch_forecast(_CFG.weather_entity)

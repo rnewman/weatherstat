@@ -105,3 +105,41 @@ class TestTauCurveMemo:
         t, temps = self._segment()
         assert sysid._fit_tau_curve(t, temps, temps[0] - 0.5) is None  # too close to outdoor: no fit
         assert len(sysid._TAU_CURVE_MEMO) == 1
+
+
+class TestEnvironmentActivity:
+    """Active fractions over snapshot states; how long a device has been held active."""
+
+    def test_fraction_column_wins_over_the_snapshot_state(self) -> None:
+        import numpy as np
+        import pandas as pd
+
+        from weatherstat.sysid import environment_activity
+        from weatherstat.types import EnvironmentEntryConfig
+
+        cfg = EnvironmentEntryConfig("door", "binary_sensor.door", "door_open", "door", "closed", "on")
+        assert cfg.fraction_column == "door_open_fraction"
+        df = pd.DataFrame({
+            "door_open": pd.array([True, True, False, None], dtype="boolean"),
+            "door_open_fraction": [np.nan, 0.1, 0.0, np.nan],
+        })
+        # Before fractions were collected the state stands in; a 30 s opening reads 0.1.
+        np.testing.assert_allclose(environment_activity(df, cfg), [1.0, 0.1, 0.0, 0.0])
+        shade = EnvironmentEntryConfig("s", "cover.s", "s_active", "shade", "open", "closed", value_type="continuous")
+        assert shade.fraction_column is None
+
+    def test_support_is_the_duration_enough_spans_reached(self) -> None:
+        import numpy as np
+        import pandas as pd
+
+        from weatherstat.sysid import environment_support
+
+        ts = pd.Series(pd.date_range("2026-01-01", periods=40, freq="5min", tz="UTC"))
+        on = np.zeros(40, dtype=bool)
+        on[2:8] = on[10:11] = on[15:27] = on[30:33] = True  # 30, 5, 60, 15 minutes
+        assert environment_support(ts, on) == 15.0  # the third-longest
+        assert environment_support(ts, on, min_spans=5) == 0.0
+        gap = ts.copy()
+        gap.iloc[20:] += pd.Timedelta(hours=1)  # a collector gap splits the hour-long span
+        assert environment_support(gap, on) == 25.0
+        assert environment_support(ts, np.zeros(40, dtype=bool)) == 0.0

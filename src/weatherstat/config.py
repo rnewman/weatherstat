@@ -68,6 +68,8 @@ class EffectorConfig:
     mode_encoding: dict[str, float] = field(default_factory=dict)  # for energy cost / sysid
     temp_col: str = ""  # sensor column for current temp (climate entities)
     energy_cost: float | dict[str, float] = 0.0  # per-effector energy cost (scalar or per-mode dict)
+    switch_cost: float = 0.0  # cost of each planned start, stop or mode change
+    idle_cost: float = 0.0  # regulating: cost per hour in heat/cool while not running
     # binary: hour bands (start, end, modes) during which only those modes may be used
     mode_schedule: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
 
@@ -124,6 +126,8 @@ for name, cfg in _CFG.effectors.items():
         mode_encoding=cfg.command_encoding or cfg.state_encoding,
         temp_col=temp_col,
         energy_cost=cfg.energy_cost,
+        switch_cost=cfg.switch_cost if cfg.switch_cost is not None else _CFG.switch_cost,
+        idle_cost=cfg.idle_cost if cfg.idle_cost is not None else _CFG.idle_cost,
     ))
 
 EFFECTORS: tuple[EffectorConfig, ...] = tuple(_effectors)
@@ -133,6 +137,7 @@ EFFECTOR_MAP: dict[str, EffectorConfig] = {e.name: e for e in EFFECTORS}
 ADVISORY_COOLDOWNS: dict[str, int] = _CFG.advisory.cooldowns
 ADVISORY_QUIET_HOURS: tuple[int, int] = _CFG.advisory.quiet_hours
 ADVISORY_NOTIFICATION_THRESHOLD: float = _CFG.advisory.notification_threshold
+ADVISORY_EFFORT_COST: float = _CFG.advisory.effort_cost
 
 
 # ── Intervals ──────────────────────────────────────────────────────────

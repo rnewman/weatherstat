@@ -292,7 +292,10 @@ def _render_html(snap: StatusSnapshot, controller: TUIController) -> str:
         if snap.costs is not None:
             cost_str = (
                 f"<p class='cost'>Cost: {snap.costs.total:.1f} "
-                f"(comfort {snap.costs.comfort:.1f} + energy {snap.costs.energy:.2f})"
+                f"(comfort {snap.costs.comfort:.1f} + energy {snap.costs.energy:.2f}"
+                + (f" + switching {snap.costs.switching:.2f}" if snap.costs.switching else "")
+                + (f" + your effort {snap.costs.effort:.2f}" if snap.costs.effort else "")
+                + ")"
             )
             if snap.costs.baseline is not None:
                 cost_str += f" · all-off {snap.costs.baseline:.1f}"
@@ -675,6 +678,8 @@ def _snapshot_to_dict(snap: StatusSnapshot) -> dict:
                 "total": snap.costs.total,
                 "comfort": snap.costs.comfort,
                 "energy": snap.costs.energy,
+                "switching": snap.costs.switching,
+                "effort": snap.costs.effort,
                 "baseline": snap.costs.baseline,
             }
             if snap.costs

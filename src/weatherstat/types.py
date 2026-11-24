@@ -246,6 +246,13 @@ class EnvironmentEntryConfig:
     storage: str = "sampled"  # "sampled" = every 5-min tick; "sparse" = only on change
 
     @property
+    def fraction_column(self) -> str | None:
+        """Readings column for the share of each collection interval spent active
+        (binary entries only): ``column`` is the state at the snapshot, this is how
+        long it held. A door opened for 30 s reads 0.1, not a whole 5-minute "open"."""
+        return f"{self.column}_fraction" if self.value_type == "binary" else None
+
+    @property
     def label(self) -> str:
         """Human-readable label: 'moss_garden_shade' → 'moss garden shade'."""
         return self.name.replace("_", " ")
@@ -329,6 +336,8 @@ class ControlDecision:
     total_cost: float = 0.0
     comfort_cost: float = 0.0
     energy_cost: float = 0.0
+    switch_cost: float = 0.0  # changes from the previous command
+    effort_cost: float = 0.0  # actions the plan asks of the user (total = comfort + energy + switch + effort)
     predictions: dict[str, dict[str, float]] = field(default_factory=dict)  # label -> {horizon -> temp}
     trajectory_info: dict[str, dict[str, int | None]] = field(default_factory=dict)
     rationale: dict[str, str] = field(default_factory=dict)  # effector_name -> explanation text

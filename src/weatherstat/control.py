@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,7 @@ import pandas as pd
 import requests
 
 from weatherstat.config import (
+    ADVISORY_EFFORT_COST,
     CONTROL_STATE_FILE,
     EFFECTOR_MAP,
     EFFECTORS,
@@ -739,7 +741,7 @@ def _batch_energy_cost(
     active_effs = []
     for eff_cfg in EFFECTORS:
         ec = eff_cfg.energy_cost
-        if isinstance(ec, (int, float)) and ec == 0:
+        if isinstance(ec, (int, float)) and ec == 0 and not (eff_cfg.control_type == "regulating" and eff_cfg.idle_cost):
             continue
         if isinstance(ec, dict) and all(v == 0 for v in ec.values()):
             continue
@@ -777,7 +779,7 @@ def _batch_energy_cost(
             assert isinstance(ec, (int, float))
             act = (activity or {}).get(eff_cfg.name)
             if act is not None:
-                costs += _regulating_energy(eff_cfg.name, act)
+                costs += _regulating_energy(eff_cfg.name, act, decisions)
             else:
                 costs += np.where(active, ec * 0.5 * active_frac, 0.0)
 
@@ -1140,7 +1142,9 @@ def _advisory_sweep_options(
 
     For each advisory device with relevant effects in thermal_params:
     - Non-default (active): hold + return to default at various timings
-    - Default (inactive): hold + proactive activate-with-return options
+    - Default (inactive): hold + proactive activate-with-return options, none
+      longer than the device has been held active in history (sysid
+      ``environment_support``)
 
     Devices without significant effects are omitted (held at current state).
 
@@ -1183,8 +1187,15 @@ def _advisory_sweep_options(
                     AdvisoryDecision(device, action=close_action, transition_step=step)
                 )
         else:
-            # Default: proactive activate-with-return options
+            # Default: proactive activate-with-return options, no longer than the
+            # device has been held active in history — past that, the effect of
+            # holding it is an extrapolation (a door only ever opened to walk
+            # through says little about leaving it open for an hour).
+            support = getattr(sim_params, "environment_support", None)
+            held = None if support is None else support.get(device, 0.0)
             for step in ADVISORY_RETURN_STEPS[1:]:  # skip step 0 (instant open+close is meaningless)
+                if held is not None and step * 5 > held:
+                    continue
                 device_options.append(
                     AdvisoryDecision(device, action=open_action, transition_step=0, return_step=step)
                 )
@@ -1291,7 +1302,7 @@ class EffectorOptionGroup:
 
     names: tuple[str, ...]
     options: tuple[dict[str, EffectorDecision], ...]
-    energy_costs: np.ndarray  # (n_options,)
+    energy_costs: np.ndarray  # (n_options,) energy + switching
 
 
 @dataclass(frozen=True)
@@ -1340,11 +1351,62 @@ def _option_energy_cost(
     return cost
 
 
+def _commanded_modes(prev_state: ControlState | None) -> dict[str, str]:
+    """What each effector was last commanded to (empty without a previous live cycle)."""
+    return dict(prev_state.modes) if prev_state else {}
+
+
+def _plan_switches(ed: EffectorDecision, prev: str | None) -> int:
+    """Switches the plan commits to: now (against the previous command ``prev``; none
+    counted when unknown) and, for a delayed start, when the delay ends (it is
+    commanded off until then).
+
+    The end of a plan's window is not counted. Every cycle re-plans, so a window
+    that ends in two hours is re-decided long before it does; charging that stop
+    would price "heat for 2 h" the same as "off now" and leave nothing holding a
+    running unit on."""
+    n = int(prev is not None and ed.command_mode != prev)
+    if ed.mode != "off" and ed.delay_steps > 0:
+        n += 1
+    return n
+
+
+def _switch_cost(decisions: Iterable[EffectorDecision], commanded: dict[str, str]) -> float:
+    """Σ ``switch_cost`` × the switches each effector's plan makes (``_plan_switches``).
+
+    Starting, stopping or changing a device's mode is not free (a compressor
+    start, a boiler call, wear), and re-planning every cycle without a price on
+    it lets plans that differ by noise flip the hardware back and forth. A
+    planned restart counts as well as the command sent now: "off now, back on
+    in an hour" is two switches, which is what makes staying in a mode worth it
+    when the unit will run again soon. Setpoint changes within a mode are free.
+    """
+    cost = 0.0
+    for ed in decisions:
+        eff_cfg = EFFECTOR_MAP.get(ed.name)
+        if eff_cfg is not None and eff_cfg.switch_cost:
+            cost += eff_cfg.switch_cost * _plan_switches(ed, commanded.get(ed.name))
+    return cost
+
+
+def _effort_cost(advisories: Iterable[AdvisoryDecision]) -> float:
+    """``advisory.effort_cost`` × the actions a plan asks of the user.
+
+    Advice costs someone a trip to the window: "open it" is one action, "open it
+    now, close it in an hour" two. Without a price on that, a suggestion that
+    beats doing nothing by noise (a hundredth of comfort cost) is advice like any
+    other. The same reasoning as ``_switch_cost``, for the user's switches.
+    """
+    n = sum(1 + (a.return_step is not None) for a in advisories if a.action != "hold")
+    return ADVISORY_EFFORT_COST * n
+
+
 def _build_option_groups(
     per_effector_options: dict[str, list[EffectorDecision]],
     dependent_effectors: list,
     current_temps: dict[str, float],
     base_hour: int | None = None,
+    commanded: dict[str, str] | None = None,
 ) -> list[EffectorOptionGroup]:
     """Build independent option groups from per-effector option lists.
 
@@ -1352,10 +1414,16 @@ def _build_option_groups(
     Effectors with dependents form compound groups where parent+dependent
     options are enumerated together (dependency gate is not separable).
     Dependents start now, so ``base_hour`` selects the modes their
-    ``mode_schedule`` allows (None: every supported mode).
+    ``mode_schedule`` allows (None: every supported mode). Each option's
+    cost includes its switching cost against ``commanded`` (``_switch_cost``).
     """
     from collections import defaultdict
     from itertools import product as iproduct
+
+    commanded = commanded or {}
+
+    def _cost(o: dict[str, EffectorDecision]) -> float:
+        return _option_energy_cost(o, current_temps) + _switch_cost(o.values(), commanded)
 
     independent_names = list(per_effector_options.keys())
 
@@ -1401,7 +1469,7 @@ def _build_option_groups(
             # Singleton group for each independent effector
             for m in members:
                 opts = tuple({m: ed} for ed in per_effector_options[m])
-                energy = np.array([_option_energy_cost(o, current_temps) for o in opts])
+                energy = np.array([_cost(o) for o in opts])
                 groups.append(EffectorOptionGroup(names=(m,), options=opts, energy_costs=energy))
         else:
             # Compound group: all members + their dependents
@@ -1429,7 +1497,7 @@ def _build_option_groups(
                     compound_opts.append(opt)
 
             opts_tuple = tuple(compound_opts)
-            energy = np.array([_option_energy_cost(o, current_temps) for o in opts_tuple])
+            energy = np.array([_cost(o) for o in opts_tuple])
             groups.append(EffectorOptionGroup(names=all_names, options=opts_tuple, energy_costs=energy))
 
     return groups
@@ -1480,11 +1548,29 @@ def _compute_marginals(
     )
 
 
-def _regulating_energy(eff_name: str, activity: np.ndarray) -> np.ndarray:
-    """Energy cost of a regulating effector from its simulated activity: ec × mean |activity|."""
-    ec = EFFECTOR_MAP[eff_name].energy_cost
+def _regulating_energy(
+    eff_name: str, activity: np.ndarray, decisions: list[EffectorDecision] | None = None,
+) -> np.ndarray:
+    """Cost of a regulating effector's plans from their simulated activity (n, horizon):
+    ec × mean |activity|, plus ``idle_cost`` per hour the plan keeps the unit in heat
+    or cool without it running (fan and standby — a unit idling in its mode is not
+    off). ``decisions`` (one per row) give each plan's window; without them no idle
+    cost."""
+    eff = EFFECTOR_MAP[eff_name]
+    ec = eff.energy_cost
     assert isinstance(ec, (int, float))
-    return ec * np.abs(activity).mean(axis=-1)
+    act = np.abs(activity)
+    cost = ec * act.mean(axis=-1)
+    if decisions is None or not eff.idle_cost:
+        return cost
+    horizon = act.shape[-1]
+    steps = np.arange(1, horizon + 1)  # activity column j is step j + 1 (as in the simulator)
+    on = np.array([d.mode != "off" for d in decisions])
+    delay = np.array([d.delay_steps for d in decisions])
+    dur = np.array([d.duration_steps if d.duration_steps is not None else horizon - d.delay_steps for d in decisions])
+    in_mode = on[:, None] & (steps >= delay[:, None]) & (steps < (delay + dur)[:, None])
+    idle_hours = (in_mode * (1.0 - act)).sum(axis=-1) * (5.0 / 60.0)
+    return cost + eff.idle_cost * idle_hours
 
 
 def _dedupe_regulating(
@@ -1496,10 +1582,13 @@ def _dedupe_regulating(
 
     A delegated unit's options are (mode, setpoint, delay, duration), but what the
     house sees is only its activity trace. Options whose marginal traces match
-    (within ``tol``) are the same plan; one whose trace is all zero is off. Keeps
-    the first of each (option 0, the group's off/held baseline, always survives),
-    so this is exact for the marginal. Regulating energy is set from the trace
-    here (the option list is built before anything is simulated).
+    (within ``tol``) are the same plan; one whose trace is all zero is off. Each
+    option is priced first — switching, plus energy and idle time from its trace
+    (``_regulating_energy``; the option list is built before anything is
+    simulated) — and of each such set the cheapest survives, the first on a tie:
+    idling in the commanded mode survives off only if switching costs more than
+    the idle time. Option 0, the group's off/held baseline, always survives, so
+    this is exact for the marginal.
 
     Returns (groups, marginals, n_removed).
     """
@@ -1514,26 +1603,23 @@ def _dedupe_regulating(
             new_deltas.append(delta)
             new_activity.append(acts)
             continue
+        cost = group.energy_costs.copy()
+        for n in reg:
+            cost = cost + _regulating_energy(n, acts[n], [o[n] for o in group.options])
         traces = np.concatenate([acts[n] for n in reg], axis=1)
         keys = np.round(traces / tol).astype(np.int64)
-        keep: list[int] = []
-        seen: set[bytes] = set()
         zero = np.zeros(keys.shape[1], dtype=np.int64).tobytes()
-        for i in range(len(group.options)):
+        base_key = zero if _is_off_option(group.options[0]) else keys[0].tobytes()
+        cheapest: dict[bytes, int] = {}  # trace -> cheapest option with it (option 0's set: only if cheaper)
+        for i in range(1, len(group.options)):
             k = keys[i].tobytes()
-            if i == 0:
-                seen.add(k)
-                keep.append(i)
-                continue
-            if k in seen or (k == zero and _is_off_option(group.options[0])):
-                continue
-            seen.add(k)
-            keep.append(i)
+            j = cheapest.get(k, 0 if k == base_key else None)
+            if j is None or cost[i] < cost[j]:
+                cheapest[k] = i
+        keep = sorted({0, *cheapest.values()})
         removed += len(group.options) - len(keep)
         idx = np.array(keep)
-        energy = group.energy_costs[idx].copy()
-        for n in reg:
-            energy = energy + _regulating_energy(n, acts[n][idx])
+        energy = cost[idx]
         new_groups.append(EffectorOptionGroup(
             names=group.names, options=tuple(group.options[i] for i in keep), energy_costs=energy,
         ))
@@ -1834,6 +1920,7 @@ def sweep_scenarios_physics(
     current_mrt_offsets: dict[str, float] | None = None,
     horizon_mrt_offsets: dict[str, dict[int, float]] | None = None,
     hold_release_sensors: set[str] | None = None,
+    unit_states: dict[str, tuple[str, bool]] | None = None,
 ) -> tuple[ControlDecision, Scenario, dict[str, str], AdvisoryPlan | None]:
     """Sweep trajectory scenarios using physics simulator predictions.
 
@@ -1847,6 +1934,13 @@ def sweep_scenarios_physics(
     thermal_params and crosses them with HVAC scenarios. The resulting
     AdvisoryPlan carries the baseline (all-hold) cost, per-device marginal
     opportunities, and any predicted backup-bound breaches.
+
+    Every plan pays each effector's ``switch_cost`` for each switch it makes,
+    counted from the previous command (``prev_state.modes``), so near-tied plans
+    don't flip the hardware between cycles, and regulating units pay
+    ``idle_cost`` for time in a mode without running. ``unit_states``
+    (regulating effector -> (mode, running) as reported) is where the
+    simulator starts each unit's hysteresis.
 
     Returns (decision, winning_scenario, blocked_dict, advisory_plan).
     advisory_plan is None when no advisory sweep ran.
@@ -1918,13 +2012,26 @@ def sweep_scenarios_physics(
         print(f"  Mode schedule: {', '.join(names)} limited to {'/'.join(allowed)} this hour")
 
     # ── Build option groups + marginals (superposition) ──
-    groups = _build_option_groups(per_effector_options, dependent_effectors, current_temps, base_hour)
+    # Ineligible effectors are fixed off and not commanded: no switch to price.
+    commanded = {k: v for k, v in _commanded_modes(prev_state).items() if k not in _ineligible}
+    groups = _build_option_groups(
+        per_effector_options, dependent_effectors, current_temps, base_hour, commanded=commanded,
+    )
     n_combos_total = 1
     for g in groups:
         n_combos_total *= len(g.options)
 
-    def _is_all_off(s: Scenario) -> bool:
-        return all(ed.mode == "off" for ed in s.effectors.values())
+    def _does_nothing(s: Scenario, activity: dict[str, np.ndarray], i: int) -> bool:
+        """Every effector off, or a regulating one whose simulated trace is idle (a
+        setpoint it would ignore is off in effect, whatever its mode label)."""
+        return all(
+            ed.mode == "off" or (ed.name in activity and not np.any(activity[ed.name][i]))
+            for ed in s.effectors.values()
+        )
+
+    def _delivers_now(ed: EffectorDecision | None, trace: np.ndarray | None) -> bool:
+        """Active from now, and for a regulating unit actually running at some point."""
+        return ed is not None and ed.active_now and (trace is None or bool(np.any(trace)))
 
     sweep_state = HouseState(
         current_temps=current_temps,
@@ -1936,6 +2043,7 @@ def sweep_scenarios_physics(
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
         solar_planes=solar_planes or {},
+        unit_states=unit_states or {},
     )
 
     def _score_all(
@@ -1947,7 +2055,9 @@ def sweep_scenarios_physics(
             schedules, base_hour, tidx, mrt_offsets=horizon_mrt_offsets,
         ))
         energy = _batch_energy_cost(scens, current_temps, activity)
-        total = comfort + energy
+        switching = np.array([_switch_cost(sc.effectors.values(), commanded) for sc in scens])
+        effort = np.array([_effort_cost(sc.advisories.values()) for sc in scens])
+        total = comfort + energy + switching + effort
         best_idx = int(np.argmin(total))
         return total, best_idx, float(total[best_idx])
 
@@ -1988,7 +2098,17 @@ def sweep_scenarios_physics(
     cold_info: list[str] = []
     # Check if all-off is the approximate winner
     approx_best_flat = int(ranked[0])
-    all_off_scenario_wins = approx_best_flat == all_off_flat
+    # Per group: which options do nothing (off, or a regulating trace that stays idle).
+    idle_options = [
+        np.array([
+            all(ed.mode == "off" or (ed.name in acts and not np.any(acts[ed.name][i])) for ed in opt.values())
+            for i, opt in enumerate(group.options)
+        ])
+        for group, acts in zip(groups, marginals.activity, strict=True)
+    ]
+    all_off_scenario_wins = all(
+        bool(idle[ix[approx_best_flat]]) for idle, ix in zip(idle_options, combo_indices, strict=True)
+    )
 
     if all_off_scenario_wins:
         for schedule in schedules:
@@ -2028,9 +2148,10 @@ def sweep_scenarios_physics(
                     constrained_mask[:] = False
                     break
                 group = groups[gi]
+                acts = marginals.activity[gi]
                 valid_options = np.array([
-                    cold_eff in opt and opt[cold_eff].mode != "off" and opt[cold_eff].delay_steps == 0
-                    for opt in group.options
+                    _delivers_now(opt.get(cold_eff), acts[cold_eff][i] if cold_eff in acts else None)
+                    for i, opt in enumerate(group.options)
                 ])
                 constrained_mask &= valid_options[combo_indices[gi]]
 
@@ -2107,13 +2228,9 @@ def sweep_scenarios_physics(
         # commit to a plan that silently relies on user action to avoid the
         # breach.
         if advisory_plan.backup_breaches and advisory_plan.baseline_idx is not None:
-            baseline_scenario = scenarios[advisory_plan.baseline_idx]
-            baseline_has_heating = any(
-                ed.mode != "off" for ed in baseline_scenario.effectors.values()
-            )
-            best_has_heating = any(
-                ed.mode != "off" for ed in scenarios[best_idx].effectors.values()
-            )
+            base_i = advisory_plan.baseline_idx
+            baseline_has_heating = not _does_nothing(scenarios[base_i], exact_activity, base_i)
+            best_has_heating = not _does_nothing(scenarios[best_idx], exact_activity, best_idx)
             if baseline_has_heating and not best_has_heating:
                 print(f"  [advisory] Backup breach override: {advisory_plan.backup_breaches[0].message}")
                 best_idx = advisory_plan.baseline_idx
@@ -2122,12 +2239,12 @@ def sweep_scenarios_physics(
     # cold_effectors and cold_info were computed during approximate scoring above.
     # The constrained-best was added to top-K, so it's available here. Now apply
     # the override on exact costs if all-off still wins after exact refinement.
-    if cold_effectors and _is_all_off(scenarios[best_idx]):
+    if cold_effectors and _does_nothing(scenarios[best_idx], exact_activity, best_idx):
         constrained_mask_exact = np.ones(len(scenarios), dtype=bool)
         for i, scenario in enumerate(scenarios):
             for name in cold_effectors:
-                ed = scenario.effectors.get(name)
-                if ed is None or ed.mode == "off" or ed.delay_steps != 0:
+                trace = exact_activity[name][i] if name in exact_activity else None
+                if not _delivers_now(scenario.effectors.get(name), trace):
                     constrained_mask_exact[i] = False
                     break
         if constrained_mask_exact.any():
@@ -2142,11 +2259,12 @@ def sweep_scenarios_physics(
     predictions = _pred_dict(pred_matrix, best_idx, target_idx)
     # Recompute comfort/energy split for the winner (cheap: single scenario)
     comfort = compute_comfort_cost(predictions, schedules, base_hour, mrt_offsets=horizon_mrt_offsets)
-    energy = compute_energy_cost(
-        scenario, current_temps,
-        regulating_activity={n: float(np.abs(a[best_idx]).mean()) for n, a in exact_activity.items()},
-    )
-    total = comfort + energy
+    energy = float(_batch_energy_cost(
+        [scenario], current_temps, {n: a[best_idx:best_idx + 1] for n, a in exact_activity.items()},
+    )[0])
+    switching = _switch_cost(scenario.effectors.values(), commanded)
+    effort = _effort_cost(scenario.advisories.values())
+    total = comfort + energy + switching + effort
 
     # Build effector decisions and command targets
     effector_decisions: list[EffectorDecision] = list(scenario.effectors.values())
@@ -2172,6 +2290,8 @@ def sweep_scenarios_physics(
         total_cost=round(total, 4),
         comfort_cost=round(comfort, 4),
         energy_cost=round(energy, 4),
+        switch_cost=round(switching, 4),
+        effort_cost=round(effort, 4),
         predictions=sensor_preds,
         trajectory_info=trajectory_info,
     )
@@ -2530,6 +2650,20 @@ def _regulation_log(sim_params: object, current_temps: dict[str, float]) -> dict
     return out or None
 
 
+def _unit_states(latest: pd.Series | dict) -> dict[str, tuple[str, bool]]:
+    """Regulating effector -> (hvac mode, running in it) as the unit last reported."""
+    out: dict[str, tuple[str, bool]] = {}
+    for eff in EFFECTORS:
+        if eff.control_type != "regulating":
+            continue
+        mode = latest.get(f"{eff.name}_mode")
+        if not isinstance(mode, str):
+            continue
+        action = str(latest.get(f"{eff.name}_action", ""))
+        out[eff.name] = (mode, action == {"heat": "heating", "cool": "cooling"}.get(mode))
+    return out
+
+
 def run_control_cycle(live: bool = False) -> ControlDecision | None:
     """Run a single control cycle.
 
@@ -2818,8 +2952,9 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         solar_planes=solar_planes,
     )
 
-    # Load previous state for mode hold enforcement
+    # Load previous state: mode hold enforcement and switching cost
     prev_state = load_control_state()
+    unit_states = _unit_states(latest)
 
     # Outdoor temp for simulator: prefer first forecast temp (met.no, accurate)
     # over the side sensor (solar-heated, unreliable during daytime).
@@ -2863,6 +2998,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         current_mrt_offsets=_mrt_per_sensor,
         horizon_mrt_offsets=_horizon_mrt,
         hold_release_sensors={o.sensor for o in active_overlays},
+        unit_states=unit_states,
     )
     _sweep_seconds = time.monotonic() - t0
     print(f"  Sweep completed in {_sweep_seconds * 1000:.0f}ms")
@@ -2883,6 +3019,7 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
         solar_planes=solar_planes,
+        unit_states=unit_states,
     )
 
     # All-off baseline
@@ -3097,7 +3234,8 @@ def run_control_cycle(live: bool = False) -> ControlDecision | None:
             print(f"  Trajectory {eff_name}: {label}, duration {dur_str}")
     print(
         f"  Total cost: {decision.total_cost:.4f}"
-        f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f})"
+        f" (comfort: {decision.comfort_cost:.4f}, energy: {decision.energy_cost:.4f},"
+        f" switching: {decision.switch_cost:.4f}, effort: {decision.effort_cost:.4f})"
     )
     print(f"  All-off baseline: comfort={off_comfort:.4f}")
 

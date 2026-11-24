@@ -98,6 +98,10 @@ Each HVAC device needs:
 
 - **`energy_cost`**: Relative cost per unit of operation. Doesn't need to be in real currency — it's a weight that balances comfort against energy use. Higher = more expensive = the optimizer avoids using it unless necessary.
 
+- **`switch_cost`** (optional): The price of each time a plan turns the device on or off or changes its mode — now, or when a delayed start begins. (The end of a plan's window isn't charged: the next cycles re-plan it.) The plan only changes when it gains more than this, so near-equal plans don't toggle the device every few minutes. Defaults to `defaults.switch_cost` (0.1, in the same units as comfort cost).
+
+- **`idle_cost`** (optional, regulating units): The price per hour of leaving a unit in heat or cool while it isn't running (its fan still blows room air). With `switch_cost` it decides between switching a unit off and leaving it ready: it stays in its mode only if it should run again within about 2 × `switch_cost` / `idle_cost` hours. Defaults to `defaults.idle_cost` (0.2 per hour, i.e. about an hour).
+
 - **`depends_on`** (optional): Name(s) of parent effector(s) this device depends on. A duct fan that blows air over hydronic coils should declare `depends_on: your_thermostat_name` — it's only useful when the thermostat is actively heating. Multiple parents means ALL must be active (AND gate).
 
 - **`state_device`** (optional): A state sensor that confirms the effector is actually delivering. For thermostats with a boiler, the thermostat might be "calling for heat" but the boiler isn't firing. If you have a boiler mode sensor, reference it here.

@@ -74,6 +74,8 @@ class CycleCosts:
     comfort: float
     energy: float
     baseline: float | None
+    switching: float = 0.0  # changes from the previous command
+    effort: float = 0.0  # actions the plan asks of the user
 
 
 @dataclass(frozen=True)
@@ -563,6 +565,8 @@ class TUIController:
                         comfort=decision.comfort_cost,
                         energy=decision.energy_cost,
                         baseline=decision.baseline_cost or None,
+                        switching=decision.switch_cost,
+                        effort=decision.effort_cost,
                     )
                     sensor_costs = dict(decision.sensor_costs)
                     baseline_sensor_costs = dict(decision.baseline_sensor_costs)

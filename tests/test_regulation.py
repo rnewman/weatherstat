@@ -166,6 +166,68 @@ def test_fit_response_needs_data() -> None:
     assert fit_response(df, UNIT) is None
 
 
+def _hysteretic_history(n: int, rng: np.random.Generator) -> pd.DataFrame:
+    """A heat-mode unit with a deadband, in whole degrees past a 72° setpoint: idle, it
+    starts at 0° past; running, it carries on to 1° past and stops at 2°; switched into
+    heat (from a one-row "off" every 20 rows) it runs unless 2° past already."""
+    past, running, prev_mode = 1.0, False, "heat"
+    rows = []
+    for i in range(n):
+        past = float(np.clip(past + rng.choice([-1.0, 0.0, 1.0]), -3.0, 5.0))
+        mode = "off" if i % 20 == 19 else "heat"
+        if mode == "off":
+            running = False
+        elif prev_mode != "heat" or running:
+            running = past < 2.0
+        else:
+            running = past <= 0.0
+        rows.append({f"{UNIT}_temp": 72.0 + past, f"{UNIT}_target": 72.0, f"{UNIT}_mode": mode,
+                     f"{UNIT}_action": "heating" if running else ("off" if mode == "off" else "idle")})
+        prev_mode = mode
+    return _with_timestamps(pd.DataFrame(rows))
+
+
+def test_fit_response_learns_the_deadband() -> None:
+    """Start, stay and enter are fitted from consecutive rows: an idle unit starts
+    between 0 and 1° past its setpoint, a running or just-switched one stops between
+    1 and 2° past. The single curve averages the two."""
+    curve = fit_response(_hysteretic_history(8000, np.random.default_rng(4)), UNIT)
+    assert curve is not None
+    heat = curve.for_mode("heat")
+    assert set(heat.transitions) == {"start", "stay", "enter"}
+    assert heat.transition("start").half_on == pytest.approx(0.5)
+    assert heat.transition("stay").half_on == pytest.approx(1.5)
+    assert heat.transition("enter").half_on == pytest.approx(1.5)
+    for kind in ("start", "stay", "enter"):
+        assert heat.transition(kind).brier == 0.0
+    assert heat.brier > 0.0  # one curve can't be right on both sides of the deadband
+    assert 0.5 < heat.half_on < 1.5
+
+
+def test_fit_response_skips_rows_across_gaps() -> None:
+    """A row after a collector gap has no previous state: no transition rows from it."""
+    df = _hysteretic_history(8000, np.random.default_rng(5))
+    gapped = df.copy()
+    ts = pd.to_datetime(gapped["timestamp"], utc=True) + pd.to_timedelta(np.arange(len(gapped)) * 10, unit="min")
+    gapped["timestamp"] = ts.dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")  # every row 15 min apart
+    curve = fit_response(gapped, UNIT)
+    assert curve is not None and curve.for_mode("heat").transitions == {}
+    assert curve.for_mode("heat").transition("stay") is curve.for_mode("heat")
+
+
+def test_responses_json_round_trip_with_transitions() -> None:
+    from weatherstat.regulation import responses_from_json, responses_to_json
+
+    heat = ResponseCurve(3.25, 2.0, 2800, 0.06, transitions={
+        "start": ResponseCurve(2.0, 1.0, 400, 0.04), "stay": ResponseCurve(3.0, 1.0, 2500, 0.01),
+    })
+    curve = ResponseCurve(1.25, 0.25, 5000, 0.17, modes={"heat": heat})
+    data = responses_to_json({UNIT: curve})
+    assert data[UNIT]["modes"]["heat"]["transitions"]["stay"]["offset"] == 3.0
+    assert responses_from_json(data) == {UNIT: curve}
+    assert curve.has_transitions and not ResponseCurve(1.0, 1.0).has_transitions
+
+
 # ── Simulator: one activity per unit ─────────────────────────────────────
 
 _SENSORS = ["bedroom_temp", "piano_temp", "office_temp"]
@@ -187,12 +249,15 @@ def _params(weights: dict[str, float], response: ResponseCurve | None = None) ->
     )
 
 
-def _state(temps: dict[str, float], outdoor: float = 50.0) -> HouseState:
+def _state(
+    temps: dict[str, float], outdoor: float = 50.0, unit_states: dict[str, tuple[str, bool]] | None = None,
+) -> HouseState:
     """tau is floored at 100 h (TauModel), so rooms still drift toward ``outdoor``."""
     return HouseState(
         current_temps=temps, outdoor_temp=outdoor, forecast_temps=[outdoor] * 12,
         environment_states={}, hour_of_day=2.0,
         solar_fractions=[0.0] * 12, solar_elevations=[0.0] * 72,
+        unit_states=unit_states or {},
     )
 
 
@@ -319,6 +384,58 @@ def test_setpoint_below_the_input_is_a_floor() -> None:
     assert bedroom[12][1] == pytest.approx(bedroom[12][0])  # the first hour is the same as off
 
 
+def _deadband() -> ResponseCurve:
+    """Each mode: an idle unit starts 0.5° past its setpoint, a running or just-switched
+    one stops 1.5° past (steep ramps); the single curve sits in between."""
+    mode = ResponseCurve(1.5, 1.0, transitions={
+        "start": ResponseCurve(0.625, 0.25), "stay": ResponseCurve(1.625, 0.25), "enter": ResponseCurve(1.625, 0.25),
+    })
+    return ResponseCurve(1.5, 1.0, modes={"heat": mode, "cool": mode})
+
+
+_ROOM_71 = {"bedroom_temp": 71.0, "piano_temp": 70.0, "office_temp": 70.0}
+
+
+def test_running_unit_carries_on_where_an_idle_one_waits() -> None:
+    """Heat @ 70 with the input at 71 (1° past): inside the deadband. A unit already
+    heating keeps going; one idle in heat mode waits; one switched in from off starts."""
+    params = _params({"bedroom_temp": 1.0}, _deadband())
+    plan = _split("heat", 70.0)
+
+    def trace(mode: str, running: bool) -> np.ndarray:  # outdoors = room: no drift
+        return _deltas(params, _state(_ROOM_71, outdoor=71.0, unit_states={UNIT: (mode, running)}), plan)[1]
+
+    running, idle, entered = trace("heat", True), trace("heat", False), trace("off", False)
+    assert running[0] == pytest.approx(1.0)
+    assert np.all(idle == 0.0)
+    assert entered[0] == pytest.approx(1.0)
+    # Running on, it stops 1.5° past (V ≈ 71.6; as a probability, within the half hour
+    # after) and stays off inside the deadband.
+    assert np.all(running[:6] == 1.0) and running[12] < 0.01 and running[-1] < 1e-6
+
+
+def test_cool_set_above_the_input_does_nothing() -> None:
+    """Switching a heating unit to cool with its setpoint 3° above what it reads: past
+    the far side of the deadband, so not a single step of cooling — the same house as
+    off, which the planner folds it into."""
+    params = _params({"bedroom_temp": 1.0}, _deadband())
+    state = _state(_ROOM_71, unit_states={UNIT: ("heat", False)})
+    d, act = _deltas(params, state, _split("cool", 74.0))
+    assert np.all(act == 0.0)
+    assert all(v == 0.0 for v in d.values())
+
+
+def test_delayed_start_is_a_mode_change() -> None:
+    """A delayed plan is commanded off until it starts, so even a unit running in that
+    mode now re-enters it: off before the delay, then the enter response."""
+    params = _params({"bedroom_temp": 1.0}, _deadband())
+    state = _state(_ROOM_71, unit_states={UNIT: ("heat", True)})
+    plan = Scenario(effectors={UNIT: EffectorDecision(UNIT, mode="heat", target=70.0, delay_steps=12)})
+    _, act = _deltas(params, state, plan)
+    assert np.all(act[:11] == 0.0)
+    assert act[11] == pytest.approx(1.0)  # entered 1° past: inside where it stops
+
+
 def test_chunked_prediction_matches_single_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     import weatherstat.simulator as sim
 
@@ -368,10 +485,66 @@ def test_dedupe_folds_idle_options_into_off() -> None:
     assert np.all(np.abs(acts[1:]).max(axis=1) > 0)
     keys = {np.round(a, 3).tobytes() for a in acts}
     assert len(keys) == len(acts)
-    # Energy is ec × mean |activity|
-    ec = EFFECTOR_MAP[UNIT].energy_cost
-    np.testing.assert_allclose(new_groups[0].energy_costs, ec * np.abs(acts).mean(axis=1))
+    # Priced from the trace (energy + idle time in mode) plus the plan's starts/stops
+    from weatherstat.control import _regulating_energy, _switch_cost
+
+    options = [o[UNIT] for o in new_groups[0].options]
+    switches = np.array([_switch_cost([ed], {}) for ed in options])
+    np.testing.assert_allclose(new_groups[0].energy_costs, _regulating_energy(UNIT, acts, options) + switches)
     # Outdoors = room, so V stays 72, above the whole preferred band: every heat
     # setpoint is a floor that never engages and is gone; cooling to the band remains.
     modes = {o[UNIT].mode for o in new_groups[0].options}
     assert modes == {"off", "cool"}
+
+
+def _idle_survivors(commanded: dict[str, str]) -> list[tuple[EffectorDecision, float]]:
+    """Room above the whole band (heat setpoints never engage): the options that do
+    nothing and survive the fold, with their cost."""
+    from weatherstat.config import EFFECTOR_MAP
+    from weatherstat.control import (
+        CONTROL_HORIZONS,
+        _build_option_groups,
+        _compute_marginals,
+        _dedupe_regulating,
+        _regulating_sweep_options,
+    )
+    from weatherstat.types import ComfortSchedule, ComfortScheduleEntry, RoomComfort
+
+    params = _params({"bedroom_temp": 1.0})
+    temps = {"bedroom_temp": 72.0, "piano_temp": 70.0, "office_temp": 70.0}
+    sched = [ComfortSchedule(sensor="bedroom_temp", label="bedroom", entries=(
+        ComfortScheduleEntry(0, 24, RoomComfort("bedroom", 69.0, 71.0, 68.0, 74.0, 65.0, 77.0)),
+    ))]
+    opts = _regulating_sweep_options(EFFECTOR_MAP[UNIT], sched, 12, params.gains, None, temps,
+                                     regulation=params.regulation[UNIT])
+    groups = _build_option_groups({UNIT: opts}, [], temps, commanded=commanded)
+    marginals = _compute_marginals(_state(temps, outdoor=72.0), groups, params, CONTROL_HORIZONS)
+    new_groups, new_m, _ = _dedupe_regulating(groups, marginals)
+    acts = new_m.activity[0][UNIT]
+    return [(o[UNIT], float(c)) for o, c, a in zip(new_groups[0].options, new_groups[0].energy_costs, acts, strict=True)
+            if not np.any(a)]
+
+
+def test_idle_unit_is_switched_off() -> None:
+    """A unit idling in heat blows room air: idle time costs, so with nothing to do
+    for the whole horizon switching it off (one switch) beats keeping it in heat."""
+    from weatherstat.config import EFFECTOR_MAP
+
+    eff = EFFECTOR_MAP[UNIT]
+    assert eff.idle_cost * 2.0 > eff.switch_cost  # 2 h idle outweighs a switch
+    survivors = _idle_survivors({UNIT: "heat"})
+    assert [ed.mode for ed, _ in survivors] == ["off"]
+    assert survivors[0][1] == pytest.approx(eff.switch_cost)
+
+
+def test_free_idle_keeps_the_commanded_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With idle time free, idling in the commanded mode costs nothing and survives
+    beside off (which costs a switch); off itself always survives."""
+    from weatherstat.config import EFFECTOR_MAP
+
+    monkeypatch.setitem(EFFECTOR_MAP, UNIT, replace(EFFECTOR_MAP[UNIT], idle_cost=0.0))
+    survivors = _idle_survivors({UNIT: "heat"})
+    assert [ed.mode for ed, _ in survivors] == ["off", "heat"]
+    (_, off_cost), (held, held_cost) = survivors
+    assert off_cost == pytest.approx(EFFECTOR_MAP[UNIT].switch_cost) and held_cost == 0.0
+    assert held.active_now  # heat now: no switch (a window's end is not charged)

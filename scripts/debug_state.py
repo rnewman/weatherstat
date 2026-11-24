@@ -17,6 +17,7 @@ Usage:
     python scripts/debug_state.py why [EFFECTOR]          # explain why active effectors are on
     python scripts/debug_state.py advisory               # advisory states + compound tau effects
     python scripts/debug_state.py regulation             # regulation inputs: weights, response, live V vs unit, history
+    python scripts/debug_state.py switches [DAYS]        # commanded mode changes per effector per day (default 7)
 
     --bundle <dir>   Point at a debug bundle instead of the live data directory.
                      Example: python scripts/debug_state.py --bundle ~/.weatherstat/bundles/bundle_20260330T103104p0000 temps
@@ -432,6 +433,15 @@ def cmd_taus() -> None:
                     )
         print()
 
+    # How long each advisory device has been held active: proactive advice to hold
+    # it active longer than this is not offered (an extrapolation).
+    support = params.get("environment_support")
+    if support is not None:
+        print("  Held active in history (3rd-longest span; longer advice not offered):")
+        for dev, minutes in sorted(support.items()):
+            print(f"    {dev:<24} {minutes:6.0f} min")
+        print()
+
 def cmd_decisions(n: int = 5) -> None:
     """Show recent decisions."""
     p = _paths()
@@ -786,6 +796,16 @@ def cmd_regulation(n_history: int = 5) -> None:
                 where = f"{abs(half_on):.2f}° {'past' if half_on >= 0 else 'short of'} its setpoint"
                 print(f"  response ({label}): half-on {where}, ramp {c['band']:.2f}° wide"
                       f"  ({c.get('n_rows', 0)} rows, brier {brier if brier is not None else '?'})")
+                # Hysteresis: what the unit does next given what it was doing a row earlier
+                for kind, desc in (("start", "idle → starts"), ("stay", "running → stops"),
+                                   ("enter", "switched in → runs")):
+                    t = (c.get("transitions") or {}).get(kind)
+                    if t is None:
+                        continue
+                    t_half = t["offset"] - t["band"] / 2
+                    t_where = f"{abs(t_half):.2f}° {'past' if t_half >= 0 else 'short of'}"
+                    print(f"      {desc:<20} half-on {t_where}, ramp {t['band']:.2f}°"
+                          f"  ({t.get('n_rows', 0)} rows, brier {t.get('brier', '?')})")
         else:
             print(f"  response: not fitted (regulation_responses absent) — configured band "
                   f"{EFFECTOR_MAP[name].proportional_band}")
@@ -827,6 +847,52 @@ def cmd_regulation(n_history: int = 5) -> None:
             print(f"  {h.get('ts', '?')[:16]}  {h.get('effector')}: {weights_text(h.get('weights', {}))}")
     else:
         print("\nNo adoption history yet (regulation_history.jsonl).")
+
+
+def cmd_switches(days: int = 7) -> None:
+    """Commanded mode changes per effector per local day (live decisions): a plan that
+    flips the hardware between near-tied options shows up here."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from weatherstat.yaml_config import load_config
+
+    p = _paths()
+    if not p["decision_log"].exists():
+        print("No decision_log.db found.")
+        return
+    tz = ZoneInfo(load_config().location.timezone)
+    conn = sqlite3.connect(str(p["decision_log"]))
+    rows = conn.execute(
+        "SELECT timestamp, effector_decisions FROM decisions WHERE live = 1 ORDER BY timestamp"
+    ).fetchall()
+    conn.close()
+    prev: dict[str, str] = {}
+    per_day: dict[str, dict[str, int]] = {}
+    cycles: dict[str, int] = {}
+    names: list[str] = []
+    for ts, eds in rows:
+        day = datetime.fromisoformat(ts).astimezone(tz).date().isoformat()
+        cycles[day] = cycles.get(day, 0) + 1
+        for d in json.loads(eds or "[]"):
+            name = d["name"]
+            if name not in names:
+                names.append(name)
+            mode = d.get("command_mode") or d.get("mode", "off")
+            if name in prev and prev[name] != mode:
+                per_day.setdefault(day, {})[name] = per_day.get(day, {}).get(name, 0) + 1
+            prev[name] = mode
+    shown = sorted(cycles)[-days:]
+    if not shown:
+        print("No live decisions logged.")
+        return
+    short = [n.replace("thermostat_", "t_").replace("mini_split_", "split_").replace("blower_", "b_") for n in names]
+    width = max(8, *(len(x) for x in short))
+    print("Commanded mode changes per day (live cycles)")
+    print(f"{'day':<12}{'cycles':>7}  " + "".join(f"{x:>{width + 1}}" for x in short))
+    for day in shown:
+        counts = per_day.get(day, {})
+        print(f"{day:<12}{cycles[day]:>7}  " + "".join(f"{counts.get(n, 0):>{width + 1}}" for n in names))
 
 
 def cmd_why(effector_filter: str | None = None) -> None:
@@ -1349,6 +1415,7 @@ COMMANDS = {
     "why": lambda args: cmd_why(args[0] if args else None),
     "advisory": lambda args: cmd_advisory(),
     "regulation": lambda args: cmd_regulation(int(args[0]) if args else 5),
+    "switches": lambda args: cmd_switches(int(args[0]) if args else 7),
 }
 
 if __name__ == "__main__":

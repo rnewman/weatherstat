@@ -457,10 +457,12 @@ class WeatherstatApp(App):
             }
             for e in snap.effectors
         ]
-        costs_tuple = (0.0, 0.0, 0.0)
+        costs_tuple = (0.0, 0.0, 0.0, 0.0, 0.0)
         baseline = None
         if snap.costs is not None:
-            costs_tuple = (snap.costs.total, snap.costs.comfort, snap.costs.energy)
+            costs_tuple = (
+                snap.costs.total, snap.costs.comfort, snap.costs.energy, snap.costs.switching, snap.costs.effort,
+            )
             baseline = snap.costs.baseline
         panel = self.query_one(EffectorPanel)
         panel.set_data(

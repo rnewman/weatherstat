@@ -215,3 +215,26 @@ class TestOutcomeBackfill:
         assert dl.backfill_outcomes(log_path) == 1
         with sqlite3.connect(log_path) as c:
             assert c.execute("SELECT outcome_backfilled, outcomes FROM decisions").fetchone() == (1, None)
+
+
+class TestActiveFraction:
+    """Share of the collection interval a binary entity spent active, from HA history."""
+
+    def test_brief_opening_between_snapshots(self) -> None:
+        from datetime import UTC, datetime
+
+        from weatherstat.collector import active_fraction
+
+        start, end = datetime(2026, 11, 24, 3, 0, tzinfo=UTC), datetime(2026, 11, 24, 3, 5, tzinfo=UTC)
+        records = [
+            {"state": "off", "last_changed": "2026-11-24T01:00:00+00:00"},  # state at start
+            {"state": "on", "last_changed": "2026-11-24T03:02:00+00:00"},
+            {"state": "off", "last_changed": "2026-11-24T03:02:30+00:00"},
+        ]
+        assert active_fraction(records, "on", start, end) == 0.1  # 30 s of 5 min
+        # Still open at the snapshot: the interval it has been open, not all of it.
+        assert active_fraction(records[:2], "on", start, end) == 0.6
+        assert active_fraction([{"state": "on", "last_changed": "2026-11-23T00:00:00+00:00"}], "on", start, end) == 1.0
+        assert active_fraction([{"state": "unavailable", "last_changed": "2026-11-23T00:00:00+00:00"}],
+                               "on", start, end) == 0.0
+        assert active_fraction([], "on", start, end) is None

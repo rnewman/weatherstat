@@ -65,6 +65,8 @@ class EffectorYamlConfig:
     mode_hold_window: tuple[int, int] | None = None  # quiet hours for mode changes
     # binary: hour bands (start, end, modes) during which only those modes may be used
     mode_schedule: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
+    switch_cost: float | None = None  # cost of each planned start/stop/mode change (None = defaults.switch_cost)
+    idle_cost: float | None = None  # regulating: cost per hour in heat/cool while not running (None = defaults)
 
     @property
     def domain(self) -> str:
@@ -204,6 +206,10 @@ class ConstraintSchedule:
 class AdvisoryConfig:
     cooldowns: dict[str, int]
     quiet_hours: tuple[int, int] = (22, 7)
+    # Cost of each action advice asks of you, in comfort-cost units: "open the
+    # window" is one, "open it now, close it in an hour" two. A suggestion is made
+    # only when it beats doing nothing by more than the effort it takes.
+    effort_cost: float = 0.5
     # Minimum |cost_delta| in raw sweep cost units to push a Home Assistant
     # notification. Smaller beneficial opportunities are still tracked and
     # displayed in the TUI; this gate only controls phone push notifications.
@@ -257,6 +263,13 @@ class WeatherstatConfig:
     cold_room_override: float | None = None  # force heating when this far below min (default: 1°F / 0.6°C)
     backup_margin: float = 3.0  # backup bounds = acceptable ± this margin (default: 3°F / 1.7°C)
     hard_rail_multiplier: float | None = None  # penalty multiplier outside acceptable bounds (default: 3.0)
+    # Cost of each start, stop or mode change a plan commits to (now, or when a delayed start
+    # begins), in cost units: the plan changes only when that buys more. Per-effector override.
+    switch_cost: float = 0.1
+    # Regulating units: cost per hour spent in heat/cool while not running (fan, standby). With
+    # switch_cost, a unit stays in its mode only if it should run again within about
+    # 2 × switch_cost / idle_cost hours; otherwise it is switched off. Per-effector override.
+    idle_cost: float = 0.2
     control_interval: int = 300  # seconds between control cycles (default: 5 min)
     sysid_interval: int = 3600  # seconds between automatic sysid runs (default: 1 hour, 0 = disabled)
     command_retention_days: int = 14  # days to keep predictions/command_*.json (0 = keep forever)
@@ -474,8 +487,9 @@ class WeatherstatConfig:
 
     @property
     def environment_columns(self) -> list[str]:
-        """All environment columns (for forward-fill after sparse load)."""
-        return [cfg.column for cfg in self.environment.values()]
+        """All environment columns, with active-fraction columns (for forward-fill after sparse load)."""
+        cols = [cfg.column for cfg in self.environment.values()]
+        return cols + [cfg.fraction_column for cfg in self.environment.values() if cfg.fraction_column]
 
     @property
     def thermostat_action_columns(self) -> list[str]:
@@ -561,6 +575,8 @@ class WeatherstatConfig:
         # Environment factors (windows, doors, shades, etc.)
         for cfg in self.environment.values():
             defs.append((cfg.column, "REAL" if cfg.value_type == "continuous" else "INTEGER"))
+            if cfg.fraction_column:
+                defs.append((cfg.fraction_column, "REAL"))
         # Per-room temps (aggregate and individual)
         for col in self.temp_sensors:
             if col != self.outdoor_sensor and not col.startswith("thermostat_"):
@@ -675,6 +691,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
             proportional_band=float(dev.get("proportional_band", 1.0)),
             mode_hold_window=mode_hold_window,
             mode_schedule=_parse_mode_schedule(name, dev.get("mode_schedule"), control_type, supported_modes),
+            switch_cost=float(dev["switch_cost"]) if dev.get("switch_cost") is not None else None,
+            idle_cost=float(dev["idle_cost"]) if dev.get("idle_cost") is not None else None,
         )
 
     # ── State sensors (categorical with encoding) ─────────────────────
@@ -817,6 +835,7 @@ def _parse_config(data: dict) -> WeatherstatConfig:
     advisory_config = AdvisoryConfig(
         cooldowns={str(k): int(v) for k, v in adv_data.get("cooldowns", {}).items()},
         quiet_hours=(int(adv_quiet[0]), int(adv_quiet[1])),
+        effort_cost=float(adv_data.get("effort_cost", 0.5)),
         notification_threshold=float(adv_data.get("notification_threshold", 1.5)),
     )
 
@@ -869,6 +888,8 @@ def _parse_config(data: dict) -> WeatherstatConfig:
         max_1h_change=_opt_float("max_1h_change"),
         cold_room_override=_opt_float("cold_room_override"),
         hard_rail_multiplier=_opt_float("hard_rail_multiplier"),
+        switch_cost=float(defaults.get("switch_cost", 0.1)),
+        idle_cost=float(defaults.get("idle_cost", 0.2)),
         backup_margin=backup_margin,
         control_interval=_opt_int("control_interval", 300),
         sysid_interval=_opt_int("sysid_interval", 3600),

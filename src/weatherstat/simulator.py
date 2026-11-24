@@ -98,6 +98,9 @@ class SimParams:
     regulation: dict[str, RegulationModel] = field(default_factory=dict)
     # regulating effector -> what it regulates on (virtual input weights) and how it
     # responds (learned curve). See regulation.py / PLAN-41.
+    environment_support: dict[str, float] | None = None
+    # environment entry -> minutes it has been held active in history (sysid
+    # environment_support); None when thermal_params predates it (no limit).
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,10 @@ class HouseState:
     # Per-step wall-plane incidence factors keyed by plane name ("east",
     # "west"), same indexing as solar_elevations. Optional: empty dict means
     # no directional solar forcing (backward compatible).
+    unit_states: dict[str, tuple[str, bool]] = field(default_factory=dict)
+    # Regulating effector -> (hvac mode it is in, whether it is running) right now.
+    # A plan that keeps the unit in that mode continues from it; any other start
+    # is a mode change (regulation.py § Hysteresis). Absent: every start is one.
 
     def __post_init__(self) -> None:
         if not self.solar_fractions:
@@ -348,6 +355,10 @@ def load_sim_params(path: Path | None = None) -> SimParams:
         environment_solar_betas=environment_solar_betas,
         correlational_couplings=correlational_couplings,
         regulation=regulation,
+        environment_support=(
+            {str(k): float(v) for k, v in data["environment_support"].items()}
+            if "environment_support" in data else None
+        ),
     )
 
 
@@ -1038,8 +1049,14 @@ def _regulating_activity(
     have a reading (renormalized, as the published value is). V's members
     are integrated jointly, because a unit's activity depends on V and V on
     every active unit's activity. Activity at step k is decided from the
-    temperatures at the start of step k: level = response(sign·(target − V)),
-    gated by the plan's [delay, delay + duration) window.
+    temperatures at the start of step k from err = sign·(target − V), gated
+    by the plan's [delay, delay + duration) window.
+
+    With fitted transitions the level is the unit's running probability a,
+    a two-state chain: a·stay(err) + (1 − a)·start(err) while the plan keeps
+    the unit in one mode, enter(err) on the step it switches mode — from
+    ``state.unit_states`` on step 1, from off after a delay. Without them it
+    is the mode's single curve, response(err).
     """
     from weatherstat.regulation import MIN_COVERAGE
 
@@ -1061,13 +1078,34 @@ def _regulating_activity(
     member_set = sorted({s for _, members, _, _ in units for s in members})
     T = {s: np.full(n_scenarios, preps[s].cur_temp) for s in member_set}
     activity = {reg.effector_name: np.zeros((n_scenarios, max_horizon + 1)) for reg, *_ in units}
+    # Hysteresis state per unit and scenario: whether the unit is already in the
+    # scenario's mode, and its running probability.
+    in_mode: dict[str, np.ndarray] = {}
+    running: dict[str, np.ndarray] = {}
+    for reg, *_ in units:
+        mode_now, running_now = state.unit_states.get(reg.effector_name, ("off", False))
+        sign_now = {"heat": 1.0, "cool": -1.0}.get(mode_now, 0.0)
+        in_mode[reg.effector_name] = (reg.modes == sign_now) & (sign_now != 0.0)
+        running[reg.effector_name] = np.where(in_mode[reg.effector_name], float(running_now), 0.0)
     for step in range(1, max_horizon + 1):
         for reg, members, w, model in units:
+            name = reg.effector_name
             V = sum(wi * T[s] for wi, s in zip(w, members, strict=True))
-            active = (step >= reg.delay_steps) & (step < reg.delay_steps + reg.duration_steps)
+            active = (step >= reg.delay_steps) & (step < reg.delay_steps + reg.duration_steps) & (reg.modes != 0)
             sign = np.where(active, reg.modes, 0.0)
-            level = model.response.level_for(sign * (reg.targets - V), sign)
-            activity[reg.effector_name][:, step] = sign * level
+            err = sign * (reg.targets - V)
+            response = model.response
+            if response.has_transitions:
+                a = running[name]
+                kept = response.level_for(err, sign, "stay") * a + response.level_for(err, sign, "start") * (1.0 - a)
+                level = np.where(
+                    active, np.where(in_mode[name], kept, response.level_for(err, sign, "enter")), 0.0,
+                )
+                running[name] = level
+                in_mode[name] = active  # off before a delayed start and after the window
+            else:
+                level = response.level_for(err, sign)
+            activity[name][:, step] = sign * level
         for s in member_set:
             prep = preps[s]
             dTdt = prep.base_dTdt(T[s], step - 1, outdoor_vec[step - 1])

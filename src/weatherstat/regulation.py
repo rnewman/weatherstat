@@ -35,10 +35,22 @@ action keeps it on the same scale as the gains, which are fitted against action.
 Units do not stop at their setpoint: one with a built-in heating offset holds
 2–3° past it, and the same unit cools to a different point, so heat and cool
 are fitted separately (a pooled fit splits the difference and is right for
-neither). The fit answers two questions with one curve: how hard the unit will
-run for a setpoint (simulator), and which setpoint makes it hold a level
+neither). The per-mode curve says which setpoint makes the unit hold a level
 (planner, ``setpoint_for``). The configured ``proportional_band`` is only the
 fallback before a fit exists.
+
+**Hysteresis.** A unit's thermostat has a deadband: once running it carries on
+past the point where an idle unit would start, and switching it into a mode
+starts it if it is anywhere short of where it would stop. One curve averages
+those cases, so it credits a setpoint the unit would ignore with a little
+activity. Each mode therefore also has three transition curves, fitted on
+consecutive 5-minute rows: ``start`` (idle in the mode a row earlier),
+``stay`` (running) and ``enter`` (just switched into the mode). The simulator
+runs them as a two-state chain from what the unit is doing now
+(``HouseState.unit_states``): the running probability is
+a·stay(err) + (1 − a)·start(err) while the plan keeps the unit in its mode, and
+enter(err) on the step it changes mode. A setpoint past the far side of the
+deadband simulates as exactly idle, and the planner folds it into off.
 """
 
 from __future__ import annotations
@@ -69,6 +81,9 @@ WEIGHT_TOLERANCE: float = _CFG.regulation_weight_tolerance
 # change in what the unit reads (e.g. switching from an HA aggregate to V) is followed.
 RESPONSE_WINDOW_DAYS = 60
 RESPONSE_MIN_ROWS = 500  # per fit: a mode with fewer rows uses the pooled curve
+TRANSITION_MIN_ROWS = 100  # per transition fit: fewer rows and that transition uses the mode's curve
+TRANSITIONS = ("start", "stay", "enter")
+_CONTIGUOUS = pd.Timedelta(minutes=7)  # consecutive collector rows (5 min apart, with slack)
 _HALF_ON = np.arange(-2.0, 4.01, 0.25)
 _BANDS = np.array([0.25, 0.5, 1.0, 1.5, 2.0, 3.0])
 RESPONSE_MODES = {"heat": 1.0, "cool": -1.0}
@@ -88,6 +103,9 @@ class ResponseCurve:
     # Per-mode fits ("heat", "cool"). This curve itself is the pooled one, used for a
     # mode without its own fit.
     modes: dict[str, ResponseCurve] = field(default_factory=dict)
+    # Per-mode curves only: P(running) given what the unit was doing a row earlier
+    # (``TRANSITIONS``). A missing transition falls back to this curve.
+    transitions: dict[str, ResponseCurve] = field(default_factory=dict)
 
     @property
     def half_on(self) -> float:
@@ -97,14 +115,28 @@ class ResponseCurve:
     def for_mode(self, mode: str) -> ResponseCurve:
         return self.modes.get(mode, self)
 
+    def transition(self, kind: str) -> ResponseCurve:
+        return self.transitions.get(kind, self)
+
+    @property
+    def has_transitions(self) -> bool:
+        return bool(self.transitions) or any(m.transitions for m in self.modes.values())
+
     def level(self, err: np.ndarray | float) -> np.ndarray:
         return np.clip((np.asarray(err, dtype=float) + self.offset) / self.band, 0.0, 1.0)
 
-    def level_for(self, err: np.ndarray, sign: np.ndarray) -> np.ndarray:
-        """``level`` per scenario: the heat curve where ``sign`` > 0, the cool curve where < 0."""
+    def level_for(self, err: np.ndarray, sign: np.ndarray, kind: str | None = None) -> np.ndarray:
+        """``level`` per scenario: the heat curve where ``sign`` > 0, the cool curve where < 0.
+
+        ``kind`` (one of ``TRANSITIONS``) selects that transition curve of each mode.
+        """
+
+        def curve(c: ResponseCurve) -> ResponseCurve:
+            return c.transition(kind) if kind else c
+
         if not self.modes:
-            return self.level(err)
-        heat, cool = self.for_mode("heat").level(err), self.for_mode("cool").level(err)
+            return curve(self).level(err)
+        heat, cool = curve(self.for_mode("heat")).level(err), curve(self.for_mode("cool")).level(err)
         return np.where(np.asarray(sign) >= 0, heat, cool)
 
     def setpoint_for(self, hold: float, sign: float) -> float:
@@ -275,9 +307,9 @@ def virtual_reading(
 # ── Learned response ──────────────────────────────────────────────────────
 
 
-def _fit_curve(err: np.ndarray, running: np.ndarray) -> ResponseCurve | None:
+def _fit_curve(err: np.ndarray, running: np.ndarray, min_rows: int = RESPONSE_MIN_ROWS) -> ResponseCurve | None:
     """Best ramp for P(running) vs error, by mean squared error over the grid."""
-    if len(err) < RESPONSE_MIN_ROWS:
+    if len(err) < min_rows:
         return None
     scores = np.array([
         [float(np.mean((np.clip((err + h + b / 2.0) / b, 0.0, 1.0) - running) ** 2)) for b in _BANDS]
@@ -305,14 +337,18 @@ def fit_response(df: pd.DataFrame, effector: str, window_days: float = RESPONSE_
     information about the response and are skipped.
 
     Returns the pooled curve with ``modes`` holding a separate fit for each mode
-    that has enough rows; None when even the pooled fit lacks data.
+    that has enough rows, each with its ``transitions``: the same fit on rows whose
+    previous row (the snapshot 5 minutes earlier) was idle in the mode (``start``),
+    running in it (``stay``) or in another mode (``enter``). None when even the
+    pooled fit lacks data.
     """
     cols = [f"{effector}_temp", f"{effector}_target", f"{effector}_mode", f"{effector}_action"]
     if any(c not in df.columns for c in cols):
         return None
     d = df[["timestamp", *cols]].copy()
-    ts = pd.to_datetime(d["timestamp"], format="ISO8601", utc=True)
-    d = d[ts >= ts.max() - pd.Timedelta(days=window_days)]
+    d["_ts"] = pd.to_datetime(d["timestamp"], format="ISO8601", utc=True)
+    d = d[d["_ts"] >= d["_ts"].max() - pd.Timedelta(days=window_days)].sort_values("_ts")
+    ts = d["_ts"]
     mode = d[f"{effector}_mode"].astype(str)
     sign = np.select([mode.eq("heat"), mode.eq("cool")], [1.0, -1.0], 0.0)
     v = pd.to_numeric(d[f"{effector}_temp"], errors="coerce").to_numpy(dtype=float)
@@ -322,17 +358,35 @@ def fit_response(df: pd.DataFrame, effector: str, window_days: float = RESPONSE_
     ok = (sign != 0) & np.isfinite(v) & np.isfinite(tgt)
     if int(ok.sum()) < RESPONSE_MIN_ROWS:
         return None
-    err = sign[ok] * (tgt[ok] - v[ok])
+    err_all = sign * (tgt - v)
+    err = err_all[ok]
     y = running[ok]
     pooled = _fit_curve(err, y)
     if pooled is None:
         return None
+    # The row before each row, when it is the previous collector snapshot.
+    contiguous = np.zeros(len(d), dtype=bool)
+    contiguous[1:] = (ts.iloc[1:].to_numpy() - ts.iloc[:-1].to_numpy()) <= _CONTIGUOUS.to_timedelta64()
+    prev_sign = np.concatenate([[0.0], sign[:-1]])
+    prev_running = np.concatenate([[0.0], running[:-1]])
     modes: dict[str, ResponseCurve] = {}
     for name, s in RESPONSE_MODES.items():
         sel = sign[ok] == s
         curve = _fit_curve(err[sel], y[sel])
-        if curve is not None:
-            modes[name] = curve
+        if curve is None:
+            continue
+        in_mode = ok & (sign == s)
+        stayed = in_mode & contiguous & (prev_sign == s)
+        rows = {
+            "start": stayed & (prev_running == 0.0),
+            "stay": stayed & (prev_running == 1.0),
+            "enter": in_mode & contiguous & (prev_sign != s),
+        }
+        transitions = {
+            kind: fit for kind, m in rows.items()
+            if (fit := _fit_curve(err_all[m], running[m], min_rows=TRANSITION_MIN_ROWS)) is not None
+        }
+        modes[name] = replace(curve, transitions=transitions)
     return replace(pooled, modes=modes)
 
 
@@ -349,6 +403,8 @@ def _curve_to_json(r: ResponseCurve) -> dict:
     out: dict = {"offset": r.offset, "band": r.band, "n_rows": r.n_rows, "brier": r.brier}
     if r.modes:
         out["modes"] = {m: _curve_to_json(c) for m, c in r.modes.items()}
+    if r.transitions:
+        out["transitions"] = {k: _curve_to_json(c) for k, c in r.transitions.items()}
     return out
 
 
@@ -357,16 +413,18 @@ def _curve_from_json(v: dict) -> ResponseCurve:
         offset=float(v["offset"]), band=float(v["band"]),
         n_rows=int(v.get("n_rows", 0)), brier=v.get("brier"),
         modes={str(m): _curve_from_json(c) for m, c in (v.get("modes") or {}).items()},
+        transitions={str(k): _curve_from_json(c) for k, c in (v.get("transitions") or {}).items()},
     )
 
 
 def responses_to_json(responses: dict[str, ResponseCurve]) -> dict[str, dict]:
-    """``regulation_responses`` in thermal_params.json: the pooled curve, with per-mode fits under ``modes``."""
+    """``regulation_responses`` in thermal_params.json: the pooled curve, with per-mode fits
+    (each with its ``transitions``) under ``modes``."""
     return {k: _curve_to_json(r) for k, r in responses.items()}
 
 
 def responses_from_json(data: dict) -> dict[str, ResponseCurve]:
-    """Inverse of ``responses_to_json``; files written before per-mode fits have no ``modes``."""
+    """Inverse of ``responses_to_json``; older files have no ``modes`` or ``transitions``."""
     return {str(k): _curve_from_json(v) for k, v in (data or {}).items()}
 
 

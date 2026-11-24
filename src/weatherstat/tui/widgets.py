@@ -283,7 +283,7 @@ class EffectorPanel(Static):
         self._decisions: list[dict] = []
         self._command_targets: dict[str, float] = {}
         self._current_temps: dict[str, float] = {}
-        self._costs: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._costs: tuple[float, float, float, float, float] = (0.0,) * 5  # total, comfort, energy, switching, effort
         self._baseline_cost: float | None = None
         self._overrides: dict[str, str] = {}  # effector_name -> description
         self._rationale: dict[str, str] = {}  # effector_name -> explanation
@@ -302,7 +302,7 @@ class EffectorPanel(Static):
         self,
         decisions: list[dict],
         command_targets: dict[str, float],
-        costs: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        costs: tuple[float, float, float, float, float] = (0.0,) * 5,  # total, comfort, energy, switching, effort
         baseline_cost: float | None = None,
         rationale: dict[str, str] | None = None,
         sensor_costs: dict[str, float] | None = None,
@@ -376,8 +376,10 @@ class EffectorPanel(Static):
             if r:
                 lines.append(f"    [dim]{r}[/]")
 
-        total, comfort, energy = self._costs
-        lines.append(f"\n  Cost: {total:.1f}  (comfort {comfort:.1f} + energy {energy:.2f})")
+        total, comfort, energy, switching, effort = self._costs
+        switch_str = f" + switching {switching:.2f}" if switching else ""
+        effort_str = f" + your effort {effort:.2f}" if effort else ""
+        lines.append(f"\n  Cost: {total:.1f}  (comfort {comfort:.1f} + energy {energy:.2f}{switch_str}{effort_str})")
         if self._baseline_cost is not None:
             lines.append(f"  vs all-off: {self._baseline_cost:.1f}")
 

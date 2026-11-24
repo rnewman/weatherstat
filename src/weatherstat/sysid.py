@@ -32,6 +32,7 @@ from scipy.optimize import curve_fit
 
 from weatherstat.config import DATA_DIR, UNIT_SYMBOL, delta_temp
 from weatherstat.extract import load_collector_snapshots
+from weatherstat.types import EnvironmentEntryConfig
 from weatherstat.weather import SOLAR_PLANES
 from weatherstat.yaml_config import load_config
 
@@ -140,6 +141,8 @@ class SysIdResult:
     coupling_identification: dict[str, dict[str, dict[str, dict]]] = field(default_factory=dict)  # family -> device -> sensor -> record
     # effector -> {offset, band, n_rows, brier, modes: {heat|cool: {...}}}
     regulation_responses: dict[str, dict] = field(default_factory=dict)
+    # environment entry -> minutes it has been held active (see environment_support)
+    environment_support: dict[str, float] = field(default_factory=dict)
 
 
 # ── Stage 0: Enumerate effectors and sensors from config ──────────────────
@@ -359,8 +362,7 @@ def _find_uncontrolled_segments(
     # as a constant unknown state and does not disqualify the segment.
     # One grouped nunique (dropna) over the qualifying rows replaces a
     # Python loop over every segment × column.
-    all_env_cols = [cfg.column for cfg in _CFG.environment.values()]
-    existing_env_cols = [c for c in all_env_cols if c in df.columns]
+    existing_env_cols = [c for c in _CFG.environment_columns if c in df.columns]
     if existing_env_cols:
         n_unique = df[existing_env_cols].iloc[rows].groupby(seg_ids).nunique()
         unstable = (n_unique > 1).any(axis=1).to_numpy()
@@ -439,6 +441,51 @@ def _weighted_median(values_weights: list[tuple[float, int]]) -> float:
     mid = cumw[-1] / 2.0
     idx = np.searchsorted(cumw, mid)
     return round(float(vals[min(idx, len(vals) - 1)]), 1)
+
+
+# ── Environment activity ──────────────────────────────────────────────────
+
+SUPPORT_MIN_SPANS = 3  # sustained spans needed before a duration counts as observed
+_SPAN_GAP = pd.Timedelta(minutes=7)  # consecutive collector rows (5 min apart, with slack)
+
+
+def environment_activity(df: pd.DataFrame, cfg: EnvironmentEntryConfig) -> np.ndarray:
+    """Share of each row's interval an environment entry was active (0–1).
+
+    The collector's active-fraction column where it exists, else the state at
+    the snapshot. The fraction keeps a door opened for 30 s from counting as
+    open for the whole 5 minutes, which taught sysid that an open door barely
+    matters when it was only ever opened to walk through.
+    """
+    state = df[cfg.column].astype("float64") if cfg.column in df.columns else pd.Series(np.nan, index=df.index)
+    frac_col = cfg.fraction_column
+    if frac_col and frac_col in df.columns:
+        state = df[frac_col].astype("float64").fillna(state)
+    return state.fillna(0.0).to_numpy()
+
+
+def environment_support(ts: pd.Series, active: np.ndarray, min_spans: int = SUPPORT_MIN_SPANS) -> float:
+    """Minutes an entry has been held active: the duration at least ``min_spans``
+    of its sustained active spans reached (0 with fewer).
+
+    Advice to hold a device active for longer than this asks the model about a
+    state it has hardly seen, so the sweep doesn't offer it. A collector gap
+    ends a span.
+    """
+    on = np.asarray(active, dtype=bool)
+    if not on.any():
+        return 0.0
+    t = ts.to_numpy()
+    gap = np.ones(len(on), dtype=bool)
+    gap[1:] = (t[1:] - t[:-1]) > _SPAN_GAP.to_timedelta64()
+    starts = on & (gap | ~np.roll(on, 1))
+    starts[0] = on[0]
+    idx = np.flatnonzero(on)
+    sid = np.cumsum(starts)[idx]
+    first = np.r_[0, np.flatnonzero(np.diff(sid)) + 1]
+    last = np.r_[first[1:] - 1, len(idx) - 1]
+    durations = np.sort((t[idx[last]] - t[idx[first]]) / np.timedelta64(1, "m") + 5.0)[::-1]
+    return float(durations[min_spans - 1]) if len(durations) >= min_spans else 0.0
 
 
 # ── Preprocessing ─────────────────────────────────────────────────────────
@@ -780,6 +827,7 @@ def build_design_matrix(
     _MIN_ACTIVE_ROWS = 50  # ~4h of 5-min data
     _TAU_SKIP_KINDS = {"shade"}
     env_col_to_name = {cfg.column: name for name, cfg in _CFG.environment.items()}
+    env_cfg_by_col = {cfg.column: cfg for cfg in _CFG.environment.values()}
     all_adv_cols = [
         cfg.column for cfg in _CFG.environment.values() if cfg.kind not in _TAU_SKIP_KINDS
     ]
@@ -790,7 +838,7 @@ def build_design_matrix(
     adv_state_arrays: dict[str, np.ndarray] = {}  # device_name -> state array (for reuse)
     for wc in existing_adv_cols:
         dev_name = env_col_to_name[wc]
-        state_arr = df[wc].astype("float64").fillna(0.0).values
+        state_arr = environment_activity(df, env_cfg_by_col[wc])
         n_active = int(state_arr.sum())
         if n_active < _MIN_ACTIVE_ROWS:
             if verbose:
@@ -807,7 +855,7 @@ def build_design_matrix(
         dev_name = env_col_to_name[wc]
         if dev_name in adv_state_arrays:
             continue
-        state_arr = df[wc].astype("float64").fillna(0.0).values
+        state_arr = environment_activity(df, env_cfg_by_col[wc])
         if int(state_arr.sum()) < _MIN_ACTIVE_ROWS:
             continue
         adv_state_arrays[dev_name] = state_arr
@@ -1096,9 +1144,7 @@ def _fit_sensor_model(
             env_cfg = _CFG.environment.get(dev)
             if env_cfg is None or env_cfg.column not in df.columns:
                 continue
-            dev_state = (
-                df[env_cfg.column].astype("float64").ffill().fillna(0.0) > 0.5
-            ).values[valid]
+            dev_state = (environment_activity(df, env_cfg) > 0.5)[valid]
             fj = feature_names.index(feature)
             result = classify_coupling(
                 X, y, feature_names, feature, dev_state, ts_hours_valid,
@@ -1507,6 +1553,15 @@ def fit_sysid(
             print(f"  Response {name} {label}: half-on {curve.half_on:+.2f} past setpoint, ramp {curve.band:.2f} wide "
                   f"[{curve.n_rows} rows, brier {curve.brier}]")
 
+    support = {
+        name: environment_support(df["_ts"], environment_activity(df, cfg) >= 0.5)
+        for name, cfg in _CFG.advisory_environment.items()
+        if cfg.column in df.columns
+    }
+    if support:
+        print("  Held active (min of the " + str(SUPPORT_MIN_SPANS) + " longest spans): "
+              + ", ".join(f"{n} {m:.0f}m" for n, m in sorted(support.items())))
+
     sysid_result = SysIdResult(
         timestamp=datetime.now(UTC).isoformat(),
         data_start=data_start,
@@ -1524,6 +1579,7 @@ def fit_sysid(
         regression_models=regression_models,
         coupling_identification=coupling_identification,
         regulation_responses=responses_to_json(responses),
+        environment_support=support,
     )
     return sysid_result, sensor_diagnostics
 

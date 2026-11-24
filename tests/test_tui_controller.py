@@ -447,3 +447,16 @@ class TestFrozenSensors:
             snap = ctrl.build_snapshot()  # no DB in the sandbox: nothing frozen
         assert snap.temps.get("bedroom_temp") == 69.8 and snap.frozen == {}
         assert any("bedroom_temp reading again" in m for m in cap.logs)
+
+
+def test_effector_panel_renders_before_and_after_a_decision() -> None:
+    """Temperatures arrive before the first decision: the panel must draw with its
+    placeholder costs, then show every cost term it is given."""
+    from weatherstat.tui.widgets import EffectorPanel
+
+    panel = EffectorPanel()
+    panel.set_current_temps({"bedroom_temp": 72.0})
+    panel.set_data([], {}, costs=(1.0, 0.5, 0.2, 0.1, 0.2))
+    text = str(panel.render())
+    assert "switching 0.10" in text and "your effort 0.20" in text
+

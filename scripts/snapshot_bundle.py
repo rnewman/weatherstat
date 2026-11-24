@@ -283,6 +283,7 @@ def replay_bundle(bundle_dir: Path) -> None:
 
     from weatherstat.config import PREDICTION_SENSORS, SENSOR_LABELS, TIMEZONE
     from weatherstat.control import (
+        _unit_states,
         apply_comfort_profile,
         compute_current_mrt_offsets,
         default_comfort_schedules,
@@ -465,9 +466,11 @@ def replay_bundle(bundle_dir: Path) -> None:
         prev_state=prev_state,
         solar_fractions=solar_fractions,
         solar_elevations=solar_elevations,
+        unit_states=_unit_states(snap),
     )
 
-    print(f"  Comfort: {decision.comfort_cost:.1f}  Energy: {decision.energy_cost:.3f}")
+    print(f"  Comfort: {decision.comfort_cost:.1f}  Energy: {decision.energy_cost:.3f}"
+          f"  Switching: {decision.switch_cost:.3f}  Effort: {decision.effort_cost:.3f}")
     print("  Effectors:")
     for e in decision.effectors:
         t = f" @ {e.target}" if e.target is not None else ""

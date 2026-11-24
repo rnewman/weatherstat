@@ -592,10 +592,12 @@ def fetch_recent_history(hours_back: int = 14) -> tuple[pd.DataFrame, list[Forec
                 s = series[~series.index.duplicated(keep="last")]
                 result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")
         else:
+            # action: whether the unit is running (its state column, as sysid uses it)
             for suffix, series in [
                 ("temp", series_dict["temp"]),
                 ("target", series_dict["target"]),
                 ("mode", series_dict["mode"]),
+                ("action", series_dict["action"]),
             ]:
                 s = series[~series.index.duplicated(keep="last")]
                 result[f"{name}_{suffix}"] = s.reindex(time_index, method="ffill")

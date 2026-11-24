@@ -395,6 +395,8 @@ def status_payload(snap: Any) -> dict:
                 "total": _r(costs.total, 3),
                 "comfort": _r(costs.comfort, 3),
                 "energy": _r(costs.energy, 3),
+                "switching": _r(costs.switching, 3),
+                "effort": _r(costs.effort, 3),
                 "baseline": _r(costs.baseline, 3),
             }
             if costs

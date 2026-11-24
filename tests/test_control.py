@@ -1231,6 +1231,19 @@ class TestAdvisorySweepOptions:
         returns = [o.return_step for o in opts[1:]]
         assert returns == [12, 24, 36]
 
+    def test_proactive_options_stop_at_the_held_duration(self) -> None:
+        """A device held active for at most ~90 min in history isn't advised to be held for 2 h or
+        3 h; one never held for an hour gets no proactive advice; closing an active one is unaffected."""
+        from dataclasses import replace
+
+        sp = self._make_sim_params_with_advisory("piano_window")
+        held = replace(sp, environment_support={"piano_window": 90.0})
+        opts = _advisory_sweep_options({"piano_window": False}, held)["piano_window"]
+        assert [o.return_step for o in opts[1:]] == [12]
+        brief = replace(sp, environment_support={"piano_window": 10.0})
+        assert [o.action for o in _advisory_sweep_options({"piano_window": False}, brief)["piano_window"]] == ["hold"]
+        assert len(_advisory_sweep_options({"piano_window": True}, brief)["piano_window"]) == 5
+
     def test_irrelevant_device_omitted(self) -> None:
         """Device with no effects in thermal_params is omitted from options."""
         from weatherstat.simulator import load_sim_params
@@ -2044,13 +2057,17 @@ class TestSuperposition:
         sample_indices = [i for i in sample_indices if i < n_combos]
         scenarios = _materialize_scenarios(groups, combo_indices, sample_indices)
 
+        from weatherstat.control import _batch_energy_cost, _switch_cost
+
         for s_idx, flat_idx in enumerate(sample_indices):
             reg_activity = {
-                name: float(np.abs(acts[name][combo_indices[g][flat_idx]]).mean())
+                name: acts[name][combo_indices[g][flat_idx]][None, :]
                 for g, acts in enumerate(marginals.activity)
                 for name in acts
             }
-            expected = compute_energy_cost(scenarios[s_idx], temps, regulating_activity=reg_activity)
+            scenario = scenarios[s_idx]
+            expected = float(_batch_energy_cost([scenario], temps, reg_activity)[0])
+            expected += _switch_cost(scenario.effectors.values(), {})  # planned starts/stops
             assert abs(precomputed[flat_idx] - expected) < 0.001, (
                 f"Energy cost mismatch at flat {flat_idx}: "
                 f"precomputed={precomputed[flat_idx]:.4f} vs expected={expected:.4f}"
@@ -2267,3 +2284,85 @@ class TestMissingSensorsNotScored:
         preds = {f"piano_temp_t+{h}": 60.0 for h in CONTROL_HORIZONS}
         assert compute_comfort_cost(preds, piano, 14) > 0
         assert compute_comfort_cost(preds, [s for s in schedules if s.sensor != "piano_temp"], 14) == 0
+
+
+class TestSwitchCost:
+    """The switches a plan commits to have a price; re-planning doesn't flip on noise."""
+
+    def test_counts_the_switches_the_plan_commits_to(self) -> None:
+        from weatherstat.control import _switch_cost
+
+        commanded = {"mini_split_bedroom": "heat", "blower_office": "off"}
+        split = EFFECTOR_MAP["mini_split_bedroom"].switch_cost
+        assert split > 0
+
+        def cost(ed: EffectorDecision) -> float:
+            return _switch_cost([ed], commanded)
+
+        assert cost(EffectorDecision("mini_split_bedroom", "heat", 70.0)) == 0.0  # new target, same mode: free
+        assert cost(EffectorDecision("mini_split_bedroom", "cool", 74.0)) == split
+        assert cost(EffectorDecision("mini_split_bedroom")) == split
+        # Heat for 2 h: the window's end is re-planned long before it arrives, so it is not
+        # charged, and continuing costs less than stopping now.
+        assert cost(EffectorDecision("mini_split_bedroom", "heat", 70.0, duration_steps=24)) == 0.0
+        # "Off now, back on in an hour": stop now, start later — two.
+        delayed = EffectorDecision("mini_split_bedroom", "heat", 70.0, delay_steps=12)
+        assert cost(delayed) == pytest.approx(2 * split)
+        assert cost(EffectorDecision("blower_office", "low")) == EFFECTOR_MAP["blower_office"].switch_cost
+        # No previous command: only the planned restart.
+        assert cost(EffectorDecision("thermostat_upstairs", "heating")) == 0.0
+        assert cost(EffectorDecision("thermostat_upstairs", "heating", delay_steps=12, duration_steps=12)) == (
+            pytest.approx(EFFECTOR_MAP["thermostat_upstairs"].switch_cost)
+        )
+
+    def test_prohibitive_switch_cost_holds_every_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from dataclasses import replace
+
+        from weatherstat.control import sweep_scenarios_physics
+        from weatherstat.simulator import load_sim_params
+        from weatherstat.types import ControlState
+
+        for name, eff in list(EFFECTOR_MAP.items()):
+            monkeypatch.setitem(EFFECTOR_MAP, name, replace(eff, switch_cost=1e3))
+        temps = {
+            "thermostat_upstairs_temp": 71.0, "thermostat_downstairs_temp": 70.5,
+            "bedroom_temp": 70.5, "office_temp": 71.0, "family_room_temp": 71.0,
+            "kitchen_temp": 71.5, "bathroom_temp": 71.5, "piano_temp": 71.5,
+        }
+        for split_mode in ("heat", "cool", "off"):
+            modes = {e.name: "off" for e in EFFECTORS}
+            modes["mini_split_bedroom"] = split_mode
+            prev = ControlState(last_decision_time="2026-11-01T12:00:00+00:00", modes=modes)
+            decision, _scenario, _blocked, _plan = sweep_scenarios_physics(
+                temps, 45.0, [45.0] * 12, {}, load_sim_params(), 14.0, {}, make_schedules(), 14, prev,
+                solar_fractions=[0.0] * 13, solar_elevations=[0.0] * 144,
+            )
+            assert {ed.name: ed.command_mode for ed in decision.effectors} == modes
+            assert decision.switch_cost == 0.0
+            assert decision.total_cost == pytest.approx(decision.comfort_cost + decision.energy_cost, abs=1e-3)
+
+
+class TestEffortCost:
+    """Advice costs the user an action per step it asks for; noise-level benefits aren't advice."""
+
+    def test_counts_the_actions_asked_of_the_user(self) -> None:
+        from weatherstat.control import ADVISORY_EFFORT_COST, _effort_cost
+
+        assert ADVISORY_EFFORT_COST > 0
+        assert _effort_cost([AdvisoryDecision("win", action="hold")]) == 0.0
+        assert _effort_cost([AdvisoryDecision("win", action="close", transition_step=12)]) == ADVISORY_EFFORT_COST
+        # Open now, close in an hour: two trips.
+        both = AdvisoryDecision("door", action="open", transition_step=0, return_step=12)
+        assert _effort_cost([both]) == pytest.approx(2 * ADVISORY_EFFORT_COST)
+        assert _effort_cost([both, AdvisoryDecision("win", action="close")]) == pytest.approx(3 * ADVISORY_EFFORT_COST)
+
+
+def test_unit_states_from_the_latest_row() -> None:
+    from weatherstat.control import _unit_states
+
+    row = {
+        "mini_split_bedroom_mode": "heat", "mini_split_bedroom_action": "heating",
+        "mini_split_living_room_mode": "cool", "mini_split_living_room_action": "idle",
+    }
+    assert _unit_states(row) == {"mini_split_bedroom": ("heat", True), "mini_split_living_room": ("cool", False)}
+    assert _unit_states({"mini_split_bedroom_mode": float("nan")}) == {}
